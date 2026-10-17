@@ -10,6 +10,7 @@
 //!                                   - K_{k-1/2} (ϕ_k^{n+1} - ϕ_{k-1}^{n+1}) / Δz_{k-1/2} ]
 
 use crate::mesh::data::Bathymetry2D;
+use crate::physics::air_sea::{FRESH_WATER_DENSITY, JerlovWater, SEAWATER_HEAT_CAPACITY};
 use crate::physics::vertical_mixing::{Column, Forcing, Turbulence, VerticalMixing};
 use crate::solver::algorithms::tridiagonal::solve_tridiagonal;
 use crate::solver::core::blocks::{Pooled, for_each_block};
@@ -27,13 +28,38 @@ pub struct SurfaceFields<'a> {
     /// Surface roughness `z₀ₛ` (m), e.g. from the waves' height
     /// ([`Column::surface_roughness`])
     pub roughness: Option<&'a [f64]>,
+    /// Heat and freshwater fluxes (see [`SurfaceTracerFluxes`])
+    pub tracers: Option<SurfaceTracerFluxes<'a>>,
+}
+
+/// Per-column surface fluxes of heat and fresh water for
+/// [`apply_vertical_diffusion`], one value per column (`[element][node]`),
+/// positive into the ocean (see [`crate::physics::surface_fluxes`]).
+#[derive(Clone, Copy, Debug)]
+pub struct SurfaceTracerFluxes<'a> {
+    /// Net heat flux at the surface without the shortwave (W/m²), added to
+    /// `Forcing::surface_heat_flux`
+    pub nonsolar: &'a [f64],
+    /// Net shortwave entering the water (W/m²), absorbed with depth as
+    /// `water` transmits it
+    pub shortwave: &'a [f64],
+    /// Evaporation minus precipitation (kg m⁻² s⁻¹), the virtual salt flux
+    /// `S F/ρ_fw` of the surface salinity
+    pub freshwater: &'a [f64],
+    /// The optical water type of the shortwave absorption
+    pub water: JerlovWater,
 }
 
 /// Apply vertical mixing and diffusion to the 3D state.
 ///
 /// The surface and bottom stresses enter as the momentum fluxes `τ/ρ₀` at the
 /// column ends, so over `dt` the depth-integrated velocity of every column
-/// changes by `dt·(τ_s − τ_b)/ρ₀`. The surface stress of a column is
+/// changes by `dt·(τ_s − τ_b)/ρ₀`. Likewise the surface heat flux
+/// `forcing.surface_heat_flux` plus the column's `surface.tracers` (non-solar
+/// at the surface, the shortwave absorbed through the column) changes its
+/// heat content `ρ₀ c_p ∫ T dz` by `dt` times the flux, and E − P its salt
+/// `∫ S dz` by `dt·S F/ρ_fw` (`S` of the surface layer before the step,
+/// [`FRESH_WATER_DENSITY`]). The surface stress of a column is
 /// `forcing.surface_stress` plus, if given, its entry of `surface.stress`
 /// (`[τ_x, τ_y]`, N/m², one per column, `[element][node]`); the closure
 /// receives the column's own [`Forcing`] and friction velocity, and its
@@ -201,8 +227,34 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 eddy_viscosity[w_points.clone()].copy_from_slice(av);
                 eddy_diffusivity[w_points].copy_from_slice(kt);
 
-                // 3. Solve diffusion: u, v with the stresses (kinematic) and
-                // the drags, T with the surface buoyancy flux, S without
+                // 3. The surface fluxes of heat and salt (kinematic), the
+                // shortwave absorbed through the column as a source of the
+                // implicit step (`T + dt·source` on the right-hand side)
+                let heat_capacity = rho0 * SEAWATER_HEAT_CAPACITY;
+                let mut heat_flux = forcing.surface_heat_flux;
+                let mut salt_flux = 0.0;
+                if let Some(fluxes) = &surface.tracers {
+                    heat_flux += fluxes.nonsolar[idx];
+                    salt_flux = salt[local.end - 1] * fluxes.freshwater[idx] / FRESH_WATER_DENSITY;
+                    let shortwave = fluxes.shortwave[idx];
+                    if shortwave != 0.0 {
+                        let eta = z_w[nl];
+                        let mut above = 1.0;
+                        for l in (0..nl).rev() {
+                            let below = if l == 0 {
+                                0.0
+                            } else {
+                                fluxes.water.transmitted(eta - z_w[l])
+                            };
+                            temp[i * nl + l] +=
+                                dt * shortwave * (above - below) / (heat_capacity * dz[l]);
+                            above = below;
+                        }
+                    }
+                }
+
+                // 4. Solve diffusion: u, v with the stresses (kinematic) and
+                // the drags, T and S with their surface fluxes
                 for (phi, nu, flux_top, flux_bot, bottom_drag, layer_drag) in [
                     (
                         &mut u[local.clone()],
@@ -223,12 +275,12 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                     (
                         &mut temp[local.clone()],
                         &*kt,
-                        forcing.surface_buoyancy_flux,
+                        heat_flux / heat_capacity,
                         0.0,
                         0.0,
                         None,
                     ),
-                    (&mut salt[local], &*kt, 0.0, 0.0, 0.0, None),
+                    (&mut salt[local], &*kt, salt_flux, 0.0, 0.0, None),
                 ] {
                     solve_diffusion_column(
                         phi,
@@ -491,7 +543,7 @@ mod tests {
         let forcing = Forcing {
             surface_stress: [0.1, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
         let dt = 100.0;
 
@@ -551,7 +603,7 @@ mod tests {
         let forcing = Forcing {
             surface_stress: [0.12, -0.05],
             bottom_stress: [0.03, 0.01],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
         let (dt, rho0, depth) = (300.0, 1027.0, 40.0);
 
@@ -612,7 +664,7 @@ mod tests {
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
         let depth = 20.0;
         let mut dz = vec![0.0; n_levels];
@@ -689,7 +741,7 @@ mod gls_gates {
         let forcing = Forcing {
             surface_stress: [rho0 * u_star * u_star, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
         let mut z_w = vec![0.0; n_levels + 1];
         sigma.z_at_faces_into(0.0, depth, &mut z_w);
@@ -789,7 +841,7 @@ mod gls_gates {
         let forcing = Forcing {
             surface_stress: [rho0 * u_star * u_star, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
         let drag = BottomDrag3D::log_layer(z0b).with_bounds(0.0, 1.0);
         let top = n_levels - 1;
@@ -897,7 +949,7 @@ mod gls_gates {
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
         let drag = BottomDrag3D::log_layer(z0).with_bounds(0.0, 1.0);
         let gls = GlsMixing::k_epsilon()
@@ -985,7 +1037,7 @@ mod gls_gates {
         let forcing = Forcing {
             surface_stress: [rho0 * u_star * u_star, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
         let drag = BottomDrag3D::log_layer(z0).with_bounds(0.0, 1.0);
         for gls in [
@@ -1051,7 +1103,7 @@ mod gls_gates {
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
         for gls in [
             GlsMixing::k_epsilon(),
@@ -1121,7 +1173,7 @@ mod gls_gates {
         let forcing = |tau: [f64; 2]| Forcing {
             surface_stress: tau,
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
         let stratified = |n_columns: usize| {
             let mut state = Solution3D::new(1, n_columns, n_levels);
@@ -1183,6 +1235,102 @@ mod gls_gates {
         }
     }
 
+    /// Heat and salt under turbulent mixing: three columns of a stratified
+    /// layer under wind (GLS k-ε) with their own surface fluxes, non-solar
+    /// −150, +40 and 0 W/m² on top of a uniform 10 W/m², shortwave 600, 0
+    /// and 250 W/m² (Jerlov IB), E − P 5e-5, −1e-4 and 0 kg m⁻² s⁻¹. Every
+    /// step changes each column's heat content `ρ₀ c_p ∫ T dz` by exactly
+    /// `Δt (Q + Q_ns + Q_sw)` and its salt `∫ S dz` by `Δt S F/ρ_fw` (the
+    /// surface salinity before the step), to round-off.
+    #[test]
+    fn surface_fluxes_change_heat_and_salt_by_their_integrals() {
+        use crate::physics::air_sea::{FRESH_WATER_DENSITY, JerlovWater, SEAWATER_HEAT_CAPACITY};
+        let (depth, n_levels, dt, steps) = (30.0, 30, 60.0, 120);
+        let eos = LinearEOS::default();
+        let sigma = SigmaGrid::uniform(n_levels);
+        let gls = GlsMixing::k_epsilon();
+        let forcing = Forcing {
+            surface_stress: [0.1, 0.0],
+            bottom_stress: [0.0, 0.0],
+            surface_heat_flux: 10.0,
+        };
+        let mut state = Solution3D::new(1, 3, n_levels);
+        for column in state.temp.chunks_exact_mut(n_levels) {
+            for (t, &s) in column.iter_mut().zip(sigma.sigma_rho()) {
+                *t = eos.t0 + 0.1 * s * depth;
+            }
+        }
+        state.salt.fill(eos.s0);
+        eos.update_density(&mut state);
+        let (nonsolar, shortwave, freshwater) =
+            ([-150.0, 40.0, 0.0], [600.0, 0.0, 250.0], [5e-5, -1e-4, 0.0]);
+        let tracers = SurfaceTracerFluxes {
+            nonsolar: &nonsolar,
+            shortwave: &shortwave,
+            freshwater: &freshwater,
+            water: JerlovWater::IB,
+        };
+        let bathymetry = Bathymetry2D::constant(1, 3, -depth);
+        let dz = depth / n_levels as f64;
+        let capacity = eos.rho0 * SEAWATER_HEAT_CAPACITY;
+        let content = |values: &[f64], col: usize| -> f64 {
+            values[col * n_levels..(col + 1) * n_levels]
+                .iter()
+                .sum::<f64>()
+                * dz
+        };
+        let (mut heat_err, mut salt_err) = (0.0_f64, 0.0_f64);
+        for _ in 0..steps {
+            let before = state.clone();
+            apply_vertical_diffusion(
+                &mut state,
+                &sigma,
+                &bathymetry,
+                dt,
+                &gls,
+                &forcing,
+                SurfaceFields {
+                    tracers: Some(tracers),
+                    ..SurfaceFields::default()
+                },
+                G,
+                eos.rho0,
+                0.0,
+                StepDrag::NONE,
+            );
+            eos.update_density(&mut state);
+            for col in 0..3 {
+                let q = forcing.surface_heat_flux + nonsolar[col] + shortwave[col];
+                let gained = capacity * (content(&state.temp, col) - content(&before.temp, col));
+                heat_err = heat_err.max((gained - dt * q).abs() / (dt * q.abs()));
+                let surface_salt = before.salt[(col + 1) * n_levels - 1];
+                let expected = dt * surface_salt * freshwater[col] / FRESH_WATER_DENSITY;
+                let salt = content(&state.salt, col) - content(&before.salt, col);
+                salt_err = salt_err.max((salt - expected).abs());
+            }
+        }
+        assert!(state.u[n_levels - 1] > 0.01, "the wind drove no current");
+        assert!(
+            heat_err < 1e-9,
+            "heat off its fluxes by {heat_err:.3e} (relative)"
+        );
+        // Of a column of ≈ 1050 psu·m
+        assert!(
+            salt_err < 1e-10,
+            "salt off its flux by {salt_err:.3e} psu·m"
+        );
+        // The columns warm in the order of their net heat input: 460, 260
+        // and 50 W/m²
+        let mean = |col: usize| content(&state.temp, col) / depth;
+        assert!(
+            mean(0) > mean(2) && mean(2) > mean(1),
+            "{} {} {}",
+            mean(0),
+            mean(1),
+            mean(2)
+        );
+    }
+
     /// A surface roughness field (the waves' `≈ 0.6 H_s`) reaches every
     /// column on its own. Three columns of a stratified layer under 0.1 Pa
     /// with breaking waves (k-ω, whose wave-affected layer metre layers
@@ -1204,7 +1352,7 @@ mod gls_gates {
         let forcing = Forcing {
             surface_stress: [0.1, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
         let stratified = |n_columns: usize| {
             let mut state = Solution3D::new(1, n_columns, n_levels);

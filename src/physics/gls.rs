@@ -1108,7 +1108,7 @@ mod tests {
                 &Forcing {
                     surface_stress: [0.0; 2],
                     bottom_stress: [0.0; 2],
-                    surface_buoyancy_flux: 0.0,
+                    surface_heat_flux: 0.0,
                 },
                 dt,
                 Turbulence {

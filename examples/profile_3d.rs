@@ -197,7 +197,7 @@ fn main() {
     let forcing = Forcing {
         surface_stress: [0.1, 0.05],
         bottom_stress: [0.0, 0.0],
-        surface_buoyancy_flux: 0.0,
+        surface_heat_flux: 0.0,
     };
     let physics = Hydrostatic3D::new(
         mesh.clone(),

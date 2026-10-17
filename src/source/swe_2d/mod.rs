@@ -29,7 +29,7 @@ pub use coriolis::{CoriolisSource2D, coriolis_beta, coriolis_parameter};
 pub use friction::{
     BottomFriction2D, ChezyFriction2D, ManningFriction2D, SpatiallyVaryingManning2D,
 };
-pub use gridded_atmosphere::{GriddedAtmosphere2D, GriddedWindStress};
+pub use gridded_atmosphere::{GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress};
 pub use tidal::{TidalPotential, TidalPotentialConstituent};
 pub use viscosity::HorizontalViscosity2D;
 pub use waves::{WaveCurrentFriction2D, WaveForce2D};

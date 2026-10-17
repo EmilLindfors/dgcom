@@ -401,10 +401,11 @@ mod tests {
     use crate::mesh::data::{Bathymetry2D, ElementSlopeBound};
     use crate::mesh::{Mesh2D, Mesh2DBuilder};
     use crate::operators::{DGOperators2D, GeometricFactors2D};
+    use crate::physics::air_sea::{FRESH_WATER_DENSITY, SEAWATER_HEAT_CAPACITY};
     use crate::physics::vertical_mixing::{ConstantMixing, Forcing};
     use crate::physics::{
-        AnalyticSurfaceStress, BottomDrag3D, Hydrostatic3D, ImplicitVerticalAdvection, LinearEOS,
-        PhysicsBuilder, SWEPhysics2D,
+        AnalyticSurfaceStress, BottomDrag3D, Hydrostatic3D, ImplicitVerticalAdvection, JerlovWater,
+        LinearEOS, PhysicsBuilder, SWEPhysics2D, SeaSurface, SurfaceFluxFields, SurfaceFluxes3D,
     };
     use crate::simulation::Simulation;
     use crate::solver::rhs::{VerticalAdvection, w_cell_thicknesses};
@@ -437,7 +438,7 @@ mod tests {
         Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         }
     }
 
@@ -4310,6 +4311,128 @@ mod tests {
         assert!(errors[2] < 1e-3, "transport errors {errors:?}");
     }
 
+    /// Newtonian cooling of each column's surface toward `t_star` (W m⁻² K⁻¹
+    /// times the difference), a shortwave ramping up as `q_sw·t/t_ramp`, and
+    /// a constant E − P.
+    struct NewtonianFluxes {
+        lambda: f64,
+        t_star: f64,
+        q_sw: f64,
+        t_ramp: f64,
+        e_minus_p: f64,
+    }
+
+    impl SurfaceFluxes3D for NewtonianFluxes {
+        fn surface_fluxes_into(
+            &self,
+            t: f64,
+            surface: SeaSurface<'_>,
+            fluxes: SurfaceFluxFields<'_>,
+        ) {
+            for (q, &sst) in fluxes.nonsolar.iter_mut().zip(surface.temperature) {
+                *q = -self.lambda * (sst - self.t_star);
+            }
+            fluxes.shortwave.fill(self.q_sw * t / self.t_ramp);
+            fluxes.freshwater.fill(self.e_minus_p);
+        }
+    }
+
+    /// Gate: the per-column surface fluxes ([`Hydrostatic3D::with_surface_fluxes`])
+    /// over a stratified, still ocean without mixing, where each layer's
+    /// temperature follows a closed recursion. The non-solar flux is the
+    /// Newtonian cooling of the column's own surface layer at the start of
+    /// the step (forward Euler on the top layer, which alone feels it); the
+    /// shortwave, ramping linearly in time, is taken at the middle of the
+    /// step, so every layer gains exactly `∫Q dt` times the light it absorbs
+    /// (`I(d_top) − I(d_bot)`, the bottom layer all that reaches it); E − P
+    /// raises the surface salinity by `Δt S F/(ρ_fw Δz)` per step. Before,
+    /// the 3D model had one domain-wide heat flux and no shortwave or salt
+    /// flux.
+    #[test]
+    fn surface_fluxes_heat_each_column_from_its_own_surface() {
+        let (depth, n_levels, dt, steps) = (20.0, 10, 600.0, 36);
+        let t_end = dt * steps as f64;
+        let fluxes = NewtonianFluxes {
+            lambda: 40.0,
+            t_star: 18.0,
+            q_sw: 600.0,
+            t_ramp: t_end,
+            e_minus_p: 5e-5,
+        };
+        let water = JerlovWater::III;
+        let (mut physics, mut state) = flat_periodic_3d(depth, n_levels, no_stress(), 0.0);
+        // Density without temperature or salinity: no pressure gradient
+        // between the columns, so the ocean stays still
+        physics.eos.alpha = 0.0;
+        physics.eos.beta = 0.0;
+        let physics = physics
+            .with_surface_fluxes(NewtonianFluxes { ..fluxes })
+            .with_shortwave_absorption(water);
+        // 0.3 °C per layer, warmest at the surface; the columns differ by up
+        // to 1 °C so that each reads its own surface
+        let n_columns = state.eta.data.len();
+        let base = |col: usize| 10.0 + (col % 7) as f64 / 6.0;
+        for col in 0..n_columns {
+            for l in 0..n_levels {
+                state.temp[col * n_levels + l] = base(col) + 0.3 * l as f64;
+            }
+        }
+        let s0 = state.salt[0];
+        let mut integrator = ModeSplitIntegrator::new();
+        for n in 0..steps {
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+        }
+
+        let dz = depth / n_levels as f64;
+        let capacity = RHO0 * SEAWATER_HEAT_CAPACITY * dz;
+        // The shortwave's time integral, and the light each layer absorbs
+        let energy = fluxes.q_sw * t_end / 2.0;
+        let light = |l: usize| {
+            let top = water.transmitted(depth - (l + 1) as f64 * dz);
+            let bottom = if l == 0 {
+                0.0
+            } else {
+                water.transmitted(depth - l as f64 * dz)
+            };
+            top - bottom
+        };
+        let (mut t_err, mut s_err) = (0.0_f64, 0.0_f64);
+        for col in 0..n_columns {
+            let column = &state.temp[col * n_levels..(col + 1) * n_levels];
+            for (l, &t) in column.iter().enumerate().take(n_levels - 1) {
+                let expected = base(col) + 0.3 * l as f64 + energy * light(l) / capacity;
+                t_err = max_or_nan([t_err, (t - expected).abs()]);
+            }
+            let top = n_levels - 1;
+            let mut expected = base(col) + 0.3 * top as f64;
+            for n in 0..steps {
+                let q_sw = fluxes.q_sw * (n as f64 + 0.5) * dt / t_end;
+                let q_ns = -fluxes.lambda * (expected - fluxes.t_star);
+                expected += dt * (q_ns + q_sw * light(top)) / capacity;
+            }
+            t_err = max_or_nan([t_err, (column[top] - expected).abs()]);
+
+            let salt = &state.salt[col * n_levels..(col + 1) * n_levels];
+            let rate = 1.0 + dt * fluxes.e_minus_p / (FRESH_WATER_DENSITY * dz);
+            let expected = s0 * rate.powi(steps);
+            s_err = max_or_nan([s_err, (salt[top] - expected).abs()]);
+            s_err = max_or_nan(salt[..top].iter().map(|s| (s - s0).abs()).chain([s_err]));
+        }
+        // The top layer's cooling and warming, for scale
+        let warmed = state.temp[n_levels - 1] - (base(0) + 0.3 * (n_levels - 1) as f64);
+        assert!(
+            warmed.abs() > 0.1,
+            "the surface changed by {warmed} °C only"
+        );
+        assert!(
+            t_err < 1e-12,
+            "temperature off its recursion by {t_err:.3e} °C"
+        );
+        assert!(s_err < 1e-12, "salinity off its recursion by {s_err:.3e}");
+        let flow = max_or_nan(state.u.iter().chain(&state.v).map(|u| u.abs()));
+        assert!(flow < 1e-12, "the still ocean moved: {flow:.3e} m/s");
+    }
+
     /// TODO P4.4 gate: without vertical shear the 3D bottom drag is the 2D
     /// quadratic friction `C_d|ū|ū/h`. A uniform flow over a flat, periodic
     /// ocean on one σ-level decays as `u₀/(1 + C_d u₀ t/D)`; the mode split
@@ -6384,7 +6507,7 @@ mod tests {
             let forcing = Forcing {
                 surface_stress: [0.2, -0.1],
                 bottom_stress: [0.0, 0.0],
-                surface_buoyancy_flux: 0.0,
+                surface_heat_flux: 0.0,
             };
             let physics = Hydrostatic3D::new(
                 mesh.clone(),

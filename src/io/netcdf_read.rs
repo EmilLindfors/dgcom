@@ -16,7 +16,7 @@ use std::path::Path;
 
 use netcdf::{Extent, Variable};
 
-use super::atmosphere::{AtmosphereReader, P_REFERENCE, wind_from_direction};
+use super::atmosphere::{AtmosphereField, AtmosphereReader, P_REFERENCE, wind_from_direction};
 use super::field_series::FieldSeries;
 use super::geo_grid::GeoGrid;
 use super::netcdf_io::NetCDFError;
@@ -880,8 +880,8 @@ impl OceanModelReader {
 }
 
 impl AtmosphereReader {
-    /// Read 10 m wind and sea-level pressure from a NetCDF file (or OPeNDAP
-    /// URL) of a weather model.
+    /// Read 10 m wind, sea-level pressure and the fields of the surface heat
+    /// budget from a NetCDF file (or OPeNDAP URL) of a weather model.
     ///
     /// - Grid: `latitude`/`longitude` or `lat`/`lon`, 1D (ERA5, either
     ///   direction) or 2D (MEPS, MET Nordic, AROME-Arctic Lambert grids).
@@ -894,6 +894,15 @@ impl AtmosphereReader {
     /// - Pressure: `air_pressure_at_sea_level`, `msl`, `prmsl`, `mslp` or
     ///   `Pair`, in Pa, or in hPa/mbar by its `units` (without units, values
     ///   below 2000 are taken as hPa).
+    /// - The surface heat budget ([`AtmosphereField`]), each optional, by
+    ///   their CF names as `met_forcing_subset` writes them:
+    ///   `air_temperature_2m` (K or °C by `units`; without units, values
+    ///   above 150 are taken as K), `relative_humidity_2m` (a fraction, or %
+    ///   by `units`), `surface_downwelling_shortwave_flux_in_air` and
+    ///   `surface_downwelling_longwave_flux_in_air` (W/m²), and
+    ///   `precipitation_flux` (kg m⁻² s⁻¹). Accumulated fields (MEPS's
+    ///   `integral_of_…_wrt_time`) are not read: they need de-accumulating
+    ///   per forecast run.
     ///
     /// Errors if the file has neither wind nor pressure.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, NetCDFError> {
@@ -989,14 +998,69 @@ impl AtmosphereReader {
             if hpa {
                 p.iter_mut().for_each(|v| *v *= 100.0);
             }
-            reader = reader.with_pressure(FieldSeries::with_offset(n_points, &p, P_REFERENCE));
+            reader = reader.with_field(
+                AtmosphereField::Pressure,
+                FieldSeries::with_offset(n_points, &p, P_REFERENCE),
+            );
             sources.push(format!(
                 "pressure {name}{}",
                 if hpa { " (hPa)" } else { "" }
             ));
             break;
         }
-        if !reader.has_wind() && !reader.has_pressure() {
+        const SCALARS: [(AtmosphereField, &str); 5] = [
+            (AtmosphereField::AirTemperature, "air_temperature_2m"),
+            (AtmosphereField::RelativeHumidity, "relative_humidity_2m"),
+            (
+                AtmosphereField::Shortwave,
+                "surface_downwelling_shortwave_flux_in_air",
+            ),
+            (
+                AtmosphereField::Longwave,
+                "surface_downwelling_longwave_flux_in_air",
+            ),
+            (AtmosphereField::Precipitation, "precipitation_flux"),
+        ];
+        for (field, name) in SCALARS {
+            let Some(var) = file.variable(name) else {
+                continue;
+            };
+            let Some(shape) = fields.shape(&var)? else {
+                continue;
+            };
+            let mut values = fields.read(&var, &shape, Reduce::Surface)?;
+            let units = attr_string(&var, "units").map(|u| u.trim().to_ascii_lowercase());
+            let unsupported = |units: &str| {
+                NetCDFError::InvalidData(format!("{name}: unsupported units {units:?}"))
+            };
+            let (scale, offset) = match (field, units.as_deref()) {
+                (AtmosphereField::AirTemperature, Some("k" | "kelvin")) => (1.0, -273.15),
+                (
+                    AtmosphereField::AirTemperature,
+                    Some("degc" | "degree_celsius" | "celsius" | "c" | "°c"),
+                ) => (1.0, 0.0),
+                (AtmosphereField::AirTemperature, None) => {
+                    let kelvin = values.iter().filter(|v| v.is_finite()).all(|&v| v > 150.0);
+                    (1.0, if kelvin { -273.15 } else { 0.0 })
+                }
+                (AtmosphereField::RelativeHumidity, Some("1" | "fraction") | None) => (1.0, 0.0),
+                (AtmosphereField::RelativeHumidity, Some("%" | "percent")) => (0.01, 0.0),
+                (
+                    AtmosphereField::Shortwave | AtmosphereField::Longwave,
+                    Some("w m-2" | "w/m2" | "w/m^2" | "w m**-2") | None,
+                ) => (1.0, 0.0),
+                (
+                    AtmosphereField::Precipitation,
+                    Some("kg m-2 s-1" | "kg/m2/s" | "kg/m^2/s" | "kg m**-2 s**-1") | None,
+                ) => (1.0, 0.0),
+                (_, Some(other)) => return Err(unsupported(other)),
+                (_, None) => (1.0, 0.0),
+            };
+            values.iter_mut().for_each(|v| *v = scale * *v + offset);
+            reader = reader.with_field(field, to_series(n_points, &values));
+            sources.push(format!("{} {name}", field.name()));
+        }
+        if !reader.has_wind() && !reader.has(AtmosphereField::Pressure) {
             return Err(NetCDFError::MissingVariable(format!(
                 "wind or sea-level pressure in {}",
                 path.display()
@@ -1394,7 +1458,7 @@ mod tests {
         let state = reader.get(5.1, 60.05, 1800.0).unwrap();
         let (u, v) = state.wind.unwrap();
         assert!(u.abs() < 0.05 && (v - 5.0).abs() < 1e-3, "({u}, {v})");
-        assert!((state.pressure.unwrap() - 100_000.0).abs() < 1e-3);
+        assert!((state.get(AtmosphereField::Pressure).unwrap() - 100_000.0).abs() < 1e-3);
         assert!(reader.source().contains("rotated"));
         let joined = AtmosphereReader::from_files(&[&path]).unwrap();
         assert_eq!(joined.times(), reader.times());
@@ -1415,6 +1479,43 @@ mod tests {
         let reader = AtmosphereReader::from_file(path).unwrap();
         let (u, v) = reader.get(8.1, 63.05, 0.0).unwrap().wind.unwrap();
         assert!((u - 10.0).abs() < 1e-5 && v.abs() < 1e-5);
-        assert!(!reader.has_pressure());
+        assert!(!reader.has(AtmosphereField::Pressure));
+        assert!(!reader.has_heat_budget());
+    }
+
+    /// The heat budget's fields as `met_forcing_subset` writes them, in SI
+    /// units: K → °C, humidity in % → a fraction.
+    #[test]
+    fn heat_budget_fields_in_si_units() {
+        let (_dir, path) = write_file(|file| {
+            let dims = &["time", "Y", "X"];
+            for (name, units, value) in [
+                ("wind_speed_10m", "m/s", 5.0_f32),
+                ("wind_direction_10m", "degree", 0.0),
+                ("air_temperature_2m", "K", 283.15),
+                ("relative_humidity_2m", "%", 80.0),
+                ("surface_downwelling_shortwave_flux_in_air", "W m-2", 400.0),
+                ("surface_downwelling_longwave_flux_in_air", "W m-2", 320.0),
+                ("precipitation_flux", "kg m-2 s-1", 1e-4),
+            ] {
+                let mut v = file.add_variable::<f32>(name, dims).unwrap();
+                v.put_attribute("units", units).unwrap();
+                v.put_values(&[value; 6], ..).unwrap();
+            }
+        });
+        let reader = AtmosphereReader::from_file(&path).unwrap();
+        assert!(reader.has_heat_budget());
+        let state = reader.get(8.1, 63.05, 0.0).unwrap();
+        let get = |f| state.get(f).unwrap();
+        assert!((get(AtmosphereField::AirTemperature) - 10.0).abs() < 1e-4);
+        assert!((get(AtmosphereField::RelativeHumidity) - 0.8).abs() < 1e-6);
+        assert_eq!(get(AtmosphereField::Shortwave), 400.0);
+        assert_eq!(get(AtmosphereField::Longwave), 320.0);
+        assert!((get(AtmosphereField::Precipitation) - 1e-4).abs() < 1e-10);
+        assert!(
+            reader.summary().contains("longwave"),
+            "{}",
+            reader.summary()
+        );
     }
 }

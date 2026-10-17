@@ -102,7 +102,7 @@
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
 //!     [wall_land=keep|lower] \
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
-//!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [max_closed=0.05] [ib=0] [nest_level=] \
+//!     [met=<file,…>] [heat=1] [jerlov=II] [band_km=3] [band_minutes=30] [blend=1] [max_closed=0.05] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
 //!     [wave_sources=swan|wam] [wave_integration=] [wave_limiter=] [wave_substeps=1] [wave_cfl=0.5] [wave_hours=0] \
 //!     [wave_land=absorbing|floored] [wave_force=dissipation|stress] [wave_depth_limit=1] \
@@ -204,7 +204,13 @@
 //! beyond an explicit Courant number implicit
 //! (`Hydrostatic3D::with_implicit_vertical_advection`). `wind` and `met=` as
 //! in 2D: the pressure gradient on the 2D module, the wind stress on the
-//! columns (`GriddedAtmosphere2D::split_for_3d`). The stations, the progress
+//! columns (`GriddedAtmosphere2D::split_for_3d`). When the `met=` files also
+//! carry the surface heat budget (2 m air temperature and humidity,
+//! downwelling shortwave and longwave, precipitation; `met_forcing_subset`
+//! writes them), the columns take the COARE 3.5 heat and freshwater fluxes
+//! of their own surface (`GriddedAtmosphere2D::surface_fluxes`,
+//! `Hydrostatic3D::with_surface_fluxes`), the shortwave absorbed as Jerlov's
+//! `jerlov=` water type (II); `heat=0` leaves them out. The stations, the progress
 //! lines and a 3D snapshot file (`snapshot_minutes=`,
 //! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step (60 s by
 //! default; the parent and the weather must cover a third of it past the
@@ -382,7 +388,9 @@ use dg_rs::mesh::{
     inverse_bilinear, read_gmsh_mesh,
 };
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder};
+use dg_rs::physics::{
+    Coare35, JerlovWater, PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder,
+};
 use dg_rs::simulation::{Simulation, SimulationResult};
 use dg_rs::solver::{
     LINEAR_CFL_SAFETY, Probe2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
@@ -390,7 +398,7 @@ use dg_rs::solver::{
 };
 use dg_rs::source::{
     AtmosphericPressure2D, CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D,
-    GriddedWindStress, ManningFriction2D, WindStress2D,
+    GriddedSurfaceFluxes, GriddedWindStress, ManningFriction2D, WindStress2D,
 };
 use dg_rs::tides::canonical_name;
 use dg_rs::time::{
@@ -513,6 +521,12 @@ struct Options {
     /// leave uncovered (they become walls)
     max_closed: f64,
     nesting_ib: bool,
+    /// In 3D, the bulk heat and freshwater fluxes of `met=` when it has the
+    /// fields (`heat=0`: none)
+    #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
+    heat: bool,
+    /// The optical water type of the shortwave absorption (`jerlov=II`)
+    jerlov: JerlovWater,
     /// Nesting: replace NorKyst's `gauge_gains` and `gauge_ratios`
     /// constituents by the gauge-corrected ones (`nest_tides=corrected`, the
     /// default) or keep its tides (`nest_tides=raw`)
@@ -917,6 +931,8 @@ impl Options {
             blend_bed: get("blend", 1.0)? != 0.0,
             max_closed: get("max_closed", 0.05)?,
             nesting_ib: get("ib", 0.0)? != 0.0,
+            heat: get("heat", 1.0)? != 0.0,
+            jerlov: args.get("jerlov").map_or("II", String::as_str).parse()?,
             correct_nested_tides: match args.get("nest_tides").map_or("corrected", String::as_str) {
                 "corrected" => true,
                 "raw" => false,
@@ -1845,6 +1861,8 @@ struct TideSetup {
     weather: Option<GriddedAtmosphere2D>,
     /// In 3D, the weather model's wind stress on the columns
     wind_3d: Option<GriddedWindStress>,
+    /// In 3D, the weather model's heat and freshwater fluxes on the columns
+    fluxes_3d: Option<GriddedSurfaceFluxes>,
 }
 
 /// The stations, the clock and the open boundary of a tidal run (the parent
@@ -1885,6 +1903,22 @@ fn tide_setup(
             (Some(pressure), Some(wind))
         }
         other => (other, None),
+    };
+    let fluxes_3d = match &weather {
+        Some(atmosphere) if three_d && opts.heat && atmosphere.reader().has_heat_budget() => {
+            let (_, lat_min, _, lat_max) = atmosphere.reader().grid().bbox();
+            let bulk = Coare35::at_latitude(0.5 * (lat_min + lat_max));
+            println!(
+                "  Surface heat and freshwater: COARE 3.5 on the weather, shortwave into Jerlov {:?} water",
+                opts.jerlov
+            );
+            Some(atmosphere.surface_fluxes(bulk)?)
+        }
+        Some(_) if three_d && opts.heat => {
+            println!("  Surface heat and freshwater: none (the weather has no heat budget)");
+            None
+        }
+        _ => None,
     };
     let level = match &weather {
         Some(gridded) => Some(Level::Gridded(gridded.clone())),
@@ -1938,6 +1972,7 @@ fn tide_setup(
         band,
         weather,
         wind_3d,
+        fluxes_3d,
     })
 }
 
@@ -3029,6 +3064,7 @@ fn tidal_run_3d(
         band,
         weather,
         wind_3d,
+        fluxes_3d,
     } = tide_setup(domain, opts, parent, true)?;
     // `debug_3d=rest`: walls all round, no band and no nesting: the
     // stratification at rest, as `levels=N` alone runs it
@@ -3320,7 +3356,7 @@ fn tidal_run_3d(
                 [0.0, 0.0]
             },
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         },
         G,
         RHO0,
@@ -3338,6 +3374,11 @@ fn tidal_run_3d(
     }
     if let Some(wind) = wind_3d {
         physics = physics.with_surface_stress(wind);
+    }
+    if let Some(fluxes) = fluxes_3d {
+        physics = physics
+            .with_surface_fluxes(fluxes)
+            .with_shortwave_absorption(opts.jerlov);
     }
     // The vertical advection beyond an explicit Courant number implicitly:
     // the columns just deeper than the thin depth set the step otherwise
@@ -4397,7 +4438,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         },
         G,
         RHO0,
