@@ -577,6 +577,8 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **The wave dissipation's force is over the wave step taken (TODO F.4).** `CoupledWaves2D::exchange` evaluated `WaveForceForm::Dissipation` over `compute_dt(cfl)`, not over the interval's step (`span / steps`, shorter unless it divides the span); ≈ 0.05 % on the coupled beach. Gate: `the_dissipation_force_is_over_the_wave_step_taken`.
+
 - **The 3D coastline day's halved tidal currents were its parent file, not the 3D model (TODO P1.3).** `data/mausund_norkyst_3d.nc`, cut for the Mausund sub-domain, turned 120 open faces of the Frøya box into walls; a 2D run in the same file shows the same 0.48 and the same flattened M2 phase. Nested in a parent over the whole box (`data/froya_norkyst_3d.nc`), the 3D M2 current is 0.946 of NorKyst's where the beds agree (2D 0.958; before 0.463). `froya_real_data` now refuses a NorKyst file or tidal atlas that leaves more than `max_closed` (default 0.05) of the open faces uncovered.
 
 - **Dry nodes of 3D shoreline elements no longer drift.** `from_inventory` moves a marked element's level (one the barotropic pass balances only as a whole) to its new mean by shifting its nodes; the shift went to the dry nodes too, which have no weight in the mean, so they summed every step's shift. On the Frøya day with MET wind, dry shore nodes reached 33 °C (the water held 7.5–14.4 °C), and wetting brought the drift back into the water. Dry nodes keep their last value, as documented; wet results are unchanged until a node wets. `froya_real_data`'s "thin columns" T range leaves out dry columns. Regression case in `inventory_conversion_keeps_element_inventories`.

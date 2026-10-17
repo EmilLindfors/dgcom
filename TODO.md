@@ -99,7 +99,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **F.4** H_s, T_p and direction at the stations (gauges, NorKyst's point, farms) in the station files.
 - [ ] **F.4** Measure the coupling lag's error at Δ = 10 / 5 / 2.5 min; if it matters, extrapolate (`2q(t) − q(t−Δ)`) or a second pass.
 - [ ] **F.4** Make `WaveForceForm::Dissipation` the `CoupledWaves2D` default once a surf-zone case with a measured set-down is checked.
-- [ ] **F.4** The coupling passes `compute_dt(cfl)` to the dissipation, not the step taken (`span/steps`): keep the exchange's last `dt`.
 - [ ] **F.4** A wave-dependent breaking flux into GLS: ρg × (whitecapping + breaking) per column from `WaveModel2D::dissipation` (COAWST `TKE_WAVEDISS`).
 - [ ] **F.4** 3D vertical structure (a): the Stokes transport in continuity (Eulerian return flow `D ū = −M_s`); changes the 2D model too.
 - [ ] **F.4** 3D vertical structure (b): the breaking force near the surface (Uchiyama 2010 `B(z)` or a roller), gated against the constant-ν undertow (Svendsen 1984, Stive & Wind 1986).
