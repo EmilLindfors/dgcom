@@ -566,7 +566,8 @@ impl CoupledWaves2D {
         let start = Instant::now();
         let (f0, b0) = match self.last.take() {
             Some(last) => last,
-            None => self.forcing(q),
+            // No step taken yet: over the step the waves would take now
+            None => self.forcing(q, self.model.compute_dt(self.cfl)),
         };
         self.coupling
             .update_waves(&mut self.model, q, &self.bathymetry);
@@ -602,7 +603,7 @@ impl CoupledWaves2D {
         let stepping = start.elapsed().as_secs_f64();
 
         let start = Instant::now();
-        let (f1, b1) = self.forcing(q);
+        let (f1, b1) = self.forcing(q, dt);
         let force: Arc<dyn SourceTerm2D> = Arc::new(WaveForce2D::between(t, f0, t_next, &f1));
         physics.source = Some(match &self.sources {
             None => force,
@@ -626,8 +627,9 @@ impl CoupledWaves2D {
     }
 
     /// The force (ramped) and the bed stress (unramped; empty without a bed
-    /// friction to enhance) of the wave state on the circulation.
-    fn forcing(&self, q: &SWESolution2D) -> (WaveForce2D, Vec<f64>) {
+    /// friction to enhance) of the wave state on the circulation; the
+    /// dissipation's force is over the waves' step `dt`.
+    fn forcing(&self, q: &SWESolution2D, dt: f64) -> (WaveForce2D, Vec<f64>) {
         let mut force = match self.force_form {
             WaveForceForm::RadiationStress => self.coupling.depth_limited_force(
                 &self.model,
@@ -636,11 +638,10 @@ impl CoupledWaves2D {
                 DEFAULT_BREAKER_INDEX,
             ),
             // Over the waves' own step: what their sinks can remove in it
-            WaveForceForm::Dissipation => self.coupling.dissipation_force(
-                &self.model,
-                &self.state,
-                self.model.compute_dt(self.cfl),
-            ),
+            WaveForceForm::Dissipation => {
+                self.coupling
+                    .dissipation_force(&self.model, &self.state, dt)
+            }
         };
         if let Some(seconds) = self.ramp {
             force = force.with_ramp(seconds);

@@ -20,8 +20,8 @@ use dg_rs::source::{
 use dg_rs::time::{ModelClock, SSPRK3};
 use dg_rs::types::ElementIndex;
 use dg_rs::waves::{
-    CoupledWaves2D, SourceTerms, SpectralGrid, WaveCoupling2D, WaveModel2D, WaveSolution,
-    WaveWorkspace, group_velocity, wavenumber,
+    CoupledWaves2D, SourceTerms, SpectralGrid, WaveCoupling2D, WaveForceForm, WaveModel2D,
+    WaveSolution, WaveWorkspace, group_velocity, wavenumber,
 };
 
 const G: f64 = 9.81;
@@ -687,6 +687,52 @@ fn setups_by_passes(beach: &Beach, wave_beach: &Beach, passes: usize) -> Vec<f64
         coupling.update_waves(&mut waves, &q, &beach.bathymetry);
     }
     setups
+}
+
+/// The dissipation's force is what the sinks remove over the step the
+/// waves took in the interval (`span / steps`, shorter than `compute_dt`
+/// unless that divides the span), not over `compute_dt`: a regression test
+/// for the exchange, which passed `compute_dt` (TODO F.4).
+#[test]
+fn the_dissipation_force_is_over_the_wave_step_taken() {
+    let beach = Beach::new();
+    let wave_beach = Beach::with(7, 2);
+    let model = wave_beach.waves(std::f64::consts::FRAC_PI_2, None, 36);
+    let mut n = model.zero_state();
+    Beach::settle(&model, &mut n);
+    let physics = beach.physics().build();
+    let mut waves =
+        CoupledWaves2D::new(model, n, &physics, 0.0).with_force_form(WaveForceForm::Dissipation);
+    let interval = 30.0;
+    let mut sim = Simulation::new(physics, SSPRK3);
+    let mut q = beach.still_water();
+    let result = sim.run_with_exchange(
+        &mut q,
+        0.0,
+        interval,
+        interval,
+        |physics, q, t, t_next| waves.exchange(physics, q, t, t_next),
+        |_, _| {},
+    );
+    assert!(result.success, "{result:?}");
+    let stats = waves.stats();
+    assert_eq!(stats.exchanges, 1);
+    let taken = interval / stats.wave_steps as f64;
+    let largest = waves.model().compute_dt(waves.cfl());
+    assert!(
+        taken < 0.99 * largest,
+        "step {taken} s, compute_dt {largest} s"
+    );
+    let over = |dt: f64| {
+        waves
+            .coupling()
+            .dissipation_force(waves.model(), waves.state(), dt)
+    };
+    let force = waves.force().unwrap();
+    assert_eq!(force, over(taken).force());
+    let peak = force.iter().map(|f| f[0].hypot(f[1])).fold(0.0, f64::max);
+    assert!(peak > 0.0, "no breaking force");
+    assert_ne!(force, over(largest).force());
 }
 
 /// The surf zone with the waves and the circulation running together
