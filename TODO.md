@@ -224,7 +224,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.4** Velocity from z-levels stops at 300 m: extend to full depth.
 - [ ] **P1.4** Measure `io::depth_average_z`'s error (z-levels, 300 m cap) against the NorKyst v3 hindcast's `ubar_eastward`/`vbar_northward` (`romshindcast/norkyst_v3/norkyst_v3_sdepth_aggr.ncml`, hourly 2012-01 to 2025-08) at the Frøya boundary cells (`notes/norkyst-issues.md` §7).
 - [ ] **P1.5** `NestingRelaxation2D` relaxes the level at every band node ≥ 5 cm deep, puddles cut off by land included (Mausund element 58: a 5 cm puddle filled at 3e-7 m per step towards NorKyst's level): relax only water connected to the open faces, or momentum only in shore elements.
-- [ ] **P1.5** The parent-coverage guard (`max_closed`, 2026-10-16) lives in `froya_real_data`'s `close_open_faces`, so no test runs it (checked by hand: `mausund_norkyst_3d.nc` on the Frøya mesh is refused at 120 of 223 faces, `froya_norkyst_3d.nc` accepted). Move the coverage check into the library next to `OceanModelState` / `BoundaryTides` (one function: which open faces a parent or atlas covers) with a unit test on a parent grid that misses a corner.
 - [ ] **P1.5** A depth range in `norkyst-client`'s grid mode (`depth = "0:1:0"` today) as a second source of 3D profiles.
 
 ## Inputs and forcing (P1.6) — [notes/inputs-forcing.md](notes/inputs-forcing.md)

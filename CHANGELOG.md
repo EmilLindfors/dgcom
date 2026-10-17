@@ -6,6 +6,8 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **`boundary::BoundaryCoverage`: which open faces a parent model or tidal atlas covers (TODO P1.5).** `of_parent` / `of_atlas` / `of` find the faces with a node the source cannot serve, `close(mesh, max_fraction)` makes walls of them or refuses with `CoverageError` when they are more than the given share (a parent cut for a smaller domain closed 120 of the Frøya box's 223 open faces and halved the 3D M2 current, 2026-10-16). `froya_real_data`'s `max_closed` guard now uses it; unit-tested on a parent missing a corner.
+
 - **An out-of-sample domain, Bodø (P3.4, `notes/validation.md`):** a 24 h day at Bodø (67.25°N) with every setting frozen at Frøya's and the pass marks set before the runs. 4 of 5 pass: M2 currents 0.957 (2D) and 0.939 (3D) of NorKyst's, 3D/2D 0.957, T RMSE below 10 m 0.17 and 0.16 °C on two sections, no NaN or clips. The gauge fails (11.4 cm centred against ≤ 5; NorKyst's own 12.0); the gauge-corrected boundary tide alone gives 3.4 cm, so the failure is the parent's N2.
 - **Depth sections against NorKyst-800 (TODO P4.6, P3.4):** `norkyst_profiles_3d section=name:lon0,lat0:lon1,lat1:n` probes `n` points along a line, and `scripts/norkyst_section_3d.py` draws model, NorKyst and their difference against distance and depth (mean T, S, the cross-section velocity and its M2 amplitude) with the section's bias, RMSE and pattern correlation, overall and below 10 m.
 
