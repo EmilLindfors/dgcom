@@ -359,7 +359,7 @@ use dg_rs::analysis::{
 #[cfg(feature = "netcdf")]
 use dg_rs::boundary::NestingOptions;
 use dg_rs::boundary::{
-    AtlasPoint, BCContext2D, BoundaryLevel, BoundaryTides, CharacteristicOBC,
+    AtlasPoint, BCContext2D, BoundaryCoverage, BoundaryLevel, BoundaryTides, CharacteristicOBC,
     ExternalStateProvider, HarmonicTide, InverseBarometer, MultiBoundaryCondition2D,
     NestingRelaxation2D, OceanModelState, Reflective2D, SWEBoundaryCondition2D, TidalAtlas,
 };
@@ -1322,11 +1322,17 @@ impl Domain {
             return Ok(());
         }
         let atlas = TidalAtlas::read(atlas_path)?;
-        let closed = self.close_open_faces(&opts.tides, opts.max_closed, |lon, lat| {
-            atlas
-                .nearest(lon, lat)
-                .is_some_and(|(_, d)| d <= ATLAS_COVERAGE)
-        })?;
+        let closed =
+            self.close_open_faces(&opts.tides, opts.max_closed, |mesh, ops, projection| {
+                BoundaryCoverage::of_atlas(
+                    mesh,
+                    ops,
+                    projection,
+                    BoundaryTag::Open,
+                    &atlas,
+                    ATLAS_COVERAGE,
+                )
+            })?;
         if closed > 0 {
             println!(
                 "  {closed} open-boundary faces lie farther than {:.0} km from the tidal atlas: walls",
@@ -1336,51 +1342,26 @@ impl Domain {
         Ok(())
     }
 
-    /// Make walls of the open-boundary faces with a node where `covered(lon,
-    /// lat)` is false; returns how many. More than `max_closed` of the open
-    /// faces is an error: a forcing file cut for a smaller domain would turn
-    /// the open boundary into a closed box (the 3D coastline day in
-    /// `mausund_norkyst_3d.nc`, cut for Mausund, closed 120 open faces and
-    /// halved the M2 current, TODO P1.3).
+    /// Make walls of the open-boundary faces `coverage` finds uncovered;
+    /// returns how many. More than `max_closed` of the open faces is an
+    /// error (`BoundaryCoverage::close`).
     fn close_open_faces(
         &mut self,
         source: &str,
         max_closed: f64,
-        covered: impl Fn(f64, f64) -> bool,
+        coverage: impl FnOnce(&Mesh2D, &DGOperators2D, &LocalProjection) -> BoundaryCoverage,
     ) -> Result<usize, String> {
         let Some(projection) = self.projection else {
             return Ok(0);
         };
-        let (mesh, ops) = (
-            Arc::get_mut(&mut self.mesh).expect("mesh not shared yet"),
-            &self.ops,
-        );
-        let (mut closed, mut open) = (0, 0);
-        for e in 0..mesh.edges.len() {
-            let edge = &mesh.edges[e];
-            if edge.right.is_some() || edge.boundary_tag != Some(BoundaryTag::Open) {
-                continue;
-            }
-            open += 1;
-            let (k, face) = (ElementIndex::new(edge.left.element), edge.left.face);
-            let uncovered = ops.face_nodes[face].iter().any(|&i| {
-                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
-                let (lat, lon) = projection.xy_to_geo(x, y);
-                !covered(lon, lat)
-            });
-            if uncovered {
-                mesh.edges[e].boundary_tag = Some(BoundaryTag::Wall);
-                closed += 1;
-            }
-        }
-        if closed as f64 > max_closed * open as f64 {
-            return Err(format!(
-                "{source} leaves {closed} of {open} open-boundary faces uncovered (more than \
-                 max_closed={max_closed}): cut one for this domain (`norkyst_nesting_subset \
-                 bbox=…`) or raise max_closed"
-            ));
-        }
-        Ok(closed)
+        let coverage = coverage(&self.mesh, &self.ops, &projection);
+        let mesh = Arc::get_mut(&mut self.mesh).expect("mesh not shared yet");
+        coverage.close(mesh, max_closed).map_err(|e| {
+            format!(
+                "{source}: {e}: cut one for this domain (`norkyst_nesting_subset bbox=…`) or \
+                 raise max_closed"
+            )
+        })
     }
 
     /// NorKyst nesting (`norkyst=`): read the parent, close the open faces it
@@ -1426,13 +1407,8 @@ impl Domain {
             .with_band(1000.0 * opts.band_km)
             .with_ramp_up(3600.0 * opts.ramp_hours)
             .with_reference_level(level);
-        let wet = reader.wet_mask();
-        let closed = self.close_open_faces(path, opts.max_closed, |lon, lat| {
-            reader.stencil(lon, lat).is_some()
-                || reader
-                    .grid
-                    .nearest(lon, lat, options.max_snap, |k| wet[k])
-                    .is_some()
+        let closed = self.close_open_faces(path, opts.max_closed, |mesh, ops, projection| {
+            BoundaryCoverage::of_parent(mesh, ops, projection, BoundaryTag::Open, &reader, &options)
         })?;
         if closed > 0 {
             println!("  {closed} open-boundary faces have no wet NorKyst point nearby: walls");

@@ -59,6 +59,7 @@ pub mod band;
 pub mod bathymetry_validation;
 mod boundary_2d;
 mod characteristic;
+mod coverage;
 mod harmonic_tide;
 mod multi_bc_2d;
 mod nesting_3d;
@@ -84,6 +85,7 @@ pub use characteristic::{
     BoundaryLevel, CharacteristicOBC, ElevationOnly, ExternalState, ExternalStateProvider,
     InverseBarometer, ParentTimeSeries, StillWater, characteristic_state,
 };
+pub use coverage::{BoundaryCoverage, CoverageError};
 pub use harmonic_tide::{HarmonicTide, tidal_ramp};
 pub use multi_bc_2d::MultiBoundaryCondition2D;
 pub use nesting_3d::{
