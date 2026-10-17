@@ -54,32 +54,33 @@ impl OceanState {
 #[derive(Clone, Debug)]
 pub struct OceanModelReader {
     /// Parent grid (ρ-points)
-    pub grid: GeoGrid,
+    grid: GeoGrid,
     /// Snapshot times, Unix seconds (UTC), strictly increasing. A single
     /// snapshot is time-invariant.
-    pub time: Vec<f64>,
+    time: Vec<f64>,
     /// Sea surface height ζ (m)
-    pub ssh: Option<FieldSeries>,
+    ssh: Option<FieldSeries>,
     /// Depth-mean eastward velocity (m/s)
-    pub u: Option<FieldSeries>,
+    u: Option<FieldSeries>,
     /// Depth-mean northward velocity (m/s)
-    pub v: Option<FieldSeries>,
+    v: Option<FieldSeries>,
     /// Still-water depth h (m, positive down), NaN on land
-    pub depth: Option<Vec<f64>>,
+    depth: Option<Vec<f64>>,
     /// Surface temperature (°C)
-    pub temperature: Option<FieldSeries>,
+    temperature: Option<FieldSeries>,
     /// Surface salinity
-    pub salinity: Option<FieldSeries>,
-    /// How the velocity was obtained (e.g. `ubar_eastward/vbar_northward`,
-    /// `u_eastward/v_northward averaged over z-levels`)
-    pub velocity_source: Option<String>,
-    /// Profiles of the eastward and northward velocity (m/s), for 3D nesting
-    /// (see [`Self::with_profiles`]).
-    pub u_profile: Option<ProfileSeries>,
-    pub v_profile: Option<ProfileSeries>,
-    /// Profiles of temperature (°C) and salinity.
-    pub temperature_profile: Option<ProfileSeries>,
-    pub salinity_profile: Option<ProfileSeries>,
+    salinity: Option<FieldSeries>,
+    /// How the velocity was obtained
+    velocity_source: Option<String>,
+    /// Profiles of the eastward and northward velocity (m/s), temperature
+    /// (°C) and salinity, for 3D nesting (see [`Self::with_profiles`])
+    u_profile: Option<ProfileSeries>,
+    v_profile: Option<ProfileSeries>,
+    temperature_profile: Option<ProfileSeries>,
+    salinity_profile: Option<ProfileSeries>,
+    /// [`Self::is_wet`] per grid point, refreshed by the builders that set
+    /// what it reads (SSH, velocity, depth)
+    wet: Vec<bool>,
 }
 
 impl OceanModelReader {
@@ -106,7 +107,24 @@ impl OceanModelReader {
             v_profile: None,
             temperature_profile: None,
             salinity_profile: None,
-        })
+            wet: Vec::new(),
+        }
+        .with_wet_mask())
+    }
+
+    /// Recompute the wet mask from the fields set so far.
+    fn with_wet_mask(mut self) -> Self {
+        self.wet = (0..self.grid.len())
+            .map(|k| {
+                self.depth.as_ref().is_none_or(|d| d[k] > 0.0)
+                    && [&self.ssh, &self.u, &self.v]
+                        .into_iter()
+                        .flatten()
+                        .all(|s| s.is_valid(k))
+                    && (self.has_ssh() || self.has_currents() || self.depth.is_some())
+            })
+            .collect();
+        self
     }
 
     fn check(&self, name: &str, series: &FieldSeries) {
@@ -124,7 +142,7 @@ impl OceanModelReader {
     pub fn with_ssh(mut self, ssh: FieldSeries) -> Self {
         self.check("ssh", &ssh);
         self.ssh = Some(ssh);
-        self
+        self.with_wet_mask()
     }
 
     /// Set the depth-mean velocity (east, north) (m/s).
@@ -134,14 +152,14 @@ impl OceanModelReader {
         self.u = Some(u);
         self.v = Some(v);
         self.velocity_source = Some(source.to_string());
-        self
+        self.with_wet_mask()
     }
 
     /// Set the still-water depth (m, positive; NaN on land).
     pub fn with_depth(mut self, depth: Vec<f64>) -> Self {
         assert_eq!(depth.len(), self.grid.len(), "OceanModelReader: depth size");
         self.depth = Some(depth);
-        self
+        self.with_wet_mask()
     }
 
     /// Set the surface temperature and salinity.
@@ -257,17 +275,73 @@ impl OceanModelReader {
     /// Whether grid point `k` is wet: its depth (if known) is positive and
     /// its SSH and velocity (those present) have values at every snapshot.
     pub fn is_wet(&self, k: usize) -> bool {
-        self.depth.as_ref().is_none_or(|d| d[k] > 0.0)
-            && [&self.ssh, &self.u, &self.v]
-                .into_iter()
-                .flatten()
-                .all(|s| s.is_valid(k))
-            && (self.has_ssh() || self.has_currents() || self.depth.is_some())
+        self.wet[k]
     }
 
     /// Wet flag per grid point (see [`Self::is_wet`]).
-    pub fn wet_mask(&self) -> Vec<bool> {
-        (0..self.grid.len()).map(|k| self.is_wet(k)).collect()
+    pub fn wet_mask(&self) -> &[bool] {
+        &self.wet
+    }
+
+    /// Parent grid (ρ-points).
+    pub fn grid(&self) -> &GeoGrid {
+        &self.grid
+    }
+
+    /// Snapshot times, Unix seconds (UTC), strictly increasing.
+    pub fn times(&self) -> &[f64] {
+        &self.time
+    }
+
+    /// Sea surface height ζ (m).
+    pub fn ssh(&self) -> Option<&FieldSeries> {
+        self.ssh.as_ref()
+    }
+
+    /// Depth-mean eastward velocity (m/s).
+    pub fn u(&self) -> Option<&FieldSeries> {
+        self.u.as_ref()
+    }
+
+    /// Depth-mean northward velocity (m/s).
+    pub fn v(&self) -> Option<&FieldSeries> {
+        self.v.as_ref()
+    }
+
+    /// Still-water depth h (m, positive down), NaN on land.
+    pub fn depth(&self) -> Option<&[f64]> {
+        self.depth.as_deref()
+    }
+
+    /// Surface temperature (°C).
+    pub fn temperature(&self) -> Option<&FieldSeries> {
+        self.temperature.as_ref()
+    }
+
+    /// Surface salinity.
+    pub fn salinity(&self) -> Option<&FieldSeries> {
+        self.salinity.as_ref()
+    }
+
+    /// How the velocity was obtained (e.g. `ubar_eastward/vbar_northward`,
+    /// `u_eastward/v_northward averaged over z-levels`).
+    pub fn velocity_source(&self) -> Option<&str> {
+        self.velocity_source.as_deref()
+    }
+
+    /// Profiles of the eastward and northward velocity (m/s).
+    pub fn velocity_profiles(&self) -> Option<(&ProfileSeries, &ProfileSeries)> {
+        self.u_profile.as_ref().zip(self.v_profile.as_ref())
+    }
+
+    /// Profiles of temperature (°C).
+    pub fn temperature_profile(&self) -> Option<&ProfileSeries> {
+        self.temperature_profile.as_ref()
+    }
+
+    /// Profiles of salinity.
+    pub fn salinity_profile(&self) -> Option<&ProfileSeries> {
+        self.salinity_profile.as_ref()
     }
 
     /// Bilinear stencil over the wet corners of the cell holding
@@ -408,6 +482,26 @@ mod tests {
         assert!(r.get_state_interpolated(8.1, 63.1, 3601.0).is_none());
         assert!(r.get_state(8.2, 63.2, 0).is_some_and(|s| s.ssh.is_some()));
         assert!(r.get_state(8.1, 63.1, 2).is_none());
+    }
+
+    /// The wet mask is kept with the fields: each builder that sets what it
+    /// reads refreshes it, whatever the order, and a point dry in one field
+    /// at one snapshot is dry.
+    #[test]
+    fn the_wet_mask_follows_the_builders() {
+        let grid = GeoGrid::regular(vec![8.0, 8.1], vec![63.0, 63.1]).unwrap();
+        let empty = OceanModelReader::new(grid.clone(), vec![0.0, 3600.0]).unwrap();
+        assert_eq!(empty.wet_mask(), [false; 4]);
+        // Point 1 has no SSH at the second snapshot; point 2 is land in depth
+        let ssh = FieldSeries::new(4, vec![0.0, 0.0, 0.0, 0.0, 0.0, f32::NAN, 0.0, 0.0]);
+        let depth = vec![30.0, 30.0, 0.0, 30.0];
+        let ssh_only = empty.clone().with_ssh(ssh.clone());
+        assert_eq!(ssh_only.wet_mask(), [true, false, true, true]);
+        let a = ssh_only.with_depth(depth.clone());
+        let b = empty.with_depth(depth).with_ssh(ssh);
+        assert_eq!(a.wet_mask(), [true, false, false, true]);
+        assert_eq!(a.wet_mask(), b.wet_mask());
+        assert_eq!(reader().wet_mask().iter().filter(|&&w| !w).count(), 1);
     }
 
     #[test]

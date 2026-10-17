@@ -227,7 +227,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Inputs and forcing (P1.6) — [notes/inputs-forcing.md](notes/inputs-forcing.md)
 
-- [ ] **P1.6** `OceanModelReader` has public mutable fields, and `is_wet` reads every snapshot of SSH, u and v at each call (219 reads per point on the 73-snapshot Frøya file): make the fields private behind its `with_*` builders and keep the wet mask in the reader (`OceanModelColumns` and `OceanModelState` each take their own copy of `wet_mask()` today).
+- [ ] **P1.6** `AtmosphereReader` has public fields (`grid`, `time`, read directly by `source::swe_2d::gridded_atmosphere`): make them private behind accessors, as `OceanModelReader` (2026-10-17).
 - [ ] **P1.6** Settle the topobathy sea part's vertical datum (NN2000 or chart datum, 1.43 m too shallow at Mausund): check against WFS `wfs.dybdedata` points; add the 8 cm NN2000 → MSL offset if it matters.
 - [ ] **P1.6** Measure `lower_wall_land` in 3D (stratified rest, and a tide with `levels=20 slopes3d=on`) before making it the default, then in `viz/src/scenario.rs`.
 - [ ] **P1.6** Put the coastline mesh's walls in the water in `scripts/gmsh_coastline_mesh.py` (dilate the opened land back, or the projected bed's 0 contour), never closing a sound.

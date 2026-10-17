@@ -190,21 +190,18 @@ mod app {
 
         println!("Reading {} …", parent_path.display());
         let parent = OceanModelReader::from_file_with_profiles(&parent_path)?;
-        let series = [
-            &parent.temperature_profile,
-            &parent.salinity_profile,
-            &parent.u_profile,
-            &parent.v_profile,
-        ]
-        .map(|s| s.as_ref());
-        let [Some(p_temp), Some(p_salt), Some(p_u), Some(p_v)] = series else {
+        let (Some(p_temp), Some(p_salt), Some((p_u, p_v))) = (
+            parent.temperature_profile(),
+            parent.salinity_profile(),
+            parent.velocity_profiles(),
+        ) else {
             return Err("the parent has no T, S, u and v profiles".into());
         };
         let series = [p_temp, p_salt, p_u, p_v];
         let ProfileLevels::Depth(depths) = p_temp.levels().clone() else {
             return Err("the parent's profiles are not on z-levels".into());
         };
-        let parent_bed = parent.depth.clone().ok_or("the parent has no depth")?;
+        let parent_bed = parent.depth().ok_or("the parent has no depth")?;
         let wet = parent.wet_mask();
 
         // The points
@@ -265,10 +262,10 @@ mod app {
         }
 
         // NorKyst's wet points inside the mesh, for the domain means
-        let inside: Vec<usize> = (0..parent.grid.len())
+        let inside: Vec<usize> = (0..parent.grid().len())
             .filter(|&k| wet[k])
             .filter(|&k| {
-                let (lon, lat) = parent.grid.position(k);
+                let (lon, lat) = parent.grid().position(k);
                 let (x, y) = projection.geo_to_xy(lat, lon);
                 locator.locate([x, y]).is_some()
             })

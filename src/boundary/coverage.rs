@@ -95,12 +95,11 @@ impl BoundaryCoverage {
         reader: &OceanModelReader,
         options: &NestingOptions,
     ) -> Self {
-        let wet = reader.wet_mask();
         Self::of(mesh, ops, projection, tag, |lon, lat| {
             reader.stencil(lon, lat).is_some()
                 || reader
-                    .grid
-                    .nearest(lon, lat, options.max_snap, |k| wet[k])
+                    .grid()
+                    .nearest(lon, lat, options.max_snap, |k| reader.is_wet(k))
                     .is_some()
         })
     }

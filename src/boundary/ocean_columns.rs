@@ -95,11 +95,6 @@ pub struct OceanModelColumns<P> {
     /// Horizontal stencil and east axis of every mesh node (`[element][node]`),
     /// `None` if the parent does not cover it; computed on first use.
     nodes: Vec<OnceLock<Option<NodeStencil>>>,
-    /// The parent's wet points ([`OceanModelReader::wet_mask`]), for the
-    /// nearest wet point of a node outside its wet cells (each test reads
-    /// every snapshot: the coastline day's band searched the whole grid
-    /// through them for 50 CPU-s at its first step).
-    wet: Vec<bool>,
 }
 
 /// Where a child node samples the parent.
@@ -130,7 +125,6 @@ impl<P: CoordinateProjection> OceanModelColumns<P> {
             "OceanModelColumns: the parent has no profiles (read it with \
              OceanModelReader::from_file_with_profiles)"
         );
-        let wet = reader.wet_mask();
         Self {
             reader,
             projection,
@@ -140,7 +134,6 @@ impl<P: CoordinateProjection> OceanModelColumns<P> {
             nodes: (0..mesh.n_elements * ops.n_nodes)
                 .map(|_| OnceLock::new())
                 .collect(),
-            wet,
         }
     }
 
@@ -164,10 +157,10 @@ impl<P: CoordinateProjection> OceanModelColumns<P> {
                 let stencil = match self.reader.stencil(lon, lat) {
                     Some((_, s)) => s,
                     None => {
-                        let wet = |k: usize| self.wet[k];
+                        let wet = |k: usize| self.reader.is_wet(k);
                         let (k, _) =
                             self.reader
-                                .grid
+                                .grid()
                                 .nearest(lon, lat, self.options.max_snap, wet)?;
                         Stencil::point(k)
                     }
@@ -226,14 +219,13 @@ impl<P: CoordinateProjection + Send + Sync> ParentColumns3D for OceanModelColumn
         let depths = &depths[..n_levels];
         let time = self.moment(ctx.time);
         let space = stencil.idx.iter().map(|&k| k as usize).zip(stencil.w);
-        let sample = |series: &Option<ProfileSeries>, out: &mut [f64]| {
-            series
-                .as_ref()
-                .is_some_and(|p| p.sample(&time, space.clone(), depths, column_depth, out))
+        let sample = |series: Option<&ProfileSeries>, out: &mut [f64]| {
+            series.is_some_and(|p| p.sample(&time, space.clone(), depths, column_depth, out))
         };
         let supplied = self.supplies();
         if supplied.velocity {
-            if !(sample(&self.reader.u_profile, out.u) && sample(&self.reader.v_profile, out.v)) {
+            let profiles = self.reader.velocity_profiles();
+            if !(sample(profiles.map(|p| p.0), out.u) && sample(profiles.map(|p| p.1), out.v)) {
                 return false;
             }
             for (u, v) in out.u.iter_mut().zip(out.v.iter_mut()) {
@@ -242,14 +234,14 @@ impl<P: CoordinateProjection + Send + Sync> ParentColumns3D for OceanModelColumn
             }
         }
         if supplied.tracers
-            && !(sample(&self.reader.temperature_profile, out.temp)
-                && sample(&self.reader.salinity_profile, out.salt))
+            && !(sample(self.reader.temperature_profile(), out.temp)
+                && sample(self.reader.salinity_profile(), out.salt))
         {
             return false;
         }
         // Below the parent's bed: the reference plus the decaying anomaly
         if supplied.tracers
-            && let (Some(deep), Some(depth)) = (&self.deep, &self.reader.depth)
+            && let (Some(deep), Some(depth)) = (&self.deep, self.reader.depth())
         {
             let h: f64 = stencil
                 .idx
@@ -395,7 +387,7 @@ mod tests {
         let mesh = Mesh2D::uniform_rectangle(-2000.0, 2000.0, -2000.0, 2000.0, 2, 2);
         let ops = DGOperators2D::new(1);
         let shallow = Arc::try_unwrap(reader(&projection)).expect("one owner");
-        let m = shallow.grid.len();
+        let m = shallow.grid().len();
         let reference = |d: f64| (10.0 - 0.1 * d, 35.0);
         let parent = OceanModelColumns::new(
             Arc::new(shallow.with_depth(vec![5.0; m])),
