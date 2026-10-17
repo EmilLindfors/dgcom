@@ -206,8 +206,11 @@
 //! in 2D: the pressure gradient on the 2D module, the wind stress on the
 //! columns (`GriddedAtmosphere2D::split_for_3d`). The stations, the progress
 //! lines and a 3D snapshot file (`snapshot_minutes=`,
-//! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step and
-//! `cfl_3d=` sets its Courant number (`Hydrostatic3D::compute_dt`; 2).
+//! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step (60 s by
+//! default; the parent and the weather must cover a third of it past the
+//! end, where the last step's barotropic window reads them,
+//! `ModeSplitIntegrator::FORCING_REACH`) and `cfl_3d=` sets its Courant
+//! number (`Hydrostatic3D::compute_dt`; 2).
 //! Measured 2026-10-10: on the Mausund tide (3 h, nested) 2 holds and 3
 //! blows up within 0.8 h (a 50 m element during the ramp, at 25 s steps);
 //! against 0.5, 1 moves ū by 0.3 mm/s RMS and 2 by ≤ 3 mm/s, T by 0.013
@@ -304,10 +307,11 @@
 //! Shores need none (the 3D wetting and drying moves their layers on the 2D
 //! kernel's subcells) and do not move. Off by default. With it, `cliffs3d=D`
 //! raises to land (+2 m) the shore nodes of elements with a node deeper than
-//! D m (40 by default; `cliffs3d=off`) that a tide would make resolved
+//! D m (20 by default; `cliffs3d=off`) that a tide would make resolved
 //! columns beside the deep ones (`Bathymetry2D::raise_cliff_shores`): a
 //! 0.74 m corner among 61–82 m held the 3D step below 0.4 s for hours at
-//! each high water. And `ponds3d=L` fills to their sills the tidal ponds
+//! each high water, and at 40 m two shores of 0.3–0.5 m beside 24–38 m
+//! blew up the 72 h run with MET wind on day 2. And `ponds3d=L` fills to their sills the tidal ponds
 //! of at most one element's nodes at water levels between L m (the lowest
 //! astronomical tide, −1.43 m, by default; `ponds3d=off`) and +2 m: nodes
 //! the open water does not reach along the grid lines
@@ -419,9 +423,14 @@ const TIDE_3D_THIN_DEPTH: f64 = 1.0;
 /// Highest water for `cliffs3d=` (m above MSL), above the highest
 /// astronomical tide at Mausund; the shore nodes it raises go to this height
 const CLIFF_HIGH_WATER: f64 = 2.0;
-/// Default depth (m) of `cliffs3d=`: the x–z slices let shallow water beside
-/// 21–40 m hold and beside 60 m grow
-const CLIFF_DEEP: f64 = 40.0;
+/// Default depth (m) of `cliffs3d=`: at 40 m (the x–z slices let shallow
+/// water beside 21–40 m hold for a day) the 72 h run with MET wind blew up at
+/// 37 h from shores of 0.3–0.5 m beside 24–38 m; at 20 m it held the 72 h
+const CLIFF_DEEP: f64 = 20.0;
+/// Longest step of a 3D tide (s) unless `dt_3d=` sets it: it does not bind
+/// on the coastline mesh (10–18 s steps), and it bounds how far past the end
+/// the last step reads its forcing (`ModeSplitIntegrator::FORCING_REACH`)
+const MAX_DT_3D: f64 = 60.0;
 /// Default level of `ponds3d=` (m above MSL): the lowest astronomical tide at
 /// Mausund (chart datum), the lowest water any run sees
 const POND_LOW_WATER: f64 = -1.43;
@@ -566,7 +575,7 @@ struct Options {
     /// default)
     slopes_3d: Option<ElementSlopeBound>,
     /// With `slopes3d`, raise the shore nodes of elements deeper than this
-    /// (m) to land (`Bathymetry2D::raise_cliff_shores`): `cliffs3d=D`, 40 m
+    /// (m) to land (`Bathymetry2D::raise_cliff_shores`): `cliffs3d=D`, 20 m
     /// by default, `cliffs3d=off`
     cliffs_3d: Option<f64>,
     /// With `slopes3d`, fill to their sills the tidal ponds of at most one
@@ -1848,6 +1857,14 @@ fn tide_setup(
     three_d: bool,
 ) -> Result<TideSetup, Box<dyn std::error::Error>> {
     let t_end = opts.hours * 3600.0;
+    // A 3D step's barotropic pass reads its forcing past the step's end, the
+    // last one past `t_end`
+    let t_forcing = if three_d {
+        let reach = dg_rs::time::ModeSplitIntegrator::FORCING_REACH;
+        t_end + (reach - 1.0) * opts.dt_3d.unwrap_or(MAX_DT_3D)
+    } else {
+        t_end
+    };
     let station_atlas = Path::new(&opts.station_atlas);
     let station_atlas = station_atlas
         .exists()
@@ -1859,7 +1876,7 @@ fn tide_setup(
     if opts.levels == 0 {
         println!("  Bed friction: Manning n = {}", domain.manning);
     }
-    let weather = weather(domain, opts, &clock, t_end)?;
+    let weather = weather(domain, opts, &clock, t_forcing)?;
     // A 3D model's columns take the wind, its 2D module the pressure
     // (split before the level's clone shares the fields)
     let (weather, wind_3d) = match weather {
@@ -1884,6 +1901,20 @@ fn tide_setup(
         )?),
         other => other,
     };
+    if let Some(parent) = &parent {
+        parent.check_time_coverage(0.0, t_forcing).map_err(|e| {
+            if t_forcing > t_end {
+                format!(
+                    "{e}: a 3D run reads its forcing up to a third of a step ({:.0} s) past its \
+                     end; cut the parent an hour longer (`norkyst_nesting_subset hours=`) \
+                     or end the run earlier",
+                    t_forcing - t_end
+                )
+            } else {
+                e
+            }
+        })?;
+    }
     let band = parent
         .as_ref()
         .filter(|_| opts.band_km > 0.0)
@@ -3653,10 +3684,9 @@ fn tidal_run_3d(
         .with_barotropic_cfl(opts.cfl_bt)
         .with_barotropic_scheme(opts.rk_bt)
         .with_barotropic_levels(opts.bt_levels);
-    let mut sim = Simulation3D::new(physics, integrator).with_cfl(opts.cfl_3d);
-    if let Some(dt) = opts.dt_3d {
-        sim = sim.with_dt_max(dt);
-    }
+    let mut sim = Simulation3D::new(physics, integrator)
+        .with_cfl(opts.cfl_3d)
+        .with_dt_max(opts.dt_3d.unwrap_or(MAX_DT_3D));
     if let Some(restart) = restart {
         sim.resume(&restart)?;
         state = restart.state;
@@ -5389,7 +5419,6 @@ fn open_boundary(
     level: Option<Level>,
 ) -> Result<OpenBoundary, Box<dyn std::error::Error>> {
     if let Some(parent) = parent {
-        parent.check_time_coverage(0.0, t_end)?;
         let description = format!(
             "NorKyst nesting ({})",
             parent.reader().velocity_source().unwrap_or("no currents")
