@@ -36,17 +36,17 @@ pub struct AtmosphereState {
 #[derive(Clone, Debug)]
 pub struct AtmosphereReader {
     /// Model grid
-    pub grid: GeoGrid,
+    grid: GeoGrid,
     /// Snapshot times, Unix seconds, strictly increasing
-    pub time: Vec<f64>,
+    time: Vec<f64>,
     /// 10 m wind, eastward (m/s)
-    pub u10: Option<FieldSeries>,
+    u10: Option<FieldSeries>,
     /// 10 m wind, northward (m/s)
-    pub v10: Option<FieldSeries>,
+    v10: Option<FieldSeries>,
     /// Air pressure at sea level (Pa)
-    pub pressure: Option<FieldSeries>,
+    pressure: Option<FieldSeries>,
     /// Where the fields came from (variable names, rotation)
-    pub source: String,
+    source: String,
 }
 
 impl AtmosphereReader {
@@ -100,6 +100,31 @@ impl AtmosphereReader {
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = source.into();
         self
+    }
+
+    /// Model grid.
+    pub fn grid(&self) -> &GeoGrid {
+        &self.grid
+    }
+
+    /// Snapshot times, Unix seconds, strictly increasing.
+    pub fn times(&self) -> &[f64] {
+        &self.time
+    }
+
+    /// 10 m wind (east, north) (m/s).
+    pub fn wind(&self) -> Option<(&FieldSeries, &FieldSeries)> {
+        self.u10.as_ref().zip(self.v10.as_ref())
+    }
+
+    /// Air pressure at sea level (Pa).
+    pub fn pressure(&self) -> Option<&FieldSeries> {
+        self.pressure.as_ref()
+    }
+
+    /// Where the fields came from (variable names, rotation).
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
     /// Whether the fields include wind.
