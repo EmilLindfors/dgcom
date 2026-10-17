@@ -8,6 +8,7 @@ The files were split out of the old 1,500-line `TODO.md` on 2026-10-10, verbatim
 |---|---|---|
 | [overview.md](overview.md) | State and strategy at the 2026-09-25 review, key metrics, references | — |
 | [validation.md](validation.md) | Frøya/Mausund runs, the tidal error budget at the gauge, current comparisons with NorKyst, the ROMS cost benchmark, long-run stability | P3 |
+| [norkyst-issues.md](norkyst-issues.md) | NorKyst-800 v3 against 17 Kartverket gauges and its tidal forcing files: N2 (fixed 2026-03), K2/P1/Q1, datum, pressure, ubar/vbar; the report and draft message to MET | P3.1, P1.5 |
 | [farm.md](farm.md) | The salmon-farm application target (stage A 2D, stage B 3D), cage drag in 2D and 3D, farm-site readers | F.1 |
 | [particles.md](particles.md) | Lagrangian particle tracking, 2D and 3D, lice behaviour | F.2 |
 | [viz.md](viz.md) | The Bevy viewer in `viz/` | F.3 |
