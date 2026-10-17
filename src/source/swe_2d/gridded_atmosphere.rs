@@ -174,7 +174,7 @@ impl GriddedAtmosphere2D {
         for k in ElementIndex::iter(mesh.n_elements) {
             for i in 0..n_nodes {
                 let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
-                let node = AtmosphereNode::at(&reader.grid, projection.as_ref(), (x, y))
+                let node = AtmosphereNode::at(reader.grid(), projection.as_ref(), (x, y))
                     .ok_or_else(|| {
                         let (lat, lon) = projection.xy_to_geo(x, y);
                         format!(
@@ -363,7 +363,7 @@ impl GriddedAtmosphere2D {
 
     fn time_stencil(&self, t: f64) -> TimeStencil {
         TimeStencil::new(
-            &self.inner.reader.time,
+            self.inner.reader.times(),
             self.inner.clock.unix(t),
             TimeInterpolation::Linear,
         )
@@ -385,8 +385,8 @@ impl GriddedAtmosphere2D {
         let inner = &self.inner;
         let reader = &inner.reader;
         let space = node.stencil.idx.iter().map(|&k| k as usize);
-        let wind = match (&reader.u10, &reader.v10) {
-            (Some(u), Some(v)) if wind => {
+        let wind = match reader.wind() {
+            Some((u, v)) if wind => {
                 let w = space.clone().zip(node.stencil.w);
                 let (e, n) = (u.interpolate(time, w.clone()), v.interpolate(time, w));
                 let (c, s) = node.east;
@@ -394,7 +394,7 @@ impl GriddedAtmosphere2D {
             }
             _ => (0.0, 0.0),
         };
-        let gradient = match &reader.pressure {
+        let gradient = match reader.pressure() {
             Some(p) if pressure => (
                 ramp * p.interpolate(time, space.clone().zip(node.gradient.map(|g| g.0))),
                 ramp * p.interpolate(time, space.zip(node.gradient.map(|g| g.1))),
@@ -435,7 +435,7 @@ impl GriddedAtmosphere2D {
     /// Node sampling at a mesh position, computed on the fly.
     fn node_at(&self, position: (f64, f64)) -> Option<AtmosphereNode> {
         AtmosphereNode::at(
-            &self.inner.reader.grid,
+            self.inner.reader.grid(),
             self.inner.projection.as_ref(),
             position,
         )
@@ -444,7 +444,7 @@ impl GriddedAtmosphere2D {
     /// Inverse-barometer level (m) at a node.
     fn inverse_barometer(&self, node: &AtmosphereNode, t: f64) -> f64 {
         let inner = &self.inner;
-        let Some(p) = inner.reader.pressure.as_ref().filter(|_| inner.pressure) else {
+        let Some(p) = inner.reader.pressure().filter(|_| inner.pressure) else {
             return 0.0;
         };
         let time = self.time_stencil(t);
@@ -473,7 +473,7 @@ impl GriddedAtmosphere2D {
         };
         // Everything the reader has, whatever the switches: a split
         // atmosphere's wind stress shares the snapshots
-        let pressure = inner.reader.pressure.as_ref();
+        let pressure = inner.reader.pressure();
         let values: Snapshot = inner
             .nodes
             .iter()
@@ -647,7 +647,7 @@ impl BoundaryLevel for GriddedAtmosphere2D {
         match ctx.node_index.filter(|&i| i < self.inner.nodes.len()) {
             Some(i) => {
                 let inner = &self.inner;
-                if inner.reader.pressure.is_none() || !inner.pressure {
+                if !inner.reader.has_pressure() || !inner.pressure {
                     return 0.0;
                 }
                 let p = self.with_snapshots(&self.time_stencil(ctx.time), |snapshots| {
@@ -940,7 +940,7 @@ mod tests {
         let projection = LocalProjection::new(63.5, 8.5);
         let mesh = Mesh2D::uniform_rectangle(-10e3, 10e3, -10e3, 10e3, 2, 2);
         let ops = DGOperators2D::new(1);
-        let grid = reader(&projection).grid.clone();
+        let grid = reader(&projection).grid().clone();
         let m = grid.len();
         let make = |speed: f32| {
             let reader = AtmosphereReader::new(grid.clone(), vec![T0, T0 + 3600.0])

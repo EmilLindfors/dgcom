@@ -953,7 +953,7 @@ impl AtmosphereReader {
             match axes {
                 Axes::EastNorth => sources.push(format!("wind {a_name}/{b_name}")),
                 Axes::Grid => {
-                    rotate_to_east_north(&mut a, &mut b, &reader.grid.x_axis_angles());
+                    rotate_to_east_north(&mut a, &mut b, &reader.grid().x_axis_angles());
                     sources.push(format!("wind {a_name}/{b_name} rotated from the grid axes"));
                 }
                 Axes::SpeedFrom => {
@@ -1395,9 +1395,9 @@ mod tests {
         let (u, v) = state.wind.unwrap();
         assert!(u.abs() < 0.05 && (v - 5.0).abs() < 1e-3, "({u}, {v})");
         assert!((state.pressure.unwrap() - 100_000.0).abs() < 1e-3);
-        assert!(reader.source.contains("rotated"));
+        assert!(reader.source().contains("rotated"));
         let joined = AtmosphereReader::from_files(&[&path]).unwrap();
-        assert_eq!(joined.time, reader.time);
+        assert_eq!(joined.times(), reader.times());
         assert!(AtmosphereReader::from_files(&[&path, &path]).is_err());
     }
 

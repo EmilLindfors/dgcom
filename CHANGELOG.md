@@ -423,6 +423,8 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **`AtmosphereReader`'s fields are private (TODO P1.6),** as `OceanModelReader`'s: read them through `grid()`, `times()`, `wind()` (east, north), `pressure()` and `source()`; build with the `with_*` methods.
+
 - **`OceanModelReader`'s fields are private (TODO P1.6).** Read them through accessors (`grid()`, `times()`, `ssh()`, `u()`, `v()`, `depth()`, `velocity_source()`, `velocity_profiles()`, `temperature_profile()`, `salinity_profile()`, …); build with the `with_*` methods. The reader keeps its wet mask (refreshed by `with_ssh`, `with_velocity`, `with_depth`), so `is_wet` no longer reads every snapshot and `wet_mask()` returns `&[bool]`.
 
 - **`HarmonicAnalysis::fit` by a row-by-row Givens QR instead of the normal equations (TODO P3.1).** No n × m design matrix (12.6 MB for a year of 10-minute samples with 15 constituents), the conditioning of A rather than of AᵀA, the residual from the factor's last diagonal; 2.9× faster on that year (44 against 128 ms), the same constants.
