@@ -6,6 +6,7 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **`ModeSplitIntegrator::FORCING_REACH` and `BarotropicFilter::reach` (TODO P4.6).** The barotropic pass of a step from tⁿ runs the filter's whole window and reads boundaries and surface forcing up to tⁿ + (M*/n_bt)·Δt, at most 4/3 Δt (gate `the_filter_window_stays_within_the_forcing_reach`, n_bt 4–2000), so a run's forcing must cover a third of a step past its end.
 - **`boundary::BoundaryCoverage`: which open faces a parent model or tidal atlas covers (TODO P1.5).** `of_parent` / `of_atlas` / `of` find the faces with a node the source cannot serve, `close(mesh, max_fraction)` makes walls of them or refuses with `CoverageError` when they are more than the given share (a parent cut for a smaller domain closed 120 of the Frøya box's 223 open faces and halved the 3D M2 current, 2026-10-16). `froya_real_data`'s `max_closed` guard now uses it; unit-tested on a parent missing a corner.
 
 - **An out-of-sample domain, Bodø (P3.4, `notes/validation.md`):** a 24 h day at Bodø (67.25°N) with every setting frozen at Frøya's and the pass marks set before the runs. 4 of 5 pass: M2 currents 0.957 (2D) and 0.939 (3D) of NorKyst's, 3D/2D 0.957, T RMSE below 10 m 0.17 and 0.16 °C on two sections, no NaN or clips. The gauge fails (11.4 cm centred against ≤ 5; NorKyst's own 12.0); the gauge-corrected boundary tide alone gives 3.4 cm, so the failure is the parent's N2.
@@ -423,6 +424,7 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **`froya_real_data cliffs3d=` is 20 m by default (was 40; TODO P4.6).** At 40 m the 72 h nested run with MET wind blew up at 37 h from two cliff shores of 0.3–0.5 m beside 24–38 m; at 20 m (1917 shore nodes, 15.3 km² of water at MSL made land, against 6.1 km²) it runs the 72 h with at most 204 steps per half hour. That run answers P4.6's day-2 question: the model has NorKyst's mixing event (domain-mean surface −1.04 °C and +0.30 from 27 to 54 h, NorKyst −1.21 °C and +0.29), but not its diurnal warming (`notes/3d-validation.md`).
 - **`AtmosphereReader`'s fields are private (TODO P1.6),** as `OceanModelReader`'s: read them through `grid()`, `times()`, `wind()` (east, north), `pressure()` and `source()`; build with the `with_*` methods.
 
 - **`OceanModelReader`'s fields are private (TODO P1.6).** Read them through accessors (`grid()`, `times()`, `ssh()`, `u()`, `v()`, `depth()`, `velocity_source()`, `velocity_profiles()`, `temperature_profile()`, `salinity_profile()`, …); build with the `with_*` methods. The reader keeps its wet mask (refreshed by `with_ssh`, `with_velocity`, `with_depth`), so `is_wet` no longer reads every snapshot and `wet_mask()` returns `&[bool]`.
@@ -579,6 +581,7 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **A 3D run no longer panics in its last step for a parent that ends with the run (TODO P4.6).** The last step's barotropic window read the parent past `t_end` (0.62 s past the last snapshot of a 72 h parent, after 4.7 h of wall time). `froya_real_data` now checks the parent and the weather to `t_end + Δt_max/3` at setup, with the 3D step capped at 60 s unless `dt_3d=` sets it, and says to cut the parent an hour longer.
 - **The wave dissipation's force is over the wave step taken (TODO F.4).** `CoupledWaves2D::exchange` evaluated `WaveForceForm::Dissipation` over `compute_dt(cfl)`, not over the interval's step (`span / steps`, shorter unless it divides the span); ≈ 0.05 % on the coupled beach. Gate: `the_dissipation_force_is_over_the_wave_step_taken`.
 
 - **The 3D coastline day's halved tidal currents were its parent file, not the 3D model (TODO P1.3).** `data/mausund_norkyst_3d.nc`, cut for the Mausund sub-domain, turned 120 open faces of the Frøya box into walls; a 2D run in the same file shows the same 0.48 and the same flattened M2 phase. Nested in a parent over the whole box (`data/froya_norkyst_3d.nc`), the 3D M2 current is 0.946 of NorKyst's where the beds agree (2D 0.958; before 0.463). `froya_real_data` now refuses a NorKyst file or tidal atlas that leaves more than `max_closed` (default 0.05) of the open faces uncovered.

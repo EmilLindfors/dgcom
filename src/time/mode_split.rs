@@ -770,6 +770,13 @@ impl BarotropicFilter {
         self.n_bt
     }
 
+    /// The window's length in baroclinic steps, `M*/n_bt`: the pass runs to
+    /// `tⁿ + reach·Δt`, past `tⁿ⁺¹` (at most
+    /// [`ModeSplitIntegrator::FORCING_REACH`]).
+    pub fn reach(&self) -> f64 {
+        self.weights.len() as f64 / self.n_bt as f64
+    }
+
     /// Weight of the state after substep `m`, stored at index `m − 1`. The
     /// window length `M*` is `weights().len()`.
     pub fn weights(&self) -> &[f64] {
@@ -1173,6 +1180,14 @@ impl Default for ModeSplitIntegrator {
 impl ModeSplitIntegrator {
     /// Barotropic CFL used unless set with [`Self::with_barotropic_cfl`].
     pub const DEFAULT_BAROTROPIC_CFL: f64 = 0.5;
+
+    /// How far a step reads its forcing, in steps: the barotropic pass of the
+    /// step from `tⁿ` runs the filter's whole window and evaluates boundaries
+    /// and surface forcing up to `tⁿ + FORCING_REACH·Δt`
+    /// ([`BarotropicFilter::reach`]: 4/3 at 6 substeps, → 1.32). A run to
+    /// `t_end` with steps up to `Δt` needs its forcing to
+    /// `t_end + (FORCING_REACH − 1)·Δt`.
+    pub const FORCING_REACH: f64 = 4.0 / 3.0;
 
     /// Integrator with the default barotropic CFL and at least
     /// [`MIN_BAROTROPIC_SUBSTEPS`] substeps per step.
@@ -2421,6 +2436,23 @@ mod tests {
                 w.len()
             );
         }
+    }
+
+    /// A run's forcing must cover `FORCING_REACH` steps past its last step's
+    /// start (a 72 h run on a 72 h parent read 0.62 s past the parent's last
+    /// snapshot in its last step's window and panicked, 2026-10-17).
+    #[test]
+    fn the_filter_window_stays_within_the_forcing_reach() {
+        let mut largest: f64 = 0.0;
+        for n_bt in MIN_BAROTROPIC_SUBSTEPS..=2000 {
+            let reach = BarotropicFilter::new(n_bt).reach();
+            assert!(
+                reach <= ModeSplitIntegrator::FORCING_REACH + 1e-12,
+                "n_bt {n_bt}: the window reaches {reach} steps"
+            );
+            largest = largest.max(reach);
+        }
+        assert!((largest - ModeSplitIntegrator::FORCING_REACH).abs() < 1e-12);
     }
 
     /// A constant-rate barotropic signal is reproduced exactly at `tⁿ⁺¹`: the
