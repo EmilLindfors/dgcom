@@ -265,7 +265,6 @@ impl OceanModelState {
         let distance = boundary_distances(mesh, ops, &[tag], options.band_width)
             .ok_or(NestingError::NoBoundary(tag))?;
 
-        let wet = reader.wet_mask();
         let mut slot_of_node = vec![u32::MAX; distance.len()];
         let mut nodes = Vec::new();
         let mut band_elements = vec![false; mesh.n_elements];
@@ -280,8 +279,8 @@ impl OceanModelState {
             let stencil = match reader.stencil(lon, lat) {
                 Some((_, s)) => Some(s),
                 None => reader
-                    .grid
-                    .nearest(lon, lat, options.max_snap, |k| wet[k])
+                    .grid()
+                    .nearest(lon, lat, options.max_snap, |k| reader.is_wet(k))
                     .map(|(k, _)| {
                         snapped += on_boundary as usize;
                         Stencil::point(k)
@@ -299,7 +298,7 @@ impl OceanModelState {
                 }
                 continue;
             };
-            let parent_depth = reader.depth.as_ref().map_or(f64::NAN, |h| {
+            let parent_depth = reader.depth().map_or(f64::NAN, |h| {
                 stencil
                     .idx
                     .iter()
@@ -344,11 +343,10 @@ impl OceanModelState {
                     len: 1,
                 };
                 let zeta = reader
-                    .ssh
-                    .as_ref()
+                    .ssh()
                     .expect("checked")
                     .interpolate(&at, space.clone());
-                let (u, v) = match (&reader.u, &reader.v) {
+                let (u, v) = match (reader.u(), reader.v()) {
                     (Some(u), Some(v)) => {
                         let e = u.interpolate(&at, space.clone());
                         let n = v.interpolate(&at, space.clone());
@@ -379,7 +377,7 @@ impl OceanModelState {
 
     /// A clock whose `t = 0` is the first snapshot of `reader`.
     pub fn first_snapshot(reader: &OceanModelReader) -> ModelClock {
-        ModelClock::new(reader.time[0])
+        ModelClock::new(reader.times()[0])
     }
 
     /// The model clock.
@@ -571,7 +569,7 @@ impl OceanModelState {
         let mut series = inner.series.clone();
         for (slot, node_series) in series.chunks_exact_mut(3 * n_times).enumerate() {
             for (snapshot, q) in node_series.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                let t = inner.clock.model_time(inner.reader.time[snapshot]);
+                let t = inner.clock.model_time(inner.reader.times()[snapshot]);
                 let (eta, u, v) = tides.evaluate(slot, t);
                 for (value, delta) in q.iter_mut().zip([eta, u, v]) {
                     *value = (*value as f64 + delta) as f32;

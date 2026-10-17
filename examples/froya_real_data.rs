@@ -5392,11 +5392,7 @@ fn open_boundary(
         parent.check_time_coverage(0.0, t_end)?;
         let description = format!(
             "NorKyst nesting ({})",
-            parent
-                .reader()
-                .velocity_source
-                .as_deref()
-                .unwrap_or("no currents")
+            parent.reader().velocity_source().unwrap_or("no currents")
         );
         let level = level.filter(|_| opts.nesting_ib);
         return Ok((characteristic(parent, level), description));

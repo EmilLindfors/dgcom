@@ -805,7 +805,7 @@ impl OceanModelReader {
                     }
                     None => {
                         source += ", rotated by the grid angle";
-                        reader.grid.x_axis_angles()
+                        reader.grid().x_axis_angles()
                     }
                 };
                 rotate_to_east_north(&mut u, &mut v, &angles);
@@ -837,7 +837,7 @@ impl OceanModelReader {
                     let angles =
                         match read_static(&file, &["angle"], fields.time_dim.as_deref(), dims)? {
                             Some(a) => a,
-                            None => reader.grid.x_axis_angles(),
+                            None => reader.grid().x_axis_angles(),
                         };
                     rotate_profiles_to_east_north(&mut u, &mut v, &angles);
                 }
@@ -1115,7 +1115,7 @@ mod tests {
         // P0.20: raw values were returned, so "hours since …" files were
         // compared against simulation seconds.
         let reader = read(Some(HOURS), &[0.1, 0.2, 0.3], Zeta::Float).unwrap();
-        assert_eq!(reader.time, vec![T0, T0 + 3600.0, T0 + 7200.0]);
+        assert_eq!(reader.times(), [T0, T0 + 3600.0, T0 + 7200.0]);
         assert_eq!(reader.time_range(), Some((T0, T0 + 7200.0)));
     }
 
@@ -1154,7 +1154,7 @@ mod tests {
         let (lat, lon) = CENTRE;
         let ssh = reader.get_state(lon, lat, 0).unwrap().ssh.unwrap();
         assert!((ssh - 0.37).abs() < 1e-6, "ssh = {ssh}");
-        assert_eq!(reader.depth.as_deref(), Some(&[50.0; 4][..]));
+        assert_eq!(reader.depth(), Some(&[50.0; 4][..]));
         let (u, v) = reader.get_state(lon, lat, 0).unwrap().velocity.unwrap();
         assert!((u - 0.2).abs() < 1e-6 && (v + 0.1).abs() < 1e-6);
     }
@@ -1162,7 +1162,7 @@ mod tests {
     #[test]
     fn packed_i16_ssh_is_unpacked_with_fill() {
         let reader = read(Some(HOURS), &[0.37, -0.25], Zeta::PackedI16).unwrap();
-        let ssh = reader.ssh.as_ref().unwrap();
+        let ssh = reader.ssh().unwrap();
         assert!(ssh.get(0, 0).is_nan(), "fill value must become NaN");
         assert!((ssh.get(0, 3) - 0.37).abs() < 1e-6);
         assert!((ssh.get(1, 0) + 0.25).abs() < 1e-6);
@@ -1174,7 +1174,7 @@ mod tests {
     fn bathymetry_h_is_not_read_as_ssh() {
         // P0.20: "h" was an SSH candidate; in ROMS/NorKyst it is the depth.
         let reader = read(Some(HOURS), &[0.1], Zeta::Absent).unwrap();
-        assert!(reader.ssh.is_none());
+        assert!(reader.ssh().is_none());
     }
 
     /// Writes a 2 × 3 regular grid with the given extra variables.
@@ -1240,18 +1240,17 @@ mod tests {
     fn z_level_velocity_is_averaged_to_the_bed() {
         let (_dir, path) = z_level_file();
         let reader = OceanModelReader::from_file(path).unwrap();
-        let u = reader.u.as_ref().unwrap();
+        let u = reader.u().unwrap();
         // 20 m column: (0.75·10 + 0.5·10)/20; 60 m column: (0.75·10 + 0.25·40 + 0·10)/60
         assert!((u.get(0, 0) - 0.625).abs() < 1e-6, "{}", u.get(0, 0));
         assert!((u.get(0, 1) - 17.5 / 60.0).abs() < 1e-6, "{}", u.get(0, 1));
         assert!(
             reader
-                .velocity_source
-                .as_ref()
+                .velocity_source()
                 .unwrap()
                 .contains("averaged over depth")
         );
-        assert!((reader.temperature.as_ref().unwrap().get(0, 2) - 12.0).abs() < 1e-6);
+        assert!((reader.temperature().unwrap().get(0, 2) - 12.0).abs() < 1e-6);
     }
 
     /// A ROMS-like s-level file: two layers (Vtransform 2, `hc` 0, the
@@ -1305,7 +1304,7 @@ mod tests {
         let (e, n) = reader.get_state(lon, lat, 0).unwrap().velocity.unwrap();
         assert!((e - 1.2 * angle.cos()).abs() < 1e-6, "{e}");
         assert!((n - 1.2 * angle.sin()).abs() < 1e-6, "{n}");
-        assert!(reader.velocity_source.as_ref().unwrap().contains("angle"));
+        assert!(reader.velocity_source().unwrap().contains("angle"));
     }
 
     /// Profiles for 3D nesting keep the z-levels: from the surface down, NaN
@@ -1314,7 +1313,7 @@ mod tests {
     fn z_level_profiles_keep_the_levels() {
         let (_dir, path) = z_level_file();
         let reader = OceanModelReader::from_file_with_profiles(&path).unwrap();
-        let u = reader.u_profile.as_ref().unwrap();
+        let (u, _) = reader.velocity_profiles().unwrap();
         assert_eq!(u.levels(), &ProfileLevels::Depth(vec![0.0, 10.0, 50.0]));
         let column = u.column(0, 0);
         assert_eq!(&column[..2], &[1.0, 0.5]);
@@ -1323,14 +1322,14 @@ mod tests {
         // Below the bed of the 20 m column: its deepest value
         assert_eq!(u.value_at(0, 0, 30.0, 20.0), Some(0.5));
         assert_eq!(u.value_at(0, 1, 30.0, 60.0), Some(0.25));
-        let t = reader.temperature_profile.as_ref().unwrap();
+        let t = reader.temperature_profile().unwrap();
         assert_eq!(t.column(0, 3), &[12.0, 8.0, 8.0]);
         assert!(reader.has_current_profiles());
         // No salinity in the file
         assert!(!reader.has_tracer_profiles());
         let plain = OceanModelReader::from_file(&path).unwrap();
-        assert_eq!(plain.u, reader.u);
-        assert!(plain.u_profile.is_none());
+        assert_eq!(plain.u(), reader.u());
+        assert!(plain.velocity_profiles().is_none());
     }
 
     /// Profiles on ROMS s-levels are fractions of the column at the layer
@@ -1341,10 +1340,7 @@ mod tests {
         let angle = 30f64.to_radians();
         let (_dir, path) = s_level_file(angle);
         let reader = OceanModelReader::from_file_with_profiles(path).unwrap();
-        let (u, v) = (
-            reader.u_profile.as_ref().unwrap(),
-            reader.v_profile.as_ref().unwrap(),
-        );
+        let (u, v) = reader.velocity_profiles().unwrap();
         let ProfileLevels::Fraction(fractions) = u.levels() else {
             panic!("s-levels should be fractions");
         };
