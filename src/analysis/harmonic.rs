@@ -26,8 +26,14 @@
 //! share one pair of unknowns. A fitted pair that is not separable is an
 //! error ([`AnalysisError::NotSeparable`]); [`HarmonicAnalysis::resolvable`]
 //! chooses what a record can fit.
-
-use faer::{Mat, linalg::solvers::Solve};
+//!
+//! # Solution
+//!
+//! Each sample's row of the design matrix is rotated into the triangular
+//! factor of `[A | y]` as it is formed (a Givens QR), so a fit needs O(m²)
+//! memory for m unknowns whatever the record's length, and keeps the
+//! conditioning of `A` rather than the square of it that the normal
+//! equations `AᵀA x = Aᵀy` have.
 
 use super::{AnalysisError, TimeSeries};
 use crate::tides::constituent_period;
@@ -367,30 +373,53 @@ impl HarmonicAnalysis {
             })
             .collect::<Result<_, AnalysisError>>()?;
 
-        // Design matrix: [1, (f cos(arg), f sin(arg)) per fitted constituent]
-        let mut a = Mat::<f64>::zeros(n, n_unknowns);
-        for (row, &t_unix) in times_unix.iter().enumerate() {
+        // A row of the design matrix and the sample, [1, (f cos(arg), f sin(arg))
+        // per fitted constituent, y], is rotated into the upper-triangular R of
+        // [A | y] at once (Givens; Golub & Van Loan 2013, §5.2.5, §6.5.3): no
+        // n × m matrix, the conditioning of A rather than of AᵀA, and R's last
+        // diagonal is the residual norm.
+        let p = n_unknowns + 1;
+        let mut r = vec![0.0f64; p * p];
+        let mut w = vec![0.0f64; p];
+        for (&t_unix, &value) in times_unix.iter().zip(values) {
             let t = t_unix - t0;
-            a[(row, 0)] = 1.0;
+            w[0] = 1.0;
             for (j, &(omega, f, phase)) in fitted.iter().enumerate() {
                 let arg = omega * t + phase;
-                a[(row, 1 + 2 * j)] = f * arg.cos();
-                a[(row, 2 + 2 * j)] = f * arg.sin();
+                w[1 + 2 * j] = f * arg.cos();
+                w[2 + 2 * j] = f * arg.sin();
             }
             for &(j, inf, (omega, f, phase)) in &attached {
                 let arg = omega * t + phase - inf.lag_offset_deg.to_radians();
-                a[(row, 1 + 2 * j)] += inf.amplitude_ratio * f * arg.cos();
-                a[(row, 2 + 2 * j)] += inf.amplitude_ratio * f * arg.sin();
+                w[1 + 2 * j] += inf.amplitude_ratio * f * arg.cos();
+                w[2 + 2 * j] += inf.amplitude_ratio * f * arg.sin();
+            }
+            w[n_unknowns] = value;
+            for j in 0..p {
+                if w[j] == 0.0 {
+                    continue;
+                }
+                let row = &mut r[j * p..(j + 1) * p];
+                let rho = row[j].hypot(w[j]);
+                let (c, s) = (row[j] / rho, w[j] / rho);
+                row[j] = rho;
+                for (rk, wk) in row[j + 1..].iter_mut().zip(&mut w[j + 1..]) {
+                    (*rk, *wk) = (c * *rk + s * *wk, c * *wk - s * *rk);
+                }
             }
         }
-        let y = Mat::<f64>::from_fn(n, 1, |i, _| values[i]);
-        let ata = a.transpose() * &a;
-        let aty = a.transpose() * &y;
-        let x = ata.as_ref().full_piv_lu().solve(&aty);
+        // R x = Qᵀy
+        let mut x = vec![0.0f64; n_unknowns];
+        for j in (0..n_unknowns).rev() {
+            let row = &r[j * p..(j + 1) * p];
+            let known: f64 = (j + 1..n_unknowns).map(|k| row[k] * x[k]).sum();
+            x[j] = (row[n_unknowns] - known) / row[j];
+        }
+        let ss_res = r[p * p - 1].powi(2);
 
         // H cos(arg − G) = H cos G cos(arg) + H sin G sin(arg)
         let constant = |name, j: usize, ratio: f64, offset: f64, inferred| {
-            let (c, s) = (x[(1 + 2 * j, 0)], x[(2 + 2 * j, 0)]);
+            let (c, s) = (x[1 + 2 * j], x[2 + 2 * j]);
             ReferenceConstant {
                 name,
                 amplitude: ratio * c.hypot(s),
@@ -407,15 +436,10 @@ impl HarmonicAnalysis {
             constant(inf.name, j, inf.amplitude_ratio, inf.lag_offset_deg, true)
         }));
 
-        let fitted_values = &a * &x;
         let mean_value = values.iter().sum::<f64>() / n as f64;
-        let (mut ss_res, mut ss_tot) = (0.0, 0.0);
-        for (i, &v) in values.iter().enumerate() {
-            ss_res += (v - fitted_values[(i, 0)]).powi(2);
-            ss_tot += (v - mean_value).powi(2);
-        }
+        let ss_tot: f64 = values.iter().map(|v| (v - mean_value).powi(2)).sum();
         Ok(ReferenceFit {
-            mean: x[(0, 0)],
+            mean: x[0],
             constants,
             r_squared: if ss_tot > 0.0 {
                 1.0 - ss_res / ss_tot
@@ -500,6 +524,70 @@ mod tests {
         for (p, v) in predicted.iter().zip(&values) {
             assert!((p - v).abs() < 1e-8, "{p} vs {v}");
         }
+    }
+
+    /// A 60-day record of 10-minute samples with gaps and a 3 m datum, plus
+    /// a deterministic off-tide wobble: the fit recovers the constants, and
+    /// its residual (from the QR's last diagonal) equals the one computed
+    /// from the prediction.
+    #[test]
+    fn residual_from_the_factor_matches_the_prediction() {
+        let t0 = ModelClock::at_datetime(2025, 1, 1, 0, 0).epoch_unix;
+        let truth: [(&str, f64, f64); 5] = [
+            ("M2", 0.80, 283.0),
+            ("S2", 0.28, 318.0),
+            ("N2", 0.17, 262.0),
+            ("K1", 0.07, 190.0),
+            ("O1", 0.05, 45.0),
+        ];
+        let clock = ModelClock::new(t0);
+        // Every sample but those in a 2-day gap every 9 days
+        let times: Vec<f64> = (0..60 * 144)
+            .map(|i| t0 + 600.0 * i as f64)
+            .filter(|t| ((t - t0) / 86_400.0) % 9.0 >= 2.0)
+            .collect();
+        let t_mid = 0.5 * (times[times.len() - 1] - t0);
+        let wobble = |t: f64| 0.02 * (2.0 * std::f64::consts::PI * t / (3.7 * 86_400.0)).sin();
+        let values: Vec<f64> = times
+            .iter()
+            .map(|&tu| {
+                let t = tu - t0;
+                3.0 + wobble(t)
+                    + truth
+                        .iter()
+                        .map(|&(name, h, g)| {
+                            let c = clock.nodal_correction(name, t_mid).unwrap();
+                            let omega =
+                                2.0 * std::f64::consts::PI / constituent_period(name).unwrap();
+                            c.f * h * (omega * t + c.phase_offset_rad() - g.to_radians()).cos()
+                        })
+                        .sum::<f64>()
+            })
+            .collect();
+        let fit = HarmonicAnalysis::new(&["M2", "S2", "N2", "K1", "O1"])
+            .fit(&times, &values)
+            .unwrap();
+        for (name, h, g) in truth {
+            let c = fit.get(name).unwrap();
+            // The wobble (3.7-day period) leaks a little into the tidal bands
+            assert!((c.amplitude - h).abs() < 2e-3, "{name}: H {}", c.amplitude);
+            assert!(lag_error(c.lag_deg, g) < 1.0, "{name}: G {}", c.lag_deg);
+        }
+        assert!((fit.mean - 3.0).abs() < 2e-3, "Z0 {}", fit.mean);
+        let predicted = fit.predict(&times);
+        let rms = (predicted
+            .iter()
+            .zip(&values)
+            .map(|(p, v)| (p - v).powi(2))
+            .sum::<f64>()
+            / times.len() as f64)
+            .sqrt();
+        assert!(rms > 0.01, "the wobble is left in the residual: {rms}");
+        assert!(
+            (fit.residual_rms - rms).abs() < 1e-12,
+            "{} vs {rms}",
+            fit.residual_rms
+        );
     }
 
     /// The same constants from two records of one tide that start at
