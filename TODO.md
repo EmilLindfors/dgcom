@@ -324,8 +324,12 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## 3D: mixing (P4.4) — [notes/3d-mixing.md](notes/3d-mixing.md)
 
-- [ ] **P4.4** Per-column surface heat and freshwater fluxes, Q_net/(ρ₀c_p), from bulk formulae on `AtmosphereReader` fields (one domain buoyancy flux today). The 72 h nested run with MET wind (2026-10-17, `notes/3d-validation.md`) reproduces NorKyst's day-2 mixing (−1.04 against −1.21 °C, +0.30 against +0.29) but not its diurnal warming (≈ 0.6 °C on day 1, 0.33 °C on day 3, the model 0.11): the domain-mean surface sits 0.2–0.4 °C cold and the top 3 m at the NorKyst point 0.8 °C. Needs 2 m air temperature, humidity and radiation (`froya_met.nc` has wind and pressure only); SST relaxation to the parent is the cheap alternative.
-- [ ] **P4.4** Surface stress in thin columns (`with_min_column_depth`) through `G` as τ/ρ₀ (tidal flats get no wind in 3D today).
+- [ ] **P4.4** Day 3's warming is a third of NorKyst's with the heat fluxes (+0.13 against +0.34 °C at 54–63 h, overcast, both surfaces freshening): compare the parent's boundary T/S with the interior before blaming the fluxes.
+- [ ] **P4.4** Wind stress from the same COARE iteration (stability-dependent, relative to the surface current) instead of `GriddedWindStress`'s Large & Pond.
+- [ ] **P4.4** COARE cost: 10 iterations against ROMS's 3; exit on convergence (≈ 1 % of the 3D step now).
+- [ ] **P4.4** De-accumulate forecast radiation (MEPS/AROME) in `AtmosphereReader::from_file`, so forecasts work without `met_forcing_subset`'s conversion.
+- [ ] **P4.4** Low priority: the rain's heat, COARE's cool skin and warm layer, the latitude per column.
+- [ ] **P4.4** Surface stress and heat/freshwater fluxes in thin columns (`with_min_column_depth`): τ/ρ₀ through `G`, the flux over the whole thin column (tidal flats get no wind or heat in 3D today).
 - [ ] **P4.4** Wave height for the surface roughness, z₀ₛ ≈ 0.6 H_s per column, from a MyWaveWAM reader or fetch-limited H_s(U₁₀, fetch).
 - [ ] **P4.4** Positivity-safe advected `k`/`ψ` (Zhang–Shu scaling toward the element mean, or a length cap); check on a real run with fronts.
 - [ ] **P4.4** k-ε with waves: σ_ε as a function of P/ε (Burchard 2001, GOTM `sig_peps`); until then k-ω or generic with waves.
