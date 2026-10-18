@@ -109,7 +109,9 @@ mod wave_spectra;
 mod z_levels;
 
 pub use adcp_reader::{ADCPFile, ADCPFileError, read_adcp_file, write_adcp_file};
-pub use atmosphere::{AtmosphereReader, AtmosphereState, P_REFERENCE, wind_from_direction};
+pub use atmosphere::{
+    AtmosphereField, AtmosphereReader, AtmosphereState, P_REFERENCE, wind_from_direction,
+};
 pub use bed_raster::BedRaster;
 pub use coastline::{CoastlineData, CoastlineError, CoastlineStatistics, FROYA_BBOX, NORWAY_BBOX};
 pub use constituent_reader::{

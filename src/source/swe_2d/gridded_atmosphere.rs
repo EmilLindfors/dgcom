@@ -39,18 +39,29 @@
 //! without its wind for the 2D module, and a [`GriddedWindStress`] for
 //! [`crate::physics::Hydrostatic3D::with_surface_stress`]. Both share the
 //! node stencils and the regridded snapshots.
+//!
+//! With the fields of the surface heat budget (air temperature, humidity,
+//! radiation, and optionally precipitation), [`GriddedAtmosphere2D::surface_fluxes`]
+//! gives the columns their heat and freshwater fluxes
+//! ([`GriddedSurfaceFluxes`], for
+//! [`crate::physics::Hydrostatic3D::with_surface_fluxes`]): the COARE 3.5 bulk
+//! formulae ([`crate::physics::air_sea`]) at every node, from the weather
+//! interpolated bilinearly in space and linearly in time and each column's
+//! own surface temperature and salinity. The fluxes are not ramped: they
+//! excite no gravity waves, and the wind in them is the weather's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::boundary::{BCContext2D, BoundaryLevel, tidal_ramp};
 use crate::io::{
-    AtmosphereReader, CoordinateProjection, P_REFERENCE, Stencil, TimeInterpolation, TimeStencil,
-    east_axis,
+    AtmosphereField, AtmosphereReader, CoordinateProjection, P_REFERENCE, Stencil,
+    TimeInterpolation, TimeStencil, east_axis,
 };
 use crate::mesh::Mesh2D;
 use crate::operators::DGOperators2D;
-use crate::physics::SurfaceStress3D;
+use crate::physics::air_sea::{AirState, Coare35};
+use crate::physics::{SeaSurface, SurfaceFluxFields, SurfaceFluxes3D, SurfaceStress3D};
 use crate::solver::SWEState2D;
 use crate::solver::core::blocks::for_each_block;
 use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
@@ -185,7 +196,7 @@ impl GriddedAtmosphere2D {
                 nodes.push(node);
             }
         }
-        let (wind, pressure) = (reader.has_wind(), reader.has_pressure());
+        let (wind, pressure) = (reader.has_wind(), reader.has(AtmosphereField::Pressure));
         Ok(Self {
             inner: Arc::new(Inner {
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -333,6 +344,36 @@ impl GriddedAtmosphere2D {
         (atmosphere, stress)
     }
 
+    /// The heat and freshwater fluxes of this weather on the columns of a 3D
+    /// model by the bulk formulae `bulk`, sharing this one's stencils and
+    /// clock (not its ramp: see the module docs).
+    ///
+    /// # Errors
+    /// If the weather lacks the wind or a field of
+    /// [`AtmosphereField::HEAT_BUDGET`] (precipitation is optional).
+    pub fn surface_fluxes(&self, bulk: Coare35) -> Result<GriddedSurfaceFluxes, String> {
+        let reader = &self.inner.reader;
+        let missing: Vec<&str> = std::iter::once((!reader.has_wind()).then_some("wind"))
+            .chain(
+                AtmosphereField::HEAT_BUDGET
+                    .iter()
+                    .map(|&f| (!reader.has(f)).then_some(f.name())),
+            )
+            .flatten()
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "GriddedAtmosphere2D::surface_fluxes: the weather ({}) has no {}",
+                reader.source(),
+                missing.join(", ")
+            ));
+        }
+        Ok(GriddedSurfaceFluxes {
+            atmosphere: self.clone(),
+            bulk,
+        })
+    }
+
     /// The weather fields.
     pub fn reader(&self) -> &AtmosphereReader {
         &self.inner.reader
@@ -394,7 +435,7 @@ impl GriddedAtmosphere2D {
             }
             _ => (0.0, 0.0),
         };
-        let gradient = match reader.pressure() {
+        let gradient = match reader.field(AtmosphereField::Pressure) {
             Some(p) if pressure => (
                 ramp * p.interpolate(time, space.clone().zip(node.gradient.map(|g| g.0))),
                 ramp * p.interpolate(time, space.zip(node.gradient.map(|g| g.1))),
@@ -444,7 +485,11 @@ impl GriddedAtmosphere2D {
     /// Inverse-barometer level (m) at a node.
     fn inverse_barometer(&self, node: &AtmosphereNode, t: f64) -> f64 {
         let inner = &self.inner;
-        let Some(p) = inner.reader.pressure().filter(|_| inner.pressure) else {
+        let Some(p) = inner
+            .reader
+            .field(AtmosphereField::Pressure)
+            .filter(|_| inner.pressure)
+        else {
             return 0.0;
         };
         let time = self.time_stencil(t);
@@ -473,7 +518,7 @@ impl GriddedAtmosphere2D {
         };
         // Everything the reader has, whatever the switches: a split
         // atmosphere's wind stress shares the snapshots
-        let pressure = inner.reader.pressure();
+        let pressure = inner.reader.field(AtmosphereField::Pressure);
         let values: Snapshot = inner
             .nodes
             .iter()
@@ -641,13 +686,95 @@ impl SurfaceStress3D for GriddedWindStress {
     }
 }
 
+/// The heat and freshwater fluxes of a [`GriddedAtmosphere2D`]'s weather on
+/// the columns of a 3D model
+/// ([`crate::physics::Hydrostatic3D::with_surface_fluxes`]); made by
+/// [`GriddedAtmosphere2D::surface_fluxes`].
+///
+/// At every node the weather at time `t` (bilinear in space, linear in time
+/// between the reader's snapshots; the standard pressure without a pressure
+/// field, no rain without precipitation) and the column's surface
+/// temperature and salinity give [`Coare35::budget`].
+#[derive(Clone, Debug)]
+pub struct GriddedSurfaceFluxes {
+    atmosphere: GriddedAtmosphere2D,
+    bulk: Coare35,
+}
+
+impl GriddedSurfaceFluxes {
+    /// The weather at flat node `node` and time `time`.
+    fn air(&self, node: usize, time: &TimeStencil) -> AirState {
+        let inner = &self.atmosphere.inner;
+        let reader = &inner.reader;
+        let stencil = &inner.nodes[node].stencil;
+        let space = stencil.idx.iter().map(|&k| k as usize).zip(stencil.w);
+        let field = |f: AtmosphereField, default: f64| {
+            reader
+                .field(f)
+                .map_or(default, |series| series.interpolate(time, space.clone()))
+        };
+        let (u, v) = reader.wind().expect("checked by surface_fluxes");
+        AirState {
+            wind_speed: u
+                .interpolate(time, space.clone())
+                .hypot(v.interpolate(time, space.clone())),
+            air_temperature: field(AtmosphereField::AirTemperature, f64::NAN),
+            relative_humidity: field(AtmosphereField::RelativeHumidity, f64::NAN),
+            pressure: field(AtmosphereField::Pressure, P_REFERENCE),
+            shortwave: field(AtmosphereField::Shortwave, f64::NAN),
+            longwave: field(AtmosphereField::Longwave, f64::NAN),
+            precipitation: field(AtmosphereField::Precipitation, 0.0),
+        }
+    }
+}
+
+impl SurfaceFluxes3D for GriddedSurfaceFluxes {
+    fn surface_fluxes_into(&self, t: f64, surface: SeaSurface<'_>, fluxes: SurfaceFluxFields<'_>) {
+        let inner = &self.atmosphere.inner;
+        let n = inner.nodes.len();
+        assert!(
+            surface.temperature.len() == n && surface.salinity.len() == n,
+            "one surface temperature and salinity per node"
+        );
+        let SurfaceFluxFields {
+            nonsolar,
+            shortwave,
+            freshwater,
+        } = fluxes;
+        assert!(
+            nonsolar.len() == n && shortwave.len() == n && freshwater.len() == n,
+            "one flux per node"
+        );
+        let time = self.atmosphere.time_stencil(t);
+        let nn = inner.n_nodes;
+        for_each_block(
+            n / nn,
+            [nonsolar, shortwave, freshwater],
+            || (),
+            |_, k, [nonsolar, shortwave, freshwater]| {
+                for i in 0..nn {
+                    let node = k * nn + i;
+                    let budget = self.bulk.budget(
+                        &self.air(node, &time),
+                        surface.temperature[node],
+                        surface.salinity[node],
+                    );
+                    nonsolar[i] = budget.nonsolar;
+                    shortwave[i] = budget.shortwave;
+                    freshwater[i] = budget.freshwater;
+                }
+            },
+        );
+    }
+}
+
 impl BoundaryLevel for GriddedAtmosphere2D {
     /// The inverse-barometer level at the boundary node.
     fn level(&self, ctx: &BCContext2D) -> f64 {
         match ctx.node_index.filter(|&i| i < self.inner.nodes.len()) {
             Some(i) => {
                 let inner = &self.inner;
-                if !inner.reader.has_pressure() || !inner.pressure {
+                if !inner.reader.has(AtmosphereField::Pressure) || !inner.pressure {
                     return 0.0;
                 }
                 let p = self.with_snapshots(&self.time_stencil(ctx.time), |snapshots| {
@@ -704,7 +831,10 @@ mod tests {
                     FieldSeries::new(m, vec![10.0; 2 * m]),
                     FieldSeries::new(m, vec![0.0; 2 * m]),
                 )
-                .with_pressure(FieldSeries::with_offset(m, &pressure, P_REFERENCE)),
+                .with_field(
+                    AtmosphereField::Pressure,
+                    FieldSeries::with_offset(m, &pressure, P_REFERENCE),
+                ),
         )
     }
 
@@ -999,6 +1129,104 @@ mod tests {
                 &tau_x[..4]
             );
         }
+    }
+
+    /// The bulk fluxes on the columns are COARE's at every node, from the
+    /// weather there (air temperature linear in mesh x, which the bilinear
+    /// stencils reproduce, half-way between two snapshots) and the column's
+    /// own surface temperature and salinity; a weather without the heat
+    /// budget's fields cannot give them.
+    #[test]
+    fn surface_fluxes_are_coares_at_every_node() {
+        use crate::physics::air_sea::{AirState, Coare35};
+        let projection = LocalProjection::new(63.5, 8.5);
+        let base = reader(&projection);
+        let grid = base.grid().clone();
+        let m = grid.len();
+        let air_t = |x: f64| 12.0 + 4.0 * x / 30e3;
+        let (lat, lon) = (grid.lat().to_vec(), grid.lon().to_vec());
+        let temperature: Vec<f64> = [0.0, 2.0]
+            .iter()
+            .flat_map(|&warming| {
+                let (lat, lon) = (lat.clone(), lon.clone());
+                (0..m).map(move |k| {
+                    let (x, _) = projection.geo_to_xy(lat[k], lon[k]);
+                    air_t(x) + warming
+                })
+            })
+            .collect();
+        let field = |value: f64| FieldSeries::new(m, vec![value as f32; 2 * m]);
+        let with_heat = Arc::new(
+            AtmosphereReader::clone(&base)
+                .with_field(
+                    AtmosphereField::AirTemperature,
+                    FieldSeries::with_offset(m, &temperature, 0.0),
+                )
+                .with_field(AtmosphereField::RelativeHumidity, field(0.8))
+                .with_field(AtmosphereField::Shortwave, field(500.0))
+                .with_field(AtmosphereField::Longwave, field(320.0))
+                .with_field(AtmosphereField::Precipitation, field(1e-4)),
+        );
+        let mesh = Mesh2D::uniform_rectangle(-20e3, 20e3, -15e3, 15e3, 4, 3);
+        let ops = DGOperators2D::new(2);
+        let bulk = Coare35::at_latitude(63.5);
+        let atmosphere =
+            GriddedAtmosphere2D::new(with_heat, &mesh, &ops, projection, ModelClock::new(T0))
+                .unwrap()
+                .with_ramp_up(7200.0);
+        let fluxes = atmosphere.surface_fluxes(bulk).unwrap();
+        let n = mesh.n_elements * ops.n_nodes;
+        let sst: Vec<f64> = (0..n).map(|i| 10.0 + (i % 5) as f64).collect();
+        let sss = vec![33.0; n];
+        let [mut nonsolar, mut shortwave, mut freshwater] = std::array::from_fn(|_| vec![0.0; n]);
+        fluxes.surface_fluxes_into(
+            1800.0,
+            SeaSurface {
+                temperature: &sst,
+                salinity: &sss,
+            },
+            SurfaceFluxFields {
+                nonsolar: &mut nonsolar,
+                shortwave: &mut shortwave,
+                freshwater: &mut freshwater,
+            },
+        );
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, _] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let node = k.as_usize() * ops.n_nodes + i;
+                let air = AirState {
+                    // 10 m/s from the reader's wind, not ramped
+                    wind_speed: 10.0,
+                    air_temperature: air_t(x) + 1.0,
+                    relative_humidity: 0.8,
+                    // The reader's pressure half-way between 1 and 2 hPa per
+                    // 10 km
+                    pressure: P_REFERENCE + 0.015 * x,
+                    shortwave: 500.0,
+                    longwave: 320.0,
+                    precipitation: 1e-4,
+                };
+                let expected = bulk.budget(&air, sst[node], 33.0);
+                assert!(
+                    (nonsolar[node] - expected.nonsolar).abs() < 1e-3,
+                    "{} vs {}",
+                    nonsolar[node],
+                    expected.nonsolar
+                );
+                assert!((shortwave[node] - expected.shortwave).abs() < 1e-9);
+                assert!((freshwater[node] - expected.freshwater).abs() < 1e-9);
+                (lo, hi) = (lo.min(nonsolar[node]), hi.max(nonsolar[node]));
+            }
+        }
+        assert!(hi - lo > 50.0, "the fluxes should vary: [{lo}, {hi}] W/m²");
+        // Wind and pressure only: no heat budget
+        let err = GriddedAtmosphere2D::new(base, &mesh, &ops, projection, ModelClock::new(T0))
+            .unwrap()
+            .surface_fluxes(bulk)
+            .unwrap_err();
+        assert!(err.contains("air temperature"), "{err}");
     }
 
     /// The inverse-barometer level is −(p − p_ref)/(ρg), and ramps.

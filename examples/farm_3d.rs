@@ -400,7 +400,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Forcing {
                 surface_stress: [wind, 0.0],
                 bottom_stress: [0.0, 0.0],
-                surface_buoyancy_flux: 0.0,
+                surface_heat_flux: 0.0,
             },
             G,
             RHO0,

@@ -44,7 +44,7 @@ fn main() -> Result<(), String> {
     let forcing = Forcing {
         surface_stress: [0.0, 0.0],
         bottom_stress: [0.0, 0.0],
-        surface_buoyancy_flux: 0.0,
+        surface_heat_flux: 0.0,
     };
 
     // Build 2D sub-model

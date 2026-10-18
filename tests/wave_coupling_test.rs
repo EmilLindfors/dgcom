@@ -1188,7 +1188,7 @@ fn a_longshore_current_in_3d_has_the_viscous_profile_of_a_uniform_force() {
         Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         },
         G,
         rho0,

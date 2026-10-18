@@ -52,8 +52,10 @@ pub struct Forcing {
     pub surface_stress: [f64; 2],
     /// Bottom stress (bx, by) [N/m^2]
     pub bottom_stress: [f64; 2],
-    /// Surface buoyancy flux [m^2/s^3] (positive into ocean)
-    pub surface_buoyancy_flux: f64,
+    /// Net surface heat flux [W/m^2] (positive into the ocean), entering
+    /// the temperature as `Q/(ρ₀ c_p)` at the surface; per-column fluxes
+    /// add to it ([`crate::physics::SurfaceFluxes3D`])
+    pub surface_heat_flux: f64,
 }
 
 /// Trait for vertical mixing closure schemes.
@@ -305,7 +307,7 @@ mod tests {
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
 
         let mix = ConstantMixing::new(0.1, 0.01);
@@ -355,7 +357,7 @@ mod tests {
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
 
         let mix = PacanowskiPhilanderMixing::default();
@@ -399,7 +401,7 @@ mod tests {
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
 
         let mix = PacanowskiPhilanderMixing::default();
@@ -454,7 +456,7 @@ mod tests {
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
-            surface_buoyancy_flux: 0.0,
+            surface_heat_flux: 0.0,
         };
 
         let mix = PacanowskiPhilanderMixing::default();

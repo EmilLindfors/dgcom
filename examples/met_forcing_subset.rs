@@ -4,9 +4,18 @@
 //! countries, MEPS corrected with observations) is archived as one file per
 //! hour. This cuts the window around a lon/lat box out of each hour's file
 //! and writes one CF NetCDF file with the 10 m wind (`wind_speed_10m`,
-//! `wind_direction_10m`: the direction it blows *from*) and the air pressure
-//! at sea level, which `AtmosphereReader::from_file` reads directly
-//! (`froya_real_data met=<file>`).
+//! `wind_direction_10m`: the direction it blows *from*), the air pressure
+//! at sea level, and what the surface heat and freshwater fluxes need: the
+//! 2 m air temperature and relative humidity, the downwelling shortwave and
+//! longwave radiation and the precipitation. `AtmosphereReader::from_file`
+//! reads it directly (`froya_real_data met=<file>`).
+//!
+//! The analysis stores radiation and precipitation as integrals over the
+//! hour ending at the file's time. They are written as fluxes at the
+//! snapshot times (W/m², kg m⁻² s⁻¹): the mean of the two hours around each
+//! snapshot, so that linear interpolation in time is centred and keeps the
+//! daily totals. A run of `hours` therefore reads `hours + 2` files, the
+//! hour after the last snapshot included.
 //!
 //! MEPS or AROME-Arctic forecast files (grid-relative `x_wind_10m`,
 //! `y_wind_10m`) can be read by `AtmosphereReader` as they are, e.g. a
@@ -53,13 +62,38 @@ mod app {
     const ARCHIVE: &str = "https://thredds.met.no/thredds/dodsC/metpparchive";
     /// Coarse stride for locating the domain in the 1 km grid
     const STRIDE: usize = 16;
-    const FIELDS: [(&str, &str, &str); 3] = [
+    /// Fields at the analysis time: `(name, units, standard name)`
+    const FIELDS: [(&str, &str, &str); 5] = [
         ("wind_speed_10m", "m/s", "wind_speed"),
         ("wind_direction_10m", "degree", "wind_from_direction"),
         (
             "air_pressure_at_sea_level",
             "Pa",
             "air_pressure_at_sea_level",
+        ),
+        ("air_temperature_2m", "K", "air_temperature"),
+        ("relative_humidity_2m", "1", "relative_humidity"),
+    ];
+    /// Integrals over the hour before the analysis time: `(name, units,
+    /// written name, written units, written standard name)`
+    const INTEGRALS: [(&str, &str, &str, &str); 3] = [
+        (
+            "integral_of_surface_downwelling_shortwave_flux_in_air_wrt_time",
+            "W s/m^2",
+            "surface_downwelling_shortwave_flux_in_air",
+            "W m-2",
+        ),
+        (
+            "integral_of_surface_downwelling_longwave_flux_in_air_wrt_time",
+            "J/m^2",
+            "surface_downwelling_longwave_flux_in_air",
+            "W m-2",
+        ),
+        (
+            "precipitation_amount",
+            "kg/m^2",
+            "precipitation_flux",
+            "kg m-2 s-1",
         ),
     ];
 
@@ -104,7 +138,11 @@ mod app {
             retry(name, || v.get_values(win.extents(&[])))
         };
         let (lon, lat) = (read2d("longitude")?, read2d("latitude")?);
-        for (name, units, _) in FIELDS {
+        let expected = FIELDS
+            .iter()
+            .map(|&(name, units, _)| (name, units))
+            .chain(INTEGRALS.iter().map(|&(name, units, ..)| (name, units)));
+        for (name, units) in expected {
             let var = first.variable(name).ok_or(format!("no variable {name}"))?;
             let found = attribute_string(&var, "units").unwrap_or_default();
             if found != units {
@@ -145,17 +183,57 @@ mod app {
             v.put_attribute("units", units)?;
             v.put_attribute("standard_name", standard_name)?;
         }
+        for (_, _, name, units) in INTEGRALS {
+            let mut v = nc.add_variable::<f32>(name, &["time", "y", "x"])?;
+            v.put_attribute("units", units)?;
+            v.put_attribute("standard_name", name)?;
+            v.put_attribute(
+                "cell_methods",
+                "time: mean (interval: 2 hours, centred on the snapshot)",
+            )?;
+        }
 
         let started = Instant::now();
-        for (hour, &t) in times.iter().enumerate() {
+        let window = win.extents(&[slice(0, 1)]);
+        // The previous file's hourly integrals, ending at the snapshot before
+        let mut before: Option<Vec<Vec<f32>>> = None;
+        // The first snapshot through the hour after the last
+        for file_hour in 0..=n {
+            let t = t0 + 3600.0 * file_hour as f64;
             let file = retry("open", || netcdf::open(url(t)))?;
-            for (name, _, _) in FIELDS {
-                let var = file.variable(name).ok_or(format!("no variable {name}"))?;
-                let values: Vec<f32> = retry(name, || var.get_values(win.extents(&[slice(0, 1)])))?;
-                nc.variable_mut(name).expect("defined above").put_values(
-                    &values,
-                    [slice(hour, 1), slice(0, win.ny), slice(0, win.nx)],
-                )?;
+            let at = |hour: usize| [slice(hour, 1), slice(0, win.ny), slice(0, win.nx)];
+            if file_hour < n {
+                for (name, _, _) in FIELDS {
+                    let var = file.variable(name).ok_or(format!("no variable {name}"))?;
+                    let values: Vec<f32> = retry(name, || var.get_values(window.clone()))?;
+                    nc.variable_mut(name)
+                        .expect("defined above")
+                        .put_values(&values, at(file_hour))?;
+                }
+            }
+            // This file's integrals end at its time, so the hour before it
+            // and the hour after the snapshot before it
+            let integrals = INTEGRALS
+                .iter()
+                .map(|&(name, ..)| {
+                    let var = file.variable(name).ok_or(format!("no variable {name}"))?;
+                    retry(name, || var.get_values::<f32, _>(window.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if file_hour == 0 {
+                // The hour ending at the first snapshot needs the file of
+                // the snapshot after it as well
+                before = Some(integrals);
+                continue;
+            }
+            let hour = file_hour - 1;
+            let previous = before.replace(integrals);
+            let (previous, next) = (previous.expect("set above"), before.as_ref().expect("set"));
+            for ((_, _, name, _), (a, b)) in INTEGRALS.iter().zip(previous.iter().zip(next)) {
+                let mean: Vec<f32> = a.iter().zip(b).map(|(a, b)| (a + b) / 7200.0).collect();
+                nc.variable_mut(name)
+                    .expect("defined above")
+                    .put_values(&mean, at(hour))?;
             }
             if hour % 12 == 0 || hour + 1 == n {
                 println!(

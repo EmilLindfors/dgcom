@@ -1,9 +1,14 @@
-//! Gridded atmospheric forcing: 10 m wind and sea-level pressure.
+//! Gridded atmospheric forcing: 10 m wind, sea-level pressure and the
+//! fields of the surface heat budget.
 //!
 //! [`AtmosphereReader`] holds the fields of a weather model (MET Nordic
 //! analysis, MEPS, AROME-Arctic, ERA5, or the wind NorKyst-800 was forced
 //! with) on the model's own grid: the 10 m wind as **east/north**
-//! components and the air pressure at sea level. Times are Unix seconds.
+//! components, and scalar [`AtmosphereField`]s: the air pressure at sea
+//! level and, for the bulk heat and freshwater fluxes
+//! ([`crate::physics::air_sea`]), the 2 m air temperature and relative
+//! humidity, the downwelling shortwave and longwave radiation and the
+//! precipitation. Times are Unix seconds.
 //!
 //! [`AtmosphereReader::from_file`] / [`AtmosphereReader::from_files`]
 //! (feature `netcdf`) read CF NetCDF: grid-relative winds (`x_wind_10m`,
@@ -15,7 +20,8 @@
 //! winning where they overlap.
 //!
 //! `source::GriddedAtmosphere2D` turns the fields into wind stress and the
-//! pressure-gradient force on a mesh.
+//! pressure-gradient force on a mesh, and `source::GriddedSurfaceFluxes`
+//! into the heat and freshwater fluxes of a 3D model's columns.
 
 use super::field_series::{FieldSeries, TimeInterpolation, TimeStencil};
 use super::geo_grid::{GeoGrid, Stencil};
@@ -23,13 +29,76 @@ use super::geo_grid::{GeoGrid, Stencil};
 /// Standard sea-level pressure (Pa), the storage offset of pressure fields.
 pub const P_REFERENCE: f64 = 101_325.0;
 
+/// A scalar field of an [`AtmosphereReader`], in SI units (temperature in
+/// °C).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtmosphereField {
+    /// Air pressure at sea level (Pa)
+    Pressure,
+    /// 2 m air temperature (°C)
+    AirTemperature,
+    /// 2 m relative humidity (fraction, 0–1)
+    RelativeHumidity,
+    /// Downwelling shortwave radiation at the surface (W/m²)
+    Shortwave,
+    /// Downwelling longwave radiation at the surface (W/m²)
+    Longwave,
+    /// Precipitation (kg m⁻² s⁻¹)
+    Precipitation,
+}
+
+impl AtmosphereField {
+    /// Every field, in storage order.
+    pub const ALL: [Self; 6] = [
+        Self::Pressure,
+        Self::AirTemperature,
+        Self::RelativeHumidity,
+        Self::Shortwave,
+        Self::Longwave,
+        Self::Precipitation,
+    ];
+
+    /// The fields the bulk heat flux needs ([`crate::physics::air_sea`]);
+    /// precipitation is optional (none: no rain).
+    pub const HEAT_BUDGET: [Self; 4] = [
+        Self::AirTemperature,
+        Self::RelativeHumidity,
+        Self::Shortwave,
+        Self::Longwave,
+    ];
+
+    /// Short name, for summaries and messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pressure => "pressure",
+            Self::AirTemperature => "air temperature",
+            Self::RelativeHumidity => "humidity",
+            Self::Shortwave => "shortwave",
+            Self::Longwave => "longwave",
+            Self::Precipitation => "precipitation",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Atmospheric state at one point and time.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AtmosphereState {
     /// 10 m wind (east, north) (m/s)
     pub wind: Option<(f64, f64)>,
-    /// Air pressure at sea level (Pa)
-    pub pressure: Option<f64>,
+    /// The scalar fields, indexed by [`AtmosphereField`] (`None` where the
+    /// reader has no such field)
+    pub fields: [Option<f64>; 6],
+}
+
+impl AtmosphereState {
+    /// The value of `field`, if the reader has it.
+    pub fn get(&self, field: AtmosphereField) -> Option<f64> {
+        self.fields[field.index()]
+    }
 }
 
 /// Weather-model fields on the model grid; see the module docs.
@@ -43,8 +112,8 @@ pub struct AtmosphereReader {
     u10: Option<FieldSeries>,
     /// 10 m wind, northward (m/s)
     v10: Option<FieldSeries>,
-    /// Air pressure at sea level (Pa)
-    pressure: Option<FieldSeries>,
+    /// The scalar fields, indexed by [`AtmosphereField`]
+    fields: [Option<FieldSeries>; 6],
     /// Where the fields came from (variable names, rotation)
     source: String,
 }
@@ -64,7 +133,7 @@ impl AtmosphereReader {
             time,
             u10: None,
             v10: None,
-            pressure: None,
+            fields: Default::default(),
             source: String::new(),
         })
     }
@@ -89,10 +158,10 @@ impl AtmosphereReader {
         self
     }
 
-    /// Set the sea-level pressure (Pa).
-    pub fn with_pressure(mut self, pressure: FieldSeries) -> Self {
-        self.check("pressure", &pressure);
-        self.pressure = Some(pressure);
+    /// Set a scalar field (SI units, temperature in °C).
+    pub fn with_field(mut self, field: AtmosphereField, series: FieldSeries) -> Self {
+        self.check(field.name(), &series);
+        self.fields[field.index()] = Some(series);
         self
     }
 
@@ -117,9 +186,9 @@ impl AtmosphereReader {
         self.u10.as_ref().zip(self.v10.as_ref())
     }
 
-    /// Air pressure at sea level (Pa).
-    pub fn pressure(&self) -> Option<&FieldSeries> {
-        self.pressure.as_ref()
+    /// A scalar field, if present.
+    pub fn field(&self, field: AtmosphereField) -> Option<&FieldSeries> {
+        self.fields[field.index()].as_ref()
     }
 
     /// Where the fields came from (variable names, rotation).
@@ -132,9 +201,15 @@ impl AtmosphereReader {
         self.u10.is_some() && self.v10.is_some()
     }
 
-    /// Whether the fields include pressure.
-    pub fn has_pressure(&self) -> bool {
-        self.pressure.is_some()
+    /// Whether the reader has `field`.
+    pub fn has(&self, field: AtmosphereField) -> bool {
+        self.fields[field.index()].is_some()
+    }
+
+    /// Whether the reader has every field of the bulk heat flux
+    /// ([`AtmosphereField::HEAT_BUDGET`]).
+    pub fn has_heat_budget(&self) -> bool {
+        AtmosphereField::HEAT_BUDGET.iter().all(|&f| self.has(f))
     }
 
     /// First and last snapshot time (Unix seconds).
@@ -161,7 +236,7 @@ impl AtmosphereReader {
         };
         Some(AtmosphereState {
             wind: field(&self.u10).zip(field(&self.v10)),
-            pressure: field(&self.pressure),
+            fields: AtmosphereField::ALL.map(|f| field(&self.fields[f.index()])),
         })
     }
 
@@ -186,7 +261,11 @@ impl AtmosphereReader {
             {
                 return Err("AtmosphereReader::concat: the files have different grids".into());
             }
-            if p.has_wind() != first.has_wind() || p.has_pressure() != first.has_pressure() {
+            if p.has_wind() != first.has_wind()
+                || AtmosphereField::ALL
+                    .iter()
+                    .any(|&f| p.has(f) != first.has(f))
+            {
                 return Err("AtmosphereReader::concat: the files have different fields".into());
             }
         }
@@ -218,8 +297,10 @@ impl AtmosphereReader {
         if let (Some(u), Some(v)) = (join(&|p| p.u10.as_ref()), join(&|p| p.v10.as_ref())) {
             joined = joined.with_wind(u, v);
         }
-        if let Some(p) = join(&|p| p.pressure.as_ref()) {
-            joined = joined.with_pressure(p);
+        for field in AtmosphereField::ALL {
+            if let Some(series) = join(&|p| p.field(field)) {
+                joined = joined.with_field(field, series);
+            }
         }
         Ok(joined)
     }
@@ -228,13 +309,14 @@ impl AtmosphereReader {
     pub fn summary(&self) -> String {
         let (ny, nx) = self.grid.dims();
         let (x0, y0, x1, y1) = self.grid.bbox();
-        let fields: Vec<&str> = [
-            self.has_wind().then_some("wind"),
-            self.has_pressure().then_some("pressure"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let fields: Vec<&str> = std::iter::once(self.has_wind().then_some("wind"))
+            .chain(
+                AtmosphereField::ALL
+                    .iter()
+                    .map(|&f| self.has(f).then_some(f.name())),
+            )
+            .flatten()
+            .collect();
         format!(
             "Atmosphere: {ny}x{nx} grid, {} times ({} h), lon [{x0:.2}, {x1:.2}], lat [{y0:.2}, {y1:.2}], {} ({})",
             self.time.len(),
@@ -266,11 +348,14 @@ mod tests {
                 FieldSeries::new(4, vec![value; n]),
                 FieldSeries::new(4, vec![0.0; n]),
             )
-            .with_pressure(FieldSeries::with_offset(
-                4,
-                &vec![P_REFERENCE + value as f64; n],
-                P_REFERENCE,
-            ))
+            .with_field(
+                AtmosphereField::Pressure,
+                FieldSeries::with_offset(4, &vec![P_REFERENCE + value as f64; n], P_REFERENCE),
+            )
+            .with_field(
+                AtmosphereField::Shortwave,
+                FieldSeries::new(4, vec![100.0 * value; n]),
+            )
     }
 
     #[test]
@@ -281,8 +366,17 @@ mod tests {
         assert_eq!(joined.time, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
         let wind = |t| joined.get(5.5, 60.5, t).unwrap().wind.unwrap().0;
         assert_eq!((wind(1.0), wind(2.0), wind(1.5)), (1.0, 2.0, 1.5));
-        let p = joined.get(5.5, 60.5, 4.0).unwrap().pressure.unwrap();
+        let state = joined.get(5.5, 60.5, 4.0).unwrap();
+        let p = state.get(AtmosphereField::Pressure).unwrap();
         assert!((p - P_REFERENCE - 2.0).abs() < 1e-9);
+        assert_eq!(state.get(AtmosphereField::Shortwave), Some(200.0));
+        assert_eq!(state.get(AtmosphereField::Longwave), None);
+        // Files with different fields do not join
+        let other = part(&[5.0], 1.0).with_field(
+            AtmosphereField::Longwave,
+            FieldSeries::new(4, vec![300.0; 4]),
+        );
+        assert!(AtmosphereReader::concat(vec![part(&[4.0], 1.0), other]).is_err());
         assert!(AtmosphereReader::concat(vec![part(&[3.0], 1.0), part(&[1.0], 1.0)]).is_err());
         assert!(AtmosphereReader::concat(vec![part(&[1.0], 1.0), part(&[1.0, 2.0], 1.0)]).is_err());
     }

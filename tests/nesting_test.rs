@@ -29,7 +29,7 @@ use dg_rs::boundary::{
 };
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::io::{
-    AtmosphereReader, CoordinateProjection, FieldSeries, GeoGrid, LocalProjection,
+    AtmosphereField, AtmosphereReader, CoordinateProjection, FieldSeries, GeoGrid, LocalProjection,
     OceanModelReader, P_REFERENCE, TimeInterpolation,
 };
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
@@ -448,7 +448,10 @@ fn weather(
                 FieldSeries::new(m, vec![e as f32; 2 * m]),
                 FieldSeries::new(m, vec![n as f32; 2 * m]),
             )
-            .with_pressure(FieldSeries::with_offset(m, &pressure, P_REFERENCE)),
+            .with_field(
+                AtmosphereField::Pressure,
+                FieldSeries::with_offset(m, &pressure, P_REFERENCE),
+            ),
     )
 }
 

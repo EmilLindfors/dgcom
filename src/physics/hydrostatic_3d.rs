@@ -48,7 +48,11 @@
 //! [`crate::physics::cage_drag`]). `τ_s` is the stress of [`Forcing`]
 //! plus the column's of [`Hydrostatic3D::with_surface_stress`], if any (see
 //! [`crate::physics::surface_stress`] for when it is evaluated), `τ_b` the
-//! prescribed stress of [`Forcing`], if any. Thin columns
+//! prescribed stress of [`Forcing`], if any. Heat and fresh water enter
+//! the columns' vertical diffusion only: the uniform heat flux of
+//! [`Forcing`] and the per-column fluxes of
+//! [`Hydrostatic3D::with_surface_fluxes`] (see
+//! [`crate::physics::surface_fluxes`]). Thin columns
 //! ([`Hydrostatic3D::with_min_column_depth`]) get no `G`: their depth mean
 //! is the 2D module's alone.
 //!
@@ -64,15 +68,19 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::SWEPhysics2D;
+use crate::physics::air_sea::JerlovWater;
 use crate::physics::bottom_drag::BottomDrag3D;
 use crate::physics::cage_drag::{for_each_caged_node, layer_coefficient};
 use crate::physics::eos::EquationOfState;
 use crate::physics::implicit_advection::{
     ImplicitVerticalAdvection, apply_implicit_vertical_advection,
 };
+use crate::physics::surface_fluxes::{SeaSurface, SurfaceFluxFields, SurfaceFluxes3D};
 use crate::physics::surface_stress::SurfaceStress3D;
 use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
-use crate::physics::vertical_diffusion::{SurfaceFields, apply_vertical_diffusion};
+use crate::physics::vertical_diffusion::{
+    SurfaceFields, SurfaceTracerFluxes, apply_vertical_diffusion,
+};
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
 use crate::solver::core::blocks::{Pooled, for_each_block, reduce_blocks, update_with};
@@ -112,7 +120,7 @@ where
     pub eos: EOS,
     pub mixing: MIX,
     pub swe_physics: SWEPhysics2D<BC>, // 2D sub-model
-    /// Stresses and buoyancy flux, the same on every column.
+    /// Stresses and heat flux, the same on every column.
     pub forcing: Forcing,
     /// A surface stress field added to `forcing.surface_stress` column by
     /// column, if any (see [`Self::with_surface_stress`]).
@@ -121,6 +129,12 @@ where
     /// e.g. from the waves' height, for the closure (see
     /// [`Self::with_surface_roughness`]).
     pub surface_roughness: Option<Vec<f64>>,
+    /// Heat and freshwater fluxes of every column, if any (see
+    /// [`Self::with_surface_fluxes`]).
+    pub surface_fluxes: Option<Arc<dyn SurfaceFluxes3D>>,
+    /// The optical water type that absorbs the shortwave of
+    /// `surface_fluxes` (see [`Self::with_shortwave_absorption`]).
+    pub shortwave_absorption: JerlovWater,
     pub g: f64,
     pub rho0: f64,
     /// Temperature of water flowing in through a physical boundary (walls
@@ -193,6 +207,10 @@ where
     /// `[τ_x, τ_y]` of `surface_stress` on every column (allocated on first
     /// use).
     surface_stress_scratch: Mutex<[Vec<f64>; 2]>,
+    /// `surface_fluxes`' surface temperature and salinity, and its
+    /// non-solar, shortwave and freshwater fluxes on every column
+    /// (allocated on first use).
+    surface_flux_scratch: Mutex<[Vec<f64>; 5]>,
     /// The stratification about which the vertical tracer advection
     /// reconstructs, if any (see [`Self::with_vertical_reference`]).
     vertical_reference: Option<VerticalReference>,
@@ -320,6 +338,8 @@ where
             forcing,
             surface_stress: None,
             surface_roughness: None,
+            surface_fluxes: None,
+            shortwave_absorption: JerlovWater::default(),
             g,
             rho0,
             temp_bc: Arc::new(ExtrapolationTracerBC3D),
@@ -348,6 +368,7 @@ where
             masked_scratch: Mutex::new(None),
             viscosity_scratch: Mutex::new(None),
             surface_stress_scratch: Mutex::new([Vec::new(), Vec::new()]),
+            surface_flux_scratch: Mutex::new(Default::default()),
             vertical_reference: None,
             automatic_vertical_reference: true,
         }
@@ -892,6 +913,27 @@ where
         self
     }
 
+    /// Heat and freshwater fluxes that vary from column to column and with
+    /// each column's surface temperature, such as the bulk formulae on a
+    /// weather model's fields ([`crate::source::GriddedSurfaceFluxes`]),
+    /// added to the uniform `Forcing::surface_heat_flux`: the non-solar
+    /// heat at the surface, the shortwave absorbed with depth (see
+    /// [`Self::with_shortwave_absorption`]) and E − P as a virtual salt flux,
+    /// evaluated at the middle of each step from the surface layer at its
+    /// start (see [`crate::physics::surface_fluxes`]).
+    pub fn with_surface_fluxes(mut self, fluxes: impl SurfaceFluxes3D + 'static) -> Self {
+        self.surface_fluxes = Some(Arc::new(fluxes));
+        self
+    }
+
+    /// The optical water type that absorbs the shortwave of
+    /// [`Self::with_surface_fluxes`] (default Jerlov II, coastal shelf
+    /// water).
+    pub fn with_shortwave_absorption(mut self, water: JerlovWater) -> Self {
+        self.shortwave_absorption = water;
+        self
+    }
+
     /// A surface roughness `z₀ₛ` (m) per column (`[element][node]`), for a
     /// closure with one (GLS: the larger of it and its own, then Charnock's).
     /// From waves, Terray et al.'s (1996) `z₀ₛ ≈ 0.6 H_s` (ROMS `ZOS_HSIG`):
@@ -934,6 +976,49 @@ where
         tau_y.resize(n, 0.0);
         stress.surface_stress_into(t, tau_x, tau_y);
         f(Some([tau_x, tau_y]))
+    }
+
+    /// The fluxes of [`Self::with_surface_fluxes`] at time `t` over
+    /// `state`'s surface layer, as `[SST, SSS, non-solar, shortwave, E − P]`
+    /// on every column, or `None` if there are none.
+    fn surface_fluxes_at(
+        &self,
+        state: &Solution3D,
+        t: f64,
+    ) -> Option<std::sync::MutexGuard<'_, [Vec<f64>; 5]>> {
+        let fluxes = self.surface_fluxes.as_ref()?;
+        let mut guard = self
+            .surface_flux_scratch
+            .lock()
+            .expect("Failed to lock surface_flux_scratch");
+        let [sst, sss, nonsolar, shortwave, freshwater] = &mut *guard;
+        let (n, nl) = (state.eta.data.len(), state.n_levels);
+        for buffer in [
+            &mut *sst,
+            &mut *sss,
+            &mut *nonsolar,
+            &mut *shortwave,
+            &mut *freshwater,
+        ] {
+            buffer.resize(n, 0.0);
+        }
+        for (idx, (t, s)) in sst.iter_mut().zip(sss.iter_mut()).enumerate() {
+            *t = state.temp[(idx + 1) * nl - 1];
+            *s = state.salt[(idx + 1) * nl - 1];
+        }
+        fluxes.surface_fluxes_into(
+            t,
+            SeaSurface {
+                temperature: sst,
+                salinity: sss,
+            },
+            SurfaceFluxFields {
+                nonsolar,
+                shortwave,
+                freshwater,
+            },
+        );
+        Some(guard)
     }
 
     /// Horizontal eddy viscosity `nu` (m²/s, constant) of the 3D momentum,
@@ -2047,9 +2132,20 @@ where
         );
     }
 
-    /// The vertical diffusion with the surface stress at the middle of the
-    /// step, `t + dt/2`.
+    /// The vertical diffusion with the surface stress and fluxes at the
+    /// middle of the step, `t + dt/2` (the fluxes over the surface layer at
+    /// `t`).
     fn vertical_implicit(&self, state: &mut Solution3D, t: f64, dt: f64, drag: StepDrag<'_>) {
+        let fluxes = self.surface_fluxes_at(state, t + 0.5 * dt);
+        let tracers =
+            fluxes.as_deref().map(
+                |[_, _, nonsolar, shortwave, freshwater]| SurfaceTracerFluxes {
+                    nonsolar,
+                    shortwave,
+                    freshwater,
+                    water: self.shortwave_absorption,
+                },
+            );
         self.surface_stress_at(t + 0.5 * dt, |field| {
             apply_vertical_diffusion(
                 state,
@@ -2061,6 +2157,7 @@ where
                 SurfaceFields {
                     stress: field,
                     roughness: self.surface_roughness.as_deref(),
+                    tracers,
                 },
                 self.g,
                 self.rho0,
