@@ -27,7 +27,9 @@
 //! record resolves it; the depth means; the bottom water of each column;
 //! and the daily means of surface and bottom T and S. Then the domain
 //! means of the surface T and S (model area-weighted over its wet nodes,
-//! NorKyst over its wet points inside the mesh), every three hours.
+//! NorKyst over its wet points inside the mesh), every three hours, and of
+//! the mean T over the top 25 m where the column is deeper: the heat content
+//! the surface flux and advection change and the vertical mixing does not.
 //!
 //! Written to `out` (default: the snapshot's directory): `profiles_<point>.txt`
 //! (every frame and depth, both models) and `domain_mean.txt`.
@@ -80,6 +82,9 @@ mod app {
     const CANDIDATES: [&str; 5] = ["M2", "S2", "K1", "O1", "M4"];
     /// Columns shallower than this (m) are not compared
     const MIN_DEPTH: f64 = 1.0;
+    /// The upper layer of the domain-mean heat content (m), one of NorKyst's
+    /// levels
+    const UPPER_DEPTH: f64 = 25.0;
 
     /// A comparison point.
     struct Point {
@@ -185,6 +190,7 @@ mod app {
         let ops = DGOperators2D::new(header.order);
         let (nn, nl) = (ops.n_nodes, header.n_levels());
         let sigma = levels.sigma.sigma_rho().to_vec();
+        let sigma_w = levels.sigma.sigma_w().to_vec();
         let mesh = &header.mesh;
         let locator = PointLocator2D::new(mesh);
 
@@ -202,6 +208,18 @@ mod app {
             return Err("the parent's profiles are not on z-levels".into());
         };
         let parent_bed = parent.depth().ok_or("the parent has no depth")?;
+        // NorKyst's levels down to the upper layer's base, with their
+        // trapezoid weights over it
+        let upper = depths
+            .iter()
+            .position(|&d| (d - UPPER_DEPTH).abs() < 1e-9)
+            .ok_or(format!("NorKyst has no level at {UPPER_DEPTH} m"))?;
+        let mut upper_weights = vec![0.0; upper + 1];
+        for j in 0..upper {
+            let half = 0.5 * (depths[j + 1] - depths[j]) / UPPER_DEPTH;
+            upper_weights[j] += half;
+            upper_weights[j + 1] += half;
+        }
         let wet = parent.wet_mask();
 
         // The points
@@ -296,7 +314,8 @@ mod app {
         let mut domain = String::from(
             "# Domain means of the surface layer: model (area-weighted over nodes ≥ 1 m deep), \
              NorKyst (wet points inside the mesh, shallowest level)\n\
-             # columns: unix_time hours T_model S_model T_norkyst S_norkyst\n",
+             # and the mean T over the top 25 m of columns deeper than that (T25)\n\
+             # columns: unix_time hours T_model S_model T_norkyst S_norkyst T25_model T25_norkyst\n",
         );
         let mut domain_rows = Vec::new();
         let mut frame = SnapshotFrame::default();
@@ -394,14 +413,30 @@ mod app {
                     ),
                 });
             }
-            // Domain means of the surface
+            // Domain means of the surface, and of the upper layer
             let (mut area, mut sum_t, mut sum_s) = (0.0, 0.0, 0.0);
+            let (mut upper_area, mut sum_upper) = (0.0, 0.0);
             let (temp, salt) = (&frame.layers[fields[0]], &frame.layers[fields[1]]);
             for (j, &a) in node_area.iter().enumerate() {
-                if f64::from(frame.eta[j]) - header.bathymetry[j] >= MIN_DEPTH {
+                let depth = f64::from(frame.eta[j]) - header.bathymetry[j];
+                if depth >= MIN_DEPTH {
                     area += a;
                     sum_t += a * f64::from(temp[j * nl + nl - 1]);
                     sum_s += a * f64::from(salt[j * nl + nl - 1]);
+                }
+                if depth > UPPER_DEPTH {
+                    // Each layer's overlap with the top 25 m, from the surface
+                    let mut heat = 0.0;
+                    for l in (0..nl).rev() {
+                        let top = -sigma_w[l + 1] * depth;
+                        let bottom = (-sigma_w[l] * depth).min(UPPER_DEPTH);
+                        if top >= UPPER_DEPTH {
+                            break;
+                        }
+                        heat += (bottom - top) * f64::from(temp[j * nl + l]);
+                    }
+                    upper_area += a;
+                    sum_upper += a * heat / UPPER_DEPTH;
                 }
             }
             let parent_surface = |s: &ProfileSeries| {
@@ -418,21 +453,48 @@ mod app {
                 }
                 sum / n.max(1) as f64
             };
+            let parent_upper = {
+                let (mut n, mut sum) = (0usize, 0.0);
+                for &k in &inside {
+                    let value: f64 = time
+                        .terms()
+                        .map(|(ti, w)| {
+                            let column = p_temp.column(ti, k);
+                            let mean: f64 = upper_weights
+                                .iter()
+                                .zip(column)
+                                .map(|(u, &c)| u * f64::from(c))
+                                .sum();
+                            w * mean
+                        })
+                        .sum();
+                    // NaN where the bed is above the layer's base
+                    if value.is_finite() {
+                        n += 1;
+                        sum += value;
+                    }
+                }
+                sum / n.max(1) as f64
+            };
             let row = (
                 t,
                 sum_t / area,
                 sum_s / area,
                 parent_surface(p_temp),
                 parent_surface(p_salt),
+                sum_upper / upper_area,
+                parent_upper,
             );
             writeln!(
                 domain,
-                "{unix:.0} {:.3} {:.4} {:.4} {:.4} {:.4}",
+                "{unix:.0} {:.3} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}",
                 t / 3600.0,
                 row.1,
                 row.2,
                 row.3,
-                row.4
+                row.4,
+                row.5,
+                row.6
             )?;
             domain_rows.push(row);
         }
@@ -446,15 +508,17 @@ mod app {
             println!("  → {}", path.display());
         }
 
-        println!("\nDomain means of the surface layer (model | NorKyst):");
         println!(
-            "  {:>7} | {:>7} {:>7} | {:>7} {:>7}",
-            "t (h)", "T", "S", "T", "S"
+            "\nDomain means of the surface layer and of T over the top {UPPER_DEPTH} m (model | NorKyst):"
         );
-        for (t, tm, sm, tp, sp) in &domain_rows {
+        println!(
+            "  {:>7} | {:>7} {:>7} {:>7} | {:>7} {:>7} {:>7}",
+            "t (h)", "T", "S", "T25", "T", "S", "T25"
+        );
+        for (t, tm, sm, tp, sp, um, up) in &domain_rows {
             if (t / 3600.0).round() as i64 % 3 == 0 {
                 println!(
-                    "  {:>7.1} | {tm:>7.3} {sm:>7.3} | {tp:>7.3} {sp:>7.3}",
+                    "  {:>7.1} | {tm:>7.3} {sm:>7.3} {um:>7.3} | {tp:>7.3} {sp:>7.3} {up:>7.3}",
                     t / 3600.0
                 );
             }
