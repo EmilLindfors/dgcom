@@ -100,4 +100,29 @@
       - The satellite and the farms also sample different water: open pixels against the coast.
     - *For our model*: NorKyst's absolute level is a fair reference at farm depth (within about 0.3 °C over the year). Don't push the model's surface toward the satellite at the cost of the 3 m layer: the target is the near-surface stratification. The data are in `data/farm_temps/` (local, not tracked).
     - *Havvarsel-Frost* (`havvarsel-frost.met.no/api/v1/obs/badevann/get`, no account) serves yr.no's bathing temperatures. Near Frøya these are one to six crowd-sourced daytime readings per site and week, from beaches and a lake (11–16 °C, and 22 °C in Skjerlivatnet), so they don't represent water deeper than 10 m.
-  - **The 2026 window**: 5–8 June 2026, after NorKyst's tide fix (N2 right since March 2026, `notes/norkyst-issues.md`; run with `nest_tides=raw`, since the corrected mode's atlases were fitted to June 2025's N2), four clear nights (2585–2849 QL-5 pixels each) with the nightly SST warming 10.48 → 10.97 → 10.96 → 11.47 °C over the box: `data/froya_norkyst_3d_2026-06.nc` (76 h), `data/froya_met_heat_2026-06.nc` (77 h), `data/tide_gauges/mausund_obs_202606.txt`. Not run yet: the two 74 h runs on it, `mixing=k-epsilon` against `generic` (each about 7 h at 12 threads, 420 s per model hour with two running at once), were stopped while we looked for daytime and in situ data.
+  - **The 2026 window**: 5–8 June 2026, after NorKyst's tide fix (N2 right since March 2026, `notes/norkyst-issues.md`; run with `nest_tides=raw`, since the corrected mode's atlases were fitted to June 2025's N2), four clear nights (2585–2849 QL-5 pixels each) with the nightly SST warming 10.48 → 10.97 → 10.96 → 11.47 °C over the box: `data/froya_norkyst_3d_2026-06.nc` (76 h), `data/froya_met_heat_2026-06.nc` (77 h), `data/tide_gauges/mausund_obs_202606.txt`. The two 74 h runs on it, `mixing=k-epsilon` against `generic` (resumed from their 12 h restarts; 364 and 371 s per model hour with both running at 12 threads), 2026-10-18:
+    - Scored from hour 6, each run sampled at 0 and 3 m with `snapshot_sample_3d`.
+      - At the farms: `scripts/farm_obs_window.py` writes the farms' weekly means as hourly observations, with NorKyst's 0 and 3 m at the same farms and hours; `scripts/farm_window_stats.py` takes per-farm means over the window and medians across farms. 25 of the 49 farms within 1.2 km of a wet NorKyst cell are inside the mesh.
+      - At the satellite pixels: `scripts/sat_window_stats.py`, ACSPO's night QL-5 pixels inside the mesh, 3842 in all.
+    - **The closure doesn't matter here.** k-ε and generic agree within 0.02 °C on every score below. Their only visible difference is in thin columns (see below). So the near-surface stratification is set by something the two share: the levels' resolution near the surface, the surface boundary conditions for k and ψ, the background mixing, or how the heat is put in.
+    - The 0–3 m difference at the farms (median across farms, by UTC hour):
+
+      | | 00 | 06 | 09 | 12 | 15 | 18 | 21 | mean |
+      |---|---|---|---|---|---|---|---|---|
+      | NorKyst | +0.00 | +0.01 | +0.03 | +0.24 | +0.47 | +0.02 | +0.00 | +0.15 |
+      | k-ε | +0.01 | +0.03 | +0.12 | +0.27 | +0.34 | +0.11 | +0.03 | +0.16 |
+
+      The model has NorKyst's daily mean, but its afternoon peak is about 0.13 °C lower and the layer forms earlier and lasts longer into the evening. That reads as a thicker, weaker warm layer: diffused over the top levels rather than held at the surface.
+    - Level at the farms: the model is 0.2–0.25 °C colder than NorKyst at both 0 and 3 m. The offset is already there on day 0, so it is set during the start-up (the initial state, the bed changes near the shore), not a drift. With the farms' weekly offset against NorKyst (−0.78 and −0.54 °C in weeks 23 and 24), that puts the model about 0.3–0.6 °C warmer than the farms, against NorKyst's 0.5–0.8.
+    - At the satellite pixels, night by night (model at 0 m − satellite):
+
+      | night | n | satellite | NorKyst | k-ε | generic | model 0–3 m |
+      |---|---|---|---|---|---|---|
+      | 5 June | 903 | 10.41 | +0.62 | +0.63 | +0.63 | +0.02 |
+      | 6 June | 981 | 10.55 | −0.05 | +0.04 | +0.03 | −0.00 |
+      | 7 June | 981 | 10.74 | +0.14 | +0.09 | +0.09 | −0.01 |
+      | 8 June | 977 | 11.28 | −0.06 | −0.15 | −0.16 | +0.02 |
+      | all | 3842 | 10.69 | +0.11 | +0.11 | +0.10 | +0.00 |
+
+      Inside the mesh, NorKyst isn't cold at night: +0.11 overall, against −0.13 over the whole box. The model follows NorKyst within 0.1 °C. By the last night both lag the satellite's warming (+0.54 °C from 7 to 8 June against the model's +0.30). At night the model's 0–3 m difference is zero, as the satellite can't tell apart either.
+    - Thin columns go far out of range in both runs: −2.00 °C (the lower bound) around the low waters at 42–46 h and 66 h, and up to 21 °C (k-ε) or 36 °C (generic) at 54–58 h. The ordinary columns stay at 6.9–14.8 °C, and the scores above don't sample columns shallower than their depth.

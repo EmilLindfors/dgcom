@@ -6,6 +6,13 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The 3D model's near-surface stratification against the farms and the satellite (TODO P4.6).**
+  - `scripts/farm_obs_window.py` turns the farms' weekly temperatures into hourly observations over a run's window for `snapshot_sample_3d`, with NorKyst's 0 and 3 m at the same farms and hours.
+  - `scripts/farm_window_stats.py` and `scripts/sat_window_stats.py` score runs at 0 and 3 m against them and against the satellite's pixels.
+  - First use, on 5–8 June 2026 with `mixing=k-epsilon` and `generic`:
+    - The two closures agree within 0.02 °C on every score.
+    - At the farms the model's mean 0–3 m difference equals NorKyst's (+0.16 against +0.15 °C), but its afternoon peak is lower (+0.34 against +0.47 at 15 UTC).
+    - At night the model follows NorKyst against the satellite within 0.1 °C (both +0.11 overall).
 - **Farm temperatures against NorKyst (TODO P4.6).**
   - `scripts/barentswatch_farm_temps.py` fetches the fish farms' weekly 3 m sea temperatures from BarentsWatch; it needs an OAuth API client.
   - `scripts/norkyst_farm_weeks.py` makes NorKyst v3 best-estimate weekly means at the farms.
