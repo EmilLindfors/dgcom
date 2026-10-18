@@ -73,6 +73,31 @@
       - The Draugen platform (`AR_TS_MO_Draugen`, 64.352° N, 7.779° E, Okea, 10 min since 1995) has had no sea temperature since at least 2025. It does log wind at 10 m and 78 m, air temperature, dew point, waves and the surface current. It lies 26 km outside our MET Nordic window and 16 km outside the NorKyst window, so it would serve a forcing and current check on a wider subset.
     - *Copernicus Data Space* (CDSE) is a separate account, and the Marine login is refused there. Its public catalogue has Sentinel-3A/B SLSTR L2P (`SL_2_WST`) for every day of 4–8 June 2026, with day passes over Frøya at about 09–10 UTC (local morning, part of the diurnal warming), about 650 MB per granule.
     - The afternoon (VIIRS, about 13:30 local) is in PO.DAAC L2P (Earthdata login).
-    - *BarentsWatch*: the API takes an OAuth client created under "My page" → developer access (client id `email:clientname`, `https://id.barentswatch.no/connect/token`, scope `api`). A user login gives `invalid_client`. The farms' weekly 3 m temperatures test the heat at the sites, not the afternoon peak.
+    - *BarentsWatch*: the API takes an OAuth client created under "My page" → developer access (client id `email:clientname`, `https://id.barentswatch.no/connect/token`, scope `api`). A user login gives `invalid_client`. The farms' weekly 3 m temperatures test the heat at the sites, not the afternoon peak. Results are under "Farm temperatures against NorKyst" below.
+  - **Farm temperatures against NorKyst at 3 m** (2026-10-18):
+    - *Method*:
+      - `scripts/barentswatch_farm_temps.py` fetches `/v1/geodata/fishhealth/locality/{no}/seatemperature/{year}`, weekly means of the farms' daily readings at a nominal 3 m. In the box: 92 farms in 2025, 86 in 2026, 5903 farm-weeks.
+      - `scripts/norkyst_farm_weeks.py` makes NorKyst v3 best-estimate ISO-week means at 3 m, 3-hourly, at the nearest wet cell.
+      - `scripts/farm_temperature_stats.py` keeps whole weeks and farms within 1.2 km of a wet cell, then applies a per-week 3-MAD cut (at least 0.6 °C) on farm minus NorKyst. That keeps 4845 farm-weeks at 79 farms and drops 125.
+    - *The data's accuracy*: the farm data are known not to be very accurate (sensor depth, time of day and instrument vary). So only medians across many farms and the same farm's week-to-week change count here, and nothing is tuned to them.
+    - *The level is right*:
+      - The per-farm median offset (farm − NorKyst) is −0.05 °C (IQR −0.14…+0.02, range −0.41…+0.32).
+      - The monthly medians stay within ±0.3 °C through 2025–2026, apart from these months:
+        - July 2025: −0.75 (farms 13.70, NorKyst 14.77, so NorKyst is warm);
+        - October 2025: +0.26;
+        - August 2026: +0.30.
+      - So at farm depth NorKyst shows no cold bias. If anything, it runs warm in early summer.
+    - *The warming is right*:
+      - The same farm's week-to-week change matches NorKyst's: median difference within ±0.1 °C per week in most months, r 0.3–0.8.
+      - Exceptions: June 2026 +0.20 (farms +0.60 per week, NorKyst +0.40), May 2026 −0.15, September 2025 +0.20.
+    - *Our two windows*:
+      - 2025 week 24 (9–15 June): farms 10.73 against NorKyst 11.17 (−0.41).
+      - 2026 week 23 (1–7 June): farms 9.84 against 10.54 (−0.78).
+      - 2026 week 24 (8–14 June): farms 10.73 against 11.26 (−0.54).
+      - So at 3 m NorKyst is about 0.5 °C *warmer* than the farms in early June. Meanwhile the satellite's night sub-skin SST says NorKyst's surface is *colder*: −0.6 on 15 June 2025, −0.13 over 5–8 June 2026. And both the farms and the satellite warm faster than NorKyst in early June 2026.
+    - *Reading*: taken together, the two say NorKyst's top few metres are too well mixed in early summer: too little near-surface stratification, too cold at the surface, too warm at 3 m. That signature is GLS mixing in weak wind, not the surface flux.
+      - It is not proven. The farms' sensors may sit deeper than 3 m: a farm at 5–7 m reads colder in stratified June water.
+      - The satellite and the farms also sample different water: open pixels against the coast.
+    - *For our model*: NorKyst's absolute level is a fair reference at farm depth (within about 0.3 °C over the year). Don't push the model's surface toward the satellite at the cost of the 3 m layer: the target is the near-surface stratification. The data are in `data/farm_temps/` (local, not tracked).
     - *Havvarsel-Frost* (`havvarsel-frost.met.no/api/v1/obs/badevann/get`, no account) serves yr.no's bathing temperatures. Near Frøya these are one to six crowd-sourced daytime readings per site and week, from beaches and a lake (11–16 °C, and 22 °C in Skjerlivatnet), so they don't represent water deeper than 10 m.
   - **The 2026 window**: 5–8 June 2026, after NorKyst's tide fix (N2 right since March 2026, `notes/norkyst-issues.md`; run with `nest_tides=raw`, since the corrected mode's atlases were fitted to June 2025's N2), four clear nights (2585–2849 QL-5 pixels each) with the nightly SST warming 10.48 → 10.97 → 10.96 → 11.47 °C over the box: `data/froya_norkyst_3d_2026-06.nc` (76 h), `data/froya_met_heat_2026-06.nc` (77 h), `data/tide_gauges/mausund_obs_202606.txt`. Not run yet: the two 74 h runs on it, `mixing=k-epsilon` against `generic` (each about 7 h at 12 threads, 420 s per model hour with two running at once), were stopped while we looked for daytime and in situ data.

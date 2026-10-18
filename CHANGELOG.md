@@ -6,6 +6,13 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Farm temperatures against NorKyst (TODO P4.6).**
+  - `scripts/barentswatch_farm_temps.py` fetches the fish farms' weekly 3 m sea temperatures from BarentsWatch; it needs an OAuth API client.
+  - `scripts/norkyst_farm_weeks.py` makes NorKyst v3 best-estimate weekly means at the farms.
+  - `scripts/farm_temperature_stats.py` gives robust statistics: medians, a 3-MAD cut, and the same farm's week-to-week change.
+  - Results over 79 farms near Frøya, January 2025 to October 2026, at 3 m:
+    - NorKyst's per-farm median offset is +0.05 °C (NorKyst warmer), and the monthly medians are within ±0.3 °C apart from July 2025 (NorKyst +0.75).
+    - In early June NorKyst is about 0.5 °C warmer than the farms. The satellite's surface is warmer than NorKyst, so NorKyst's top metres look too well mixed.
 - **`examples/snapshot_sample_3d.rs`: a 3D run at point observations (TODO P4.6).** Samples a snapshot file at `unix_time lon lat value` records (satellite SST pixels, farm temperatures, FerryBox, CTD) at a depth below the surface, within the element's nodal basis and linear in time, and prints model − observation per day. First use: NOAA ACSPO L3S-LEO night SST (coastwatch ERDDAP, no account) against the Frøya runs; on 15 and 18 June 2025 inside the mesh NorKyst is −0.61 and −0.20 °C against the satellite and the 3D run follows it (−0.58, −0.20).
 - **`froya_real_data mixing=k-epsilon|k-omega|generic`**: the 3D columns' GLS closure (Canuto A), `generic` being NorKyst v3's "gen" (Christensen et al. 2026); the setup line prints it.
 - **Surface heat and freshwater fluxes per 3D column, from the COARE 3.5 bulk formulae on a weather model's fields (TODO P4.4).** In the 72 h nested Frøya run with MET Nordic's weather (2026-10-18) the domain-mean surface now follows NorKyst's day-1 warming (+0.46 °C from 6 to 14 h against NorKyst's +0.53; without the fluxes the model cooled 0.3 °C and ended day 1 0.59 °C cold): the bias over 3–24 h is +0.03 °C (rms 0.05, from −0.33 and 0.41), after it −0.08 to −0.33 °C (from −0.17 to −0.42). The top 3 m at the NorKyst point and Kattholmen go from −0.75…−0.82 °C to −0.48…−0.58 (r 0.45–0.65 → 0.54–0.77), Frohavet's from −0.42…−0.46 to −0.30…−0.36; the surface S bias +0.08 → +0.05. Jerlov III instead of II changes day 1 by ≤ 0.04 °C anywhere. Day 3's warming is still a third of NorKyst's (+0.13 against +0.34 °C, under cloud, with a salinity dip in both). No measurable cost (226 against 225 s per model hour).
