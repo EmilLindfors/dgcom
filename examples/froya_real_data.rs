@@ -102,7 +102,7 @@
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
 //!     [wall_land=keep|lower] \
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
-//!     [met=<file,…>] [heat=1] [jerlov=II] [band_km=3] [band_minutes=30] [blend=1] [max_closed=0.05] [ib=0] [nest_level=] \
+//!     [met=<file,…>] [heat=1] [jerlov=III] [mixing=k-epsilon] [band_km=3] [band_minutes=30] [blend=1] [max_closed=0.05] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
 //!     [wave_sources=swan|wam] [wave_integration=] [wave_limiter=] [wave_substeps=1] [wave_cfl=0.5] [wave_hours=0] \
 //!     [wave_land=absorbing|floored] [wave_force=dissipation|stress] [wave_depth_limit=1] \
@@ -210,7 +210,10 @@
 //! writes them), the columns take the COARE 3.5 heat and freshwater fluxes
 //! of their own surface (`GriddedAtmosphere2D::surface_fluxes`,
 //! `Hydrostatic3D::with_surface_fluxes`), the shortwave absorbed as Jerlov's
-//! `jerlov=` water type (II); `heat=0` leaves them out. The stations, the progress
+//! `jerlov=` water type (III, NorKyst v3's); `heat=0` leaves them out. The vertical mixing
+//! is GLS with Canuto A stability functions, `mixing=k-epsilon` (default),
+//! `k-omega` or `generic` (Umlauf & Burchard's, NorKyst v3's "gen";
+//! Christensen et al. 2026). The stations, the progress
 //! lines and a 3D snapshot file (`snapshot_minutes=`,
 //! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step (60 s by
 //! default; the parent and the weather must cover a third of it past the
@@ -389,7 +392,8 @@ use dg_rs::mesh::{
 };
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{
-    Coare35, JerlovWater, PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder,
+    Coare35, GlsMixing, JerlovWater, PhysicsBuilder, PhysicsModule, SWEPhysics2D,
+    SWEPhysics2DBuilder,
 };
 use dg_rs::simulation::{Simulation, SimulationResult};
 use dg_rs::solver::{
@@ -525,8 +529,11 @@ struct Options {
     /// fields (`heat=0`: none)
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     heat: bool,
-    /// The optical water type of the shortwave absorption (`jerlov=II`)
+    /// The optical water type of the shortwave absorption (`jerlov=III`)
     jerlov: JerlovWater,
+    /// The GLS closure of the 3D columns (`mixing=k-epsilon`): its name and
+    /// constructor
+    mixing: (&'static str, fn() -> GlsMixing),
     /// Nesting: replace NorKyst's `gauge_gains` and `gauge_ratios`
     /// constituents by the gauge-corrected ones (`nest_tides=corrected`, the
     /// default) or keep its tides (`nest_tides=raw`)
@@ -932,7 +939,15 @@ impl Options {
             max_closed: get("max_closed", 0.05)?,
             nesting_ib: get("ib", 0.0)? != 0.0,
             heat: get("heat", 1.0)? != 0.0,
-            jerlov: args.get("jerlov").map_or("II", String::as_str).parse()?,
+            jerlov: args.get("jerlov").map_or("III", String::as_str).parse()?,
+            mixing: match args.get("mixing").map_or("k-epsilon", String::as_str) {
+                "k-epsilon" => ("k-epsilon", GlsMixing::k_epsilon),
+                "k-omega" => ("k-omega", GlsMixing::k_omega),
+                "generic" => ("generic", GlsMixing::generic),
+                other => {
+                    return Err(format!("bad mixing={other}: k-epsilon, k-omega or generic"));
+                }
+            },
             correct_nested_tides: match args.get("nest_tides").map_or("corrected", String::as_str) {
                 "corrected" => true,
                 "raw" => false,
@@ -3043,8 +3058,8 @@ fn tidal_run_3d(
     const DEEP_DECAY: f64 = 10.0;
     use dg_rs::io::Restart3D;
     use dg_rs::physics::{
-        BottomDrag3D, EquationOfState, Forcing, GlsMixing, Hydrostatic3D,
-        ImplicitVerticalAdvection, LinearEOS, TimeStepLimit, VerticalMixing,
+        BottomDrag3D, EquationOfState, Forcing, Hydrostatic3D, ImplicitVerticalAdvection,
+        LinearEOS, TimeStepLimit, VerticalMixing,
     };
     use dg_rs::simulation::{RunContext3D, Simulation3D};
     use dg_rs::solver::state::Solution3D;
@@ -3338,7 +3353,7 @@ fn tidal_run_3d(
             Box::new(dg_rs::physics::ConstantMixing::new(1e-3, 0.0))
                 as Box<dyn VerticalMixing + Send + Sync>
         } else {
-            Box::new(GlsMixing::k_epsilon())
+            Box::new((opts.mixing.1)())
         },
         swe,
         Forcing {
@@ -3398,7 +3413,7 @@ fn tidal_run_3d(
         .unwrap_or_else(|| Path::new("output").join(format!("{}_3d", domain.name)));
     fs::create_dir_all(&output_dir)?;
     println!(
-        "\nTides in 3D: {forcing}, {:.2} h{} → {}",
+        "\nTides in 3D: {forcing}, {:.2} h{}, GLS {} → {}",
         opts.hours,
         if !opts.met.is_empty() {
             ", gridded wind and pressure"
@@ -3407,6 +3422,7 @@ fn tidal_run_3d(
         } else {
             ""
         },
+        opts.mixing.0,
         output_dir.display()
     );
     // A resumed run (`resume=`): the physics above is built from the initial
@@ -4320,7 +4336,7 @@ fn compare_wave_nodes(
 /// local time stepping could save), and the barotropic substeps per step.
 fn cost_3d(domain: &Domain, opts: &Options) {
     use dg_rs::physics::{
-        BottomDrag3D, ConstantMixing, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, VerticalMixing,
+        BottomDrag3D, ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, VerticalMixing,
     };
     use dg_rs::solver::state::Solution3D;
     use dg_rs::solver::{TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile};
@@ -4432,7 +4448,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         if opts.debug_3d.split(',').any(|f| f == "constant") {
             Box::new(ConstantMixing::new(1e-3, 0.0)) as Box<dyn VerticalMixing + Send + Sync>
         } else {
-            Box::new(GlsMixing::k_epsilon())
+            Box::new((opts.mixing.1)())
         },
         swe,
         Forcing {

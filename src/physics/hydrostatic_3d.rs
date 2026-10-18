@@ -927,8 +927,8 @@ where
     }
 
     /// The optical water type that absorbs the shortwave of
-    /// [`Self::with_surface_fluxes`] (default Jerlov II, coastal shelf
-    /// water).
+    /// [`Self::with_surface_fluxes`] (default Jerlov III, turbid coastal
+    /// water, as NorKyst v3).
     pub fn with_shortwave_absorption(mut self, water: JerlovWater) -> Self {
         self.shortwave_absorption = water;
         self
