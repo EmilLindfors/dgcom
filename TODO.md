@@ -342,7 +342,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## 3D: validation (P4.6) — [notes/3d-validation.md](notes/3d-validation.md)
 
-- [ ] **P4.6** The afternoon peak against observations: ACSPO L3S (no account) has night passes only, which test the day-to-day heat; daytime SST needs PO.DAAC L2P/L3U (Earthdata login) or Copernicus SLSTR, and in situ needs BarentsWatch farm temperatures (3 m, weekly) or Copernicus FerryBox, all with credentials.
+- [ ] **P4.6** The afternoon peak against observations. ACSPO and Copernicus Marine's ODYSSEA L3S are night and foundation SST only, and Copernicus Marine has no in situ SST in the domain. Daytime needs SLSTR L2P from CDSE (09–10 UTC, its own account) or VIIRS L2P from PO.DAAC (13:30 local, Earthdata). The farms' 3 m weekly temperatures need a BarentsWatch API client (`email:clientname`), not a user login (`notes/3d-validation.md` "What the accounts give").
+- [ ] **P4.6** Draugen (64.35° N, 7.78° E; Copernicus Marine `AR_TS_MO_Draugen`, 10 min) against the forcing and the surface current: wind at 10 m, air temperature, dew point and current against MET Nordic, MEPS and NorKyst. It needs MET and NorKyst subsets about 30 km wider to the north-west.
 - [ ] **P4.6** A source for `TracerReferenceProfile` (a z-binned horizontal mean of the state or the parent), needed before the Kuzmin limiter over slopes in a realistic run.
 - [ ] **P4.6** Move the smooth references to `from_smooth_fn` and measure (Frøya `tidal_run_3d`, `levels=N`, `seamount_3d.rs kuzmin=2`, `src/simulation/simulation_3d.rs:3359`).
 - [ ] **P4.6** Tanh-pycnocline seamount at r_x0 0.08 spins up 0.38 → 1.5 cm/s over 5 days: 30 days, refine nx and levels, compare with Shchepetkin & McWilliams (2003, Fig. 10).
