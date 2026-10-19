@@ -25,12 +25,13 @@
 //!    (see [`crate::source::river`]). After the 2D RHS, each stage's work
 //!    (`+ G`, the combination, the drag, the sums) is one element-block
 //!    pass.
-//! 3. **3D stages.** SSP-RK3 on the 3D fields, with the velocity and the
-//!    tracers stepped as inventories `H_z u`, `H_z C` and divided by the new
-//!    `H_z` at the end of the step. `η, ū, v̄` get the constant rates of the
-//!    pass, `(η̄ − ηⁿ)/Δt` etc.; SSP-RK3 reproduces a constant-rate solution
-//!    exactly, so each stage sees the barotropic state linearly interpolated
-//!    to its stage time. In every stage the column sum of the momentum
+//! 3. **3D stages.** SSP-RK3 (or SSP-RK(4,3),
+//!    [`ModeSplitIntegrator::with_baroclinic_scheme`]) on the 3D fields, with
+//!    the velocity and the tracers stepped as inventories `H_z u`, `H_z C` and
+//!    divided by the new `H_z` at the end of the step. `η, ū, v̄` get the
+//!    constant rates of the pass, `(η̄ − ηⁿ)/Δt` etc.; a consistent Runge–Kutta
+//!    scheme reproduces a constant-rate solution exactly, so each stage sees
+//!    the barotropic state linearly interpolated to its stage time. In every stage the column sum of the momentum
 //!    tendency is replaced by the constant rate of the barotropic transport,
 //!    `(D̄ūⁿ⁺¹ − Dⁿūⁿ)/Δt`, shared out by `Δσ_l`, so the depth mean of `u` is
 //!    `ūⁿ⁺¹` at the end. Stage 1 reuses the `R₃D` of step 1. The terms that
@@ -97,7 +98,9 @@ use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{DGSolution2D, SWESolution2D};
 use crate::source::{RiverInflow, RiverSources};
 use crate::time::multirate::{Multirate, MultiratePass, MultirateStats, MultirateStepper};
-use crate::time::{IntegratorInfo, SSPRK3, SspScheme, StageWorkspace, TimeIntegrator};
+use crate::time::{
+    IntegratorInfo, SSPRK3, SspScheme, StageWorkspace, StandardIntegrator, TimeIntegrator,
+};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 use std::cell::RefCell;
@@ -372,6 +375,15 @@ pub trait ModeSplitPhysics {
     /// of `out` are overwritten by [`Self::transport_rhs_into`] or the
     /// splitter.
     fn momentum_rhs_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D);
+
+    /// [`Self::momentum_rhs_into`] in a 3D stage after the step's first: the
+    /// last [`Self::momentum_rhs_into`] was the step's start's (the slow
+    /// forcing's, which the first stage reuses). A physics may keep terms it
+    /// takes once per step at that evaluation's values; by default every
+    /// term is evaluated again.
+    fn stage_momentum_rhs_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D) {
+        self.momentum_rhs_into(state, t, out);
+    }
 
     /// Add the inventory tendency `∂(H_z u)/∂t` of the momentum terms that
     /// move with the layer volume fluxes (advection) to `out.u` and `out.v`,
@@ -1151,13 +1163,15 @@ impl Buffers {
 }
 
 /// Mode-split time integrator: one filtered barotropic pass per baroclinic
-/// SSP-RK3 step (see the module docs).
+/// SSP-RK3 or SSP-RK(4,3) step (see the module docs).
 pub struct ModeSplitIntegrator {
     /// Coupling method.
     pub split_method: SplitMethod,
     barotropic_cfl: f64,
     /// The SSP scheme of the barotropic substeps.
     barotropic_scheme: SspScheme,
+    /// The SSP scheme of the 3D stages.
+    baroclinic_scheme: SspScheme,
     min_substeps: usize,
     /// Most levels of local time stepping in the barotropic pass (0: global
     /// substeps), see [`Self::with_barotropic_levels`].
@@ -1196,6 +1210,7 @@ impl ModeSplitIntegrator {
             split_method: SplitMethod::GTerm,
             barotropic_cfl: Self::DEFAULT_BAROTROPIC_CFL,
             barotropic_scheme: SspScheme::Rk3,
+            baroclinic_scheme: SspScheme::Rk3,
             min_substeps: MIN_BAROTROPIC_SUBSTEPS,
             barotropic_levels: 0,
             multirate: None,
@@ -1224,6 +1239,30 @@ impl ModeSplitIntegrator {
     pub fn with_barotropic_scheme(mut self, scheme: SspScheme) -> Self {
         self.barotropic_scheme = scheme;
         self
+    }
+
+    /// Step the 3D stages with `scheme` (SSP-RK3 by default).
+    ///
+    /// [`SspScheme::Rk43`] pays only with the 3D CFL number raised with it
+    /// (`Simulation3D::with_cfl`), for 4/3 of the 3D work per step. Where a
+    /// forward-Euler bound sets the 3D step it doubles: the positivity of the
+    /// subcell finite volumes of shoreline elements (the smallest GLL
+    /// subcell of a P2 element is a sixth of it: Courant 1/6 along an axis)
+    /// and the explicit vertical advection, whose bound and implicit split
+    /// take the stages' longest forward-Euler step
+    /// (`BarotropicFlux::euler_dt`, `Δt/2`). Where only linear stability
+    /// does (horizontal advection in the DG elements), its region is
+    /// 1.34–1.42× SSP-RK3's at P1–P3 (Fourier analysis of upwind DGSEM), less
+    /// than the 4/3 of work. The Coriolis bound and `dt_max` are not scaled
+    /// by the CFL number.
+    pub fn with_baroclinic_scheme(mut self, scheme: SspScheme) -> Self {
+        self.baroclinic_scheme = scheme;
+        self
+    }
+
+    /// The SSP scheme of the 3D stages.
+    pub fn baroclinic_scheme(&self) -> SspScheme {
+        self.baroclinic_scheme
     }
 
     /// Step the barotropic pass with local time stepping
@@ -1617,6 +1656,7 @@ impl ModeSplitIntegrator {
         let means: &[bool] = element_means;
         let barotropic_flux = BarotropicFlux {
             dt,
+            euler_dt: dt / self.baroclinic_scheme.ssp_coefficient(),
             hu: &transport.hu.data,
             hv: &transport.hv.data,
             face: &transport.face,
@@ -1682,9 +1722,13 @@ impl ModeSplitIntegrator {
         let values = &values_cell;
         to_inventories(state);
         let mut first_stage = true;
-        let mut hooks_left = SSPRK3.n_stages();
+        let integrator = match self.baroclinic_scheme {
+            SspScheme::Rk3 => StandardIntegrator::SSPRK3,
+            SspScheme::Rk43 => StandardIntegrator::SSPRK43,
+        };
+        let mut hooks_left = integrator.n_stages();
         let stages = profiling::start();
-        SSPRK3.step_with_relaxation(
+        integrator.step_with_relaxation(
             state,
             dt,
             t,
@@ -1698,7 +1742,7 @@ impl ModeSplitIntegrator {
                     first_stage = false;
                 } else {
                     profiling::scope("3d: momentum rhs", || {
-                        physics.momentum_rhs_into(concentrations, time, out)
+                        physics.stage_momentum_rhs_into(concentrations, time, out)
                     });
                 }
                 // Velocity tendencies → inventory tendencies, then the
@@ -2344,7 +2388,10 @@ fn shift_columns(field: &mut [f64], n_levels: usize, from: &DGSolution2D, to: &D
 
 impl IntegratorInfo for ModeSplitIntegrator {
     fn name(&self) -> &'static str {
-        "mode-split-filtered-ssprk3"
+        match self.baroclinic_scheme {
+            SspScheme::Rk3 => "mode-split-filtered-ssprk3",
+            SspScheme::Rk43 => "mode-split-filtered-ssprk43",
+        }
     }
 
     /// Second order: the slow coupling is third order (AB3) and the 3D stages
@@ -2356,7 +2403,7 @@ impl IntegratorInfo for ModeSplitIntegrator {
     }
 
     fn n_stages(&self) -> usize {
-        3
+        self.baroclinic_scheme.stages().len()
     }
 
     fn is_ssp(&self) -> bool {
@@ -2364,7 +2411,7 @@ impl IntegratorInfo for ModeSplitIntegrator {
     }
 
     fn stage_times(&self, dt: f64) -> Vec<f64> {
-        SSPRK3.stage_times(dt)
+        self.baroclinic_scheme.stage_times(dt)
     }
 }
 

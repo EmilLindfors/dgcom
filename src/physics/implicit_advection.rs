@@ -28,7 +28,13 @@
 //! `1 − f` at a Courant number at least the cell's own, and `1 − f` falls
 //! with `c`).
 //!
-//! The implicit part is first-order upwind and backward Euler. Each SSP-RK3
+//! The Courant numbers are for the longest forward-Euler step of the 3D
+//! stages' scheme, `Δt` over its SSP coefficient (`Δt` for SSP-RK3, `Δt/2`
+//! for SSP-RK(4,3), `BarotropicFlux::euler_dt`): each stage is a convex
+//! combination of such steps, so the explicit part keeps every stage within
+//! the bounds below.
+//!
+//! The implicit part is first-order upwind and backward Euler. Each SSP
 //! stage `u⁽ⁱ⁾ = Σ_k α_ik u⁽ᵏ⁾ + β_i Δt L(u⁽ⁱ⁻¹⁾)` advects with `Ω_e` of
 //! `u⁽ⁱ⁻¹⁾`, and is then relaxed with `Ω_i` over `β_i Δt` (the integrator's
 //! `step_with_relaxation`), solving for the stage's concentration `x` in every
@@ -85,7 +91,7 @@ impl Default for ImplicitVerticalAdvection {
     /// Fully explicit up to an outflow Courant number of 0.4, the explicit
     /// part below 0.8: within the stability range of every
     /// [`crate::solver::rhs::VerticalAdvection`] with the SSP-RK3 stages
-    /// (upwind's is 1).
+    /// (upwind's is 1), and with SSP-RK(4,3)'s at their forward-Euler step.
     fn default() -> Self {
         Self::new(0.4, 0.8)
     }

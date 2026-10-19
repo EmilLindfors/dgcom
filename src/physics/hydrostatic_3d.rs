@@ -204,6 +204,12 @@ where
     masked_scratch: Mutex<Option<Solution3D>>,
     /// Buffers of the horizontal viscosity (allocated on first use).
     viscosity_scratch: Mutex<Option<ViscosityScratch3D>>,
+    /// Whether the stages after a step's first take the horizontal
+    /// viscosity's tendency of the step's start
+    /// ([`Self::with_viscosity_once_per_step`]).
+    viscosity_once_per_step: bool,
+    /// That tendency, `[u, v]` (velocity tendencies, `[element][node][level]`).
+    step_viscosity: Mutex<[Vec<f64>; 2]>,
     /// `[τ_x, τ_y]` of `surface_stress` on every column (allocated on first
     /// use).
     surface_stress_scratch: Mutex<[Vec<f64>; 2]>,
@@ -284,6 +290,34 @@ pub struct TimeStepLimits {
     pub coriolis: TimeStepLimit,
     /// Horizontal viscosity.
     pub viscosity: TimeStepLimit,
+}
+
+/// An element's own step from horizontal advection and internal waves
+/// ([`Hydrostatic3D::element_advection_steps`]) and what sets it at its
+/// binding node.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ElementStep {
+    /// The step (s).
+    pub dt: f64,
+    /// The largest layer speed `|u|` of the binding column (m/s).
+    pub speed: f64,
+    /// Its first-mode internal-wave speed `c₁` (m/s).
+    pub c1: f64,
+    /// The node's length scale `h` (m).
+    pub length: f64,
+    /// The column's depth (m).
+    pub depth: f64,
+}
+
+/// [`Hydrostatic3D::element_rates`]' result.
+#[derive(Clone, Copy, Debug, Default)]
+struct ElementRates {
+    wave: f64,
+    vertical: f64,
+    speed: f64,
+    c1: f64,
+    length: f64,
+    depth: f64,
 }
 
 /// The temperature and salinity about which [`Hydrostatic3D`]'s vertical
@@ -367,6 +401,8 @@ where
             slow_forcing_scratch: Mutex::new(None),
             masked_scratch: Mutex::new(None),
             viscosity_scratch: Mutex::new(None),
+            viscosity_once_per_step: false,
+            step_viscosity: Mutex::new([Vec::new(), Vec::new()]),
             surface_stress_scratch: Mutex::new([Vec::new(), Vec::new()]),
             surface_flux_scratch: Mutex::new(Default::default()),
             vertical_reference: None,
@@ -1056,6 +1092,17 @@ where
         self
     }
 
+    /// Evaluate the horizontal viscosity once per mode-split step, at its
+    /// start, and give the later stages that tendency, as ROMS applies its
+    /// horizontal mixing of momentum once per baroclinic step. Its own error
+    /// is first order in time, `O(Δt ∂ₜ(∇·ν∇u))`, against the third order of
+    /// the stages; the viscosity's cost falls from one evaluation per stage
+    /// to one per step. Off by default.
+    pub fn with_viscosity_once_per_step(mut self) -> Self {
+        self.viscosity_once_per_step = true;
+        self
+    }
+
     /// Nest the 3D fields in a parent model: its velocity and tracer profiles
     /// at the open faces of the nesting's tags, and relaxation within its
     /// band (see [`Nesting3D`]). The depth mean stays the
@@ -1317,11 +1364,54 @@ where
     /// the shear, which has no depth mean), zero in thin columns.
     /// `state.rho` must be current.
     pub fn compute_momentum_rhs_into(&self, state: &Solution3D, t: f64, rhs: &mut Solution3D) {
+        self.momentum_rhs(state, t, rhs, false);
+    }
+
+    /// [`Self::compute_momentum_rhs_into`]; at a later stage of a step
+    /// (`stage`) with [`Self::with_viscosity_once_per_step`], the viscosity's
+    /// tendency of the step's start instead of the state's.
+    fn momentum_rhs(&self, state: &Solution3D, t: f64, rhs: &mut Solution3D, stage: bool) {
         crate::profiling::scope("3d: pgf, coriolis", || {
             compute_momentum_rhs_3d(rhs, state, &self.rhs_config())
         });
         let viscosity = crate::profiling::start();
-        if !self.horizontal_viscosity.is_zero() {
+        if !self.horizontal_viscosity.is_zero() && self.viscosity_once_per_step {
+            let mut kept = self
+                .step_viscosity
+                .lock()
+                .expect("Failed to lock step_viscosity");
+            if !stage {
+                let mut guard = self
+                    .viscosity_scratch
+                    .lock()
+                    .expect("Failed to lock viscosity_scratch");
+                let scratch = guard.get_or_insert_with(|| {
+                    ViscosityScratch3D::new(self.mesh.n_elements, &self.ops)
+                });
+                let [u, v] = &mut *kept;
+                for field in [&mut *u, &mut *v] {
+                    field.clear();
+                    field.resize(rhs.u.len(), 0.0);
+                }
+                apply_horizontal_viscosity_3d(
+                    u,
+                    v,
+                    state,
+                    self.horizontal_viscosity,
+                    &self.mesh,
+                    &self.ops,
+                    &self.geom,
+                    &self.bathymetry,
+                    &self.sigma,
+                    &self.boundaries,
+                    self.min_column_depth,
+                    scratch,
+                );
+            }
+            let [u, v] = &*kept;
+            update_with(&mut rhs.u, u, |r, x| *r += x);
+            update_with(&mut rhs.v, v, |r, x| *r += x);
+        } else if !self.horizontal_viscosity.is_zero() {
             let mut guard = self
                 .viscosity_scratch
                 .lock()
@@ -1410,7 +1500,7 @@ where
             // The stages advect with the explicit part of Ω; the rest is
             // the implicit relaxation's
             if let Some(split) = &self.implicit_vertical_advection {
-                self.split_vertical_velocity(split, state, transport, barotropic.dt);
+                self.split_vertical_velocity(split, state, transport, barotropic.euler_dt);
             }
             crate::profiling::stop("3d: layer transports", layer);
             let reference = self.vertical_reference.as_ref().map(|reference| {
@@ -1637,12 +1727,24 @@ where
     ///   see [`VerticalAdvection`]), unless the excess is advected implicitly
     ///   ([`Self::with_implicit_vertical_advection`]);
     /// - Coriolis, `|f| Δt ≤ 1` (SSP-RK3 is stable on the imaginary axis up
-    ///   to √3);
+    ///   to √3, SSP-RK(4,3) up to 2.16);
     /// - the horizontal viscosity, by the BR1 spectral radius.
     ///
     /// Thin columns are left to the 2D module (a domain of thin columns
     /// only gets 1 s).
     pub fn compute_dt(&self, state: &Solution3D, cfl: f64) -> f64 {
+        self.compute_dt_ssp(state, cfl, 1.0)
+    }
+
+    /// [`Self::compute_dt`] for 3D stages of an SSP scheme with coefficient
+    /// `ssp` (1 for SSP-RK3, 2 for SSP-RK(4,3),
+    /// [`crate::time::SspScheme::ssp_coefficient`]):
+    /// the vertical advection's bound is a forward-Euler one (the stages'
+    /// upwind-limited reconstruction), so it holds for `ssp` times its step.
+    /// `cfl` sets the horizontal one, which is linear in the DG elements and
+    /// a forward-Euler (positivity) bound in the subcell elements: raise it
+    /// with the scheme (see `ModeSplitIntegrator::with_baroclinic_scheme`).
+    pub fn compute_dt_ssp(&self, state: &Solution3D, cfl: f64, ssp: f64) -> f64 {
         let limits = self.time_step_limits(state, cfl);
         let mut dt = limits
             .advection
@@ -1650,7 +1752,7 @@ where
             .min(limits.coriolis.dt)
             .min(limits.viscosity.dt);
         if self.implicit_vertical_advection.is_none() {
-            dt = dt.min(limits.vertical.dt);
+            dt = dt.min(ssp * limits.vertical.dt);
         }
         *self
             .last_time_step_limits
@@ -1668,53 +1770,92 @@ where
             .expect("Failed to lock last_time_step_limits")
     }
 
+    /// Element `k`'s rates of [`Self::compute_dt`]: the largest
+    /// `(|u| + c₁)/h` and `|Ω|/H_z` over its nodes that are not thin, and
+    /// what makes up the first at the node that sets it.
+    fn element_rates(&self, state: &Solution3D, k: usize) -> ElementRates {
+        let (nn, nl) = (state.n_nodes, state.n_levels);
+        let (sigma_rho, d_sigma) = (self.sigma.sigma_rho(), self.sigma.d_sigma());
+        let mut rates = ElementRates::default();
+        for i in 0..nn {
+            let idx = k * nn + i;
+            // Thin films are the 2D module's (and its own CFL's) business
+            if self.is_thin(state, idx) {
+                continue;
+            }
+            let depth = state.eta.data[idx] - self.bathymetry.data[idx];
+            let column = idx * nl..(idx + 1) * nl;
+            let (u, v, w, rho) = (
+                &state.u[column.clone()],
+                &state.v[column.clone()],
+                &state.w[column.clone()],
+                &state.rho[column],
+            );
+            let mut speed = 0.0_f64;
+            for l in 0..nl {
+                speed = speed.max(u[l].hypot(v[l]));
+                rates.vertical = rates.vertical.max(w[l].abs() / (d_sigma[l] * depth));
+            }
+            // WKB: Σ N Δz = Σ √(−(g/ρ₀) Δρ Δz) over the interior w-points
+            let mut integral = 0.0;
+            for l in 1..nl {
+                let dz = (sigma_rho[l] - sigma_rho[l - 1]) * depth;
+                let n2_dz2 = -self.g / self.rho0 * (rho[l] - rho[l - 1]) * dz;
+                integral += n2_dz2.max(0.0).sqrt();
+            }
+            let c1 = (integral / std::f64::consts::PI).max(Self::MIN_INTERNAL_WAVE_SPEED);
+            // 1/h = (|∇r| + |∇s|)/2: 1/√J on a square
+            let ((rx, ry), (sx, sy)) = (self.geom.grad_r(k, i), self.geom.grad_s(k, i));
+            let inverse_length = 0.5 * (rx.hypot(ry) + sx.hypot(sy));
+            let wave = (speed + c1) * inverse_length;
+            if wave > rates.wave {
+                rates.wave = wave;
+                rates.speed = speed;
+                rates.c1 = c1;
+                rates.length = 1.0 / inverse_length;
+                rates.depth = depth;
+            }
+        }
+        rates
+    }
+
+    /// Every element's own step from horizontal advection and internal
+    /// waves at Courant number `cfl` (the bound of [`Self::compute_dt`] that
+    /// usually sets it; infinite for an element of thin columns only), with
+    /// what sets it: the layer speed `|u|`, `c₁`, the length `h` and the
+    /// depth of the node that binds.
+    pub fn element_advection_steps(&self, state: &Solution3D, cfl: f64) -> Vec<ElementStep> {
+        let order_factor = (self.ops.order as f64 + 1.0).powi(2);
+        (0..self.mesh.n_elements)
+            .map(|k| {
+                let r = self.element_rates(state, k);
+                ElementStep {
+                    dt: cfl / r.wave / order_factor,
+                    speed: r.speed,
+                    c1: r.c1,
+                    length: r.length,
+                    depth: r.depth,
+                }
+            })
+            .collect()
+    }
+
     /// Each bound of [`Self::compute_dt`] at Courant number `cfl`, and the
     /// element that sets it: horizontal advection and internal waves,
     /// vertical advection (reported also where it is implicit, when
     /// [`Self::compute_dt`] does not apply it), Coriolis, and the horizontal
     /// viscosity. A bound nothing sets is infinite.
     pub fn time_step_limits(&self, state: &Solution3D, cfl: f64) -> TimeStepLimits {
-        let (nn, nl) = (state.n_nodes, state.n_levels);
-        let (sigma_rho, d_sigma) = (self.sigma.sigma_rho(), self.sigma.d_sigma());
         let [advection, vertical, coriolis] = reduce_blocks::<f64, _, _, 0>(
             self.mesh.n_elements,
             [],
             || (),
             |_, k, []| {
-                // Largest (|u| + c₁)/h over the nodes, and |Ω|/H_z
-                let (mut wave_rate, mut vertical_rate) = (0.0_f64, 0.0_f64);
-                for i in 0..nn {
-                    let idx = k * nn + i;
-                    // Thin films are the 2D module's (and its own CFL's) business
-                    if self.is_thin(state, idx) {
-                        continue;
-                    }
-                    let depth = state.eta.data[idx] - self.bathymetry.data[idx];
-                    let column = idx * nl..(idx + 1) * nl;
-                    let (u, v, w, rho) = (
-                        &state.u[column.clone()],
-                        &state.v[column.clone()],
-                        &state.w[column.clone()],
-                        &state.rho[column],
-                    );
-                    let mut speed = 0.0_f64;
-                    for l in 0..nl {
-                        speed = speed.max(u[l].hypot(v[l]));
-                        vertical_rate = vertical_rate.max(w[l].abs() / (d_sigma[l] * depth));
-                    }
-                    // WKB: Σ N Δz = Σ √(−(g/ρ₀) Δρ Δz) over the interior w-points
-                    let mut integral = 0.0;
-                    for l in 1..nl {
-                        let dz = (sigma_rho[l] - sigma_rho[l - 1]) * depth;
-                        let n2_dz2 = -self.g / self.rho0 * (rho[l] - rho[l - 1]) * dz;
-                        integral += n2_dz2.max(0.0).sqrt();
-                    }
-                    let c1 = (integral / std::f64::consts::PI).max(Self::MIN_INTERNAL_WAVE_SPEED);
-                    // 1/h = (|∇r| + |∇s|)/2: 1/√J on a square
-                    let ((rx, ry), (sx, sy)) = (self.geom.grad_r(k, i), self.geom.grad_s(k, i));
-                    let inverse_length = 0.5 * (rx.hypot(ry) + sx.hypot(sy));
-                    wave_rate = wave_rate.max((speed + c1) * inverse_length);
-                }
+                let ElementRates {
+                    wave: wave_rate,
+                    vertical: vertical_rate,
+                    ..
+                } = self.element_rates(state, k);
                 let f = self
                     .mesh
                     .element_vertices(ElementIndex::new(k))
@@ -1732,7 +1873,7 @@ where
             |a, b| [0, 1, 2].map(|j| a[j].min(b[j])),
         );
 
-        // The horizontal viscosity, explicit in the SSP-RK3 stages: BR1
+        // The horizontal viscosity, explicit in the SSP stages: BR1
         // couples an element to its face neighbours' gradients, so each
         // element is bounded by the largest ν of its own and theirs
         let mut viscosity = TimeStepLimit::NONE;
@@ -1909,6 +2050,10 @@ where
 
     fn momentum_rhs_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D) {
         self.compute_momentum_rhs_into(state, t, out);
+    }
+
+    fn stage_momentum_rhs_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D) {
+        self.momentum_rhs(state, t, out, true);
     }
 
     fn transport_rhs_into(

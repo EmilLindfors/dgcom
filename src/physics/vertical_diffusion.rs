@@ -12,6 +12,7 @@
 use crate::mesh::data::Bathymetry2D;
 use crate::physics::air_sea::{FRESH_WATER_DENSITY, JerlovWater, SEAWATER_HEAT_CAPACITY};
 use crate::physics::vertical_mixing::{Column, Forcing, Turbulence, VerticalMixing};
+#[cfg(test)]
 use crate::solver::algorithms::tridiagonal::solve_tridiagonal;
 use crate::solver::core::blocks::{Pooled, for_each_block};
 use crate::solver::state::Solution3D;
@@ -254,46 +255,32 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 }
 
                 // 4. Solve diffusion: u, v with the stresses (kinematic) and
-                // the drags, T and S with their surface fluxes
-                for (phi, nu, flux_top, flux_bot, bottom_drag, layer_drag) in [
-                    (
-                        &mut u[local.clone()],
-                        &*av,
-                        tau_sx / rho0,
-                        tau_bx / rho0,
-                        bottom_drag,
-                        layer_drag,
-                    ),
-                    (
-                        &mut v[local.clone()],
-                        &*av,
-                        tau_sy / rho0,
-                        tau_by / rho0,
-                        bottom_drag,
-                        layer_drag,
-                    ),
-                    (
-                        &mut temp[local.clone()],
-                        &*kt,
-                        heat_flux / heat_capacity,
-                        0.0,
-                        0.0,
-                        None,
-                    ),
-                    (&mut salt[local], &*kt, salt_flux, 0.0, 0.0, None),
-                ] {
-                    solve_diffusion_column(
-                        phi,
-                        nu,
-                        dz,
-                        dt,
-                        flux_top,
-                        flux_bot,
-                        bottom_drag,
-                        layer_drag,
-                        [a, b, c, d, x, c_prime, d_prime],
-                    );
-                }
+                // the drags, T and S with their surface fluxes; each pair has
+                // one matrix
+                let (u, v) = (&mut u[local.clone()], &mut v[local.clone()]);
+                solve_diffusion_pair(
+                    [u, v],
+                    av,
+                    dz,
+                    dt,
+                    [tau_sx / rho0, tau_sy / rho0],
+                    [tau_bx / rho0, tau_by / rho0],
+                    bottom_drag,
+                    layer_drag,
+                    [a, b, c, d, x, c_prime, d_prime],
+                );
+                let (temp, salt) = (&mut temp[local.clone()], &mut salt[local]);
+                solve_diffusion_pair(
+                    [temp, salt],
+                    kt,
+                    dz,
+                    dt,
+                    [heat_flux / heat_capacity, salt_flux],
+                    [0.0, 0.0],
+                    0.0,
+                    None,
+                    [a, b, c, d, x, c_prime, d_prime],
+                );
             }
         },
     );
@@ -345,7 +332,9 @@ impl ColumnScratch {
 /// with the upward fluxes `flux_top` at the surface and `flux_bot +
 /// drag_bot·φ₀` at the bed (`drag_bot·φ₀` and `λ_l φ` at the new time,
 /// `λ_l` from `drag_layers`, zero without). `work` holds the tridiagonal
-/// system and the solver's buffers.
+/// system and the solver's buffers. The reference of
+/// [`solve_diffusion_pair`], which the model uses.
+#[cfg(test)]
 fn solve_diffusion_column(
     phi: &mut [f64],
     nu: &[f64],
@@ -406,10 +395,129 @@ fn solve_diffusion_column(
     phi.copy_from_slice(x);
 }
 
+/// [`solve_diffusion_column`] for two fields with the same `ν` and drags
+/// (`u` and `v`; `T` and `S`): the matrix is built and eliminated once, for
+/// both right-hand sides, with each field's result bit for bit its own
+/// solve's.
+fn solve_diffusion_pair(
+    phis: [&mut [f64]; 2],
+    nu: &[f64],
+    dz: &[f64],
+    dt: f64,
+    flux_top: [f64; 2],
+    flux_bot: [f64; 2],
+    drag_bot: f64,
+    drag_layers: Option<&[f64]>,
+    [a, b, c, d, x, c_prime, d_prime]: [&mut [f64]; 7],
+) {
+    let n = dz.len();
+    for k in 0..n {
+        let lambda = dt / dz[k];
+        let val_lower = if k == 0 {
+            0.0
+        } else {
+            let dist = 0.5 * (dz[k] + dz[k - 1]);
+            lambda * nu[k] / dist
+        };
+        let val_upper = if k == n - 1 {
+            0.0
+        } else {
+            let dist = 0.5 * (dz[k] + dz[k + 1]);
+            lambda * nu[k + 1] / dist
+        };
+        a[k] = -val_lower;
+        c[k] = -val_upper;
+        b[k] = 1.0 + val_lower + val_upper + drag_layers.map_or(0.0, |rate| dt * rate[k]);
+    }
+    let lambda_bot = dt / dz[0];
+    let lambda_top = dt / dz[n - 1];
+    b[0] += lambda_bot * drag_bot;
+
+    // The elimination's factors, shared: `c_prime` and `1/m` (in `x`)
+    c_prime[0] = c[0] / b[0];
+    x[0] = b[0];
+    for i in 1..n {
+        let m = 1.0 / (b[i] - a[i] * c_prime[i - 1]);
+        if i < n - 1 {
+            c_prime[i] = c[i] * m;
+        }
+        x[i] = m;
+    }
+    for (phi, (top, bot)) in phis.into_iter().zip(flux_top.into_iter().zip(flux_bot)) {
+        d.copy_from_slice(phi);
+        d[0] -= lambda_bot * bot;
+        d[n - 1] += lambda_top * top;
+        d_prime[0] = d[0] / x[0];
+        for i in 1..n {
+            d_prime[i] = (d[i] - a[i] * d_prime[i - 1]) * x[i];
+        }
+        phi[n - 1] = d_prime[n - 1];
+        for i in (0..n - 1).rev() {
+            phi[i] = d_prime[i] - c_prime[i] * phi[i + 1];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::physics::vertical_mixing::ConstantMixing;
+
+    /// The pair shares one elimination and gives each field its own solve's
+    /// result bit for bit, with drags and fluxes.
+    #[test]
+    fn a_pair_is_two_column_solves_bit_for_bit() {
+        let n = 20;
+        let dz: Vec<f64> = (0..n)
+            .map(|k| 0.3 + 0.17 * k as f64 + 0.01 * (k * k) as f64)
+            .collect();
+        let nu: Vec<f64> = (0..=n)
+            .map(|k| 1e-4 + 3e-3 * ((k as f64) * 0.7).sin().abs())
+            .collect();
+        let drags: Vec<f64> = (0..n).map(|k| 1e-4 * (k % 3) as f64).collect();
+        let fields = [
+            (0..n).map(|k| (k as f64 * 0.3).cos()).collect::<Vec<f64>>(),
+            (0..n).map(|k| 8.0 + 0.1 * k as f64).collect::<Vec<f64>>(),
+        ];
+        let mut work: [Vec<f64>; 7] = std::array::from_fn(|_| vec![0.0; n]);
+        for (drag_bot, layers) in [(0.0, None), (2.5e-3, Some(&drags[..]))] {
+            let (top, bot) = ([1.3e-4, -2.0e-5], [4.0e-5, 1.0e-6]);
+            let mut expected = fields.clone();
+            for (j, phi) in expected.iter_mut().enumerate() {
+                let [a, b, c, d, x, cp, dp] = &mut work;
+                solve_diffusion_column(
+                    phi,
+                    &nu,
+                    &dz,
+                    60.0,
+                    top[j],
+                    bot[j],
+                    drag_bot,
+                    layers,
+                    [a, b, c, d, x, cp, dp],
+                );
+            }
+            let mut pair = fields.clone();
+            let [p0, p1] = &mut pair;
+            let [a, b, c, d, x, cp, dp] = &mut work;
+            solve_diffusion_pair(
+                [p0, p1],
+                &nu,
+                &dz,
+                60.0,
+                top,
+                bot,
+                drag_bot,
+                layers,
+                [a, b, c, d, x, cp, dp],
+            );
+            for (e, p) in expected.iter().zip(&pair) {
+                for (x, y) in e.iter().zip(p) {
+                    assert_eq!(x.to_bits(), y.to_bits());
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_diffusion_constant() {
