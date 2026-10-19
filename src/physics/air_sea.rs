@@ -370,7 +370,8 @@ fn psi_t(zet: f64) -> f64 {
 /// the red part absorbed in the top metre or two, the blue-green part over
 /// `ζ₂`. Open ocean is type I; coastal water with plankton and dissolved
 /// matter (CDOM from the rivers along the Norwegian coast) absorbs higher,
-/// type II–III.
+/// type II–III. The default is III, NorKyst v3's, which Sentinel-3/OLCI
+/// water colour supports along the coast (Christensen et al. 2026).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum JerlovWater {
     /// Clear open ocean (R 0.58, ζ₁ 0.35 m, ζ₂ 23 m)
@@ -380,9 +381,9 @@ pub enum JerlovWater {
     /// R 0.67, ζ₁ 1.0 m, ζ₂ 17 m
     IB,
     /// Coastal shelf water (R 0.77, ζ₁ 1.5 m, ζ₂ 14 m)
-    #[default]
     II,
     /// Turbid coastal water (R 0.78, ζ₁ 1.4 m, ζ₂ 7.9 m)
+    #[default]
     III,
 }
 

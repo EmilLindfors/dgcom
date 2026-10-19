@@ -6,6 +6,22 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The 3D model's near-surface stratification against the farms and the satellite (TODO P4.6).**
+  - `scripts/farm_obs_window.py` turns the farms' weekly temperatures into hourly observations over a run's window for `snapshot_sample_3d`, with NorKyst's 0 and 3 m at the same farms and hours.
+  - `scripts/farm_window_stats.py` and `scripts/sat_window_stats.py` score runs at 0 and 3 m against them and against the satellite's pixels.
+  - First use, on 5–8 June 2026 with `mixing=k-epsilon` and `generic`:
+    - The two closures agree within 0.02 °C on every score.
+    - At the farms the model's mean 0–3 m difference equals NorKyst's (+0.16 against +0.15 °C), but its afternoon peak is lower (+0.34 against +0.47 at 15 UTC).
+    - At night the model follows NorKyst against the satellite within 0.1 °C (both +0.11 overall).
+- **Farm temperatures against NorKyst (TODO P4.6).**
+  - `scripts/barentswatch_farm_temps.py` fetches the fish farms' weekly 3 m sea temperatures from BarentsWatch; it needs an OAuth API client.
+  - `scripts/norkyst_farm_weeks.py` makes NorKyst v3 best-estimate weekly means at the farms.
+  - `scripts/farm_temperature_stats.py` gives robust statistics: medians, a 3-MAD cut, and the same farm's week-to-week change.
+  - Results over 79 farms near Frøya, January 2025 to October 2026, at 3 m:
+    - NorKyst's per-farm median offset is +0.05 °C (NorKyst warmer), and the monthly medians are within ±0.3 °C apart from July 2025 (NorKyst +0.75).
+    - In early June NorKyst is about 0.5 °C warmer than the farms. The satellite's surface is warmer than NorKyst, so NorKyst's top metres look too well mixed.
+- **`examples/snapshot_sample_3d.rs`: a 3D run at point observations (TODO P4.6).** Samples a snapshot file at `unix_time lon lat value` records (satellite SST pixels, farm temperatures, FerryBox, CTD) at a depth below the surface, within the element's nodal basis and linear in time, and prints model − observation per day. First use: NOAA ACSPO L3S-LEO night SST (coastwatch ERDDAP, no account) against the Frøya runs; on 15 and 18 June 2025 inside the mesh NorKyst is −0.61 and −0.20 °C against the satellite and the 3D run follows it (−0.58, −0.20).
+- **`froya_real_data mixing=k-epsilon|k-omega|generic`**: the 3D columns' GLS closure (Canuto A), `generic` being NorKyst v3's "gen" (Christensen et al. 2026); the setup line prints it.
 - **Surface heat and freshwater fluxes per 3D column, from the COARE 3.5 bulk formulae on a weather model's fields (TODO P4.4).** In the 72 h nested Frøya run with MET Nordic's weather (2026-10-18) the domain-mean surface now follows NorKyst's day-1 warming (+0.46 °C from 6 to 14 h against NorKyst's +0.53; without the fluxes the model cooled 0.3 °C and ended day 1 0.59 °C cold): the bias over 3–24 h is +0.03 °C (rms 0.05, from −0.33 and 0.41), after it −0.08 to −0.33 °C (from −0.17 to −0.42). The top 3 m at the NorKyst point and Kattholmen go from −0.75…−0.82 °C to −0.48…−0.58 (r 0.45–0.65 → 0.54–0.77), Frohavet's from −0.42…−0.46 to −0.30…−0.36; the surface S bias +0.08 → +0.05. Jerlov III instead of II changes day 1 by ≤ 0.04 °C anywhere. Day 3's warming is still a third of NorKyst's (+0.13 against +0.34 °C, under cloud, with a salinity dip in both). No measurable cost (226 against 225 s per model hour).
   - **Bulk formulae** (`physics::air_sea`): `Coare35::turbulent` / `budget` port NOAA's reference COARE 3.5 (`pycoare.coare_35`, no cool skin, warm layer or wave inputs) and match it to 1e-9 in seven cases from storm to free convection and a very stable night (`coare_matches_the_reference_implementation`); `SurfaceBudget` gives the non-solar heat (net longwave, sensible, latent), the net shortwave (albedo 0.055) and E − P. `JerlovWater` (I–III, Paulson & Simpson 1977) absorbs the shortwave with depth. 1.9 µs per column.
   - **In the 3D model**: `Hydrostatic3D::with_surface_fluxes(impl SurfaceFluxes3D)` and `with_shortwave_absorption` (default Jerlov II). At the middle of each step, from each column's surface layer at its start: `Q_ns/(ρ₀c_p)` as the surface temperature flux, the shortwave into each layer by the light it absorbs (the bottom layer all that reaches it), E − P as the virtual salt flux `S F/ρ_fw`. Gates: `surface_fluxes_heat_each_column_from_its_own_surface` (every layer of every column on its closed recursion to 1e-12; a shortwave ramping in time exact only at mid-step) and `surface_fluxes_change_heat_and_salt_by_their_integrals` (under GLS mixing each column's heat and salt change by exactly the flux, 1e-9 relative).
@@ -429,6 +445,7 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **The shortwave's default water type is Jerlov III (was II; TODO P4.4).** `JerlovWater::default()`, `Hydrostatic3D`'s and `froya_real_data jerlov=`: NorKyst v3's choice, which Sentinel-3/OLCI water colour supports along the coast (Christensen et al. 2026). In the 2025 Frøya run it moved day 1 by ≤ 0.04 °C.
 - **`froya_real_data cliffs3d=` is 20 m by default (was 40; TODO P4.6).** At 40 m the 72 h nested run with MET wind blew up at 37 h from two cliff shores of 0.3–0.5 m beside 24–38 m; at 20 m (1917 shore nodes, 15.3 km² of water at MSL made land, against 6.1 km²) it runs the 72 h with at most 204 steps per half hour. That run answers P4.6's day-2 question: the model has NorKyst's mixing event (domain-mean surface −1.04 °C and +0.30 from 27 to 54 h, NorKyst −1.21 °C and +0.29), but not its diurnal warming (`notes/3d-validation.md`).
 - **`AtmosphereReader`'s fields are private (TODO P1.6),** as `OceanModelReader`'s: read them through `grid()`, `times()`, `wind()` (east, north), `pressure()` and `source()`; build with the `with_*` methods.
 

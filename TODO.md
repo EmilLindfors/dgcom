@@ -330,6 +330,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P4.4** De-accumulate forecast radiation (MEPS/AROME) in `AtmosphereReader::from_file`, so forecasts work without `met_forcing_subset`'s conversion.
 - [ ] **P4.4** Low priority: the rain's heat, COARE's cool skin and warm layer, the latitude per column.
 - [ ] **P4.4** Surface stress and heat/freshwater fluxes in thin columns (`with_min_column_depth`): τ/ρ₀ through `G`, the flux over the whole thin column (tidal flats get no wind or heat in 3D today).
+- [ ] **P4.4** Thin columns' temperature leaves the physical range in the 5–8 June 2026 runs: down to −2.00 °C (the bound) at low water and up to 21 °C (k-ε) or 36 °C (generic) at 54–58 h, while the ordinary columns stay at 6.9–14.8 °C. Find which flux or advection step does it (`notes/3d-validation.md` "The 2026 window").
 - [ ] **P4.4** Wave height for the surface roughness, z₀ₛ ≈ 0.6 H_s per column, from a MyWaveWAM reader or fetch-limited H_s(U₁₀, fetch).
 - [ ] **P4.4** Positivity-safe advected `k`/`ψ` (Zhang–Shu scaling toward the element mean, or a length cap); check on a real run with fronts.
 - [ ] **P4.4** k-ε with waves: σ_ε as a function of P/ε (Burchard 2001, GOTM `sig_peps`); until then k-ω or generic with waves.
@@ -342,6 +343,10 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## 3D: validation (P4.6) — [notes/3d-validation.md](notes/3d-validation.md)
 
+- [ ] **P4.6** The afternoon peak against observations. ACSPO and Copernicus Marine's ODYSSEA L3S are night and foundation SST only, and Copernicus Marine has no in situ SST in the domain. Daytime needs SLSTR L2P from CDSE (09–10 UTC, its own account) or VIIRS L2P from PO.DAAC (13:30 local, Earthdata) (`notes/3d-validation.md` "What the accounts give").
+- [ ] **P4.6** The afternoon warm layer: at the farms on 5–8 June 2026 the model's 0–3 m difference peaks at +0.34 °C at 15 UTC against NorKyst's +0.47, forms earlier and lingers into the evening, the same with k-ε and generic. Try finer levels at the surface (`levels=30`, or stronger surface stretching) and the surface k/ψ boundary conditions before the closure (`notes/3d-validation.md` "The 2026 window").
+- [ ] **P4.6** The model starts 0.2–0.25 °C colder than NorKyst at the farms (0 and 3 m, from day 0, inside the mesh): find which start-up step cools the coastal columns (initial T/S at the 1442 nodes on NorKyst's mean profile, the bed blending, the cliffs and ponds).
+- [ ] **P4.6** Draugen (64.35° N, 7.78° E; Copernicus Marine `AR_TS_MO_Draugen`, 10 min) against the forcing and the surface current: wind at 10 m, air temperature, dew point and current against MET Nordic, MEPS and NorKyst. It needs MET and NorKyst subsets about 30 km wider to the north-west.
 - [ ] **P4.6** A source for `TracerReferenceProfile` (a z-binned horizontal mean of the state or the parent), needed before the Kuzmin limiter over slopes in a realistic run.
 - [ ] **P4.6** Move the smooth references to `from_smooth_fn` and measure (Frøya `tidal_run_3d`, `levels=N`, `seamount_3d.rs kuzmin=2`, `src/simulation/simulation_3d.rs:3359`).
 - [ ] **P4.6** Tanh-pycnocline seamount at r_x0 0.08 spins up 0.38 → 1.5 cm/s over 5 days: 30 days, refine nx and levels, compare with Shchepetkin & McWilliams (2003, Fig. 10).
