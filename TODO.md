@@ -324,7 +324,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## 3D: mixing (P4.4) — [notes/3d-mixing.md](notes/3d-mixing.md)
 
-- [ ] **P4.4** Day 3's warming is a third of NorKyst's with the heat fluxes (+0.13 against +0.34 °C at 54–63 h, overcast, both surfaces freshening): compare the parent's boundary T/S with the interior before blaming the fluxes.
+- [ ] **P4.4** The top 25 m runs 0.1–0.2 °C under NorKyst from day 1 (NorKyst's interior heats ≈ 20 % more than MET Nordic's weather can): run COARE on NorKyst's own MEPS forcing at its SST to tell the weather product from the model.
+- [ ] **P4.4** Weaker restratification than NorKyst after a wind drop (Frohavet 63–69 h, T(0) − T(10 m) +0.30 against +0.66 °C): GLS diffusivity under weak wind against NorKyst's `AKs`.
 - [ ] **P4.4** Wind stress from the same COARE iteration (stability-dependent, relative to the surface current) instead of `GriddedWindStress`'s Large & Pond.
 - [ ] **P4.4** COARE cost: 10 iterations against ROMS's 3; exit on convergence (≈ 1 % of the 3D step now).
 - [ ] **P4.4** De-accumulate forecast radiation (MEPS/AROME) in `AtmosphereReader::from_file`, so forecasts work without `met_forcing_subset`'s conversion.
