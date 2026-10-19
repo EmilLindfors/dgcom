@@ -34,6 +34,8 @@ where
     physics: Hydrostatic3D<EOS, MIX, BC>,
     integrator: ModeSplitIntegrator,
     config: SimulationConfig,
+    /// The steps land on every multiple of this time (s), if set.
+    landing_interval: Option<f64>,
 }
 
 impl<EOS, MIX, BC> Simulation3D<EOS, MIX, BC>
@@ -49,6 +51,7 @@ where
             physics,
             integrator,
             config: SimulationConfig::default(),
+            landing_interval: None,
         }
     }
 
@@ -73,6 +76,20 @@ where
     /// Set the callback interval.
     pub fn with_callback_interval(mut self, interval: f64) -> Self {
         self.config.callback_interval = Some(interval);
+        self
+    }
+
+    /// Land a step on every multiple of `interval` (s) of the model time
+    /// (from `t = 0`, so a resumed run lands where the first did): the steps
+    /// up to each one are shortened evenly, by at most one step's worth per
+    /// interval, so the callback sees the state at those times exactly (two
+    /// runs with different steps can then be compared there).
+    pub fn with_landing_interval(mut self, interval: f64) -> Self {
+        assert!(
+            interval > 0.0,
+            "landing interval must be positive, got {interval}"
+        );
+        self.landing_interval = Some(interval);
         self
     }
 
@@ -221,7 +238,11 @@ where
 
             // Compute time step (3D CFL)
             let mut dt = crate::profiling::scope("step: compute_dt", || {
-                self.physics.compute_dt(state, self.config.cfl)
+                self.physics.compute_dt_ssp(
+                    state,
+                    self.config.cfl,
+                    self.integrator.baroclinic_scheme().ssp_coefficient(),
+                )
             });
             if dt.is_nan() || dt <= 0.0 {
                 return SimulationResult::failure(
@@ -246,12 +267,23 @@ where
                 );
             }
 
-            // Don't overshoot the end time or leave a sliver of it (see
-            // `Simulation::run_with_callback`)
-            let landed = t + dt * (1.0 + super::runner::LANDING_SLACK) >= t_end;
-            if landed {
-                dt = t_end - t;
-            }
+            // Don't overshoot the end time or the next landing time, or leave
+            // a sliver of it (see `Simulation::run_with_callback`): the steps
+            // up to it are made equal
+            let slack = super::runner::LANDING_SLACK;
+            let target = self.landing_interval.map_or(t_end, |interval| {
+                let next = (t / interval + slack).floor() + 1.0;
+                (next * interval).min(t_end)
+            });
+            let steps_left = ((target - t) / dt * (1.0 - slack)).ceil().max(1.0);
+            let landed = steps_left == 1.0;
+            dt = if landed {
+                target - t
+            } else if self.landing_interval.is_some() {
+                (target - t) / steps_left
+            } else {
+                dt
+            };
 
             // Track statistics
             dt_min_used = dt_min_used.min(dt);
@@ -260,12 +292,12 @@ where
             // Update density based on current T, S before computing forces
             self.physics.update_density(state);
 
-            // One barotropic pass and one 3D SSP-RK3 step
+            // One barotropic pass and one 3D SSP step
             crate::profiling::scope("step: mode split", || {
                 self.integrator.step(state, &self.physics, dt, t)
             });
 
-            t = if landed { t_end } else { t + dt };
+            t = if landed { target } else { t + dt };
             n_steps += 1;
 
             // Post-process
@@ -721,6 +753,14 @@ mod tests {
             .with_barotropic_scheme(SspScheme::Rk43)
             .with_barotropic_cfl(2.0 * ModeSplitIntegrator::DEFAULT_BAROTROPIC_CFL);
         seiche_amplitude_is_kept_with(integrator, 10, 7e-4);
+    }
+
+    /// The seiche with SSP-RK(4,3) 3D stages (the 3D step here is
+    /// `dt_max`, the same as SSP-RK3's).
+    #[test]
+    fn seiche_amplitude_is_kept_with_ssp_rk43_stages() {
+        let integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(SspScheme::Rk43);
+        seiche_amplitude_is_kept_with(integrator, 20, 5e-4);
     }
 
     /// The seiche of [`seiche_amplitude_is_kept_by_the_mode_split`] with
@@ -1313,12 +1353,25 @@ mod tests {
             &self,
             physics: &Physics,
             state: &mut Solution3D,
+            check: impl FnMut(&Solution3D, &Physics),
+        ) {
+            self.run_with(SspScheme::Rk3, 40, physics, state, check);
+        }
+
+        /// One seiche period in `steps` steps of 3D stages of `scheme`,
+        /// calling `check` after every step.
+        fn run_with(
+            &self,
+            scheme: SspScheme,
+            steps: usize,
+            physics: &Physics,
+            state: &mut Solution3D,
             mut check: impl FnMut(&Solution3D, &Physics),
         ) {
             let period = 2.0 * self.length / (G * 8.0).sqrt();
-            let dt = period / 40.0;
-            let mut integrator = ModeSplitIntegrator::new();
-            for n in 0..40 {
+            let dt = period / steps as f64;
+            let mut integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(scheme);
+            for n in 0..steps {
                 physics.update_density(state);
                 integrator.step(state, physics, dt, n as f64 * dt);
                 physics.post_process(state);
@@ -1394,6 +1447,103 @@ mod tests {
         assert!(
             max_err < 1e-12,
             "tracer inventory drifted by {max_err:.3e} (relative)"
+        );
+    }
+
+    /// TODO P4.5 gate: the 3D stages on SSP-RK(4,3)
+    /// (`ModeSplitIntegrator::with_baroclinic_scheme`), at half SSP-RK3's
+    /// steps per period (twice the step, as `cfl_3d` doubles with it): uniform
+    /// T and S stay uniform under the tide over the sloping bed, stratified
+    /// ones keep their inventories, Ω closes at the surface, and the depth
+    /// mean of `u` is the barotropic `ū` after every step.
+    #[test]
+    fn ssp_rk43_stages_keep_constancy_and_conservation_under_a_tide() {
+        let case = SlopingTide::new();
+        let eos = LinearEOS::default();
+        let physics = case.physics();
+        let mut state = case.state(&physics, |_, _| (eos.t0 + 2.3, eos.s0 - 0.9));
+        let (mut drift, mut residual, mut mean) = (0.0_f64, 0.0_f64, 0.0_f64);
+        case.run_with(SspScheme::Rk43, 20, &physics, &mut state, |s, p| {
+            drift = max_or_nan(
+                s.temp
+                    .iter()
+                    .map(|t| (t - (eos.t0 + 2.3)).abs())
+                    .chain(s.salt.iter().map(|x| (x - (eos.s0 - 0.9)).abs()))
+                    .chain([drift]),
+            );
+            residual = residual.max(p.last_surface_residual());
+            let nl = s.n_levels;
+            for idx in 0..s.eta.data.len() {
+                let column = &s.u[idx * nl..(idx + 1) * nl];
+                mean = mean.max((case.sigma.depth_average(column) - s.ubar.data[idx]).abs());
+            }
+        });
+        // The bound of the SSP-RK3 gate (measured 9.3e-13 there)
+        assert!(
+            drift < 1e-11 * eos.s0,
+            "uniform tracers drifted by {drift:.3e} under the tide"
+        );
+        assert!(residual < 1e-12, "Ω surface residual {residual:.2e}");
+        assert!(mean < 1e-12, "the depth mean of u left ū by {mean:.2e}");
+
+        let physics = case.physics();
+        let mut state = case.state(&physics, |x, s| {
+            (
+                10.0 + 3.0 * x / case.length - 2.0 * s,
+                33.0 + x / case.length + s,
+            )
+        });
+        let (t0, s0) = (
+            case.inventory(&state, &state.temp),
+            case.inventory(&state, &state.salt),
+        );
+        let mut max_err = 0.0_f64;
+        case.run_with(SspScheme::Rk43, 20, &physics, &mut state, |s, _| {
+            max_err = max_or_nan([
+                max_err,
+                (case.inventory(s, &s.temp) - t0).abs() / t0,
+                (case.inventory(s, &s.salt) - s0).abs() / s0,
+            ]);
+        });
+        assert!(
+            max_err < 1e-12,
+            "tracer inventory drifted by {max_err:.3e} (relative)"
+        );
+    }
+
+    /// TODO P4.5 gate: [`layer_momentum_anomalies_are_conserved_across_a_tide`]
+    /// with SSP-RK(4,3) 3D stages at twice the step.
+    #[test]
+    fn ssp_rk43_stages_conserve_the_layer_momentum_anomalies() {
+        let case = SlopingTide::across_channel();
+        let physics = case.physics_with(ConstantMixing::new(0.0, 0.0));
+        let eos = LinearEOS::default();
+        let mut state = case.state(&physics, |_, _| (eos.t0, eos.s0));
+        let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
+        let anomalies = |s: &Solution3D| -> Vec<f64> {
+            let mut column = DGSolution2D::new(case.mesh.n_elements, nn);
+            (0..nl)
+                .map(|l| {
+                    let ds = case.sigma.d_sigma()[l];
+                    for (idx, c) in column.data.iter_mut().enumerate() {
+                        let depth = s.eta.data[idx] - case.bathymetry.data[idx];
+                        *c = depth * ds * (s.u[idx * nl + l] - s.ubar.data[idx]);
+                    }
+                    column.integrate(&case.ops, &case.geom)
+                })
+                .collect()
+        };
+        let initial = anomalies(&state);
+        let scale = 8.0 / nl as f64 * 0.1 * 200.0 * case.length;
+        let mut max_err = 0.0_f64;
+        case.run_with(SspScheme::Rk43, 20, &physics, &mut state, |s, _| {
+            for (a, b) in anomalies(s).iter().zip(&initial) {
+                max_err = max_err.max((a - b).abs() / scale);
+            }
+        });
+        assert!(
+            max_err < 1e-12,
+            "layer momentum anomaly drifted by {max_err:.3e} of the layer transport"
         );
     }
 
@@ -2286,6 +2436,43 @@ mod tests {
         );
     }
 
+    /// `with_landing_interval`: the steps land on every multiple of the
+    /// interval, from a start between multiples and to an end between them,
+    /// with no step longer than the step bound and none shorter than half of
+    /// the steps around it (the steps up to a landing are equal).
+    #[test]
+    fn steps_land_on_every_multiple_of_the_landing_interval() {
+        let (physics, mut state) = restart_case(0.0);
+        let interval = 60.0;
+        let (t_start, t_end) = (35.0, 400.0);
+        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new())
+            .with_cfl(0.5)
+            .with_dt_max(25.0)
+            .with_landing_interval(interval);
+        let mut times = vec![];
+        let result = sim.run_with_callback(&mut state, t_start, t_end, |_, t| times.push(t));
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(times.first(), Some(&t_start));
+        assert_eq!(times.last(), Some(&t_end));
+        for k in 1..=6 {
+            let target = k as f64 * interval;
+            assert!(
+                times.contains(&target),
+                "no step landed on {target} s: {times:?}"
+            );
+        }
+        let steps: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            steps
+                .iter()
+                .all(|&dt| dt > 0.0 && dt <= 25.0 * (1.0 + 1e-9))
+        );
+        // Within an interval the steps are equal (the bound changes slowly)
+        for w in steps.windows(2) {
+            assert!(w[1] > 0.4 * w[0], "a sliver step: {steps:?}");
+        }
+    }
+
     /// TODO P5.3 gate: a restart does not continue on another bed or another
     /// σ-grid.
     #[test]
@@ -2308,10 +2495,21 @@ mod tests {
         physics: &Physics,
         state: &mut Solution3D,
         steps: usize,
+        check: impl FnMut(&Solution3D),
+    ) {
+        run_beach_with(SspScheme::Rk3, 10.0, physics, state, steps, check);
+    }
+
+    /// [`run_beach`] with 3D stages of `scheme` and steps of `dt`.
+    fn run_beach_with(
+        scheme: SspScheme,
+        dt: f64,
+        physics: &Physics,
+        state: &mut Solution3D,
+        steps: usize,
         mut check: impl FnMut(&Solution3D),
     ) {
-        let mut integrator = ModeSplitIntegrator::new();
-        let dt = 10.0;
+        let mut integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(scheme);
         for n in 0..steps {
             physics.update_density(state);
             integrator.step(state, physics, dt, n as f64 * dt);
@@ -2445,6 +2643,43 @@ mod tests {
         // and nodes that dry and rewet keep their last value (2.4e-13 with
         // only the vertical profile)
         assert!(psi_err < 2e-10, "ψ inventory drifted by {psi_err:.3e}");
+    }
+
+    /// TODO P4.5 gate: [`beach_tracers_are_constant_and_conserved`] with
+    /// SSP-RK(4,3) 3D stages at twice the step: constancy in the shoreline
+    /// elements and the inventories, with wetting and drying, 0 clips.
+    #[test]
+    fn beach_tracers_are_constant_and_conserved_with_ssp_rk43_stages() {
+        let (physics, mut state, _) = beach_3d(0.3);
+        state.temp.fill(12.3);
+        state.salt.fill(33.1);
+        let mut drift = 0.0_f64;
+        run_beach_with(SspScheme::Rk43, 20.0, &physics, &mut state, 100, |s| {
+            drift = max_or_nan(
+                s.temp
+                    .iter()
+                    .map(|t| (t - 12.3).abs())
+                    .chain(s.salt.iter().map(|x| (x - 33.1).abs()))
+                    .chain([drift]),
+            );
+        });
+        assert!(drift < 5e-8, "uniform tracers drifted by {drift:.3e}");
+        assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
+
+        let (physics, mut state, _) = beach_3d(0.3);
+        let (t0, s0) = (
+            beach_inventory(&physics, &state, &state.temp),
+            beach_inventory(&physics, &state, &state.salt),
+        );
+        let mut max_err = 0.0_f64;
+        run_beach_with(SspScheme::Rk43, 20.0, &physics, &mut state, 100, |s| {
+            max_err = max_or_nan([
+                max_err,
+                (beach_inventory(&physics, s, &s.temp) - t0).abs() / t0,
+                (beach_inventory(&physics, s, &s.salt) - s0).abs() / s0,
+            ]);
+        });
+        assert!(max_err < 5e-11, "inventories drifted by {max_err:.3e}");
     }
 
     /// TODO P1.3 gate: [`beach_tracers_are_constant_and_conserved`] with the

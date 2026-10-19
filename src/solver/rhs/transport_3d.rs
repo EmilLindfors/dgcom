@@ -661,6 +661,10 @@ fn subtract_face_lift_levels(
 pub struct BarotropicFlux<'a> {
     /// Length of the baroclinic step (s).
     pub dt: f64,
+    /// The longest forward-Euler step in the 3D stages' scheme (s): `dt`
+    /// over its SSP coefficient (`dt` for SSP-RK3, `dt/2` for SSP-RK(4,3)).
+    /// A stage's explicit Courant number is taken for it.
+    pub euler_dt: f64,
     /// Nodal barotropic transport `DU_avg2` (m²/s), `[element][node]`.
     pub hu: &'a [f64],
     pub hv: &'a [f64],
@@ -2478,6 +2482,7 @@ mod tests {
                 LayerTransport::new(self.mesh.n_elements, &self.ops, self.sigma.n_levels());
             let barotropic = BarotropicFlux {
                 dt: 1.0,
+                euler_dt: 1.0,
                 hu: &self.du_hu,
                 hv: &self.du_hv,
                 face: &self.du_face,

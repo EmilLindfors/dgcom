@@ -109,7 +109,8 @@
 //!     [wave_reference=<file>] \
 //!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] \
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
-//!     [levels=0] [tide3d=0] [cfl_3d=2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] [restart_hours=0] [resume=<file>]
+//!     [levels=0] [tide3d=0] [rk_3d=43|3] [cfl_3d=4|2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] \
+//!     [restart_hours=0] [resume=<file>]
 //! ```
 //!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
@@ -219,7 +220,8 @@
 //! default; the parent and the weather must cover a third of it past the
 //! end, where the last step's barotropic window reads them,
 //! `ModeSplitIntegrator::FORCING_REACH`) and `cfl_3d=` sets its Courant
-//! number (`Hydrostatic3D::compute_dt`; 2).
+//! number (`Hydrostatic3D::compute_dt`; 4 with the SSP-RK(4,3) stages, 2
+//! with SSP-RK3's, see `rk_3d=` below).
 //! Measured 2026-10-10: on the Mausund tide (3 h, nested) 2 holds and 3
 //! blows up within 0.8 h (a 50 m element during the ramp, at 25 s steps);
 //! against 0.5, 1 moves ū by 0.3 mm/s RMS and 2 by ≤ 3 mm/s, T by 0.013
@@ -244,6 +246,26 @@
 //! 0.011 °C RMS at the nodes ≥ 10 m deep (the run's sensitivity), the pass
 //! 472 → 236 ms per step. Use `slopes3d=on` for the stratified rest state on
 //! steep beds.
+//!
+//! The 3D stages are SSP-RK(4,3) (`rk_3d=43`, the default;
+//! `ModeSplitIntegrator::with_baroclinic_scheme`) at `cfl_3d=4`, or SSP-RK3
+//! (`rk_3d=3`) at `cfl_3d=2`, the default before 2026-10-19.
+//! The 3D step is set by shoreline elements whose tracers move as subcell
+//! finite volumes, a forward-Euler bound that SSP-RK(4,3) doubles, and the
+//! vertical advection's bound and implicit split double with it. Measured
+//! 2026-10-19 from the 70 h restart of the 72 h MET-wind run
+//! (`notes/3d-numerics.md` "Third depth pass"): 294 → 216 s per model hour.
+//! With snapshots (`snapshot_minutes=`) the steps land on the snapshot times
+//! (`Simulation3D::with_landing_interval`), so `snapshot_compare_3d`
+//! compares runs with different steps frame by frame. `debug_3d=dt_dist`
+//! prints, at every progress line, every element's own 3D step (quantiles,
+//! what local time stepping in 3D could save, the five shortest and what
+//! sets them). The 72 h MET-wind run with heat fluxes took 199 s per model
+//! hour against 267 (SSP-RK3 at 2), with the same tide, currents and T/S
+//! profiles against NorKyst to 0.01 °C and 1 mm/s. `debug_3d=visc_step`
+//! takes the horizontal viscosity once per step
+//! (`Hydrostatic3D::with_viscosity_once_per_step`): 11 % faster there, but
+//! the NorKyst point's current moves 5× further from the reference.
 //!
 //! A long 3D tide can stop and resume bit for bit. `restart_hours=H` writes
 //! `<output>/<domain>.restart` (`Restart3D`, replaced in one rename, so a
@@ -679,6 +701,8 @@ struct Options {
     cfl_bt: f64,
     /// SSP scheme of the barotropic substeps (`rk_bt=3|43`)
     rk_bt: dg_rs::time::SspScheme,
+    /// SSP scheme of the 3D stages (`rk_3d=3|43`)
+    rk_3d: dg_rs::time::SspScheme,
     /// Most levels of local time stepping in the barotropic pass
     /// (`bt_levels=`, 2; 0: global substeps)
     bt_levels: usize,
@@ -780,13 +804,19 @@ impl Options {
                 .map(|v| v.parse::<f64>())
                 .transpose()
                 .map_err(|e| e.to_string())?,
-            cfl_3d: get("cfl_3d", 2.0)?,
+            // Set below: its default follows the 3D stages' scheme
+            cfl_3d: f64::NAN,
             cfl_bt: get("cfl_bt", 2.0)?,
             bt_levels: get("bt_levels", 2.0)? as usize,
             rk_bt: match args.get("rk_bt").map_or("43", String::as_str) {
                 "3" => dg_rs::time::SspScheme::Rk3,
                 "43" => dg_rs::time::SspScheme::Rk43,
                 other => return Err(format!("rk_bt={other}: expected 3 or 43")),
+            },
+            rk_3d: match args.get("rk_3d").map_or("43", String::as_str) {
+                "3" => dg_rs::time::SspScheme::Rk3,
+                "43" => dg_rs::time::SspScheme::Rk43,
+                other => return Err(format!("rk_3d={other}: expected 3 or 43")),
             },
             debug_3d: args.get("debug_3d").cloned().unwrap_or_default(),
             restart_hours: get("restart_hours", 0.0)?,
@@ -980,6 +1010,15 @@ impl Options {
             gauge_gains: constituents("gauge_gains", "K1,O1,S2")?,
             gauge_ratios: constituents("gauge_ratios", "N2,Q1,P1,K2")?,
         };
+        // SSP-RK(4,3)'s stages hold twice SSP-RK3's step where a forward-Euler
+        // bound sets it (the shoreline elements' subcells)
+        opts.cfl_3d = get(
+            "cfl_3d",
+            match opts.rk_3d {
+                dg_rs::time::SspScheme::Rk3 => 2.0,
+                dg_rs::time::SspScheme::Rk43 => 4.0,
+            },
+        )?;
         if opts.cfl.is_nan() {
             let scheme = opts.integrator.ssp_scheme().expect("an SSP integrator");
             opts.cfl = linear_cfl_swe_2d(opts.order, scheme)
@@ -3395,6 +3434,10 @@ fn tidal_run_3d(
             .with_surface_fluxes(fluxes)
             .with_shortwave_absorption(opts.jerlov);
     }
+    // The horizontal viscosity once per step (`visc_step`, as ROMS)
+    if dbg("visc_step") {
+        physics = physics.with_viscosity_once_per_step();
+    }
     // The vertical advection beyond an explicit Courant number implicitly:
     // the columns just deeper than the thin depth set the step otherwise
     if !dbg("explicit") {
@@ -3651,6 +3694,65 @@ fn tidal_run_3d(
                     "         steps {steps}: dt {dt_lo:.2}–{:.2} s{set_by}; |Ω|/H_z bound now {vertical:.2} s{implicit}",
                     (t - since) / steps as f64,
                 );
+                if dbg("dt_dist") {
+                    // Every element's own advective step now: what local time
+                    // stepping in 3D could save, and who sets it
+                    let mut own = physics.element_advection_steps(s, opts.cfl_3d);
+                    own.retain(|e| e.dt.is_finite());
+                    own.sort_by(|a, b| a.dt.total_cmp(&b.dt));
+                    let smallest = own.first().map_or(f64::NAN, |e| e.dt);
+                    let quantile = |q: f64| {
+                        let i = (own.len().saturating_sub(1) as f64 * q) as usize;
+                        own.get(i).map_or(f64::NAN, |e| e.dt)
+                    };
+                    let gain = |levels: u32| {
+                        let work: f64 = own
+                            .iter()
+                            .map(|e| {
+                                let l = ((e.dt / smallest).log2().floor() as u32).min(levels);
+                                0.5_f64.powi(l as i32)
+                            })
+                            .sum();
+                        own.len() as f64 / work
+                    };
+                    let without = |depth: f64| {
+                        own.iter()
+                            .find(|e| e.depth >= depth)
+                            .map_or(f64::NAN, |e| e.dt)
+                    };
+                    println!(
+                        "         own steps: min {smallest:.2}, p0.1 {:.2}, p1 {:.2}, p5 {:.2}, median {:.2} s; LTS gain L=1 {:.2}, 2 {:.2}, 3 {:.2}, 4 {:.2}; min over binding depth ≥ 2 m {:.2}, ≥ 5 m {:.2}",
+                        quantile(0.001),
+                        quantile(0.01),
+                        quantile(0.05),
+                        quantile(0.5),
+                        gain(1),
+                        gain(2),
+                        gain(3),
+                        gain(4),
+                        without(2.0),
+                        without(5.0),
+                    );
+                    let limits = physics.time_step_limits(s, opts.cfl_3d);
+                    println!(
+                        "           limits now: advection {:.2} (element {}), viscosity {:.2} (element {}), coriolis {:.0}, vertical {:.2}; last compute_dt's advection {:.2}",
+                        limits.advection.dt,
+                        limits.advection.element,
+                        limits.viscosity.dt,
+                        limits.viscosity.element,
+                        limits.coriolis.dt,
+                        limits.vertical.dt,
+                        physics
+                            .last_time_step_limits()
+                            .map_or(f64::NAN, |l| l.advection.dt),
+                    );
+                    for e in own.iter().take(5) {
+                        println!(
+                            "           dt {:.2} s: |u| {:.2} m/s, c1 {:.2} m/s, h {:.1} m, depth {:.2} m",
+                            e.dt, e.speed, e.c1, e.length, e.depth
+                        );
+                    }
+                }
             }
             binding = None;
             (steps, dt_lo, since) = (0, f64::INFINITY, t);
@@ -3740,10 +3842,16 @@ fn tidal_run_3d(
     let integrator = ModeSplitIntegrator::new()
         .with_barotropic_cfl(opts.cfl_bt)
         .with_barotropic_scheme(opts.rk_bt)
+        .with_baroclinic_scheme(opts.rk_3d)
         .with_barotropic_levels(opts.bt_levels);
     let mut sim = Simulation3D::new(physics, integrator)
         .with_cfl(opts.cfl_3d)
         .with_dt_max(opts.dt_3d.unwrap_or(MAX_DT_3D));
+    // The snapshots at their times exactly, so that runs with different
+    // steps compare frame by frame (`snapshot_compare_3d`)
+    if let Some(every) = snapshot_every {
+        sim = sim.with_landing_interval(every as f64 * interval);
+    }
     if let Some(restart) = restart {
         sim.resume(&restart)?;
         state = restart.state;
@@ -4620,11 +4728,14 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     } else {
         physics.with_vertical_reference(&state)
     };
-    let mut integrator = ModeSplitIntegrator::new();
+    let mut integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(opts.rk_3d);
+    let ssp = opts.rk_3d.ssp_coefficient();
     let mut t = 0.0;
     // The step of `dt_3d=`, or as `Simulation3D` takes it, every step
     let mut timed_step = |state: &mut Solution3D, t: &mut f64| -> f64 {
-        let dt = opts.dt_3d.unwrap_or_else(|| physics.compute_dt(state, cfl));
+        let dt = opts
+            .dt_3d
+            .unwrap_or_else(|| physics.compute_dt_ssp(state, cfl, ssp));
         physics.update_density(state);
         integrator.step(state, &physics, dt, *t);
         physics.post_process(state);

@@ -111,6 +111,13 @@ pub struct ViscosityScratch3D {
 /// all of them for every level).
 const LEVEL_BLOCK: usize = 5;
 
+/// Scalars per node of a block's BR1 passes: `(u′, v′)` of each of its
+/// levels, pairs in level order (a short last block leaves its last pairs
+/// zero). One pass takes each node pair's metric, normal and LIFT once for
+/// all of them, and the kernels compute each scalar as alone, so the block is
+/// its levels' passes bit for bit.
+const LANES: usize = 2 * LEVEL_BLOCK;
+
 /// The BR1 gradients of a layer's shear `(u′, v′)` at a node, and `ν_l D`
 /// there.
 #[derive(Clone, Copy, Default)]
@@ -133,20 +140,20 @@ impl ViscosityScratch3D {
     }
 }
 
-/// One element's buffers of the BR1 passes.
-struct ElementScratch {
-    own: Vec<[f64; 2]>,
-    gradient: [Vec<ScalarGradient2D>; 2],
-    diffusion: DiffusionScratch<2>,
-    out: [Vec<f64>; 2],
+/// One element's buffers of the BR1 passes of `N` scalars.
+struct ElementScratch<const N: usize> {
+    own: Vec<[f64; N]>,
+    gradient: [Vec<ScalarGradient2D>; N],
+    diffusion: DiffusionScratch<N>,
+    out: [Vec<f64>; N],
 }
 
-impl ElementScratch {
+impl<const N: usize> ElementScratch<N> {
     fn take(nn: usize) -> Pooled<Self> {
         Pooled::take(
             |s: &Self| s.own.len() == nn,
             || Self {
-                own: vec![[0.0; 2]; nn],
+                own: vec![[0.0; N]; nn],
                 gradient: std::array::from_fn(|_| vec![ScalarGradient2D::default(); nn]),
                 diffusion: DiffusionScratch::new(nn),
                 out: std::array::from_fn(|_| vec![0.0; nn]),
@@ -166,36 +173,37 @@ struct Columns<'a> {
 }
 
 impl Columns<'_> {
-    /// BR1 gradients on element `k` of the velocity field `value(idx)`
-    /// (`[element][node]` index, both components), mirrored at walls, into
-    /// `scratch.gradient`.
-    fn element_gradients(
+    /// BR1 gradients on element `k` of the velocity fields `value(idx)`
+    /// (`[element][node]` index; `(u, v)` pairs, `N/2` of them), each pair
+    /// mirrored at walls, into `scratch.gradient`.
+    fn element_gradients<const N: usize>(
         &self,
         k: usize,
-        value: impl Fn(usize) -> [f64; 2],
-        scratch: &mut ElementScratch,
+        value: impl Fn(usize) -> [f64; N],
+        scratch: &mut ElementScratch<N>,
     ) {
         let (mesh, geom, nn) = (self.mesh, self.geom, self.ops.n_nodes);
         let ElementScratch { own, gradient, .. } = scratch;
-        let [grad_u, grad_v] = gradient;
         br1_gradient_element(
             ElementIndex::new(k),
             mesh,
             self.ops,
             geom,
             |j, node| value(j.as_usize() * nn + node),
-            |k, face, fi, _node, interior| match self.boundaries.exterior(mesh, k, face) {
+            |k, face, fi, _node, mut exterior| {
                 // Mirrored: no normal velocity at the wall
-                FaceExterior::Wall => {
+                if let FaceExterior::Wall = self.boundaries.exterior(mesh, k, face) {
                     let (nx, ny) = geom.normal(k.as_usize(), face, fi);
-                    let [u, v] = interior;
-                    let normal = u * nx + v * ny;
-                    [u - 2.0 * normal * nx, v - 2.0 * normal * ny]
+                    for pair in exterior.as_chunks_mut::<2>().0 {
+                        let [u, v] = *pair;
+                        let normal = u * nx + v * ny;
+                        *pair = [u - 2.0 * normal * nx, v - 2.0 * normal * ny];
+                    }
                 }
-                _ => interior,
+                exterior
             },
             own,
-            [grad_u, grad_v],
+            gradient.each_mut().map(|g| &mut g[..]),
         );
     }
 
@@ -264,7 +272,7 @@ impl Columns<'_> {
             for_each_block(
                 ne,
                 [&mut mean_gradient[..]],
-                || ElementScratch::take(nn),
+                || ElementScratch::<2>::take(nn),
                 |scratch, k, [gradient_k]| {
                     self.element_gradients(k, |idx| mean[idx], scratch);
                     for (i, g) in gradient_k.iter_mut().enumerate() {
@@ -304,13 +312,20 @@ impl Columns<'_> {
         for_each_block(
             self.mesh.n_elements,
             [&mut layer[..n]],
-            || ElementScratch::take(nn),
+            || ElementScratch::<LANES>::take(nn),
             |scratch, k, [layer_k]| {
-                for (b, level) in levels.clone().enumerate() {
-                    self.element_gradients(k, |idx| shear(idx, level), scratch);
+                let block_shear = |idx: usize| {
+                    let mut lanes = [0.0; LANES];
+                    for (b, level) in levels.clone().enumerate() {
+                        [lanes[2 * b], lanes[2 * b + 1]] = shear(idx, level);
+                    }
+                    lanes
+                };
+                self.element_gradients(k, block_shear, scratch);
+                for b in 0..block {
                     for i in 0..nn {
                         let idx = k * nn + i;
-                        let (gu, gv) = (scratch.gradient[0][i], scratch.gradient[1][i]);
+                        let (gu, gv) = (scratch.gradient[2 * b][i], scratch.gradient[2 * b + 1][i]);
                         let nu = if smagorinsky {
                             let [mu, mv] = mean_gradient[idx];
                             let strain = strain_rate_magnitude(
@@ -375,36 +390,51 @@ pub fn apply_horizontal_viscosity_3d(
         for_each_block(
             mesh.n_elements,
             [&mut rhs_u[..n], &mut rhs_v[..n]],
-            || ElementScratch::take(nn),
+            || ElementScratch::<LANES>::take(nn),
             |scratch, k, [rhs_u, rhs_v]| {
                 let ElementScratch { diffusion, out, .. } = &mut **scratch;
-                for (b, level) in levels.clone().enumerate() {
-                    let [out_u, out_v] = &mut *out;
-                    br1_diffusion_element(
-                        ElementIndex::new(k),
-                        mesh,
-                        ops,
-                        geom,
-                        |j, node| {
-                            let node = layer[(j.as_usize() * nn + node) * block + b];
-                            node.gradient
-                                .map(|g| (node.coefficient * g.dx, node.coefficient * g.dy))
-                        },
-                        // The fluxes that match the gradients' exterior
-                        // states: at a wall (mirrored velocity) the normal
-                        // stress only, at an open face (extrapolated) none
-                        |k, face, _fi, (nx, ny), [fu, fv]| match boundaries.exterior(mesh, k, face)
-                        {
-                            FaceExterior::Wall => {
-                                let normal = nx * fu + ny * fv;
-                                [nx * normal, ny * normal]
+                br1_diffusion_element(
+                    ElementIndex::new(k),
+                    mesh,
+                    ops,
+                    geom,
+                    |j, node| {
+                        let nodes = (j.as_usize() * nn + node) * block;
+                        let mut fluxes = [(0.0, 0.0); LANES];
+                        for (b, node) in layer[nodes..nodes + block].iter().enumerate() {
+                            [fluxes[2 * b], fluxes[2 * b + 1]] = node
+                                .gradient
+                                .map(|g| (node.coefficient * g.dx, node.coefficient * g.dy));
+                        }
+                        fluxes
+                    },
+                    // The fluxes that match the gradients' exterior states:
+                    // at a wall (mirrored velocity) the normal stress only,
+                    // at an open face (extrapolated) none
+                    |k, face, _fi, (nx, ny), interior| match boundaries.exterior(mesh, k, face) {
+                        FaceExterior::Wall => {
+                            let mut stress = [0.0; LANES];
+                            for (pair, f) in stress
+                                .as_chunks_mut::<2>()
+                                .0
+                                .iter_mut()
+                                .zip(interior.as_chunks::<2>().0)
+                            {
+                                let normal = nx * f[0] + ny * f[1];
+                                *pair = [nx * normal, ny * normal];
                             }
-                            _ => [0.0; 2],
-                        },
-                        diffusion,
-                        [out_u, out_v],
-                    );
-                    for (rhs_k, out) in [&mut *rhs_u, &mut *rhs_v].into_iter().zip(out.iter()) {
+                            stress
+                        }
+                        _ => [0.0; LANES],
+                    },
+                    diffusion,
+                    out.each_mut().map(|o| &mut o[..]),
+                );
+                for (b, level) in levels.clone().enumerate() {
+                    for (rhs_k, out) in [&mut *rhs_u, &mut *rhs_v]
+                        .into_iter()
+                        .zip(&out[2 * b..2 * b + 2])
+                    {
                         for (i, &d) in out.iter().enumerate() {
                             let idx = k * nn + i;
                             if depth[idx] > 0.0 {

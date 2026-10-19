@@ -192,6 +192,9 @@ pub struct TracerReferenceProfile {
     salt: Vec<f64>,
     /// `dT/dz` and `dS/dz` at the samples, for cubic Hermite interpolation
     slopes: Option<[Vec<f64>; 2]>,
+    /// `1/Δz` if the heights are evenly spaced (to round-off): the sample
+    /// below a height is then found without a search.
+    inverse_spacing: Option<f64>,
 }
 
 /// One tracer of a [`TracerReferenceProfile`]: its samples, and their slopes
@@ -201,22 +204,73 @@ struct ProfileSamples<'a> {
     heights: &'a [f64],
     values: &'a [f64],
     slopes: Option<&'a [f64]>,
+    inverse_spacing: Option<f64>,
+}
+
+/// Where a height falls among a profile's samples: the first sample at or
+/// above it, and the fraction of the way up from the one below.
+#[derive(Clone, Copy)]
+struct SampleBracket {
+    j: usize,
+    h: f64,
+    t: f64,
+}
+
+/// The first of `heights` (increasing) at or above `z`, as
+/// `heights.partition_point(|&h| h < z)`, from a first guess on evenly spaced
+/// heights (`1/Δz`) corrected by the same comparisons, so it is the search's
+/// index whatever the spacing's round-off.
+fn first_at_or_above(heights: &[f64], inverse_spacing: Option<f64>, z: f64) -> usize {
+    let Some(inverse) = inverse_spacing else {
+        return heights.partition_point(|&h| h < z);
+    };
+    let n = heights.len();
+    // A NaN guess casts to 0, where the search for NaN ends too
+    let mut j = (((z - heights[0]) * inverse).ceil().max(0.0) as usize).min(n);
+    while j < n && heights[j] < z {
+        j += 1;
+    }
+    while j > 0 && heights[j - 1] >= z {
+        j -= 1;
+    }
+    j
 }
 
 impl ProfileSamples<'_> {
+    fn bracket(&self, z: f64) -> SampleBracket {
+        let heights = self.heights;
+        let j = first_at_or_above(heights, self.inverse_spacing, z);
+        if j == 0 || j == heights.len() {
+            return SampleBracket {
+                j,
+                h: f64::NAN,
+                t: f64::NAN,
+            };
+        }
+        let h = heights[j] - heights[j - 1];
+        SampleBracket {
+            j,
+            h,
+            t: (z - heights[j - 1]) / h,
+        }
+    }
+
     /// The profile at height `z`: linear, or cubic Hermite, between the
     /// samples, constant beyond them.
     fn at(&self, z: f64) -> f64 {
-        let (heights, values) = (self.heights, self.values);
-        let j = heights.partition_point(|&h| h < z);
+        self.at_bracket(self.bracket(z))
+    }
+
+    /// [`Self::at`] at a height whose [`Self::bracket`] is known (it is the
+    /// same for every tracer of a profile).
+    fn at_bracket(&self, SampleBracket { j, h, t }: SampleBracket) -> f64 {
+        let values = self.values;
         if j == 0 {
             return values[0];
         }
-        if j == heights.len() {
+        if j == values.len() {
             return values[j - 1];
         }
-        let h = heights[j] - heights[j - 1];
-        let t = (z - heights[j - 1]) / h;
         let (f0, f1) = (values[j - 1], values[j]);
         match self.slopes {
             None => f0 + t * (f1 - f0),
@@ -248,11 +302,20 @@ impl TracerReferenceProfile {
             heights.windows(2).all(|pair| pair[0] < pair[1]),
             "the heights of a reference profile must increase"
         );
+        // Evenly spaced to round-off: the spacing's relative spread
+        let n = heights.len();
+        let inverse_spacing = (n >= 2).then(|| (n - 1) as f64 / (heights[n - 1] - heights[0]));
+        let even = inverse_spacing.is_some_and(|inverse| {
+            heights
+                .windows(2)
+                .all(|pair| ((pair[1] - pair[0]) * inverse - 1.0).abs() < 1e-6)
+        });
         Self {
             heights,
             temp,
             salt,
             slopes: None,
+            inverse_spacing: inverse_spacing.filter(|_| even),
         }
     }
 
@@ -331,6 +394,7 @@ impl TracerReferenceProfile {
             heights: &self.heights,
             values,
             slopes: self.slopes.as_ref().map(|slopes| &slopes[j][..]),
+            inverse_spacing: self.inverse_spacing,
         }
     }
 }
@@ -452,30 +516,13 @@ pub fn apply_tracer_limiters_3d(
                 || vec![f64::NAN; state.n_elements * state.n_levels],
             );
             columns.layer_mean_heights(&mut mean_heights);
-            let reference = |component| {
-                config
-                    .reference
-                    .as_deref()
-                    .map(|profile: &TracerReferenceProfile| profile.samples(component))
-            };
-            apply_horizontal_kuzmin_field(
-                &mut state.temp,
-                reference(TracerComponent::Temperature),
+            apply_horizontal_kuzmin_fields(
+                [&mut state.temp, &mut state.salt],
+                config.reference.as_deref(),
                 &columns,
                 &mean_heights,
                 mesh,
                 relaxation,
-                TracerComponent::Temperature,
-                &mut stats,
-            );
-            apply_horizontal_kuzmin_field(
-                &mut state.salt,
-                reference(TracerComponent::Salinity),
-                &columns,
-                &mean_heights,
-                mesh,
-                relaxation,
-                TracerComponent::Salinity,
                 &mut stats,
             );
         }
@@ -818,6 +865,13 @@ struct KuzminScratch {
     patches: Vec<usize>,
     /// The node's height.
     height: Vec<f64>,
+    /// Each tracer's values at the nodes.
+    tracers: [KuzminTracerScratch; 2],
+}
+
+/// [`KuzminScratch`]'s values of one tracer.
+#[derive(Default)]
+struct KuzminTracerScratch {
     /// The reference stratification at the node's height (zero without one).
     reference: Vec<f64>,
     /// The departure from it, `T_i − T_ref(z_i)`.
@@ -832,8 +886,83 @@ struct KuzminScratch {
     scale: Vec<f64>,
 }
 
-/// Horizontal Kuzmin limiting of `field`, layer by layer, against bounds
-/// taken at constant height, of its departure from a `reference`
+/// What the Kuzmin pass reads of one tracer besides its values: the
+/// reference at every node's layer centre, every element layer's mean
+/// departure from it, and the range of every column's nodal departures in
+/// its bottom and top layers.
+struct KuzminTracer {
+    references: Pooled<Vec<f64>>,
+    averages: Pooled<Vec<f64>>,
+    end_ranges: Pooled<Vec<[f64; 4]>>,
+}
+
+impl KuzminTracer {
+    /// The tracer `field`'s pass data, with `references`, the reference at
+    /// every node's layer centre (zero without one).
+    fn new(field: &[f64], references: Pooled<Vec<f64>>, columns: &LayerColumns) -> Self {
+        let (n_elements, n_nodes, n_levels) =
+            (columns.n_elements, columns.n_nodes, columns.n_levels);
+        let mut averages = Pooled::take(
+            |a: &Vec<f64>| a.len() == n_elements * n_levels,
+            || vec![f64::NAN; n_elements * n_levels],
+        );
+        let mut end_ranges = Pooled::take(
+            |a: &Vec<[f64; 4]>| a.len() == n_elements,
+            || vec![[f64::NAN; 4]; n_elements],
+        );
+        {
+            let references: &[f64] = &references;
+            let departure = |k, i, level| {
+                let j = index(k, i, level, n_nodes, n_levels);
+                field[j] - references[j]
+            };
+            columns.layer_means(&mut averages, departure);
+            for_each_block(
+                n_elements,
+                [&mut end_ranges[..]],
+                || (),
+                |_, k, [range]| {
+                    let (bottom, top) = (0..n_nodes).fold(
+                        (
+                            [f64::INFINITY, f64::NEG_INFINITY],
+                            [f64::INFINITY, f64::NEG_INFINITY],
+                        ),
+                        |([b0, b1], [t0, t1]), i| {
+                            let (b, t) = (departure(k, i, 0), departure(k, i, n_levels - 1));
+                            ([b0.min(b), b1.max(b)], [t0.min(t), t1.max(t)])
+                        },
+                    );
+                    range[0] = [bottom[0], bottom[1], top[0], top[1]];
+                },
+            );
+        }
+        Self {
+            references,
+            averages,
+            end_ranges,
+        }
+    }
+
+    /// Element `e`'s column at the height `bracket` was found for (its
+    /// `level`), if it has water there: its value and the means of its two
+    /// layers bracketing that height.
+    #[inline]
+    fn column_at(
+        &self,
+        e: usize,
+        bracket: &HeightBracket,
+        level: usize,
+        n_levels: usize,
+    ) -> Option<(f64, f64, f64)> {
+        let column = e * n_levels..(e + 1) * n_levels;
+        self.averages[column.start + level]
+            .is_finite()
+            .then(|| bracket.column_value(&self.averages[column], self.end_ranges[e]))
+    }
+}
+
+/// Horizontal Kuzmin limiting of `temp` and `salt`, layer by layer, against
+/// bounds taken at constant height, of their departures from a `reference`
 /// stratification (none is zero).
 ///
 /// On a sloping bed a σ-layer crosses the stratification, so a smooth `T(z)`
@@ -849,7 +978,7 @@ struct KuzminScratch {
 ///   every node by the union of the element's vertex patches) *at the
 ///   node's height*: each column's layer means interpolated linearly in `z`,
 ///   and the means of its two layers bracketing that height (the cells above
-///   and below of a 3D vertex patch; [`column_at_height`]). A `T(z)` linear
+///   and below of a 3D vertex patch; [`HeightBracket`]). A `T(z)` linear
 ///   over the patch is within its bounds, and so is a smooth vertical
 ///   extremum between thick layers;
 /// - what is scaled is the departure `d_i = T_i − T̂_i` from the element's
@@ -873,120 +1002,69 @@ struct KuzminScratch {
 /// before its patches are read: those bounds are within every patch's, so
 /// `α = 1`. This about halves the Kuzmin pass's cost (`profile_3d`: 2.2 →
 /// 1.2 ms for `T` and `S` on 1024 P2 elements × 20 levels).
-fn apply_horizontal_kuzmin_field(
-    field: &mut [f64],
-    reference: Option<ProfileSamples<'_>>,
+///
+/// Both tracers go through one pass: where each column's layer means bracket
+/// a node's height is the same for both, and is found once.
+fn apply_horizontal_kuzmin_fields(
+    [temp, salt]: [&mut [f64]; 2],
+    reference: Option<&TracerReferenceProfile>,
     columns: &LayerColumns,
     heights: &[f64],
     mesh: &Mesh2D,
     relaxation: f64,
-    component: TracerComponent,
     stats: &mut TracerLimiter3DStats,
 ) {
+    const COMPONENTS: [TracerComponent; 2] =
+        [TracerComponent::Temperature, TracerComponent::Salinity];
     let (n_elements, n_nodes, n_levels) = (columns.n_elements, columns.n_nodes, columns.n_levels);
-    // The reference at every node's layer centre, looked up once (each value
-    // is read three times below)
+    // The reference at every node's layer centre, looked up once for both
+    // tracers (each value is read three times below)
     let n_values = n_elements * n_nodes * n_levels;
-    let mut references = Pooled::take(|a: &Vec<f64>| a.len() == n_values, || vec![0.0; n_values]);
+    let take = || Pooled::take(|a: &Vec<f64>| a.len() == n_values, || vec![0.0; n_values]);
+    let (mut temp_references, mut salt_references) = (take(), take());
     if let Some(profile) = reference {
+        let samples = [
+            profile.samples(TracerComponent::Temperature),
+            profile.samples(TracerComponent::Salinity),
+        ];
         for_each_block(
             n_elements,
-            [&mut references[..]],
+            [&mut temp_references[..], &mut salt_references[..]],
             || (),
-            |_, k, [references]| {
+            |_, k, [temp, salt]| {
                 let offset = k * n_nodes * n_levels;
-                for (j, r) in references.iter_mut().enumerate() {
-                    *r = profile.at(columns.centres[offset + j]);
+                for (j, (t, s)) in temp.iter_mut().zip(salt).enumerate() {
+                    let bracket = samples[0].bracket(columns.centres[offset + j]);
+                    *t = samples[0].at_bracket(bracket);
+                    *s = samples[1].at_bracket(bracket);
                 }
             },
         );
     } else {
-        references.fill(0.0);
+        temp_references.fill(0.0);
+        salt_references.fill(0.0);
     }
-    let references: &[f64] = &references;
-    let reference_at =
-        |k: usize, i: usize, level: usize| references[index(k, i, level, n_nodes, n_levels)];
-    let mut averages = Pooled::take(
-        |a: &Vec<f64>| a.len() == n_elements * n_levels,
-        || vec![f64::NAN; n_elements * n_levels],
-    );
-    // The range of every column's nodal departures in its bottom and top
-    // layers
-    let mut end_ranges = Pooled::take(
-        |a: &Vec<[f64; 4]>| a.len() == n_elements,
-        || vec![[f64::NAN; 4]; n_elements],
-    );
-    {
-        let field: &[f64] = field;
-        let departure =
-            |k, i, level| field[index(k, i, level, n_nodes, n_levels)] - reference_at(k, i, level);
-        columns.layer_means(&mut averages, departure);
-        for_each_block(
-            n_elements,
-            [&mut end_ranges[..]],
-            || (),
-            |_, k, [range]| {
-                let (bottom, top) = (0..n_nodes).fold(
-                    (
-                        [f64::INFINITY, f64::NEG_INFINITY],
-                        [f64::INFINITY, f64::NEG_INFINITY],
-                    ),
-                    |([b0, b1], [t0, t1]), i| {
-                        let (b, t) = (departure(k, i, 0), departure(k, i, n_levels - 1));
-                        ([b0.min(b), b1.max(b)], [t0.min(t), t1.max(t)])
-                    },
-                );
-                range[0] = [bottom[0], bottom[1], top[0], top[1]];
-            },
-        );
-    }
-    let averages: &[f64] = &averages;
-    let end_ranges: &[[f64; 4]] = &end_ranges;
-    let index = |i: usize, level: usize| i * n_levels + level;
-    // Element `e`'s column at height `z` (near `level`), if it has water
-    // there: its value and the means of its two layers bracketing `z`
-    let column_at = |e: usize, z: f64, level: usize| {
+    let tracers = [
+        KuzminTracer::new(temp, temp_references, columns),
+        KuzminTracer::new(salt, salt_references, columns),
+    ];
+    let local = |i: usize, level: usize| i * n_levels + level;
+    // Element `e`'s column at height `z` (near `level`): where its layer
+    // means bracket `z`, shared by both tracers
+    let bracket_at = |e: usize, z: f64, level: usize| {
         let column = e * n_levels..(e + 1) * n_levels;
-        averages[column.start + level].is_finite().then(|| {
-            column_at_height(
-                &averages[column.clone()],
-                &heights[column],
-                end_ranges[e],
-                z,
-                level,
-            )
-        })
-    };
-    // The range over `elements`' columns at height `z`: each column's value
-    // there and the means of its two layers bracketing `z`, widened by
-    // `relaxation` and by round-off relative to the tracer's `scale`
-    let bounds_at = |elements: &[usize], z: f64, level: usize, scale: f64| {
-        let (bound_min, bound_max) = elements
-            .iter()
-            .filter_map(|&e| {
-                column_at(e, z, level)
-                    .map(|(value, a, b)| (value.min(a).min(b), value.max(a).max(b)))
-            })
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (a, b)| {
-                (lo.min(a), hi.max(b))
-            });
-        relaxed_bounds(bound_min, bound_max, relaxation, scale)
+        HeightBracket::find(&heights[column], z, level)
     };
 
     let block_stats = reduce_blocks(
         n_elements,
-        [&mut field[..n_elements * n_nodes * n_levels]],
+        [&mut temp[..n_values], &mut salt[..n_values]],
         || Pooled::take(|_: &KuzminScratch| true, KuzminScratch::default),
-        |scratch, k, [field]| {
+        |scratch, k, fields| {
             let KuzminScratch {
                 patches,
                 height,
-                reference,
-                value,
-                base,
-                weight,
-                bounds,
-                scale,
+                tracers: tracer_scratch,
             } = &mut **scratch;
             let mut stats = TracerLimiter3DStats::default();
             let element = ElementIndex::new(k);
@@ -1002,117 +1080,184 @@ fn apply_horizontal_kuzmin_field(
             }
 
             for (level, &ds) in columns.sigma.d_sigma().iter().enumerate().take(n_levels) {
-                if !averages[k * n_levels + level].is_finite() {
+                // The tracers with water in this layer, and of those the ones
+                // with a node outside its own column's bounds alone (which its
+                // patch's contain, the element being in every patch): only
+                // they can be limited, and only they read the patches
+                let present = tracers
+                    .each_ref()
+                    .map(|t| t.averages[k * n_levels + level].is_finite());
+                if !present.iter().any(|&p| p) {
                     continue;
                 }
-                // The element's own column at each node's height, `T̂_i`
-                for buffer in [
-                    &mut *height,
-                    &mut *reference,
-                    &mut *value,
-                    &mut *base,
-                    &mut *weight,
-                    &mut *scale,
-                ] {
-                    buffer.clear();
+                height.clear();
+                for scratch in tracer_scratch.iter_mut() {
+                    for buffer in [
+                        &mut scratch.reference,
+                        &mut scratch.value,
+                        &mut scratch.base,
+                        &mut scratch.weight,
+                        &mut scratch.scale,
+                    ] {
+                        buffer.clear();
+                    }
                 }
-                let (mut weight_sum, mut departure) = (0.0, 0.0);
-                // Whether every node is within its own column's bounds alone,
-                // which its patch's contain (the element is in every patch):
-                // then nothing is limited, and the patches need not be read
-                let mut within_own = true;
+                // The element's own column at each node's height, `T̂_i`
+                let mut weight_sum = [0.0; 2];
+                let mut departure = [0.0; 2];
+                let mut within_own = [true; 2];
                 for i in 0..n_nodes {
                     let z = columns.centre_height(element, i, level);
-                    let Some((own, lower, upper)) = column_at(k, z, level) else {
-                        break;
-                    };
-                    let node_reference = reference_at(k, i, level);
-                    let node_value = field[index(i, level)] - node_reference;
+                    let bracket = bracket_at(k, z, level);
+                    height.push(z);
                     let node_weight = columns.geom.node_mass(k, i)
                         * layer_thickness(columns.eta, columns.bathymetry, element, i, ds);
-                    let node_scale = field[index(i, level)].abs().max(node_reference.abs());
-                    let (lo, hi) = relaxed_bounds(
-                        own.min(lower).min(upper),
-                        own.max(lower).max(upper),
-                        relaxation,
-                        node_scale,
-                    );
-                    within_own &= (lo..=hi).contains(&node_value);
-                    weight_sum += node_weight;
-                    departure += node_weight * (node_value - own);
-                    height.push(z);
-                    reference.push(node_reference);
-                    value.push(node_value);
-                    base.push(own);
-                    weight.push(node_weight);
-                    scale.push(node_scale);
+                    for c in 0..2 {
+                        if !present[c] {
+                            continue;
+                        }
+                        let (tracer, scratch, field) =
+                            (&tracers[c], &mut tracer_scratch[c], &*fields[c]);
+                        let (own, lower, upper) = tracer
+                            .column_at(k, &bracket, level, n_levels)
+                            .expect("the layer has water");
+                        let node_reference =
+                            tracer.references[index(k, i, level, n_nodes, n_levels)];
+                        let node_value = field[local(i, level)] - node_reference;
+                        let node_scale = field[local(i, level)].abs().max(node_reference.abs());
+                        let (lo, hi) = relaxed_bounds(
+                            own.min(lower).min(upper),
+                            own.max(lower).max(upper),
+                            relaxation,
+                            node_scale,
+                        );
+                        within_own[c] &= (lo..=hi).contains(&node_value);
+                        weight_sum[c] += node_weight;
+                        departure[c] += node_weight * (node_value - own);
+                        scratch.reference.push(node_reference);
+                        scratch.value.push(node_value);
+                        scratch.base.push(own);
+                        scratch.weight.push(node_weight);
+                        scratch.scale.push(node_scale);
+                    }
                 }
-                if base.len() < n_nodes || within_own {
+                let limit = [0, 1].map(|c| present[c] && !within_own[c]);
+                if !limit.iter().any(|&l| l) {
                     continue;
                 }
                 // The bounds: every vertex within its own patch's, every other
-                // node (P2 and up) within the union's
-                bounds.clear();
+                // node (P2 and up) within the union's. Each column's range at
+                // a node's height, widened by `relaxation` and by round-off
+                // relative to the tracer's scale
+                for (c, scratch) in tracer_scratch.iter_mut().enumerate() {
+                    if limit[c] {
+                        scratch.bounds.clear();
+                    }
+                }
                 for i in 0..n_nodes {
                     let patch = match node_to_vertex(i, columns.ops.n_1d) {
                         Some(local_vertex) => mesh.elements_at_vertex(vertices[local_vertex]),
                         None => &patches[..],
                     };
-                    bounds.push(bounds_at(patch, height[i], level, scale[i]));
+                    let mut range = [(f64::INFINITY, f64::NEG_INFINITY); 2];
+                    for &e in patch {
+                        let bracket = bracket_at(e, height[i], level);
+                        for c in 0..2 {
+                            if !limit[c] {
+                                continue;
+                            }
+                            if let Some((value, a, b)) =
+                                tracers[c].column_at(e, &bracket, level, n_levels)
+                            {
+                                let (lo, hi) = range[c];
+                                range[c] =
+                                    (lo.min(value.min(a).min(b)), hi.max(value.max(a).max(b)));
+                            }
+                        }
+                    }
+                    for c in 0..2 {
+                        if limit[c] {
+                            let scratch = &mut tracer_scratch[c];
+                            let (bound_min, bound_max) = range[c];
+                            scratch.bounds.push(relaxed_bounds(
+                                bound_min,
+                                bound_max,
+                                relaxation,
+                                scratch.scale[i],
+                            ));
+                        }
+                    }
                 }
 
-                // The limited state at `α = 0`: `T̂` shifted by the departure's
-                // mean `m` to keep the inventory. The shift goes into each
-                // node's room within its bounds (`T̂_i` is one of its
-                // candidates) in proportion to it, then into the room within
-                // the element's widest bounds, then (if not even those hold
-                // the layer's mean) uniformly. A shift as a factor on the
-                // column's structure, or a fallback to the layer's mean, would
-                // be ill-conditioned: that structure vanishes at nodes near the
-                // layer's mean height, where a round-off violation would set
-                // the factor, and flattening it over a slope drives a flow.
-                let m = departure / weight_sum;
-                let mut need = m.abs() * weight_sum;
-                let widest = bounds
-                    .iter()
-                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(lo, hi)| {
-                        (a.min(lo), b.max(hi))
-                    });
-                let room_of = |own: f64, (lo, hi): (f64, f64)| {
-                    if m > 0.0 { hi - own } else { own - lo }.max(0.0)
-                };
-                for tier in 0..2 {
-                    let node_bounds = |i: usize| if tier == 0 { bounds[i] } else { widest };
-                    let room: f64 = (0..n_nodes)
-                        .map(|i| weight[i] * room_of(base[i], node_bounds(i)))
-                        .sum();
-                    if need <= 0.0 || !room.is_finite() || room <= 0.0 {
+                for c in 0..2 {
+                    if !limit[c] {
                         continue;
                     }
-                    let fraction = (need / room).min(1.0);
-                    for (i, own) in base.iter_mut().enumerate() {
-                        *own += m.signum() * fraction * room_of(*own, node_bounds(i));
+                    let KuzminTracerScratch {
+                        reference,
+                        value,
+                        base,
+                        weight,
+                        bounds,
+                        ..
+                    } = &mut tracer_scratch[c];
+                    let weight_sum = weight_sum[c];
+                    // The limited state at `α = 0`: `T̂` shifted by the
+                    // departure's mean `m` to keep the inventory. The shift
+                    // goes into each node's room within its bounds (`T̂_i` is
+                    // one of its candidates) in proportion to it, then into the
+                    // room within the element's widest bounds, then (if not
+                    // even those hold the layer's mean) uniformly. A shift as a
+                    // factor on the column's structure, or a fallback to the
+                    // layer's mean, would be ill-conditioned: that structure
+                    // vanishes at nodes near the layer's mean height, where a
+                    // round-off violation would set the factor, and flattening
+                    // it over a slope drives a flow.
+                    let m = departure[c] / weight_sum;
+                    let mut need = m.abs() * weight_sum;
+                    let widest = bounds
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(lo, hi)| {
+                            (a.min(lo), b.max(hi))
+                        });
+                    let room_of = |own: f64, (lo, hi): (f64, f64)| {
+                        if m > 0.0 { hi - own } else { own - lo }.max(0.0)
+                    };
+                    for tier in 0..2 {
+                        let node_bounds = |i: usize| if tier == 0 { bounds[i] } else { widest };
+                        let room: f64 = (0..n_nodes)
+                            .map(|i| weight[i] * room_of(base[i], node_bounds(i)))
+                            .sum();
+                        if need <= 0.0 || !room.is_finite() || room <= 0.0 {
+                            continue;
+                        }
+                        let fraction = (need / room).min(1.0);
+                        for (i, own) in base.iter_mut().enumerate() {
+                            *own += m.signum() * fraction * room_of(*own, node_bounds(i));
+                        }
+                        need -= need.min(room);
                     }
-                    need -= need.min(room);
-                }
-                for own in base.iter_mut() {
-                    *own += m.signum() * need / weight_sum;
-                }
+                    for own in base.iter_mut() {
+                        *own += m.signum() * need / weight_sum;
+                    }
 
-                let alpha = (0..n_nodes)
-                    .map(|i| {
-                        let (lo, hi) = bounds[i];
-                        compute_kuzmin_alpha(base[i], value[i], lo, hi)
-                    })
-                    .fold(1.0_f64, f64::min);
-                if alpha >= 1.0 - LIMITER_EPS {
-                    continue;
-                }
+                    let alpha = (0..n_nodes)
+                        .map(|i| {
+                            let (lo, hi) = bounds[i];
+                            compute_kuzmin_alpha(base[i], value[i], lo, hi)
+                        })
+                        .fold(1.0_f64, f64::min);
+                    if alpha >= 1.0 - LIMITER_EPS {
+                        continue;
+                    }
 
-                for i in 0..n_nodes {
-                    field[index(i, level)] = reference[i] + base[i] + alpha * (value[i] - base[i]);
+                    let field = &mut *fields[c];
+                    for i in 0..n_nodes {
+                        field[local(i, level)] =
+                            reference[i] + base[i] + alpha * (value[i] - base[i]);
+                    }
+                    stats.record_limited(COMPONENTS[c]);
                 }
-                stats.record_limited(component);
             }
             stats
         },
@@ -1122,10 +1267,12 @@ fn apply_horizontal_kuzmin_field(
     *stats = stats.merged(block_stats);
 }
 
-/// A column's layer `means` (at `heights`, bottom first) at height `z`,
-/// searching from `level`: `(value, lower, upper)`, the means interpolated
-/// linearly to `z` (exact for a tracer linear in `z`) and the means of the
-/// two layers whose heights bracket `z` (the end pair beyond them).
+/// Where a column's layer-mean heights (bottom first) bracket a height `z`,
+/// found once for every tracer ([`Self::find`], searching from `level`). Its
+/// [`Self::column_value`] of a tracer's layer `means` is `(value, lower,
+/// upper)`: the means interpolated linearly to `z` (exact for a tracer linear
+/// in `z`) and the means of the two layers whose heights bracket `z` (the end
+/// pair beyond them).
 ///
 /// Beyond its end layers' means the value extrapolates the end pair, clamped
 /// to the range of the column's nodal values in that end layer
@@ -1147,38 +1294,70 @@ fn apply_horizontal_kuzmin_field(
 /// about half as many. On a flat bed a node's own layer is one of the pair: a
 /// sharp interface between layers is bounded by both water masses' means
 /// (the lock exchanges stay in range to 5e-12 °C).
-fn column_at_height(
-    means: &[f64],
-    heights: &[f64],
-    end_ranges: [f64; 4],
-    z: f64,
-    level: usize,
-) -> (f64, f64, f64) {
-    let n = means.len();
-    if n == 1 {
-        return (means[0], means[0], means[0]);
+struct HeightBracket {
+    /// The lower layer of the pair.
+    lo: usize,
+    /// `(z − z_lo)/(z_hi − z_lo)`, or `None` for coincident heights.
+    fraction: Option<f64>,
+    /// `z` below the bottom layer's height (−1), above the top's (+1), or
+    /// within them (0).
+    beyond: i8,
+    /// A column of one layer.
+    single: bool,
+}
+
+impl HeightBracket {
+    #[inline]
+    fn find(heights: &[f64], z: f64, level: usize) -> Self {
+        let n = heights.len();
+        if n == 1 {
+            return Self {
+                lo: 0,
+                fraction: None,
+                beyond: 0,
+                single: true,
+            };
+        }
+        let mut lo = level.min(n - 2);
+        while lo > 0 && z < heights[lo] {
+            lo -= 1;
+        }
+        while lo + 2 < n && z > heights[lo + 1] {
+            lo += 1;
+        }
+        let spacing = heights[lo + 1] - heights[lo];
+        Self {
+            lo,
+            fraction: (spacing > 0.0).then(|| (z - heights[lo]) / spacing),
+            beyond: if z < heights[0] {
+                -1
+            } else if z > heights[n - 1] {
+                1
+            } else {
+                0
+            },
+            single: false,
+        }
     }
-    let mut lo = level.min(n - 2);
-    while lo > 0 && z < heights[lo] {
-        lo -= 1;
+
+    /// The column's `(value, lower, upper)` from its layer `means`.
+    #[inline]
+    fn column_value(&self, means: &[f64], end_ranges: [f64; 4]) -> (f64, f64, f64) {
+        if self.single {
+            return (means[0], means[0], means[0]);
+        }
+        let (lower, upper) = (means[self.lo], means[self.lo + 1]);
+        let Some(fraction) = self.fraction else {
+            return (0.5 * (lower + upper), lower, upper);
+        };
+        let value = lower + fraction * (upper - lower);
+        let value = match self.beyond {
+            -1 => value.clamp(end_ranges[0], end_ranges[1]),
+            1 => value.clamp(end_ranges[2], end_ranges[3]),
+            _ => value,
+        };
+        (value, lower, upper)
     }
-    while lo + 2 < n && z > heights[lo + 1] {
-        lo += 1;
-    }
-    let (lower, upper) = (means[lo], means[lo + 1]);
-    let spacing = heights[lo + 1] - heights[lo];
-    if spacing <= 0.0 {
-        return (0.5 * (lower + upper), lower, upper);
-    }
-    let value = lower + (z - heights[lo]) / spacing * (upper - lower);
-    let value = if z < heights[0] {
-        value.clamp(end_ranges[0], end_ranges[1])
-    } else if z > heights[n - 1] {
-        value.clamp(end_ranges[2], end_ranges[3])
-    } else {
-        value
-    };
-    (value, lower, upper)
 }
 
 /// `[bound_min, bound_max]` widened by `relaxation` (≥ 1) times its range,
@@ -1491,6 +1670,38 @@ mod tests {
             (before - after).abs() < 1e-10,
             "inventory changed: before={before}, after={after}"
         );
+    }
+
+    /// The lookup on evenly spaced heights finds the binary search's sample
+    /// for every height: between, at and beyond the samples, and NaN.
+    #[test]
+    fn the_even_lookup_is_the_search() {
+        let profile = TracerReferenceProfile::from_fn(-381.7, 1.0, 4001, |z| (z, -z));
+        let samples = profile.samples(TracerComponent::Temperature);
+        assert!(samples.inverse_spacing.is_some());
+        let heights = &profile.heights;
+        let mut probes: Vec<f64> = heights.clone();
+        probes.extend(heights.windows(2).map(|p| 0.5 * (p[0] + p[1])));
+        probes.extend(heights.iter().map(|&h| h.next_up()));
+        probes.extend(heights.iter().map(|&h| h.next_down()));
+        probes.extend([
+            -1e9,
+            -381.71,
+            1.01,
+            1e9,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ]);
+        for z in probes {
+            assert_eq!(
+                first_at_or_above(heights, samples.inverse_spacing, z),
+                heights.partition_point(|&h| h < z),
+                "z = {z}"
+            );
+        }
+        let uneven = TracerReferenceProfile::new(vec![0.0, 1.0, 3.0], vec![0.0; 3], vec![0.0; 3]);
+        assert!(uneven.inverse_spacing.is_none());
     }
 
     /// The cubic reference reproduces a cubic profile, and is constant
