@@ -127,28 +127,24 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **F.4** Low priority: mask sources at dry nodes in mixed DIA chunks (≤ 2–3 ms of 105); a dry-node list for `absorb_on_land`; a wind-only atmosphere snapshot on the wave mesh.
 
 #### Viewer
-- [ ] **F.4** H_s and the force per node in the coupled run's snapshots; H_s/direction colouring and arrows, a breaking map, Gerstner waves from each node's spectrum.
+- [ ] **F.4** The waves' force per node in the coupled run's snapshots (arrows of what drives the wave-driven currents); per-component amplitudes from each node's spectrum in the photo view, so directions can turn within a view (`notes/waves.md` Viewer).
+- [ ] **F.4** A wave model in the viewer's live Frøya scenario (`viz/src/solver.rs` runs `run_with_callback`; `CoupledWaves2D` and `run_with_exchange` as `froya_real_data`), so the wave colourings work live, not only in replays.
 
 ## Viewer (F.3) — [notes/viz.md](notes/viz.md)
 
-- [ ] **F.3** `dg-viz` does not build: `viz/src/main.rs:879` reads `TimeSeries.data`, private since `TimeSeries` moved to `times`/`values` (found 2026-10-19; `cd viz && cargo check`).
 - [ ] **F.3** Separate physics from σ-truncation in the fjord3d rest-state flow under GLS (3.6e-5 m/s at 1 h, growing): halve level spacing and κ in turn, compare with Phillips's boundary-layer velocity.
 - [ ] **F.3** Compare the fjord3d cage wake at P1 on 40 m quads with the 2D 20 m run, a 3D P2 run and the integrated `CageDrag2D` drag (3D LTS would allow P2, see P1.3).
-- [ ] **F.3** Write `froya_real_data`'s `Clock:` line to `<output>/run.log` or a `clock.txt` the viewer reads (VTU replays lack date and gauge).
-- [ ] **F.3** Find which material's shader defs cause Bevy's `pbr_fragment` WGSL error (`cannot find declaration of uv`), likely `viz/src/shaders/water.wesl`, before Bevy 0.20 ships.
-- [ ] **F.3** An app-level test (`MinimalPlugins`, `switch` twice) that toggling the photo view restores the chart view's materials, light, clear colour and HDR.
-- [ ] **F.3** Switch runs in one window: build scenario, terrain and resources `OnEnter` a run state; keep terrain between replays of one domain.
+- [ ] **F.3** Switch runs in one window: build scenario, terrain and resources `OnEnter` a run state (the plugins' `Startup` systems there, their entities despawned and the solver thread stopped on leaving; `Inspector::new` leaks its mesh for a `'static` locator); keep terrain between replays of one domain. Then the menu bar's Run menu can open another run or file and save a snapshot, and "Back to the list of runs" is a state change, not a new process.
 - [ ] **F.3** More menu options: threads, order, LTS levels, particles, sites (`data/sites/*.txt`), places, terrain patches.
-- [ ] **F.3** Draw the run's own `station_mausund.txt` (10-min samples) in the gauge trace for hourly VTU runs (hourly frames clip peaks ≈ 3 %).
+- [ ] **F.3** Report to Bevy: `pbr_fragment.wesl` reads `uv` with only `VERTEX_UVS_B` set (a mesh with `UV_1` and no `UV_0`; still so in 0.20.0); `terrain.rs` carries an unused `UV_0` until then.
 - [ ] **F.3** The 15-day Frøya run with 10-minute frames (≈ 4 h, 2.3k frames) for on-demand replay.
 - [ ] **F.3** A close-up of tidal flats wetting and drying: find a resolved flat, add a `--place`.
 - [ ] **F.3** Offline connectivity from `.dgsnap`/`.dgpart` (needs each particle's source cage and interpolation between frames), or record online.
 - [ ] **F.3** Save the solver state on live saves, not the viewer's f32 snapshot; add S to the viewer's `Layers`.
-- [ ] **F.3** Drive the photo view's sea from the F.4 wave model (H_s, T_p, direction per node) and its wind from `AtmosphereReader`; ride the waves on the top σ-layer's current in 3D.
-- [ ] **F.3** A movable, see-through 3D section (cross-channel behind the cages, or placed with the mouse); a temperature scale that follows the field.
+- [ ] **F.3** The photo view's wind (short waves, whitecaps) from the run's weather: the 10 m wind as two more surface fields of the snapshot (`met=` runs), in place of `--wind`; ride the waves on the top σ-layer's current in 3D.
 - [ ] **F.3** Builders in `viz/` for other live scenarios (nested runs, the Mausund sub-domain).
 - [ ] **F.3** Cut terrain patches out of coarser patches too, so overlapping patches work; a world-space label per farm site.
-- [ ] **F.3** Measure the photo view's GPU cost (32 waves × 2 phases × 3 noises per pixel); bake into a height/slope texture if too slow. Make the wave-group noise periodic over the hourly `misc.z` wrap.
+- [ ] **F.3** The photo view costs ≈ 15 ms a frame over the chart view (21.6 against 5.4 ms at 4000 × 2250 on an RTX 4060 Laptop, `dg-viz --frame-times`): bake the waves into a tiled height/slope texture once per frame if a slower GPU or more waves need it. Make the wave-group noise periodic over the hourly `misc.z` wrap.
 - [ ] **F.3** Reflections of land, cages and frame (SSR or a planar reflection) and shadows for low sun; shallow-water optics (caustics, bed refraction, swash foam).
 - [ ] **F.3** Particle trails, and a density field instead of points for 10⁵+ particles.
 - [ ] **F.3** Low priority: a bucket grid for terrain boundary snapping (0.2 s at 7k segments); `bracket` returning nothing on a far seek until both frames arrive.
@@ -281,6 +277,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## 3D: numerics (P4.2, P4.3, P4.5) — [notes/3d-numerics.md](notes/3d-numerics.md)
 
+- [ ] **P4.5** Dry nodes' tracers drift (28.8 °C at element 7601, 57 h, in `output/froya_3day/3d_rk43`, wet neighbours 10.4; 10.3 again once wet): not the surface fluxes (thin columns get none), so the shoreline subcell or `from_inventory` transport. Hold a dry node's T and S at their last wet values, so no consumer of the state needs a mask (the viewer's readout has one: `Probe::eval_level_wet`).
 - [ ] **P4.3** Fix the cliff-shore class instead of masking it: `cliffs3d` (20 m since 2026-10-17, 40 blew up the 72 h run at 37 h) makes land of 15.3 km² of shore water at MSL. A shore column within an element whose other nodes are ≥ 20 m deep runs away near high water once it is resolved (≈ 1 m of 5 cm layers beside 1.4 m ones): a thin-column criterion relative to the element's deepest node (subcells while D < c·D_max), or the pressure gradient and advection between such columns (`notes/geometry-mesh.md` cliff shores).
 - [ ] **P4.5** The 72 h nested run at 150 s per model hour: 199 since 2026-10-19 (SSP-RK(4,3) stages, `notes/3d-numerics.md` "Third depth pass"; day 1 160, day 2 230), ≈ 1010 ms per 16 s step on the 70 h bench: 3D stages 546 (4 × transport RHS 60, momentum RHS 33, limiter 33), barotropic pass 274, post_process 56, slow forcing 40, vertical implicit 39. The levers are the lines below, the largest 3D local time stepping.
 - [ ] **P4.5** Local time stepping in the 3D stages (on `MultirateStepper`'s schedule, as the barotropic pass): the step is set by a few shoreline elements 1–2.4 m deep with ≈ 1 m/s; the ideal gain is 3.3–4.6× at 2–4 levels at 70 h and 3.8× / 5.4× / 5.8× at 2 / 3 / 4 levels on day 2's hard hours (own steps' p1 3×, median 9.5× the smallest; `froya_real_data debug_3d=dt_dist`). The stage hooks (the limiter's patches, the conversions) and the barotropic coupling's constant rates need a subset form.

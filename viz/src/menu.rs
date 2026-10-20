@@ -260,16 +260,15 @@ impl Menu {
             live(
                 "channel",
                 "Farm channel in 3D",
-                "A stratified channel with σ-layers: a section through a cage, lice \
-                 larvae, faeces and feed",
+                "A stratified channel with σ-layers around two cages, lice larvae, \
+                 faeces and feed",
                 None,
             ),
             live(
                 "fjord3d",
                 "Fjord farm in 3D",
-                "The fjord's tide over a brackish layer and a thermocline: σ-layers, a \
-                 section along the fjord through the cages, larvae diving out of the \
-                 fresh water",
+                "The fjord's tide over a brackish layer and a thermocline: σ-layers, \
+                 larvae diving out of the fresh water",
                 (!has("tests/data/gmsh/fjord_farm_3d.msh"))
                     .then(|| "needs tests/data/gmsh/fjord_farm_3d.msh".into()),
             ),
@@ -487,8 +486,7 @@ fn scan(dir: &Path, depth: usize, out: &mut Vec<Entry>) {
     }
     if !frames.is_empty() {
         let bytes: u64 = frames.iter().map(|f| f.0).sum();
-        let clock = std::fs::read_to_string(dir.join("run.log"))
-            .is_ok_and(|log| log.contains("Clock: t = 0 at"));
+        let clock = crate::replay::folder_clock(dir).is_some();
         out.push(Entry {
             kind: Kind::Frames,
             title: format!("{}/", shown_path(dir)),
@@ -496,7 +494,7 @@ fn scan(dir: &Path, depth: usize, out: &mut Vec<Entry>) {
                 "{} VTU frames, {}{}",
                 frames.len(),
                 size(bytes),
-                if clock { "" } else { ", no run.log (no date)" }
+                if clock { "" } else { ", no clock (no date)" }
             ),
             modified: frames.iter().filter_map(|f| f.1).max(),
             path: Some(dir.to_path_buf()),
@@ -542,16 +540,12 @@ fn details(entry: &Entry) -> String {
             snapshot_details(path).unwrap_or_else(|e| format!("cannot read it: {e}"))
         }
         (Kind::Frames, Some(dir)) => {
-            let log = std::fs::read_to_string(dir.join("run.log")).unwrap_or_default();
-            let clock = log
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("Clock: t = 0 at "))
-                .map_or(
-                    "No run.log with the run's clock: no date, and no gauge in the trace. \
-                     Write one with the run's `Clock: t = 0 at …` line."
-                        .to_string(),
-                    |c| format!("Starts {c}."),
-                );
+            let clock = crate::replay::folder_clock(dir).map_or(
+                "No clock.txt or run.log with the run's clock: no date, and no gauge in the \
+                 trace. Write a clock.txt with the run's `Clock: t = 0 at …` line."
+                    .to_string(),
+                |c| format!("Starts {} UTC.", c.format(0.0)),
+            );
             format!(
                 "Frames of `froya_real_data mesh=data/froya_coast.msh`, replayed on the \
                  Frøya scenario built as the run was. {clock} Saving writes froya.dgsnap \

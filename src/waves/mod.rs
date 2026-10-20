@@ -39,7 +39,7 @@ pub mod stokes;
 pub use boundary::{BoundarySpectra, PointSpectra, WindSeries, regrid_spectrum};
 pub use coupling::{
     CoupledWaves2D, CoupledWavesStats, DEFAULT_BED_ROUGHNESS, DEFAULT_COUPLING_H_DRY,
-    WaveCoupling2D, WaveForceForm,
+    SeaStateFields, WaveCoupling2D, WaveForceForm,
 };
 pub use dispersion::{dsigma_ddepth, group_velocity, group_velocity_ratio, wavenumber};
 pub use model::{

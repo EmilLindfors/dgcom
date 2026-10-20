@@ -1,9 +1,12 @@
 //! An orbit camera: left-drag turns about the focus, right- or middle-drag (or
-//! Shift+left-drag) slides the focus over the water, the wheel zooms. F frames the
-//! farm, O the whole domain, 1 to 9 the scenario's named places.
+//! Shift+left-drag) slides the focus over the water, the wheel zooms. [`Views`] are
+//! the framings to jump to (in the viewer F the farm, O the whole domain, 1 to 9 the
+//! scenario's named places; the jumps are the viewer's actions, not this module's,
+//! which `surf_zone` shares).
 
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 
 #[derive(Component, Clone, Copy, Debug)]
 pub struct OrbitCamera {
@@ -36,18 +39,15 @@ pub struct Views {
     pub places: Vec<(String, OrbitCamera)>,
 }
 
-/// The number keys, 1 to 9.
-pub const DIGITS: [KeyCode; 9] = [
-    KeyCode::Digit1,
-    KeyCode::Digit2,
-    KeyCode::Digit3,
-    KeyCode::Digit4,
-    KeyCode::Digit5,
-    KeyCode::Digit6,
-    KeyCode::Digit7,
-    KeyCode::Digit8,
-    KeyCode::Digit9,
-];
+/// A rectangle of the window (logical px) over which drags do not move the view: an
+/// inset such as the minimap, which takes its own clicks.
+#[derive(Resource, Default)]
+pub struct Inset(pub Option<Rect>);
+
+/// Whether the cursor is over the menus or the help ([`crate::menubar`]), which take
+/// its clicks and the wheel.
+#[derive(Resource, Default)]
+pub struct OverUi(pub bool);
 
 pub struct CameraPlugin;
 
@@ -57,33 +57,33 @@ impl Plugin for CameraPlugin {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // a Bevy system's parameters are its queries
 fn input(
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
-    views: Res<Views>,
+    inset: Option<Res<Inset>>,
+    over_ui: Option<Res<OverUi>>,
+    window: Query<&Window, With<PrimaryWindow>>,
     mut cameras: Query<&mut OrbitCamera>,
+    mut on_inset: Local<bool>,
 ) {
     let Ok(mut orbit) = cameras.single_mut() else {
         return;
     };
-    if keys.just_pressed(KeyCode::KeyF) {
-        *orbit = views.farm;
+    let over_ui = over_ui.is_some_and(|o| o.0);
+    // A drag that starts on the inset or the menus does not move the view
+    if mouse.any_just_pressed([MouseButton::Left, MouseButton::Right, MouseButton::Middle]) {
+        let cursor = window.single().ok().and_then(Window::cursor_position);
+        let rect = inset.as_ref().and_then(|inset| inset.0);
+        *on_inset = over_ui || matches!((cursor, rect), (Some(c), Some(r)) if r.contains(c));
     }
-    if keys.just_pressed(KeyCode::KeyO) {
-        *orbit = views.domain;
-    }
-    for ((_, view), key) in views.places.iter().zip(DIGITS) {
-        if keys.just_pressed(key) {
-            *orbit = *view;
-        }
-    }
+    let d = if *on_inset { Vec2::ZERO } else { motion.delta };
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let pan = mouse.pressed(MouseButton::Right)
         || mouse.pressed(MouseButton::Middle)
         || (shift && mouse.pressed(MouseButton::Left));
-    let d = motion.delta;
     if pan && d != Vec2::ZERO {
         // Along the ground: the view's right and its forward flattened.
         let (sin, cos) = orbit.yaw.sin_cos();
@@ -99,7 +99,7 @@ fn input(
         MouseScrollUnit::Line => scroll.delta.y,
         MouseScrollUnit::Pixel => scroll.delta.y / 40.0,
     };
-    if notches != 0.0 {
+    if notches != 0.0 && !over_ui {
         orbit.distance = (orbit.distance * (-0.12 * notches).exp()).clamp(5.0, 200_000.0);
     }
 }

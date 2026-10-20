@@ -32,6 +32,7 @@
 //! the wheel zooms.
 
 #[path = "../camera.rs"]
+#[allow(dead_code)] // the viewer's named places: the beach has none
 mod camera;
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
@@ -799,7 +800,20 @@ fn spawn(
     ));
 }
 
-fn keys(keys: Res<ButtonInput<KeyCode>>, mut beach: ResMut<Beach>) {
+fn keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    views: Res<Views>,
+    mut beach: ResMut<Beach>,
+    mut cameras: Query<&mut OrbitCamera>,
+) {
+    if let Ok(mut orbit) = cameras.single_mut() {
+        if keys.just_pressed(KeyCode::KeyF) {
+            *orbit = views.farm;
+        }
+        if keys.just_pressed(KeyCode::KeyO) {
+            *orbit = views.domain;
+        }
+    }
     if keys.just_pressed(KeyCode::Digit1) {
         beach.shown = 0;
     }

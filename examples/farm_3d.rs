@@ -462,9 +462,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .collect();
                 let poi = format!("{},{}", farm[0], farm[1]);
-                // Along the flow through the first cage
-                let (x0, y0) = (centres[0][0], centres[0][1]);
-                let section = format!("{},{y0},{},{y0}", x0 - 600.0, x0 + 600.0);
                 let periodic = format!("{LX},inf");
                 let mut metadata = vec![
                     (
@@ -473,7 +470,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                     ("source", "farm_3d"),
                     ("point_of_interest", poi.as_str()),
-                    ("section", section.as_str()),
                     ("periodic", periodic.as_str()),
                 ];
                 metadata.extend(cage_lines.iter().map(|c| ("cage", c.as_str())));

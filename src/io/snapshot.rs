@@ -11,10 +11,14 @@
 //! they are `Solution3D`'s η, ū, v̄, followed by its u, v, T and S on every level,
 //! `[node][level]` from the bed up ([`SOLUTION_3D_FIELDS`]).
 //!
+//! A file can also carry *surface fields*, more fields of one value per node after
+//! η, u and v ([`SnapshotLayout::surface`]): a coupled wave run's sea state
+//! ([`crate::waves::SeaStateFields`]) is written so.
+//!
 //! # Format (little-endian)
 //!
 //! ```text
-//! magic        8 bytes   b"DGSNAP\0\x02" (format version 2; version 1 is read too)
+//! magic        8 bytes   b"DGSNAP\0\x03" (format version 3; versions 1 and 2 are read too)
 //! header_len   u64       bytes of the header that follows; frames start after it
 //! header:
 //!   order                u32
@@ -30,10 +34,13 @@
 //!     sigma_rho          f64 × n_levels, the layer centres
 //!     stretching         u64 bytes of UTF-8, its name
 //!     n_fields           u32, then per field u64 bytes of UTF-8, its name
+//!   n_surface            u32 (version 3; none before), then per surface field
+//!                        u64 bytes of UTF-8, its name
 //! frames, each:
 //!   t                    f64 (model time, s)
 //!   eta, u, v            f32 per node each
-//!   per field            f32 per node and level, [node][level]
+//!   per surface field    f32 per node
+//!   per layered field    f32 per node and level, [node][level]
 //! ```
 //!
 //! Boundary kinds: 0 wall, 1 open, 2 tidal forcing, 3 periodic (value: group),
@@ -57,7 +64,7 @@ use crate::vertical::SigmaGrid;
 
 /// The magic number without its version byte, and the version written.
 const MAGIC: &[u8; 7] = b"DGSNAP\0";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 /// The layered fields of a 3D snapshot ([`SnapshotWriter::create_3d`]): velocity
 /// along the σ-layers (m/s), temperature (°C) and salinity.
@@ -88,6 +95,17 @@ pub struct SnapshotHeader {
     pub metadata: Vec<(String, String)>,
     /// The σ-grid and the layered fields of a 3D run
     pub levels: Option<SnapshotLevels>,
+    /// Names of the surface fields (one value per node), in frame order
+    pub surface: Vec<String>,
+}
+
+/// What a snapshot file's frames hold besides η, u and v.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SnapshotLayout<'a> {
+    /// Fields of one value per node, by name
+    pub surface: &'a [&'a str],
+    /// The σ-grid and the fields on every level of a 3D run
+    pub levels: Option<(&'a SigmaGrid, &'a [&'a str])>,
 }
 
 /// The vertical of a 3D snapshot.
@@ -124,20 +142,28 @@ impl SnapshotHeader {
         self.levels.as_ref().map_or(0, |l| l.sigma.n_levels())
     }
 
+    /// Index of the surface field `name` in a frame's `surface`.
+    pub fn surface_field(&self, name: &str) -> Option<usize> {
+        self.surface.iter().position(|f| f == name)
+    }
+
     /// Bytes of one frame.
     fn frame_bytes(&self) -> usize {
         let n_fields = self.levels.as_ref().map_or(0, |l| l.fields.len());
-        8 + 4 * self.n_points() * (3 + n_fields * self.n_levels())
+        8 + 4 * self.n_points() * (3 + self.surface.len() + n_fields * self.n_levels())
     }
 }
 
-/// One frame: model time, η, u, v at every node, and in 3D the layered fields.
+/// One frame: model time, η, u, v at every node, the surface fields, and in 3D the
+/// layered fields.
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotFrame {
     pub t: f64,
     pub eta: Vec<f32>,
     pub u: Vec<f32>,
     pub v: Vec<f32>,
+    /// Per surface field ([`SnapshotHeader::surface`]), one value per node
+    pub surface: Vec<Vec<f32>>,
     /// Per layered field ([`SnapshotLevels::fields`]), `[node][level]`
     pub layers: Vec<Vec<f32>>,
 }
@@ -147,6 +173,8 @@ pub struct SnapshotWriter {
     out: BufWriter<File>,
     bed: Vec<f64>,
     h_min: Depth,
+    /// Surface fields per frame
+    n_surface: usize,
     /// Levels and layered fields per frame (0 in 2D)
     n_levels: usize,
     n_fields: usize,
@@ -169,7 +197,16 @@ impl SnapshotWriter {
         metadata: &[(&str, &str)],
         h_min: f64,
     ) -> Result<Self, SnapshotError> {
-        Self::create_with(path, mesh, ops, bathymetry, clock, metadata, h_min, None)
+        Self::create_with(
+            path,
+            mesh,
+            ops,
+            bathymetry,
+            clock,
+            metadata,
+            h_min,
+            SnapshotLayout::default(),
+        )
     }
 
     /// Create `path` for a 3D run on the σ-grid `sigma`, with the layered fields
@@ -191,12 +228,16 @@ impl SnapshotWriter {
             clock,
             metadata,
             0.0,
-            Some((sigma, &SOLUTION_3D_FIELDS)),
+            SnapshotLayout {
+                surface: &[],
+                levels: Some((sigma, &SOLUTION_3D_FIELDS)),
+            },
         )
     }
 
-    /// Create `path` with any layered fields on `levels`' σ-grid (or none), for
-    /// [`Self::write_fields`].
+    /// Create `path` with the surface fields and the layered fields (on their
+    /// σ-grid) of `layout`, for [`Self::write_fields`] (or [`Self::write_state`]
+    /// with surface fields alone).
     pub fn create_with(
         path: impl AsRef<Path>,
         mesh: &Mesh2D,
@@ -205,8 +246,9 @@ impl SnapshotWriter {
         clock: Option<&ModelClock>,
         metadata: &[(&str, &str)],
         h_min: f64,
-        levels: Option<(&SigmaGrid, &[&str])>,
+        layout: SnapshotLayout,
     ) -> Result<Self, SnapshotError> {
+        let SnapshotLayout { surface, levels } = layout;
         let n = mesh.n_elements * ops.n_nodes;
         if bathymetry.len() != n {
             return Err(SnapshotError::Format(format!(
@@ -222,14 +264,15 @@ impl SnapshotWriter {
                 "metadata {k:?} = {v:?}: no '=' in keys, no newlines"
             )));
         }
-        if let Some((_, fields)) = levels
-            && let Some(f) = fields.iter().find(|f| f.is_empty())
+        if let Some(f) = levels
+            .iter()
+            .flat_map(|(_, fields)| fields.iter())
+            .chain(surface)
+            .find(|f| f.is_empty())
         {
-            return Err(SnapshotError::Format(format!(
-                "layered field name {f:?} is empty"
-            )));
+            return Err(SnapshotError::Format(format!("field name {f:?} is empty")));
         }
-        let header = encode_header(mesh, ops.order, bathymetry, clock, metadata, levels);
+        let header = encode_header(mesh, ops.order, bathymetry, clock, metadata, layout);
         let mut out = BufWriter::new(File::create(path)?);
         out.write_all(MAGIC)?;
         out.write_all(&[VERSION])?;
@@ -240,6 +283,7 @@ impl SnapshotWriter {
             out,
             bed: bathymetry.to_vec(),
             h_min: Depth::new(h_min.max(0.0)),
+            n_surface: surface.len(),
             n_levels: levels.map_or(0, |(sigma, _)| sigma.n_levels()),
             n_fields: levels.map_or(0, |(_, fields)| fields.len()),
             bytes: Vec::with_capacity(8 + 12 * n),
@@ -273,6 +317,7 @@ impl SnapshotWriter {
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
             out: BufWriter::new(file),
+            n_surface: header.surface.len(),
             n_levels: header.n_levels(),
             n_fields: header.levels.as_ref().map_or(0, |l| l.fields.len()),
             bed: header.bathymetry,
@@ -284,8 +329,14 @@ impl SnapshotWriter {
         })
     }
 
-    /// Append the state `q` at model time `t`.
-    pub fn write_state(&mut self, t: f64, q: &SWESolution2D) -> Result<(), SnapshotError> {
+    /// Append the state `q` at model time `t`, with the file's surface fields (one
+    /// value per node each, in the order the file was created with).
+    pub fn write_state(
+        &mut self,
+        t: f64,
+        q: &SWESolution2D,
+        surface: &[&[f32]],
+    ) -> Result<(), SnapshotError> {
         let [h, hu, hv] = &q.data;
         if h.len() != self.bed.len() {
             return Err(SnapshotError::Format(format!(
@@ -305,7 +356,7 @@ impl SnapshotWriter {
             std::mem::take(&mut self.u),
             std::mem::take(&mut self.v),
         );
-        let written = self.write_fields(t, &eta, &u, &v, &[]);
+        let written = self.write_fields(t, &eta, &u, &v, surface, &[]);
         (self.eta, self.u, self.v) = (eta, u, v);
         written
     }
@@ -315,12 +366,15 @@ impl SnapshotWriter {
         let n = self.bed.len();
         if state.n_levels != self.n_levels
             || self.n_fields != SOLUTION_3D_FIELDS.len()
+            || self.n_surface != 0
             || state.eta.data.len() != n
         {
             return Err(SnapshotError::Format(format!(
-                "a state of {} nodes on {} levels, the file has {n} nodes and {} levels of {} fields",
+                "a state of {} nodes on {} levels, the file has {n} nodes, {} surface fields \
+                 and {} levels of {} fields",
                 state.eta.data.len(),
                 state.n_levels,
+                self.n_surface,
                 self.n_levels,
                 self.n_fields
             )));
@@ -337,15 +391,17 @@ impl SnapshotWriter {
         self.end_frame()
     }
 
-    /// Append a frame of η, u and v (one value per node each) at model time `t`, and
-    /// the layered fields (`[node][level]` each, in the order the file was created
-    /// with; none in 2D).
+    /// Append a frame of η, u and v (one value per node each) at model time `t`, the
+    /// surface fields (one value per node each) and the layered fields
+    /// (`[node][level]` each; none in 2D), each in the order the file was created
+    /// with.
     pub fn write_fields(
         &mut self,
         t: f64,
         eta: &[f32],
         u: &[f32],
         v: &[f32],
+        surface: &[&[f32]],
         layers: &[&[f32]],
     ) -> Result<(), SnapshotError> {
         let n = self.bed.len();
@@ -357,6 +413,12 @@ impl SnapshotWriter {
                 v.len()
             )));
         }
+        if surface.len() != self.n_surface || surface.iter().any(|s| s.len() != n) {
+            return Err(SnapshotError::Format(format!(
+                "a frame needs {} surface fields of {n} values",
+                self.n_surface
+            )));
+        }
         if layers.len() != self.n_fields || layers.iter().any(|l| l.len() != n * self.n_levels) {
             return Err(SnapshotError::Format(format!(
                 "a frame needs {} layered fields of {} values",
@@ -365,7 +427,11 @@ impl SnapshotWriter {
             )));
         }
         self.begin_frame(t);
-        for field in [eta, u, v].into_iter().chain(layers.iter().copied()) {
+        for field in [eta, u, v]
+            .into_iter()
+            .chain(surface.iter().copied())
+            .chain(layers.iter().copied())
+        {
             for x in field {
                 self.bytes.extend_from_slice(&x.to_le_bytes());
             }
@@ -505,10 +571,14 @@ impl SnapshotReader {
         ))?;
         self.file.read_exact(&mut self.bytes)?;
         frame.t = f64::from_le_bytes(self.bytes[..8].try_into().unwrap());
+        frame
+            .surface
+            .resize_with(self.header.surface.len(), Vec::new);
         frame.layers.resize_with(n_fields, Vec::new);
         let mut at = 8;
         for (field, len) in [&mut frame.eta, &mut frame.u, &mut frame.v]
             .into_iter()
+            .chain(frame.surface.iter_mut())
             .map(|f| (f, n))
             .chain(frame.layers.iter_mut().map(|f| (f, layer)))
         {
@@ -559,7 +629,7 @@ fn encode_header(
     bed: &[f64],
     clock: Option<&ModelClock>,
     metadata: &[(&str, &str)],
-    levels: Option<(&SigmaGrid, &[&str])>,
+    layout: SnapshotLayout,
 ) -> Vec<u8> {
     let mut b = Vec::new();
     let u32_ = |b: &mut Vec<u8>, x: usize| b.extend_from_slice(&(x as u32).to_le_bytes());
@@ -611,7 +681,7 @@ fn encode_header(
         b.extend_from_slice(s.as_bytes());
     };
     string(&mut b, &text);
-    match levels {
+    match layout.levels {
         None => u32_(&mut b, 0),
         Some((sigma, fields)) => {
             u32_(&mut b, sigma.n_levels());
@@ -625,6 +695,8 @@ fn encode_header(
             fields.iter().for_each(|f| string(&mut b, f));
         }
     }
+    u32_(&mut b, layout.surface.len());
+    layout.surface.iter().for_each(|f| string(&mut b, f));
     b
 }
 
@@ -728,6 +800,10 @@ fn decode_header(bytes: &[u8], version: u8) -> Result<SnapshotHeader, SnapshotEr
     } else {
         None
     };
+    let n_surface = if version >= 3 { b.index()? } else { 0 };
+    let surface = (0..n_surface)
+        .map(|_| b.string().map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(SnapshotHeader {
         order,
         mesh,
@@ -735,6 +811,7 @@ fn decode_header(bytes: &[u8], version: u8) -> Result<SnapshotHeader, SnapshotEr
         clock: epoch.is_finite().then(|| ModelClock::new(epoch)),
         metadata,
         levels,
+        surface,
     })
 }
 
@@ -780,8 +857,8 @@ mod tests {
             1e-3,
         )
         .unwrap();
-        writer.write_state(0.0, &q).unwrap();
-        writer.write_state(3600.0, &q).unwrap();
+        writer.write_state(0.0, &q, &[]).unwrap();
+        writer.write_state(3600.0, &q, &[]).unwrap();
         // A partial frame, as a run being written leaves it, is not counted
         writer.out.write_all(&[0u8; 20]).unwrap();
         writer.out.flush().unwrap();
@@ -881,7 +958,7 @@ mod tests {
         }
         // A 2D state does not fit a 3D file
         let q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
-        assert!(writer.write_state(0.0, &q).is_err());
+        assert!(writer.write_state(0.0, &q, &[]).is_err());
         assert!(
             writer
                 .write_solution_3d(0.0, &Solution3D::new(mesh.n_elements, ops.n_nodes, 4))
@@ -891,39 +968,131 @@ mod tests {
     }
 
     #[test]
-    fn version_1_files_still_read() {
-        let path = scratch("v1");
+    fn versions_1_and_2_still_read() {
         let mesh = mesh();
         let ops = DGOperators2D::new(1);
         let n = mesh.n_elements * ops.n_nodes;
         let bed = vec![-5.0; n];
-        let mut writer =
-            SnapshotWriter::create(&path, &mesh, &ops, &bed, None, &[("title", "old")], 1e-3)
+        // Version 2 is version 3 without the surface fields' count at the end of the
+        // header, version 1 is version 2 without the levels' count
+        for version in [1u8, 2] {
+            let path = scratch(&format!("v{version}"));
+            let mut writer =
+                SnapshotWriter::create(&path, &mesh, &ops, &bed, None, &[("title", "old")], 1e-3)
+                    .unwrap();
+            let eta = vec![0.5f32; n];
+            writer
+                .write_fields(7.0, &eta, &eta, &eta, &[], &[])
                 .unwrap();
-        let eta = vec![0.5f32; n];
-        writer.write_fields(7.0, &eta, &eta, &eta, &[]).unwrap();
-        drop(writer);
-        // Version 1 is version 2 without the levels' count at the end of the header
-        let mut bytes = std::fs::read(&path).unwrap();
-        let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-        assert_eq!(bytes[16 + header_len - 4..16 + header_len], [0; 4]);
-        bytes.drain(16 + header_len - 4..16 + header_len);
-        bytes[7] = 1;
-        bytes[8..16].copy_from_slice(&(header_len as u64 - 4).to_le_bytes());
-        std::fs::write(&path, &bytes).unwrap();
+            drop(writer);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+            let cut = 4 * (VERSION - version) as usize;
+            assert_eq!(bytes[16 + header_len - cut..16 + header_len], vec![0; cut]);
+            bytes.drain(16 + header_len - cut..16 + header_len);
+            bytes[7] = version;
+            bytes[8..16].copy_from_slice(&((header_len - cut) as u64).to_le_bytes());
+            std::fs::write(&path, &bytes).unwrap();
 
-        let mut reader = SnapshotReader::open(&path).unwrap();
-        assert!(reader.header().levels.is_none());
-        assert_eq!(reader.header().metadata("title"), Some("old"));
-        assert_eq!(reader.n_frames().unwrap(), 1);
-        let frame = reader.read_frame(0).unwrap();
-        assert_eq!((frame.t, frame.eta[n - 1]), (7.0, 0.5));
-        assert!(frame.layers.is_empty());
-        // A version from the future is refused
-        bytes[7] = VERSION + 1;
-        std::fs::write(&path, &bytes).unwrap();
-        assert!(SnapshotReader::open(&path).is_err());
-        std::fs::remove_file(&path).unwrap();
+            let mut reader = SnapshotReader::open(&path).unwrap();
+            assert!(reader.header().levels.is_none() && reader.header().surface.is_empty());
+            assert_eq!(reader.header().metadata("title"), Some("old"));
+            assert_eq!(reader.n_frames().unwrap(), 1);
+            let frame = reader.read_frame(0).unwrap();
+            assert_eq!((frame.t, frame.eta[n - 1]), (7.0, 0.5));
+            assert!(frame.layers.is_empty() && frame.surface.is_empty());
+            // A version from the future is refused
+            bytes[7] = VERSION + 1;
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(SnapshotReader::open(&path).is_err());
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// Surface fields come between (η, u, v) and the layers, in both kinds of
+    /// file, and a frame without them is refused.
+    #[test]
+    fn surface_fields_read_back_by_name() {
+        use crate::vertical::SongHaidvogelStretching;
+
+        let mesh = mesh();
+        let ops = DGOperators2D::new(1);
+        let n = mesh.n_elements * ops.n_nodes;
+        let bed = vec![-20.0; n];
+        let sigma = SigmaGrid::new(3, SongHaidvogelStretching::new(5.0, 0.4, 10.0));
+        let value = |field: usize, i: usize| field as f32 * 100.0 + i as f32 * 0.25;
+        let fields: Vec<Vec<f32>> = (0..6)
+            .map(|f| {
+                (0..if f < 5 { n } else { 3 * n })
+                    .map(|i| value(f, i))
+                    .collect()
+            })
+            .collect();
+        for levels in [None, Some((&sigma, &["temp"][..]))] {
+            let path = scratch("surface");
+            let surface = ["hs", "tp"];
+            let layout = SnapshotLayout {
+                surface: &surface,
+                levels,
+            };
+            let mut writer =
+                SnapshotWriter::create_with(&path, &mesh, &ops, &bed, None, &[], 1e-3, layout)
+                    .unwrap();
+            let layers: &[&[f32]] = if levels.is_some() { &[&fields[5]] } else { &[] };
+            let [eta, u, v, hs, tp, _] = &fields[..] else {
+                unreachable!()
+            };
+            writer
+                .write_fields(60.0, eta, u, v, &[hs, tp], layers)
+                .unwrap();
+            assert!(writer.write_fields(60.0, eta, u, v, &[hs], layers).is_err());
+            assert!(
+                writer
+                    .write_fields(60.0, eta, u, v, &[hs, &tp[1..]], layers)
+                    .is_err()
+            );
+            if levels.is_none() {
+                let q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+                assert!(writer.write_state(120.0, &q, &[]).is_err());
+                writer.write_state(120.0, &q, &[hs, tp]).unwrap();
+            }
+            drop(writer);
+            let mut reader = SnapshotReader::open(&path).unwrap();
+            let header = reader.header().clone();
+            assert_eq!(header.surface, surface);
+            assert_eq!(header.surface_field("tp"), Some(1));
+            assert_eq!(header.surface_field("dir"), None);
+            assert_eq!(
+                reader.n_frames().unwrap(),
+                if levels.is_none() { 2 } else { 1 }
+            );
+            let frame = reader.read_frame(0).unwrap();
+            assert_eq!(frame.t, 60.0);
+            for (f, data) in [&frame.eta, &frame.u, &frame.v]
+                .into_iter()
+                .chain(&frame.surface)
+                .chain(&frame.layers)
+                .enumerate()
+            {
+                assert_eq!(data, &fields[f], "field {f}");
+            }
+            if levels.is_none() {
+                assert_eq!(reader.read_frame(1).unwrap().surface[1], *tp);
+                // A resumed run keeps its surface fields
+                let mut resumed = SnapshotWriter::append(&path, 60.0, 1e-3).unwrap();
+                resumed
+                    .write_fields(90.0, eta, u, v, &[tp, hs], &[])
+                    .unwrap();
+                drop(resumed);
+                let mut reader = SnapshotReader::open(&path).unwrap();
+                assert_eq!(reader.times().unwrap(), [60.0, 90.0]);
+                assert_eq!(
+                    reader.read_frame(1).unwrap().surface,
+                    [tp.clone(), hs.clone()]
+                );
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 
     #[test]
@@ -948,7 +1117,9 @@ mod tests {
         let eta = |t: f64| (0..n).map(|j| (t + j as f64) as f32).collect::<Vec<_>>();
         let zero = vec![0.0; n];
         for t in [0.0, 600.0, 1200.0] {
-            writer.write_fields(t, &eta(t), &zero, &zero, &[]).unwrap();
+            writer
+                .write_fields(t, &eta(t), &zero, &zero, &[], &[])
+                .unwrap();
         }
         let mut reader = SnapshotReader::open(&path).unwrap();
         assert_eq!(reader.times().unwrap(), [0.0, 600.0, 1200.0]);
@@ -976,7 +1147,9 @@ mod tests {
             SnapshotWriter::create(&path, &mesh, &ops, &bed, None, &[("title", "run")], 1e-3)
                 .unwrap();
         for t in [0.0, 600.0, 1200.0, 1800.0] {
-            writer.write_fields(t, &eta(t), &zero, &zero, &[]).unwrap();
+            writer
+                .write_fields(t, &eta(t), &zero, &zero, &[], &[])
+                .unwrap();
         }
         writer.out.write_all(&[0u8; 20]).unwrap();
         writer.out.flush().unwrap();
@@ -984,7 +1157,7 @@ mod tests {
 
         let mut resumed = SnapshotWriter::append(&path, 600.0, 1e-3).unwrap();
         resumed
-            .write_fields(1200.0, &eta(1201.0), &zero, &zero, &[])
+            .write_fields(1200.0, &eta(1201.0), &zero, &zero, &[], &[])
             .unwrap();
         drop(resumed);
         let mut reader = SnapshotReader::open(&path).unwrap();
@@ -1004,7 +1177,7 @@ mod tests {
         let mut writer = SnapshotWriter::create(&path, &mesh, &ops, &bed, None, &[], 1e-3).unwrap();
         assert!(
             writer
-                .write_fields(0.0, &[0.0; 3], &[0.0; 3], &[0.0; 3], &[])
+                .write_fields(0.0, &[0.0; 3], &[0.0; 3], &[0.0; 3], &[], &[])
                 .is_err()
         );
         assert!(SnapshotWriter::create(&path, &mesh, &ops, &bed[1..], None, &[], 1e-3).is_err());

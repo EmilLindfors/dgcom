@@ -1,11 +1,14 @@
 // The photo view's sea, bed and sky (`crate::photo`): one material, three kinds.
 //
-// - Sea surface (kind 0): wind waves as a sum of sinusoids from `crate::photo::spectrum`,
+// - Sea surface (kind 0): waves as a sum of sinusoids from `crate::photo::SeaState` (the
+//   first `flow.w` of them the model's sea for an H_s of 1 m, scaled by the model's H_s
+//   at the pixel, UV 1's x; then the wind's),
 //   their slopes per pixel, advected with the model's current (a vertex attribute) by a
 //   two-phase flow map and steepened against it; sky reflection by Fresnel, the sun's
 //   glint by a Beckmann distribution whose width is the slope variance the pixel does
-//   not resolve, and whitecaps on the crests. Premultiplied alpha: what is not reflected
-//   lets the bed through.
+//   not resolve, and whitecaps on the crests, and surf where the model's waves break
+//   (UV 1's y: the share of their energy lost per period). Premultiplied alpha: what is
+//   not reflected lets the bed through.
 // - Bed and ground (kind 1): lit by the sun and the sky through the water above (its
 //   depth a vertex attribute), seen through it: Beer–Lambert attenuation per channel on
 //   the way down and back up, the water's own colour scattered in.
@@ -25,7 +28,7 @@ struct WaterParams {
     // kx, kz (rad/m), slope amplitude a·k, phase (rad) at the shown time
     waves: array<vec4<f32>, 32>,
     // x: flow-map phase (time over its period, fractional); y: its period (s); z: slope
-    // variance below the shortest wave
+    // variance below the shortest wave; w: how many of the waves are the model's
     flow: vec4<f32>,
     // xyz: toward the sun; w: its illuminance (lux)
     sun: vec4<f32>,
@@ -41,9 +44,9 @@ struct WaterParams {
     deep: vec4<f32>,
     // rgb: haze colour (cd/m²); w: haze density (1/m)
     fog: vec4<f32>,
-    // x: whitecap threshold (m above the mean); y: rms height of the waves (m); z:
-    // whitecap coverage of the wind sea; w: direction the wind blows toward (rad from +X
-    // toward +Z)
+    // x: whitecap threshold (rms heights above the mean); y: rms height of the wind's
+    // waves (m); z: whitecap coverage of the wind sea; w: direction the wind blows toward
+    // (rad from +X toward +Z)
     foam: vec4<f32>,
     // x: kind (0 sea, 1 bed, 2 sky); y: the tile (m) the wavevectors repeat on; z: wave
     // time (s, wrapped at an hour); w: vertical exaggeration
@@ -131,17 +134,20 @@ fn haze(dist: f32) -> f32 {
 struct Sea {
     // ∂h/∂X, ∂h/∂Z
     slope: vec2<f32>,
-    // Height above the mean (m)
+    // Height above the mean (m), and of it the model's waves'
     height: f32,
+    swell: f32,
     // Slope variance the pixel does not resolve
     lost: f32,
 }
 
-// The wind waves at wrapped position `p` (m), advected by the current `u` (m/s) in the
-// flow map's two phases, `tau` (s) of advection each and weights `w`, at wave time `t`
-// (s), filtered to the pixel footprint `footprint` (m).
-fn waves(p: vec2<f32>, u: vec2<f32>, tau: vec2<f32>, w: vec2<f32>, t: f32, footprint: f32) -> Sea {
+// The waves at wrapped position `p` (m), advected by the current `u` (m/s) in the flow
+// map's two phases, `tau` (s) of advection each and weights `w`, at wave time `t` (s),
+// filtered to the pixel footprint `footprint` (m); the model's waves scaled to its H_s
+// `hs` (m) there.
+fn waves(p: vec2<f32>, u: vec2<f32>, tau: vec2<f32>, w: vec2<f32>, t: f32, footprint: f32, hs: f32) -> Sea {
     var sea: Sea;
+    let n_model = u32(params.flow.w + 0.5);
     for (var i = 0u; i < N_WAVES; i++) {
         let wave = params.waves[i];
         let k = length(wave.xy);
@@ -156,7 +162,7 @@ fn waves(p: vec2<f32>, u: vec2<f32>, tau: vec2<f32>, w: vec2<f32>, t: f32, footp
         // In groups, a few wavelengths long, running at the group velocity c/2
         let lambda = 2.0 * PI / k;
         let groups = 0.35 + 1.3 * noise((p - dir * 0.5 * c * t) / (5.0 * lambda) + f32(i) * 7.31);
-        let s = wave.z * steep * groups;
+        let s = wave.z * steep * groups * select(1.0, hs, i < n_model);
         // Waves shorter than 6 pixels fade out, into the roughness
         let keep = clamp(lambda / footprint / 3.0 - 1.0, 0.0, 1.0);
         // Short-crested: the phase warped by a noise carried with the water, a
@@ -173,6 +179,9 @@ fn waves(p: vec2<f32>, u: vec2<f32>, tau: vec2<f32>, w: vec2<f32>, t: f32, footp
         let cosine = (w.x * cos(theta0) + w.y * cos(theta1)) * norm;
         sea.slope -= keep * s * dir * sine;
         sea.height += s / k * cosine;
+        if i < n_model {
+            sea.swell += s / k * cosine;
+        }
         sea.lost += (1.0 - keep * keep) * 0.5 * s * s;
     }
     return sea;
@@ -234,6 +243,11 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front: bool) -> @location(0
         @if(VERTEX_UVS_A) {
             u = in.uv;
         }
+        // The model's H_s and the share of the waves' energy breaking takes per period
+        var model = vec2(0.0);
+        @if(VERTEX_UVS_B) {
+            model = max(in.uv_b, vec2(0.0));
+        }
         let tile = params.misc.y;
         let p = world.xz - tile * floor(world.xz / tile);
         // Two phases of the flow map, half a period apart, each restarting where its
@@ -246,7 +260,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front: bool) -> @location(0
         let w1 = 1.0 - w0;
         let tau = vec2(f0, f1) * period;
         let weights = vec2(w0, w1);
-        let sea = waves(p, u, tau, weights, params.misc.z, footprint);
+        let sea = waves(p, u, tau, weights, params.misc.z, footprint, model.x);
         let slope = sea.slope;
         let height = sea.height;
         let lost = sea.lost;
@@ -268,15 +282,25 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front: bool) -> @location(0
         let d = exp(-tan2 / m2) / (PI * m2 * n_h * n_h * n_h * n_h);
         let glint = e_sun * fresnel(dot(v, h)) * d / (4.0 * n_v) * step(0.0, sun.y);
 
-        // Whitecaps on the highest crests, broken up by a noise carried with the flow
-        let sigma = max(params.foam.y, 1e-4);
+        // Whitecaps on the highest crests of the wind's waves, more of them on the crests
+        // of the model's longer ones, broken up by a noise carried with the flow
+        let sigma_wind = max(params.foam.y, 1e-4);
         let streak = w0 * streaks(p - u * tau.x) + w1 * streaks(p - u * tau.y);
+        let threshold = params.foam.x * sigma_wind;
+        let lift = 0.35 * sigma_wind * clamp(4.0 * sea.swell / max(model.x, 1e-3), -2.0, 2.0);
         let crest = smoothstep(
-            params.foam.x,
-            params.foam.x + 0.5 * sigma,
-            height + 0.5 * sigma * (streak - 0.5),
+            threshold,
+            threshold + 0.5 * sigma_wind,
+            height - sea.swell + lift + 0.5 * sigma_wind * (streak - 0.5),
         );
-        let foam = clamp(crest * smoothstep(0.0, 0.002, params.foam.z), 0.0, 0.9);
+        // The sea here, the wind's waves and the model's (H_s = 4 rms)
+        let sigma = max(sqrt(sigma_wind * sigma_wind + model.x * model.x / 16.0), 1e-4);
+        var foam = clamp(crest * smoothstep(0.0, 0.002, params.foam.z), 0.0, 0.9);
+        // Surf where the model's waves break: white water on the crests and the foam
+        // they leave, the more of their energy breaking takes per period
+        let surf = smoothstep(0.02, 0.4, model.y);
+        let bore = smoothstep(-0.5 * sigma, 0.8 * sigma, height + sigma * (streak - 0.5));
+        foam = max(foam, surf * mix(0.35 + 0.4 * streak, 0.95, bore));
         let foam_light = vec3(0.8) * (e_sun * max(n.y * sun.y, 0.0) / PI + e_sky);
 
         let alpha = fr * (1.0 - foam) + foam;

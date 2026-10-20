@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use bevy::prelude::*;
 
+use crate::actions::{Act, Action};
 use crate::solver::{Snapshot, SolverMessage};
 
 /// Where the snapshots come from.
@@ -282,32 +283,33 @@ fn receive(channel: Res<SolverChannel>, mut playback: ResMut<Playback>) {
     }
 }
 
-fn keys(keys: Res<ButtonInput<KeyCode>>, mut playback: ResMut<Playback>) {
-    if keys.just_pressed(KeyCode::Space) {
-        playback.paused = !playback.paused;
-    }
-    if keys.just_pressed(KeyCode::BracketLeft) {
-        playback.rate = (playback.rate / 2.0).max(1.0);
-    }
-    if keys.just_pressed(KeyCode::BracketRight) {
-        playback.rate = (playback.rate * 2.0).min(1e5);
-    }
-    let step = 10.0 * playback.interval;
-    let seek = if keys.just_pressed(KeyCode::ArrowLeft) {
-        Some(playback.t - step)
-    } else if keys.just_pressed(KeyCode::ArrowRight) {
-        Some(playback.t + step)
-    } else if keys.just_pressed(KeyCode::Home) {
-        playback.oldest()
-    } else if keys.just_pressed(KeyCode::End) {
-        playback.newest()
-    } else {
-        None
-    };
-    if let Some(t) = seek {
-        playback.t = t;
-        playback.clamp();
-        playback.changed = true;
+fn keys(mut acts: MessageReader<Act>, mut playback: ResMut<Playback>) {
+    for &Act(action) in acts.read() {
+        let step = 10.0 * playback.interval;
+        let seek = match action {
+            Action::Pause => {
+                playback.paused = !playback.paused;
+                None
+            }
+            Action::Slower => {
+                playback.rate = (playback.rate / 2.0).max(1.0);
+                None
+            }
+            Action::Faster => {
+                playback.rate = (playback.rate * 2.0).min(1e5);
+                None
+            }
+            Action::SeekBack => Some(playback.t - step),
+            Action::SeekForward => Some(playback.t + step),
+            Action::First => playback.oldest(),
+            Action::Last => playback.newest(),
+            _ => None,
+        };
+        if let Some(t) = seek {
+            playback.t = t;
+            playback.clamp();
+            playback.changed = true;
+        }
     }
 }
 
@@ -376,6 +378,7 @@ mod tests {
             v: vec![0.0; 4],
             particles: Default::default(),
             layers: None,
+            waves: None,
         }
     }
 

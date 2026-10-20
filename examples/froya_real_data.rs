@@ -323,7 +323,11 @@
 //! size. The viewer replays it without rebuilding the domain, with the land
 //! around it from the elevation model:
 //! `cd viz && cargo run --release -- --replay ../output/froya/froya.dgsnap`.
-//! With stations, N is rounded to a multiple of `station_minutes`.
+//! With stations, N is rounded to a multiple of `station_minutes`. With
+//! `wave_coupling=` its frames also carry the sea state at every node
+//! (`waves::SeaStateFields`: H_s, T_p, the mean direction, the spread, and
+//! the power whitecapping and breaking take), linear in time between the
+//! exchanges, for the viewer's wave colourings, arrows and photo view.
 //!
 //! `rx0=r` smooths the bed, keeping its volume, until the slope factor
 //! r_x0 = |h₁ − h₂|/(h₁ + h₂) between neighbouring nodes at least
@@ -390,6 +394,7 @@
 //! - froya_boundary_tides.txt (tidal atlas, optional)
 //! - tide_gauges/mausund_obs.txt, froya_station_tides.txt (validation, optional)
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -415,8 +420,8 @@ use dg_rs::io::WaveSpectraFile;
 use dg_rs::io::{AtmosphereReader, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig};
 use dg_rs::io::{
     BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
-    LocalProjection, OceanModelReader, SnapshotWriter, TideGaugeFile, east_axis, read_adcp_file,
-    read_tide_gauge_file, write_adcp_file, write_tide_gauge_file, write_vtk_swe,
+    LocalProjection, OceanModelReader, SnapshotLayout, SnapshotWriter, TideGaugeFile, east_axis,
+    read_adcp_file, read_tide_gauge_file, write_adcp_file, write_tide_gauge_file, write_vtk_swe,
 };
 use dg_rs::mesh::{
     Bathymetry2D, BoundaryTag, ElementSlopeBound, Mesh2D, MeshPoint, PointLocator2D,
@@ -445,8 +450,8 @@ use dg_rs::types::Depth;
 use dg_rs::types::ElementIndex;
 use dg_rs::waves::{BoundarySpectra, PointSpectra, WindSeries};
 use dg_rs::waves::{
-    CoupledWaves2D, CoupledWavesStats, DEFAULT_RATE_LIMITER, GrowthLimiter, SourceIntegration,
-    SourceTerms, SpectralGrid, WaveForceForm, WaveModel2D, Wind,
+    CoupledWaves2D, CoupledWavesStats, DEFAULT_RATE_LIMITER, GrowthLimiter, SeaStateFields,
+    SourceIntegration, SourceTerms, SpectralGrid, WaveForceForm, WaveModel2D, Wind,
 };
 
 /// Gravitational acceleration (m/s²)
@@ -1956,6 +1961,15 @@ struct TideSetup {
 /// The stations, the clock and the open boundary of a tidal run (the parent
 /// model's, its tides corrected to the gauge, or the atlas's), and its band
 /// and weather.
+/// `<output>/clock.txt`: the run's `Clock:` line, so its VTU frames replay with their
+/// dates in `dg-viz` without the run's log.
+fn write_clock(output_dir: &Path, clock: &ModelClock) -> std::io::Result<()> {
+    fs::write(
+        output_dir.join("clock.txt"),
+        format!("Clock: t = 0 at {} UTC\n", clock.format(0.0)),
+    )
+}
+
 fn tide_setup(
     domain: &Domain,
     opts: &Options,
@@ -2119,6 +2133,7 @@ fn tidal_run(
         .clone()
         .unwrap_or_else(|| Path::new("output").join(domain.name));
     fs::create_dir_all(&output_dir)?;
+    write_clock(&output_dir, &clock)?;
     #[cfg(feature = "netcdf")]
     let mut netcdf = match &domain.projection {
         Some(projection) => Some(NetCDFWriter::create(
@@ -2194,7 +2209,11 @@ fn tidal_run(
             let metadata = snapshot_metadata(domain, &stations, "");
             let metadata: Vec<(&str, &str)> =
                 metadata.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            Some(SnapshotWriter::create(
+            let surface: &[&str] = match waves {
+                Some(_) => &SeaStateFields::NAMES,
+                None => &[],
+            };
+            Some(SnapshotWriter::create_with(
                 path,
                 &domain.mesh,
                 &domain.ops,
@@ -2202,10 +2221,16 @@ fn tidal_run(
                 Some(&clock),
                 &metadata,
                 WetDryConfig::DEFAULT_H_DRY,
+                SnapshotLayout {
+                    surface,
+                    levels: None,
+                },
             )?)
         }
         None => None,
     };
+    // The waves' sea state for the snapshot frames
+    let sea = (waves.is_some() && snapshot.is_some()).then(|| RefCell::new(SeaStates::default()));
     let mut n_callbacks = 0;
     let mut frame = 0;
     let mut write_error = None;
@@ -2217,9 +2242,12 @@ fn tidal_run(
         n_callbacks += 1;
         if let (Some(writer), Some(every)) = (snapshot.as_mut(), snapshot_every)
             && (n_callbacks - 1) % every == 0
-            && let Err(e) = writer.write_state(t, q)
         {
-            write_error.get_or_insert(e.to_string());
+            let mut sea = sea.as_ref().map(RefCell::borrow_mut);
+            let surface = sea.as_mut().map_or(Vec::new(), |sea| sea.at(t));
+            if let Err(e) = writer.write_state(t, q, &surface) {
+                write_error.get_or_insert(e.to_string());
+            }
         }
         if (n_callbacks - 1) % output_every != 0 {
             return;
@@ -2280,6 +2308,7 @@ fn tidal_run(
         interval: 60.0 * opts.wave_coupling,
         report_every: 60.0 * opts.output_minutes,
         report: &mut report,
+        sea: sea.as_ref(),
     });
     let (result, clips) = if opts.lts > 0 {
         let sim = Simulation::new(physics, Multirate::with_base(opts.integrator, opts.lts))
@@ -2355,12 +2384,52 @@ fn tidal_run(
 }
 
 /// The waves of a tidal run with `wave_coupling=`: the model, its exchange
-/// interval (s), and the progress line every `report_every` seconds.
+/// interval (s), the progress line every `report_every` seconds, and the sea
+/// states for the snapshot frames, if any.
 struct Coupling<'a> {
     waves: &'a mut CoupledWaves2D,
     interval: f64,
     report_every: f64,
     report: &'a mut dyn FnMut(&CoupledWaves2D, f64),
+    sea: Option<&'a RefCell<SeaStates>>,
+}
+
+/// The coupled waves' sea state at the two ends of the coupling interval the
+/// circulation is in, for the snapshot frames within it (linear in time
+/// between them, as the force is).
+#[derive(Default)]
+struct SeaStates {
+    before: Option<(f64, [Vec<f32>; 7])>,
+    after: Option<(f64, [Vec<f32>; 7])>,
+    /// The fields at a frame's time
+    now: [Vec<f32>; 7],
+}
+
+impl SeaStates {
+    /// The waves' sea state at their time `t`, the start of the next interval
+    /// the first time and its end after that.
+    fn push(&mut self, waves: &CoupledWaves2D, t: f64) {
+        self.before = self.after.take();
+        self.after = Some((t, waves.sea_state().as_f32()));
+    }
+
+    /// The fields at time `t`, in the order of `SeaStateFields::NAMES`.
+    fn at(&mut self, t: f64) -> Vec<&[f32]> {
+        let (Some((t1, b)), a) = (&self.after, &self.before) else {
+            return Vec::new();
+        };
+        let (t0, a) = a.as_ref().map_or((*t1, b), |(t0, a)| (*t0, a));
+        let w = if t1 > &t0 {
+            ((t - t0) / (t1 - t0)).clamp(0.0, 1.0) as f32
+        } else {
+            1.0
+        };
+        for ((out, a), b) in self.now.iter_mut().zip(a).zip(b) {
+            out.clear();
+            out.extend(a.iter().zip(b).map(|(a, b)| a + w * (b - a)));
+        }
+        self.now.iter().map(Vec::as_slice).collect()
+    }
 }
 
 /// Run the tide to `t_end`, with the waves of `coupling` exchanging every
@@ -2383,13 +2452,22 @@ where
             interval,
             report_every,
             report,
+            sea,
         }) => sim.run_with_exchange(
             q,
             0.0,
             t_end,
             interval,
             |physics, q, t, t_next| {
+                if let Some(sea) = sea
+                    && sea.borrow().after.is_none()
+                {
+                    sea.borrow_mut().push(waves, t);
+                }
                 waves.exchange(physics, q, t, t_next);
+                if let Some(sea) = sea {
+                    sea.borrow_mut().push(waves, t_next);
+                }
                 let k = (t_next / report_every).round();
                 if (t_next - k * report_every).abs() < 1e-6 * report_every {
                     report(waves, t_next);
@@ -3531,6 +3609,7 @@ fn tidal_run_3d(
         .clone()
         .unwrap_or_else(|| Path::new("output").join(format!("{}_3d", domain.name)));
     fs::create_dir_all(&output_dir)?;
+    write_clock(&output_dir, &clock)?;
     println!(
         "\nTides in 3D: {forcing}, {:.2} h{}, GLS {} → {}",
         opts.hours,

@@ -4,11 +4,15 @@
 //! Each arrow samples (u, v) by the element polynomial at its point ([`Probe`]), so it
 //! shows the current there, not at the nearest node. Its length is the grid spacing at
 //! the top of the speed scale; it is white over water coloured by speed, else coloured
-//! by speed itself. A (key) toggles them; the photo view ([`crate::photo`]) has none.
+//! by speed itself. Under a wave colouring the arrows are the waves': along their mean
+//! direction of travel, the grid spacing long at the top of the H_s scale, white (amber
+//! over the dissipation's white). A (key) toggles them; the photo view
+//! ([`crate::photo`]) has none.
 
 use bevy::prelude::*;
 use dg_rs::mesh::PointLocator2D;
 
+use crate::actions::{Act, Action};
 use crate::camera::OrbitCamera;
 use crate::colormap::{Lut, VIRIDIS};
 use crate::field::{Field, Frame, Probe};
@@ -124,8 +128,8 @@ impl Plugin for ArrowsPlugin {
     }
 }
 
-fn toggle(keys: Res<ButtonInput<KeyCode>>, mut arrows: ResMut<Arrows>) {
-    if keys.just_pressed(KeyCode::KeyA) {
+fn toggle(mut acts: MessageReader<Act>, mut arrows: ResMut<Arrows>) {
+    for _ in acts.read().filter(|a| a.0 == Action::Arrows) {
         arrows.on = !arrows.on;
     }
 }
@@ -144,9 +148,24 @@ fn draw(
     }
     let near = camera.single().is_ok_and(|c| c.distance < arrows.near);
     let grid = if near { &arrows.fine } else { &arrows.coarse };
-    let scale = grid.spacing / colouring.speed_max.max(1e-6);
+    let waves = field.waves.as_ref().filter(|_| colouring.by.is_waves());
+    let top = match waves {
+        Some(_) => colouring.hs_max,
+        None => colouring.speed_max,
+    };
+    let scale = grid.spacing / top.max(1e-6);
     for arrow in &grid.arrows {
-        let (u, v) = (arrow.probe.eval(&field.u), arrow.probe.eval(&field.v));
+        // The current, or H_s along the waves' mean direction
+        let (u, v) = match waves {
+            Some(w) => {
+                let p = &arrow.probe;
+                let (x, y) = (p.eval(&w.dir_x), p.eval(&w.dir_y));
+                let length = x.hypot(y).max(1e-6);
+                let hs = p.eval(&w.hs);
+                (hs * x / length, hs * y / length)
+            }
+            None => (arrow.probe.eval(&field.u), arrow.probe.eval(&field.v)),
+        };
         let speed = u.hypot(v);
         if speed * scale < 0.05 * grid.spacing {
             continue;
@@ -157,11 +176,12 @@ fn draw(
         let end = start + Vec3::new(u, 0.0, -v) * scale.min(1.5 * grid.spacing / speed);
         // White over water coloured by speed; the speed colour over elevation.
         let colour = match colouring.by {
-            ColourBy::Speed => LinearRgba::rgb(0.9, 0.9, 0.9),
             ColourBy::Elevation => {
                 let [r, g, b, _] = arrows.lut.at(speed / colouring.speed_max);
                 LinearRgba::rgb(r, g, b)
             }
+            ColourBy::WaveDissipation if waves.is_some() => LinearRgba::rgb(1.0, 0.45, 0.08),
+            _ => LinearRgba::rgb(0.9, 0.9, 0.9),
         };
         gizmos
             .arrow(start, end, colour)

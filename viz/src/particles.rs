@@ -29,6 +29,7 @@ use dg_rs::particles::{Particle2D, ParticleStatus, ParticleTracker2D, SWEVelocit
 use dg_rs::solver::{SWESolution2D, WetDryConfig};
 use dg_rs::source::NetCage;
 
+use crate::actions::{Act, Action};
 use crate::camera::OrbitCamera;
 use crate::cloud_3d::KINDS;
 use crate::colormap::{Lut, PLASMA};
@@ -309,8 +310,8 @@ fn spawn(
     });
 }
 
-fn toggle(keys: Res<ButtonInput<KeyCode>>, mut particles: ResMut<Particles>) {
-    if keys.just_pressed(KeyCode::KeyP) {
+fn toggle(mut acts: MessageReader<Act>, mut particles: ResMut<Particles>) {
+    for _ in acts.read().filter(|a| a.0 == Action::Particles) {
         particles.on = !particles.on;
     }
 }

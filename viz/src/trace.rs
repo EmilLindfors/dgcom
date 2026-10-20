@@ -23,6 +23,7 @@ use dg_rs::mesh::PointLocator2D;
 use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
 
+use crate::actions::{Act, Action};
 use crate::field::Probe;
 use crate::playback::Playback;
 use crate::plot::Canvas;
@@ -49,6 +50,10 @@ pub struct Trace {
     gauge: Vec<(f64, f32)>,
     title: String,
     dirty: bool,
+    /// Whether the panel is shown (G)
+    pub on: bool,
+    /// Whether `model` is the run's own record, not sampled from the frames
+    recorded: bool,
 }
 
 impl Trace {
@@ -92,7 +97,35 @@ impl Trace {
             gauge,
             title,
             dirty: true,
+            on: true,
+            recorded: false,
         }
+    }
+
+    /// The run's own record of η here (Unix times, η, placed on `clock`), as the model's
+    /// line in place of the frames' samples: every solver step's, where hourly frames
+    /// clip the peaks by up to ≈ 3 % of the range ([`crate::replay::station_record`]).
+    pub fn with_record(mut self, record: &[(f64, f64)], clock: ModelClock) -> Self {
+        let [t0, t1] = self.span;
+        let model: Vec<(f64, f32)> = record
+            .iter()
+            .map(|&(unix, eta)| (clock.model_time(unix), eta as f32))
+            .filter(|&(t, eta)| (t0..=t1).contains(&t) && eta.is_finite())
+            .collect();
+        if model.len() < 2 {
+            return self;
+        }
+        let minutes = (model[model.len() - 1].0 - model[0].0) / (model.len() - 1) as f64 / 60.0;
+        let note = format!("{minutes:.0}-min record");
+        self.title = if self.title.contains(": model") {
+            self.title
+                .replacen(": model", &format!(": model ({note})"), 1)
+        } else {
+            self.title.replacen(" (G)", &format!(", {note} (G)"), 1)
+        };
+        self.model = model;
+        self.recorded = true;
+        self
     }
 
     /// Where the trace samples the model, if inside the mesh.
@@ -196,7 +229,7 @@ fn spawn(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(14.0),
-                top: Val::Px(12.0),
+                top: Val::Px(crate::menubar::BAR_HEIGHT + 10.0),
                 width: Val::Px((WIDTH / 2) as f32),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(3.0),
@@ -262,6 +295,9 @@ fn spawn(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 
 /// Samples the snapshots that arrived since the last one sampled.
 fn sample(playback: Res<Playback>, mut trace: ResMut<Trace>) {
+    if trace.recorded {
+        return;
+    }
     if playback.on_demand.is_some() {
         if trace.model.len() < playback.series.len() {
             let new = trace.model.len();
@@ -316,6 +352,12 @@ fn draw(
         .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &(_, z)| {
             (lo.min(z), hi.max(z))
         });
+    // The label gives the drawn values' extremes, the axis has room around them
+    let range = if lo <= hi {
+        range_label(lo, hi)
+    } else {
+        String::new()
+    };
     let (lo, hi) = if lo < hi { (lo, hi) } else { (-1.0, 1.0) };
     let pad = 0.08 * (hi - lo);
     let (lo, hi) = (lo - pad, hi + pad);
@@ -346,15 +388,24 @@ fn draw(
     for (label, mut text) in &mut labels {
         let s = match label {
             Label::Title => trace.title.clone(),
-            // Millimetres where the range is small (a channel, a lake)
-            Label::Range if hi - lo < 0.1 => format!("{:+.1} to {:+.1} mm", 1e3 * hi, 1e3 * lo),
-            Label::Range => format!("{hi:+.2} to {lo:+.2} m"),
+            Label::Range => range.clone(),
             Label::Start => date(t0),
             Label::End => date(t1),
         };
         if text.0 != s {
             text.0 = s;
         }
+    }
+}
+
+/// The highest and lowest surface drawn, `hi` and `lo` (m): in millimetres where the
+/// range is small (a channel, a lake). Not the axis's ends, which pad them: at Mausund
+/// those read +1.09 to −1.05 m for a tide of +0.94 to −0.90 m.
+fn range_label(lo: f32, hi: f32) -> String {
+    if hi - lo < 0.1 {
+        format!("highest {:+.1}, lowest {:+.1} mm", 1e3 * hi, 1e3 * lo)
+    } else {
+        format!("highest {hi:+.2}, lowest {lo:+.2} m")
     }
 }
 
@@ -392,13 +443,31 @@ fn marker(playback: Res<Playback>, trace: Res<Trace>, mut node: Query<&mut Node,
     }
 }
 
-fn toggle(keys: Res<ButtonInput<KeyCode>>, mut panel: Query<&mut Visibility, With<Panel>>) {
-    if keys.just_pressed(KeyCode::KeyG) {
+fn toggle(
+    mut acts: MessageReader<Act>,
+    mut trace: ResMut<Trace>,
+    mut panel: Query<&mut Visibility, With<Panel>>,
+) {
+    for _ in acts.read().filter(|a| a.0 == Action::Trace) {
+        trace.on = !trace.on;
         for mut v in &mut panel {
-            *v = match *v {
-                Visibility::Hidden => Visibility::Inherited,
-                _ => Visibility::Hidden,
+            *v = if trace.on {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_range_label_gives_the_drawn_extremes_not_the_axis() {
+        // The 72 h Frøya run at Mausund
+        assert_eq!(range_label(-0.900, 0.941), "highest +0.94, lowest -0.90 m");
+        assert_eq!(range_label(-0.012, 0.031), "highest +31.0, lowest -12.0 mm");
     }
 }

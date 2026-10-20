@@ -21,19 +21,21 @@
 //! the column is shallower than [`MIN_DEPTH`]: there is no pycnocline to show.
 
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::visibility::NoFrustumCulling;
+use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use dg_rs::physics::{EquationOfState, LinearEOS};
 
+use crate::actions::{Act, Action};
 use crate::colormap::{Lut, PLASMA};
 use crate::field::{Frame, Nodes};
 use crate::layers::Levels;
+use crate::photo::Photo;
 use crate::playback::Playback;
 use crate::solver::Layers;
 
-/// Columns shallower than this (m) carry no sheet.
-const MIN_DEPTH: f32 = 2.0;
+/// Columns shallower than this (m) carry no sheet, and the readout no steps.
+pub(crate) const MIN_DEPTH: f32 = 2.0;
 const G: f32 = 9.81;
 
 /// What the sheet follows.
@@ -235,6 +237,7 @@ fn spawn(
     commands.spawn((
         Name::new("Pycnocline"),
         Sheet,
+        RenderLayers::layer(crate::minimap::MAIN_ONLY),
         Mesh3d(sheet.mesh.clone()),
         MeshMaterial3d(materials.add(StandardMaterial {
             // Cut out where the stratification is weak; opaque elsewhere, so it sorts
@@ -251,8 +254,8 @@ fn spawn(
     ));
 }
 
-fn keys(keys: Res<ButtonInput<KeyCode>>, mut sheet: ResMut<Stratification>) {
-    if keys.just_pressed(KeyCode::KeyN) {
+fn keys(mut acts: MessageReader<Act>, mut sheet: ResMut<Stratification>) {
+    for _ in acts.read().filter(|a| a.0 == Action::Sheet) {
         let mut next = sheet.shows.next();
         if next == SheetShows::Salinity && !sheet.has_salt {
             next = next.next();
@@ -302,16 +305,18 @@ fn draw(
     levels: Res<Levels>,
     mut sheet: ResMut<Stratification>,
     mut meshes: ResMut<Assets<Mesh>>,
+    photo: Res<Photo>,
     mut visibility: Query<&mut Visibility, With<Sheet>>,
 ) {
     let Ok(mut visible) = visibility.single_mut() else {
         return;
     };
-    let Some(criterion) = sheet.shows.index() else {
+    // A chart of the water column, as the arrows and contours: not in the photo view
+    let Some(criterion) = sheet.shows.index().filter(|_| !photo.on) else {
         visible.set_if_neq(Visibility::Hidden);
         return;
     };
-    if !(playback.changed || sheet.is_changed()) {
+    if !(playback.changed || sheet.is_changed() || photo.is_changed()) {
         return;
     }
     let Some((a, b, w)) = playback.bracket() else {

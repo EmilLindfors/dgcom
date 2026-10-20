@@ -7,9 +7,12 @@
 //! the shown time ([`Probe`], linear in time between the snapshots): the position (with
 //! latitude and longitude on a real coast), the depth at rest and now, the surface, the
 //! current (depth mean, and in 3D at the surface and the bed) with the bearing it flows
-//! towards, and in 3D the temperature and salinity at the surface and the bed and the
+//! towards, and in 3D the temperature and salinity at the surface and the bed (from
+//! the element's wet nodes: [`Probe::eval_level_wet`]) and the
 //! depths of the strongest density and salinity steps
-//! ([`crate::stratification`]).
+//! ([`crate::stratification`]); in a run with waves, the sea state: H_s, T_p, the
+//! direction the waves come from and their spread, and the power whitecapping and
+//! breaking take from them.
 //!
 //! A click (a press and release of the left button that did not drag the view) pins
 //! the point: a marker stands in the water there, and a panel under the gauge trace
@@ -26,12 +29,14 @@ use dg_rs::mesh::{Mesh2D, PointLocator2D};
 use dg_rs::operators::DGOperators2D;
 use std::sync::Arc;
 
-use crate::camera::OrbitCamera;
+use crate::actions::{Act, Action};
+use crate::camera::{OrbitCamera, OverUi};
 use crate::field::{Frame, Probe};
+use crate::minimap::Minimap;
 use crate::playback::Playback;
 use crate::plot::Canvas;
 use crate::solver::H_DRY;
-use crate::stratification::{SheetShows, column_strongest};
+use crate::stratification::{self, SheetShows, column_strongest};
 
 /// The profile plot in pixels (drawn at half this size on screen).
 const WIDTH: usize = 820;
@@ -118,6 +123,21 @@ struct Readout {
     /// Depth-mean current
     current: [f32; 2],
     column: Option<Column>,
+    sea: Option<Sea>,
+}
+
+/// The sea state at a point.
+struct Sea {
+    /// H_s (m), T_p (s)
+    hs: f32,
+    tp: f32,
+    /// Mean direction of travel, mesh x and y (not normalised)
+    toward: [f32; 2],
+    /// Directional spread (rad)
+    spread: f32,
+    /// Power whitecapping and breaking take (W/m²)
+    whitecapping: f32,
+    breaking: f32,
 }
 
 impl Inspector {
@@ -127,6 +147,10 @@ impl Inspector {
             at,
             probe: Probe::with_operators(&self.locator, &self.ops, at),
         });
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.pinned.is_some()
     }
 
     /// The point's readout at the playback's time (`None` outside the mesh or before a
@@ -145,20 +169,27 @@ impl Inspector {
                 let level = |fa: &[f32], fb: &[f32], l: usize| {
                     lerp(probe.eval_level(fa, nl, l), probe.eval_level(fb, nl, l))
                 };
+                // The tracers from the element's wet nodes only
+                let tracer = |fa: &[f32], fb: &[f32], l: usize| {
+                    let wet =
+                        |field, eta| probe.eval_level_wet(field, nl, l, [eta, &self.bed], H_DRY);
+                    lerp(wet(fa, &a.eta), wet(fb, &b.eta))
+                };
                 let has_salt = !la.salt.is_empty() && !lb.salt.is_empty();
                 let total = eta - bed;
                 let z: Vec<f32> = sigma.iter().map(|&s| eta + s * total).collect();
-                let temp: Vec<f32> = (0..nl).map(|l| level(&la.temp, &lb.temp, l)).collect();
+                let temp: Vec<f32> = (0..nl).map(|l| tracer(&la.temp, &lb.temp, l)).collect();
                 let salt: Vec<f32> = if has_salt {
-                    (0..nl).map(|l| level(&la.salt, &lb.salt, l)).collect()
+                    (0..nl).map(|l| tracer(&la.salt, &lb.salt, l)).collect()
                 } else {
                     Vec::new()
                 };
                 let uv: Vec<[f32; 2]> = (0..nl)
                     .map(|l| [level(&la.u, &lb.u, l), level(&la.v, &lb.v, l)])
                     .collect();
+                // As the sheet: none in a column too shallow to be stratified
                 let step = |shows| {
-                    has_salt
+                    (has_salt && total >= stratification::MIN_DEPTH)
                         .then(|| column_strongest(shows, &z, &temp, &salt))
                         .flatten()
                         .map(|(height, strength)| (eta - height, strength))
@@ -176,11 +207,23 @@ impl Inspector {
             }
             _ => None,
         };
+        let sea = match (&a.waves, &b.waves) {
+            (Some(wa), Some(wb)) => Some(Sea {
+                hs: both(&wa.hs, &wb.hs),
+                tp: both(&wa.tp, &wb.tp),
+                toward: [both(&wa.dir_x, &wb.dir_x), both(&wa.dir_y, &wb.dir_y)],
+                spread: both(&wa.spread, &wb.spread),
+                whitecapping: both(&wa.whitecapping, &wb.whitecapping).max(0.0),
+                breaking: both(&wa.breaking, &wb.breaking).max(0.0),
+            }),
+            _ => None,
+        };
         Some(Readout {
             bed: -bed,
             eta,
             current,
             column,
+            sea,
         })
     }
 
@@ -207,7 +250,41 @@ fn current([u, v]: [f32; 2]) -> String {
     format!("{speed:.2} m/s towards {bearing:03.0}°")
 }
 
-/// The readout as lines: `full` adds the currents at the surface and the bed.
+/// The sea state as a line: H_s and T_p, the compass bearing the waves come from (as
+/// wave directions are given) and their spread; with `full`, a second with the power
+/// they lose.
+fn sea(s: &Sea, full: bool) -> String {
+    if s.hs < 0.005 {
+        return "\nwaves: none".into();
+    }
+    let [x, y] = s.toward;
+    let from = (x.atan2(y).to_degrees() + 180.0).rem_euclid(360.0);
+    let mut line = format!(
+        "\nwaves H_s {:.2} m, T_p {:.1} s, from {from:03.0}° ({}), spread {:.0}°",
+        s.hs,
+        s.tp,
+        crate::photo::compass(from),
+        s.spread.to_degrees()
+    );
+    if full {
+        // About three figures, none below a milliwatt
+        let power = |x: f32| match x {
+            x if x >= 100.0 => format!("{x:.0}"),
+            x if x >= 1.0 => format!("{x:.1}"),
+            x if x >= 1e-3 => format!("{x:.3}"),
+            _ => "0".into(),
+        };
+        line += &format!(
+            "\n  losing {} W/m² to whitecapping, {} to breaking",
+            power(s.whitecapping),
+            power(s.breaking)
+        );
+    }
+    line
+}
+
+/// The readout as lines: `full` adds the currents at the surface and the bed, and
+/// the power the waves lose.
 fn describe(r: &Readout, full: bool) -> String {
     let water = r.eta + r.bed;
     let mut s = if water <= H_DRY {
@@ -220,6 +297,9 @@ fn describe(r: &Readout, full: bool) -> String {
     };
     if water > H_DRY {
         s += &format!("\ncurrent (depth mean) {}", current(r.current));
+        if let Some(w) = &r.sea {
+            s += &sea(w, full);
+        }
     }
     if let Some(c) = &r.column {
         if full {
@@ -279,7 +359,11 @@ impl Plugin for InspectPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn).add_systems(
             Update,
-            (pick, (tooltip, pinned, marker).after(crate::field::interpolate)).chain(),
+            (
+                pick,
+                (tooltip, pinned, marker).after(crate::field::interpolate),
+            )
+                .chain(),
         );
     }
 }
@@ -335,7 +419,7 @@ fn spawn(
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(14.0),
-                top: Val::Px(230.0),
+                top: Val::Px(crate::menubar::BAR_HEIGHT + 230.0),
                 width: Val::Px((WIDTH / 2) as f32),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
@@ -374,38 +458,41 @@ fn spawn(
 }
 
 /// The point under the cursor, and clicks that pin it.
+#[allow(clippy::too_many_arguments)] // a Bevy system's parameters are its queries
 fn pick(
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
+    mut acts: MessageReader<Act>,
+    over_ui: Res<OverUi>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform), With<OrbitCamera>>,
     frame: Res<Frame>,
+    minimap: Res<Minimap>,
     mut inspector: ResMut<Inspector>,
 ) {
-    if keys.just_pressed(KeyCode::Escape) {
+    if acts.read().any(|a| a.0 == Action::Unpin) {
         inspector.pinned = None;
     }
     let (Ok(window), Ok((camera, transform))) = (window.single(), camera.single()) else {
         return;
     };
     let cursor = window.cursor_position();
-    // The ray under the cursor, cut with mean sea level
-    let hover = cursor
-        .and_then(|c| camera.viewport_to_world(transform, c).ok())
-        .and_then(|ray| {
+    // The point on the minimap, or the ray under the cursor cut with mean sea level
+    let on_map = cursor.and_then(|c| minimap.world_at(c));
+    let hover = on_map
+        .or_else(|| {
+            let ray = camera.viewport_to_world(transform, cursor?).ok()?;
             let distance = ray.intersect_plane(Vec3::ZERO, InfinitePlane3d::new(Vec3::Y))?;
-            let p = ray.get_point(distance);
-            Some([
-                p.x as f64 + frame.origin[0],
-                -p.z as f64 + frame.origin[1],
-            ])
+            Some(ray.get_point(distance))
         })
+        .map(|p| [p.x as f64 + frame.origin[0], -p.z as f64 + frame.origin[1]])
         .map(|at| Spot {
             at,
             probe: Probe::with_operators(&inspector.locator, &inspector.ops, at),
         });
+    // A click on the minimap moves the view instead ([`crate::minimap`])
     if mouse.just_pressed(MouseButton::Left) {
-        inspector.press = cursor;
+        inspector.press = cursor.filter(|_| on_map.is_none() && !over_ui.0);
     }
     if mouse.just_released(MouseButton::Left) {
         let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
@@ -525,7 +612,9 @@ fn draw_profile(column: &Column, image: &Handle<Image>, images: &mut Assets<Imag
     let range = |v: &[f32], floor: f32| {
         let (lo, hi) = v
             .iter()
-            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| {
+                (a.min(x), b.max(x))
+            });
         let pad = (0.08 * (hi - lo)).max(0.5 * floor);
         [lo - pad, hi + pad]
     };
@@ -574,8 +663,7 @@ fn marker(
     camera: Query<&OrbitCamera>,
     mut post: Query<(&mut Transform, &mut Visibility), With<PinMarker>>,
 ) {
-    let (Ok((mut transform, mut visible)), Ok(orbit)) = (post.single_mut(), camera.single())
-    else {
+    let (Ok((mut transform, mut visible)), Ok(orbit)) = (post.single_mut(), camera.single()) else {
         return;
     };
     let Some((spot, readout)) = inspector

@@ -5,7 +5,8 @@
 //! derivative matrices that give the exact gradient of a nodal field (for the surface
 //! normals). [`Field`] is η, u and v at [`crate::playback::Playback::t`], linear in
 //! time between the two snapshots around it; in a 3D run (u, v) is the depth mean or
-//! the σ-layer [`ShownLayer`] picks. A [`Probe`] evaluates a nodal field at a point by
+//! the σ-layer [`ShownLayer`] picks, and in a run with waves the sea state too (the
+//! direction as its vector). A [`Probe`] evaluates a nodal field at a point by
 //! the element's own polynomial (`dg_rs::solver::Probe2D`'s weights).
 //!
 //! World frame: Bevy is +Y up, so mesh (x, y, z) goes to (x − x₀, z·vz, −(y − y₀)), the
@@ -19,6 +20,7 @@ use dg_rs::types::ElementIndex;
 
 use crate::playback::Playback;
 use crate::scenario::Scenario;
+use crate::solver::Waves;
 
 /// Mesh coordinates to the world.
 #[derive(Resource, Clone, Copy, Debug)]
@@ -138,12 +140,13 @@ pub enum ShownLayer {
     Level(usize),
 }
 
-/// η, u and v at the shown time.
+/// η, u and v at the shown time, and the sea state of a run with waves.
 #[derive(Resource, Default)]
 pub struct Field {
     pub eta: Vec<f32>,
     pub u: Vec<f32>,
     pub v: Vec<f32>,
+    pub waves: Option<Waves>,
     /// Model time of the field (s); `None` before the first snapshot
     pub t: Option<f64>,
 }
@@ -182,6 +185,20 @@ pub fn interpolate(playback: Res<Playback>, shown: Res<ShownLayer>, mut field: R
             lerp(&mut field.u, &a.u, &b.u);
             lerp(&mut field.v, &a.v, &b.v);
         }
+    }
+    match (&a.waves, &b.waves) {
+        (Some(wa), Some(wb)) => {
+            let waves = field.waves.get_or_insert_with(Waves::default);
+            for ((out, x), y) in waves
+                .fields_mut()
+                .into_iter()
+                .zip(wa.fields())
+                .zip(wb.fields())
+            {
+                lerp(out, x, y);
+            }
+        }
+        _ => field.waves = None,
     }
     field.t = Some(playback.t);
 }
@@ -234,5 +251,64 @@ impl Probe {
             .enumerate()
             .map(|(i, w)| w * field[(self.start + i) * n_levels + level])
             .sum()
+    }
+
+    /// [`Self::eval_level`] of a tracer, with the element's dry nodes (depth `eta -
+    /// bed` at most `h_dry`) taking the mean of its wet nodes: a dry node's tracer is
+    /// not water's (dry nodes reached 28.8 °C in the 72 h Frøya run, their wet
+    /// neighbours 10.4). Every node dry: the plain polynomial.
+    pub fn eval_level_wet(
+        &self,
+        field: &[f32],
+        n_levels: usize,
+        level: usize,
+        [eta, bed]: [&[f32]; 2],
+        h_dry: f32,
+    ) -> f32 {
+        let value = |i: usize| field[(self.start + i) * n_levels + level];
+        let wet = |i: usize| eta[self.start + i] - bed[self.start + i] > h_dry;
+        let n = self.weights.len();
+        let (sum, count) = (0..n)
+            .filter(|&i| wet(i))
+            .fold((0.0, 0), |(s, c), i| (s + value(i), c + 1));
+        if count == 0 || count == n {
+            return self.eval_level(field, n_levels, level);
+        }
+        let mean = sum / count as f32;
+        (0..n)
+            .map(|i| self.weights[i] * if wet(i) { value(i) } else { mean })
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dry_node_takes_its_wet_neighbours_tracer() {
+        // Element 7601 of the 72 h Frøya run at 57 h: surface T and depth per node
+        let temp = [10.4, 10.4, 28.8, 10.3, 22.9, 28.8, 19.0, 26.5, 10.3_f32];
+        let depth = [0.62, 0.26, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.21_f32];
+        let bed = [0.0_f32; 9];
+        let probe = Probe {
+            start: 0,
+            weights: vec![0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5],
+        };
+        assert!((probe.eval_level(&temp, 1, 0) - 16.6).abs() < 1e-4);
+        // Wet: 10.4, 10.4, 10.3 (0.01 m is H_DRY, so dry), mean 10.3667
+        let wet = probe.eval_level_wet(&temp, 1, 0, [&depth, &bed], 0.01);
+        assert!((wet - 0.5 * (10.4 + 10.4 + 10.3) / 3.0 - 0.5 * 10.3).abs() < 1e-4);
+        // All wet, or all dry: the polynomial
+        let deep = [5.0_f32; 9];
+        assert_eq!(
+            probe.eval_level_wet(&temp, 1, 0, [&deep, &bed], 0.01),
+            probe.eval_level(&temp, 1, 0)
+        );
+        let dry = [0.0_f32; 9];
+        assert_eq!(
+            probe.eval_level_wet(&temp, 1, 0, [&dry, &bed], 0.01),
+            probe.eval_level(&temp, 1, 0)
+        );
     }
 }

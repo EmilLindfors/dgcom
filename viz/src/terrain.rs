@@ -61,6 +61,7 @@ use dg_rs::mesh::PointLocator2D;
 use dg_rs::types::ElementIndex;
 use rayon::prelude::*;
 
+use crate::actions::{Act, Action};
 use crate::colormap::{LAND, Lut, SEABED};
 use crate::field::{Field, Frame, Nodes, Probe};
 use crate::photo::PhotoPart;
@@ -260,6 +261,8 @@ pub struct Terrain {
     coast: HashMap<usize, f32>,
     /// World (X, Z) corners of the base grid, a cell inside its edge
     extent: [Vec2; 2],
+    /// Whether it is shown (L)
+    pub on: bool,
 }
 
 impl Terrain {
@@ -513,6 +516,7 @@ impl Terrain {
             patches,
             coast,
             extent,
+            on: true,
         })
     }
 
@@ -650,7 +654,12 @@ pub(crate) fn spawn(
         let colours: Vec<[f32; 4]> = patch.heights.iter().map(|&z| colouring.at(z)).collect();
         let ground = patch.cells(|v| v.iter().any(|&g| patch.drawn[g]));
         // The photo view's depth of the still sea over the ground
-        let depth: Vec<[f32; 2]> = patch.heights.iter().map(|&z| [(-z).max(0.0), 0.0]).collect();
+        let n_vertices = patch.positions.len();
+        let depth: Vec<[f32; 2]> = patch
+            .heights
+            .iter()
+            .map(|&z| [(-z).max(0.0), 0.0])
+            .collect();
         commands.spawn((
             Name::new("Terrain"),
             TerrainPart,
@@ -664,6 +673,10 @@ pub(crate) fn spawn(
                     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, patch.positions.clone())
                     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, patch.normals.clone())
                     .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colours)
+                    // Unused, but Bevy's PBR fragment shader with a second UV set and
+                    // no first reads an undeclared `uv` ("cannot find declaration of
+                    // uv" on every start, Bevy 0.20.0)
+                    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; n_vertices])
                     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, depth)
                     .with_inserted_indices(Indices::U32(ground)),
                 ),
@@ -722,20 +735,22 @@ pub(crate) fn spawn(
 }
 
 fn toggle(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut shown: Local<Option<bool>>,
+    mut acts: MessageReader<Act>,
+    terrain: Option<ResMut<Terrain>>,
     mut parts: Query<(&mut Visibility, Has<OuterSea>), With<TerrainPart>>,
     style: Res<SurfaceStyle>,
 ) {
-    let on = shown.get_or_insert(true);
-    if keys.just_pressed(KeyCode::KeyL) {
-        *on = !*on;
+    let Some(mut terrain) = terrain else { return };
+    let toggles = acts.read().filter(|a| a.0 == Action::Land).count();
+    if toggles % 2 == 1 {
+        terrain.on = !terrain.on;
     } else if !style.is_changed() {
         return;
     }
+    let on = terrain.on;
     for (mut visibility, sea) in &mut parts {
         // The sea goes with the model's water
-        let visible = *on && !(sea && *style == SurfaceStyle::Hidden);
+        let visible = on && !(sea && *style == SurfaceStyle::Hidden);
         *visibility = if visible {
             Visibility::Inherited
         } else {
