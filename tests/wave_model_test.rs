@@ -56,8 +56,8 @@ fn run(model: &WaveModel2D, n: &mut WaveSolution, t_end: f64, cfl: f64) {
     let dt_max = model.compute_dt(cfl);
     let steps = (t_end / dt_max).ceil() as usize;
     let dt = t_end / steps as f64;
-    for s in 0..steps {
-        model.step(n, s as f64 * dt, dt, &mut ws);
+    for _ in 0..steps {
+        model.step(n, dt, &mut ws);
     }
 }
 
@@ -70,7 +70,7 @@ fn l2_error(
 ) -> f64 {
     let (ops, geom) = (&model.ops, &model.geom);
     let xy = nodes(model);
-    let field = n.component(c);
+    let field: Vec<f64> = n.component(c).collect();
     let mut sum = 0.0;
     for k in 0..model.mesh.n_elements {
         for a in 0..ops.n_nodes {
@@ -109,8 +109,8 @@ fn propagation_converges_at_the_dg_order() {
             let c = m.grid.component(0, j);
             let mut n = m.zero_state();
             let xy = nodes(&m);
-            for (p, x) in n.component_mut(c).iter_mut().enumerate() {
-                *x = f(xy[p][0], xy[p][1], 0.0);
+            for (p, [x, y]) in xy.iter().enumerate() {
+                n.spectrum_mut(p)[c] = f(*x, *y, 0.0);
             }
             let t_end = 0.25 * L / cg;
             run(&m, &mut n, t_end, 0.3);
@@ -190,7 +190,7 @@ fn shoaling_keeps_the_action_flux() {
     let (c, xy) = (m.grid.component(i, 0), nodes(&m));
     let flux0 = cg_at(depth(0.0)) * e[c] / sigma;
     let worst = (0..m.n_points())
-        .map(|p| (cg_at(depth(xy[p][0])) * n.component(c)[p] / flux0 - 1.0).abs())
+        .map(|p| (cg_at(depth(xy[p][0])) * n.spectrum(p)[c] / flux0 - 1.0).abs())
         .fold(0.0, f64::max);
     println!("largest relative departure of c_g N from the boundary's: {worst:.2e}");
     assert!(worst < 2e-3, "c_g N departs by {worst:e}");
@@ -400,7 +400,7 @@ fn a_following_current_shifts_the_frequency_doppler() {
     for p in (0..m.n_points()).filter(|&p| xy[p][0] > 200.0) {
         let (mut num, mut den) = (0.0, 0.0);
         for ii in 0..m.grid.n_freq() {
-            let w = n.component(ii * nd)[p] * m.grid.d_sigma[ii];
+            let w = n.spectrum(p)[ii * nd] * m.grid.d_sigma[ii];
             num += m.grid.sigma[ii] * w;
             den += w;
         }
@@ -552,7 +552,7 @@ fn spread_sea_doppler_error(
         let (mut num, mut den) = (0.0, 0.0);
         for c in 0..m.grid.n_components() {
             let i = c / nd;
-            let w = n.component(c)[p] * m.grid.d_sigma[i];
+            let w = n.spectrum(p)[c] * m.grid.d_sigma[i];
             num += m.grid.sigma[i] * w;
             den += w;
         }
@@ -1007,7 +1007,7 @@ fn a_boundary_spectrum_varying_along_the_face_is_carried_straight_in() {
     let mut n = m.zero_state();
     run(&m, &mut n, 8.0 * LY / cg, 0.5);
     let worst = (0..m.n_points())
-        .map(|p| (n.component(c)[p] * sigma / profile(xy[p][0]) - 1.0).abs())
+        .map(|p| (n.spectrum(p)[c] * sigma / profile(xy[p][0]) - 1.0).abs())
         .fold(0.0, f64::max);
     println!("largest relative departure from the boundary's profile: {worst:.2e}");
     assert!(worst < 1e-12, "departs by {worst:e}");
@@ -1020,7 +1020,7 @@ fn a_boundary_spectrum_varying_along_the_face_is_carried_straight_in() {
     let (mut a, mut b) = (m_uniform.zero_state(), m_nodal.zero_state());
     run(&m_uniform, &mut a, 0.5 * LY / cg, 0.5);
     run(&m_nodal, &mut b, 0.5 * LY / cg, 0.5);
-    assert_eq!(a.component(c), b.component(c));
+    assert!(a.component(c).eq(b.component(c)));
 }
 
 /// Substeps keep what one short step gives where refraction and breaking are
@@ -1216,8 +1216,8 @@ fn absorbing_land_is_the_coast_of_a_mesh_without_it() {
     assert_eq!(with_island.compute_dt(0.5), dt);
     let steps = |model: &WaveModel2D, n: &mut WaveSolution| {
         let mut ws = WaveWorkspace::default();
-        for s in 0..6 {
-            model.step(n, s as f64 * dt, dt, &mut ws);
+        for _ in 0..6 {
+            model.step(n, dt, &mut ws);
         }
     };
     let (mut a, mut b) = (with_island.uniform_state(&sea), without.uniform_state(&sea));
@@ -1225,7 +1225,7 @@ fn absorbing_land_is_the_coast_of_a_mesh_without_it() {
     steps(&without, &mut b);
     let nn = with_island.ops.n_nodes;
     for c in 0..grid.n_components() {
-        let (a, b) = (a.component(c), b.component(c));
+        let (a, b): (Vec<f64>, Vec<f64>) = (a.component(c).collect(), b.component(c).collect());
         for (new, &old) in kept.iter().enumerate() {
             assert!(
                 a[old * nn..(old + 1) * nn] == b[new * nn..(new + 1) * nn],

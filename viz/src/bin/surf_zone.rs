@@ -186,8 +186,8 @@ fn run(case: Case) -> Steady {
         let mut ws = WaveWorkspace::default();
         let dt = waves.compute_dt(0.5);
         let steps = (4.0 * L / (2.0 * dt)).ceil() as usize;
-        for s in 0..steps {
-            waves.step(n, s as f64 * dt, dt, &mut ws);
+        for _ in 0..steps {
+            waves.step(n, dt, &mut ws);
         }
     };
     let physics = || -> SWEPhysics2DBuilder<Reflective2D> {

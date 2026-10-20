@@ -10,10 +10,9 @@
 //! 15 m/s wind, a sheared current, implicit refraction and frequency
 //! shifting, and a JONSWAP sea everywhere and on the boundary.
 //!
-//! `step` is the production path (node-major throughout); the node passes
-//! alone (`sources`, `implicit_*`) include the transposes of the public
-//! `apply_*` functions. `sources_without_dia` leaves out the quadruplets, so
-//! the DIA's share is `sources` less it.
+//! `step` is the production path; the node passes alone (`sources`,
+//! `implicit_*`) are the public `apply_*` functions. `sources_without_dia`
+//! leaves out the quadruplets, so the DIA's share is `sources` less it.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -83,25 +82,25 @@ fn bench_wave_step(c: &mut Criterion) {
 
     let mut n = state.clone();
     group.bench_function("step", |b| {
-        b.iter(|| model.step(black_box(&mut n), 0.0, dt, &mut ws))
+        b.iter(|| model.step(black_box(&mut n), dt, &mut ws))
     });
     let mut n = state.clone();
     group.bench_function("sources", |b| {
-        b.iter(|| model.apply_sources(black_box(&mut n), dt, &mut ws))
+        b.iter(|| model.apply_sources(black_box(&mut n), dt))
     });
     // The sources less the DIA: the DIA's share is the difference
     let (without_dia, _) = build(SourceTerms::swan_defaults(G).with_quadruplets(None));
     let mut n = state.clone();
     group.bench_function("sources_without_dia", |b| {
-        b.iter(|| without_dia.apply_sources(black_box(&mut n), dt, &mut ws))
+        b.iter(|| without_dia.apply_sources(black_box(&mut n), dt))
     });
     let mut n = state.clone();
     group.bench_function("implicit_refraction", |b| {
-        b.iter(|| model.apply_implicit_refraction(black_box(&mut n), 0.5 * dt, &mut ws))
+        b.iter(|| model.apply_implicit_refraction(black_box(&mut n), 0.5 * dt))
     });
     let mut n = state.clone();
     group.bench_function("implicit_frequency_shift", |b| {
-        b.iter(|| model.apply_implicit_frequency_shift(black_box(&mut n), 0.5 * dt, &mut ws))
+        b.iter(|| model.apply_implicit_frequency_shift(black_box(&mut n), 0.5 * dt))
     });
     group.finish();
 }

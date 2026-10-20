@@ -204,10 +204,9 @@ mod tests {
         let m = model(|x, _| -(3.0 + 0.1 * x));
         let mut n = m.uniform_state(&m.grid.jonswap(1.5, 7.0, 3.3, 0.7, 4.0));
         // Not uniform: scale each node's spectrum differently
-        for c in 0..m.grid.n_components() {
-            for (p, x) in n.component_mut(c).iter_mut().enumerate() {
-                *x *= 1.0 + 0.01 * p as f64;
-            }
+        for p in 0..n.n_points {
+            let factor = 1.0 + 0.01 * p as f64;
+            n.spectrum_mut(p).iter_mut().for_each(|x| *x *= factor);
         }
         let field = StokesDriftField::new(&m, &n);
         let nn = m.ops.n_nodes;

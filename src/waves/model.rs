@@ -59,6 +59,10 @@
 //! minutes. Under [`super::GrowthLimiter::RateBothSigns`], which caps the
 //! losses too, breaking has its own pass after the other sources even in one
 //! step, so that the cap leaves the surf zone's dissipation whole.
+//! Against wave buoys (the E39 fjord buoys at Ålesund, `notes/waves.md`)
+//! WAM's integration with 4 substeps at a CFL number of 1.0 does as well as
+//! SWAN's with one at 0.5, for half the cost: it is `froya_real_data`'s
+//! default.
 //!
 //! On steep slopes refraction turns the waves fast, and its explicit Courant
 //! limit `|c_θ| Δt ≤ Δθ` sets a step far below the geographic one (100× at
@@ -91,7 +95,8 @@ use std::sync::Arc;
 
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
-use crate::time::{StageWorkspace, StandardIntegrator, TimeIntegrator};
+use crate::profiling;
+use crate::time::SspScheme;
 use crate::types::ElementIndex;
 
 use super::dispersion::{dsigma_ddepth, group_velocity, wavenumber};
@@ -101,12 +106,11 @@ use super::sources::{Dissipation, Nodes, SourceScratch, SourceTerms, Wind};
 use super::spectrum::{SpectralGrid, WaveParameters};
 use super::state::WaveSolution;
 
-#[path = "propagation.rs"]
-mod propagation;
-use propagation::{NodeMajor, from_node_major, to_node_major};
 #[cfg(feature = "simd")]
 #[path = "implicit_lanes.rs"]
 mod implicit_lanes;
+#[path = "propagation.rs"]
+mod propagation;
 
 #[cfg(all(test, feature = "simd"))]
 static SCALAR_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -219,9 +223,9 @@ impl WaveTimeStepLimits {
 /// Reusable storage of [`WaveModel2D::step`].
 #[derive(Default)]
 pub struct WaveWorkspace {
-    /// The state node-major (`[point][component]`) during a step
-    node: NodeMajor,
-    stages: StageWorkspace<NodeMajor>,
+    /// The Runge–Kutta stage values: the last and the next
+    stage: Vec<f64>,
+    next: Vec<f64>,
 }
 
 /// The spectral wave model (see the module docs).
@@ -262,7 +266,7 @@ pub struct WaveModel2D {
     /// Frequency shifting stepped implicitly around the Runge–Kutta stages
     implicit_frequency_shift: bool,
     /// The Runge–Kutta method of the propagation
-    time_integrator: StandardIntegrator,
+    time_integrator: SspScheme,
     /// Propagation steps per step, each with its implicit refraction,
     /// shifting and breaking; the other sources run once per step
     substeps: usize,
@@ -308,7 +312,7 @@ impl WaveModel2D {
             spectral_advection: SpectralAdvection::default(),
             implicit_refraction: false,
             implicit_frequency_shift: false,
-            time_integrator: StandardIntegrator::SSPRK3,
+            time_integrator: SspScheme::Rk3,
             substeps: 1,
             absorbing_land: false,
             dry_nodes: Vec::new(),
@@ -328,10 +332,10 @@ impl WaveModel2D {
     }
 
     /// The Runge–Kutta method of the propagation (default SSP-RK3).
-    /// [`StandardIntegrator::SSPRK43`] has twice SSP-RK3's SSP coefficient,
-    /// so its positivity scaling holds at twice the CFL number, for 4 stages
+    /// [`SspScheme::Rk43`] has twice SSP-RK3's SSP coefficient, so its
+    /// positivity scaling holds at twice the CFL number, for 4 stages
     /// against 3.
-    pub fn with_time_integrator(mut self, integrator: StandardIntegrator) -> Self {
+    pub fn with_time_integrator(mut self, integrator: SspScheme) -> Self {
         self.time_integrator = integrator;
         self
     }
@@ -770,6 +774,9 @@ impl WaveModel2D {
                 }
             }
         }
+        if self.implicit_refraction && self.implicit_frequency_shift {
+            return limits;
+        }
         let (dtheta, nd) = (self.grid.d_theta, self.grid.n_dir());
         let cfl = match self.spectral_advection {
             SpectralAdvection::Upwind => cfl,
@@ -799,28 +806,20 @@ impl WaveModel2D {
     }
 
     /// `out = −∇·((c_g e_θ + U) N) − ∂(c_θ N)/∂θ − ∂(c_σ N)/∂σ` for every
-    /// component (no sources). The step evaluates it node-major
-    /// ([`propagation`]); this transposes in and out.
+    /// component (no sources). The step does not store it: each Runge–Kutta
+    /// stage combines it element by element ([`Self::propagation_stage`]).
     pub fn propagation_rhs_into(&self, n: &WaveSolution, out: &mut WaveSolution) {
-        let (np, nc) = (self.n_points(), self.grid.n_components());
-        let (mut node, mut rhs) = (Vec::new(), vec![0.0; np * nc]);
-        to_node_major(&n.data, np, nc, &mut node);
-        self.propagation_rhs_node_major(&node, &mut rhs);
-        from_node_major(&rhs, np, nc, &mut out.data);
+        self.propagation_rhs_node_major(&n.data, &mut out.data);
     }
 
     /// Scale every component in every element towards its mean so that no node is
     /// negative (Zhang & Shu 2010): the mean, and so the total action, is kept; an
     /// element whose mean is negative is zeroed.
     pub fn limit_positivity(&self, n: &mut WaveSolution) {
-        let (np, nc) = (self.n_points(), self.grid.n_components());
-        let mut node = Vec::new();
-        to_node_major(&n.data, np, nc, &mut node);
-        self.limit_positivity_node_major(&mut node);
-        from_node_major(&node, np, nc, &mut n.data);
+        self.limit_positivity_node_major(&mut n.data);
     }
 
-    /// Advance `n` from `t` by `dt`: the propagation by the Runge–Kutta method
+    /// Advance `n` by `dt`: the propagation by the Runge–Kutta method
     /// of [`Self::with_time_integrator`] (positivity limited every stage) and
     /// the sources over the step. Implicit refraction and frequency shifting
     /// take half the step before the propagation and half after (Strang).
@@ -834,7 +833,7 @@ impl WaveModel2D {
     ///
     /// With [`Self::with_absorbing_land`] the dry nodes lose their action at
     /// the start of the step and after every propagation step's passes.
-    pub fn step(&self, n: &mut WaveSolution, t: f64, dt: f64, ws: &mut WaveWorkspace) {
+    pub fn step(&self, n: &mut WaveSolution, dt: f64, ws: &mut WaveWorkspace) {
         let substeps = self.substeps;
         let h = dt / substeps as f64;
         // Strang: half of the implicit spectral advection on each side of
@@ -852,26 +851,18 @@ impl WaveModel2D {
         let breaking =
             ((substeps > 1 || caps_losses) && self.sources.breaking.is_some()).then_some(h);
         let with_sources = (substeps / 2).max(1) - 1;
-        // The whole step node-major: one transpose in, one out
-        let (np, nc) = (self.n_points(), self.grid.n_components());
-        to_node_major(&n.data, np, nc, &mut ws.node.data);
         // Land that has fallen dry since the last step takes its waves
-        self.absorb_on_land(&mut ws.node.data);
+        self.absorb_on_land(&mut n.data);
         for m in 0..substeps {
             if refraction.is_some() || shift.is_some() {
-                self.node_pass_node_major(
-                    &mut ws.node.data,
-                    NodePass::before_stages(refraction, shift),
-                );
+                profiling::scope("waves: node pass before", || {
+                    self.node_pass_node_major(
+                        &mut n.data,
+                        NodePass::before_stages(refraction, shift),
+                    )
+                });
             }
-            self.time_integrator.step_with_workspace(
-                &mut ws.node,
-                h,
-                t + m as f64 * h,
-                |s, _, out| self.propagation_rhs_node_major(&s.data, &mut out.data),
-                |s| self.limit_positivity_node_major(&mut s.data),
-                &mut ws.stages,
-            );
+            profiling::scope("waves: propagation", || self.propagate(&mut n.data, h, ws));
             let sources = sources.filter(|_| m == with_sources);
             if refraction.is_some() || shift.is_some() || sources.is_some() || breaking.is_some() {
                 let pass = NodePass {
@@ -881,56 +872,65 @@ impl WaveModel2D {
                     breaking,
                     shift_first: false,
                 };
-                self.node_pass_node_major(&mut ws.node.data, pass);
+                profiling::scope("waves: node pass after", || {
+                    self.node_pass_node_major(&mut n.data, pass)
+                });
             }
-            self.absorb_on_land(&mut ws.node.data);
+            self.absorb_on_land(&mut n.data);
         }
-        from_node_major(&ws.node.data, np, nc, &mut n.data);
+    }
+
+    /// The propagation of the state `n` over `dt` by the Runge–Kutta method of
+    /// [`Self::with_time_integrator`], one pass per stage
+    /// ([`Self::propagation_stage`]), the stage values alternating between
+    /// `ws.stage` and `ws.next` (the last swapped into `n`).
+    fn propagate(&self, n: &mut Vec<f64>, dt: f64, ws: &mut WaveWorkspace) {
+        let len = n.len();
+        ws.stage.resize(len, 0.0);
+        ws.next.resize(len, 0.0);
+        for (s, &stage) in self.time_integrator.stages().iter().enumerate() {
+            let previous = if s == 0 { &*n } else { &ws.stage };
+            self.propagation_stage(n, previous, stage, dt, &mut ws.next);
+            std::mem::swap(&mut ws.stage, &mut ws.next);
+        }
+        std::mem::swap(n, &mut ws.stage);
     }
 
     /// The sources over `dt` at every node.
-    pub fn apply_sources(&self, n: &mut WaveSolution, dt: f64, ws: &mut WaveWorkspace) {
+    pub fn apply_sources(&self, n: &mut WaveSolution, dt: f64) {
         let pass = NodePass {
             sources: Some(dt),
             ..NodePass::default()
         };
-        self.node_pass(n, ws, pass);
+        self.node_pass(n, pass);
     }
 
     /// Implicit refraction over `dt` at every node (see the module docs),
     /// whether or not the model steps it so.
-    pub fn apply_implicit_refraction(&self, n: &mut WaveSolution, dt: f64, ws: &mut WaveWorkspace) {
+    pub fn apply_implicit_refraction(&self, n: &mut WaveSolution, dt: f64) {
         let pass = NodePass {
             refraction: Some(dt),
             ..NodePass::default()
         };
-        self.node_pass(n, ws, pass);
+        self.node_pass(n, pass);
     }
 
     /// Implicit frequency shifting over `dt` at every node (see the module
     /// docs), whether or not the model steps it so.
-    pub fn apply_implicit_frequency_shift(
-        &self,
-        n: &mut WaveSolution,
-        dt: f64,
-        ws: &mut WaveWorkspace,
-    ) {
+    pub fn apply_implicit_frequency_shift(&self, n: &mut WaveSolution, dt: f64) {
         let pass = NodePass {
             shift: Some(dt),
             ..NodePass::default()
         };
-        self.node_pass(n, ws, pass);
+        self.node_pass(n, pass);
     }
 
     /// At every node, on its spectrum, what `pass` gives: implicit refraction
     /// and frequency shifting (in its order), then the sources; dry land's
     /// action goes after it, as in [`Self::step`].
-    fn node_pass(&self, n: &mut WaveSolution, ws: &mut WaveWorkspace, pass: NodePass) {
-        let (np, nc) = (self.n_points(), self.grid.n_components());
-        to_node_major(&n.data, np, nc, &mut ws.node.data);
-        self.node_pass_node_major(&mut ws.node.data, pass);
-        self.absorb_on_land(&mut ws.node.data);
-        from_node_major(&ws.node.data, np, nc, &mut n.data);
+    fn node_pass(&self, n: &mut WaveSolution, pass: NodePass) {
+        self.node_pass_node_major(&mut n.data, pass);
+        self.absorb_on_land(&mut n.data);
     }
 
     /// [`Self::node_pass`] on the node-major state `node_major`.
@@ -1221,7 +1221,7 @@ impl WaveModel2D {
 
     /// The variance density `E = σ N` at node `p` into `e`.
     pub fn energy_spectrum_into(&self, n: &WaveSolution, p: usize, e: &mut [f64]) {
-        n.spectrum_into(p, e);
+        e.copy_from_slice(n.spectrum(p));
         let nd = self.grid.n_dir();
         for (c, x) in e.iter_mut().enumerate() {
             *x *= self.grid.sigma[c / nd];
@@ -1316,14 +1316,18 @@ impl WaveModel2D {
     /// Total action `Σ_c Δσ Δθ ∫ N_c dA` (m⁴·s/rad), conserved by the propagation
     /// up to boundary and spectral-end fluxes.
     pub fn total_action(&self, n: &WaveSolution) -> f64 {
-        let (nn, nd) = (self.ops.n_nodes, self.grid.n_dir());
+        let (nn, nd, nc) = (
+            self.ops.n_nodes,
+            self.grid.n_dir(),
+            self.grid.n_components(),
+        );
         let mut total = 0.0;
-        for c in 0..self.grid.n_components() {
-            let field = n.component(c);
+        for c in 0..nc {
             let mut integral = 0.0;
             for k in 0..self.mesh.n_elements {
                 for a in 0..nn {
-                    integral += self.ops.weights[a] * self.geom.jacobian(k, a) * field[k * nn + a];
+                    let x = n.data[(k * nn + a) * nc + c];
+                    integral += self.ops.weights[a] * self.geom.jacobian(k, a) * x;
                 }
             }
             total += integral * self.grid.d_sigma[c / nd] * self.grid.d_theta;
@@ -1665,14 +1669,13 @@ mod tests {
         let mut n = model.uniform_state(&e);
         let before = n.clone();
         let explicit = model.compute_dt(1.0).min(1.0);
-        let mut ws = WaveWorkspace::default();
-        model.apply_implicit_refraction(&mut n, 1e4 * explicit, &mut ws);
+        model.apply_implicit_refraction(&mut n, 1e4 * explicit);
         let (nf, nd, np) = (model.grid.n_freq(), model.grid.n_dir(), model.n_points());
         let mut turned = 0.0f64;
         for p in 0..np {
             for i in 0..nf {
                 let sum =
-                    |s: &WaveSolution| -> f64 { (0..nd).map(|j| s.component(i * nd + j)[p]).sum() };
+                    |s: &WaveSolution| -> f64 { (0..nd).map(|j| s.spectrum(p)[i * nd + j]).sum() };
                 let (a, b) = (sum(&before), sum(&n));
                 assert!(
                     (a - b).abs() <= 1e-13 * a.max(1e-300),
@@ -1680,8 +1683,8 @@ mod tests {
                 );
                 for j in 0..nd {
                     let c = i * nd + j;
-                    assert!(n.component(c)[p] >= 0.0);
-                    turned = turned.max((n.component(c)[p] - before.component(c)[p]).abs());
+                    assert!(n.spectrum(p)[c] >= 0.0);
+                    turned = turned.max((n.spectrum(p)[c] - before.spectrum(p)[c]).abs());
                 }
             }
         }
@@ -1724,8 +1727,7 @@ mod tests {
         let explicit = model.time_step_limits(1.0).frequency_shift.dt;
         model.implicit_frequency_shift = true;
         let dt = 1e4 * explicit;
-        let mut ws = WaveWorkspace::default();
-        model.apply_implicit_frequency_shift(&mut n, dt, &mut ws);
+        model.apply_implicit_frequency_shift(&mut n, dt);
         let (nf, nd) = (model.grid.n_freq(), model.grid.n_dir());
         let mut shifted = 0.0f64;
         for p in 0..np {
@@ -1733,7 +1735,7 @@ mod tests {
                 let theta = model.grid.theta[j];
                 let action = |s: &WaveSolution| -> f64 {
                     (0..nf)
-                        .map(|i| model.grid.d_sigma[i] * s.component(i * nd + j)[p])
+                        .map(|i| model.grid.d_sigma[i] * s.spectrum(p)[i * nd + j])
                         .sum()
                 };
                 let (bottom, top) = (
@@ -1741,7 +1743,7 @@ mod tests {
                     model.c_sigma(nf - 1, theta, p).max(0.0),
                 );
                 let outflow =
-                    dt * (top * n.component((nf - 1) * nd + j)[p] - bottom * n.component(j)[p]);
+                    dt * (top * n.spectrum(p)[(nf - 1) * nd + j] - bottom * n.spectrum(p)[j]);
                 let (a, b) = (action(&before), action(&n));
                 assert!(
                     (a - b - outflow).abs() <= 1e-12 * a,
@@ -1749,8 +1751,8 @@ mod tests {
                 );
                 for i in 0..nf {
                     let c = i * nd + j;
-                    assert!(n.component(c)[p] >= 0.0);
-                    shifted = shifted.max((n.component(c)[p] - before.component(c)[p]).abs());
+                    assert!(n.spectrum(p)[c] >= 0.0);
+                    shifted = shifted.max((n.spectrum(p)[c] - before.spectrum(p)[c]).abs());
                 }
             }
         }
@@ -1820,8 +1822,7 @@ mod tests {
         let dry = (0..np).filter(|&p| absorbing.absorbs_at(p)).count();
         assert!(dry > 0 && dry < np / 2, "{dry} of {np} nodes dry");
         let e = absorbing.grid.jonswap(1.0, 6.0, 3.3, 0.3, 2.0);
-        let mut ws = WaveWorkspace::default();
-        type Pass = fn(&WaveModel2D, &mut WaveSolution, f64, &mut WaveWorkspace);
+        type Pass = fn(&WaveModel2D, &mut WaveSolution, f64);
         let passes: [(&str, Pass); 3] = [
             ("sources", WaveModel2D::apply_sources),
             ("refraction", WaveModel2D::apply_implicit_refraction),
@@ -1829,8 +1830,8 @@ mod tests {
         ];
         for (name, pass) in passes {
             let (mut a, mut f) = (absorbing.uniform_state(&e), floored.uniform_state(&e));
-            pass(&absorbing, &mut a, 30.0, &mut ws);
-            pass(&floored, &mut f, 30.0, &mut ws);
+            pass(&absorbing, &mut a, 30.0);
+            pass(&floored, &mut f, 30.0);
             assert_ne!(
                 a.data,
                 absorbing.uniform_state(&e).data,
@@ -1841,10 +1842,10 @@ mod tests {
                     let expected = if absorbing.absorbs_at(p) {
                         0.0
                     } else {
-                        f.component(c)[p]
+                        f.spectrum(p)[c]
                     };
                     assert_eq!(
-                        a.component(c)[p],
+                        a.spectrum(p)[c],
                         expected,
                         "{name}: node {p}, component {c}"
                     );
@@ -1877,7 +1878,7 @@ mod tests {
         let mut ws = WaveWorkspace::default();
         let mut grown = |model: &WaveModel2D| {
             let mut n = model.zero_state();
-            model.step(&mut n, 0.0, 60.0, &mut ws);
+            model.step(&mut n, 60.0, &mut ws);
             n
         };
         model.set_winds(&winds);
@@ -1888,10 +1889,10 @@ mod tests {
         let by_right = grown(&model);
         let nn = model.ops.n_nodes;
         for c in 0..model.grid.n_components() {
-            let (a, l, r) = (
-                per_node.component(c),
-                by_left.component(c),
-                by_right.component(c),
+            let (a, l, r): (Vec<f64>, Vec<f64>, Vec<f64>) = (
+                per_node.component(c).collect(),
+                by_left.component(c).collect(),
+                by_right.component(c).collect(),
             );
             assert_eq!(a[..nn], l[..nn], "component {c}");
             assert_eq!(a[nn..], r[nn..], "component {c}");
@@ -1987,8 +1988,8 @@ mod tests {
                     SCALAR_ONLY.store(scalar, Ordering::Relaxed);
                     let mut state = start.clone();
                     let mut ws = WaveWorkspace::default();
-                    for step in 0..3 {
-                        model.step(&mut state, step as f64 * dt, dt, &mut ws);
+                    for _ in 0..3 {
+                        model.step(&mut state, dt, &mut ws);
                     }
                     SCALAR_ONLY.store(false, Ordering::Relaxed);
                     state.data.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
