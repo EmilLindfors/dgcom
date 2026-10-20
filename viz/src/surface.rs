@@ -14,33 +14,40 @@
 //! domain keeps its cut-out edge.
 //!
 //! The water's heights, normals and colours are rewritten whenever the shown field
-//! changes. Keys: C colours the water by current speed or by surface elevation; T
-//! cycles the water through translucent, opaque and hidden; - and = make the
-//! translucent water clearer or denser, down to a tint over the bed.
+//! changes. Keys: C colours the water by current speed or by surface elevation, and
+//! in a run with waves by the significant wave height, the peak period or the power
+//! the waves lose to whitecapping and breaking (on a log scale); T cycles the water
+//! through translucent, opaque and hidden; - and = make the translucent water clearer
+//! or denser, down to a tint over the bed.
 //!
 //! In the photo view ([`crate::photo`]) both meshes carry what its shader needs too:
 //! the water the current (UV 0, world X and Z, averaged over the nodes elements share
-//! so the waves riding it have no seams at element edges), the bed the depth of the
-//! water over it (UV 1).
+//! so the waves riding it have no seams at element edges) and in a run with waves the
+//! significant wave height and the share of their energy the waves lose to breaking
+//! per period (UV 1, averaged so too), the bed the depth of the water over it (UV 1).
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 
-use crate::colormap::{DIVERGING, Lut, SEABED, VIRIDIS};
+use crate::actions::{Act, Action};
+use crate::colormap::{CIVIDIS, DIVERGING, ICE, Lut, SEABED, THERMAL, VIRIDIS};
 use crate::field::{Field, Frame, Nodes};
 use crate::photo::{Photo, PhotoPart};
 use crate::playback::Playback;
-use crate::solver::H_DRY;
+use crate::solver::{H_DRY, Waves};
 use crate::terrain::{GroundColours, Terrain};
 
 pub struct SurfacePlugin;
 
 impl Plugin for SurfacePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(SurfaceStyle::Translucent)
-            .init_resource::<WaterOpacity>()
+        // Translucent, unless the app chose (opaque under a wave colouring)
+        if !app.world().contains_resource::<SurfaceStyle>() {
+            app.insert_resource(SurfaceStyle::Translucent);
+        }
+        app.init_resource::<WaterOpacity>()
             .add_systems(Startup, spawn)
             .add_systems(
                 Update,
@@ -50,11 +57,53 @@ impl Plugin for SurfacePlugin {
 }
 
 /// What the water's colour shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColourBy {
     Speed,
     Elevation,
+    /// Significant wave height
+    WaveHeight,
+    /// Peak period
+    WavePeriod,
+    /// Whitecapping and depth-induced breaking, on a log scale
+    WaveDissipation,
 }
+
+impl ColourBy {
+    /// The colouring C steps to: the waves' only in a run that has them.
+    pub fn next(self, waves: bool) -> Self {
+        match self {
+            Self::Speed => Self::Elevation,
+            Self::Elevation if waves => Self::WaveHeight,
+            Self::Elevation => Self::Speed,
+            Self::WaveHeight => Self::WavePeriod,
+            Self::WavePeriod => Self::WaveDissipation,
+            Self::WaveDissipation => Self::Speed,
+        }
+    }
+
+    pub fn is_waves(self) -> bool {
+        matches!(
+            self,
+            Self::WaveHeight | Self::WavePeriod | Self::WaveDissipation
+        )
+    }
+
+    /// The colouring a `--colour` value names.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "speed" => Self::Speed,
+            "elevation" | "eta" => Self::Elevation,
+            "hs" | "height" => Self::WaveHeight,
+            "tp" | "period" => Self::WavePeriod,
+            "dissipation" | "breaking" => Self::WaveDissipation,
+            _ => return None,
+        })
+    }
+}
+
+/// Decades the dissipation's log scale spans below its top.
+pub const DISSIPATION_DECADES: f32 = 4.0;
 
 #[derive(Resource)]
 pub struct Colouring {
@@ -63,63 +112,207 @@ pub struct Colouring {
     pub speed_max: f32,
     /// Half-width of the elevation scale (m)
     pub eta_max: f32,
+    /// Tops of the wave height (m) and peak period (s) scales
+    pub hs_max: f32,
+    pub tp_max: f32,
+    /// Top of the dissipation's log scale (W/m², a power of ten)
+    pub dissipation_max: f32,
     /// Whether the speed scale was set by hand (else it follows the flow)
     fixed_speed: bool,
-    speed_lut: Lut,
-    eta_lut: Lut,
+    luts: [Lut; 5],
 }
 
 impl Colouring {
-    pub fn new(speed_max: Option<f32>) -> Self {
+    pub fn new(speed_max: Option<f32>, by: ColourBy) -> Self {
         Self {
-            by: ColourBy::Speed,
+            by,
             speed_max: speed_max.unwrap_or(0.05),
             eta_max: 0.1,
+            hs_max: 1.0,
+            tp_max: 10.0,
+            dissipation_max: 100.0,
             fixed_speed: speed_max.is_some(),
-            speed_lut: Lut::new(VIRIDIS),
-            eta_lut: Lut::new(DIVERGING),
+            luts: [VIRIDIS, DIVERGING, THERMAL, CIVIDIS, ICE].map(Lut::new),
         }
     }
 
-    /// The colour of a node with speed `speed` and elevation `eta`.
-    fn at(&self, speed: f32, eta: f32) -> [f32; 4] {
-        match self.by {
-            ColourBy::Speed => self.speed_lut.at(speed / self.speed_max),
-            ColourBy::Elevation => self.eta_lut.at(0.5 + 0.5 * eta / self.eta_max),
+    /// Where the node `g` falls on the scale shown, 0 to 1 (speeds in `speed`).
+    fn position(&self, g: usize, speed: &[f32], field: &Field) -> f32 {
+        let waves = field.waves.as_ref();
+        match (self.by, waves) {
+            (ColourBy::Elevation, _) => 0.5 + 0.5 * field.eta[g] / self.eta_max,
+            (ColourBy::WaveHeight, Some(w)) => w.hs[g] / self.hs_max,
+            (ColourBy::WavePeriod, Some(w)) => w.tp[g] / self.tp_max,
+            (ColourBy::WaveDissipation, Some(w)) => {
+                let power = w.whitecapping[g] + w.breaking[g];
+                1.0 + (power.max(1e-30) / self.dissipation_max).log10() / DISSIPATION_DECADES
+            }
+            // The speed, also for a wave colouring of a field without waves
+            _ => speed[g] / self.speed_max,
         }
     }
 
-    /// Fits the scales to the shown field in round steps: speed to its 98th percentile,
-    /// η to its largest magnitude. A scale steps up as soon as the field exceeds it and
-    /// down only once the field fits a step lower with a quarter to spare, so it does not
-    /// flicker at a step's edge.
-    fn fit(&mut self, speed: &[f32], eta: &[f32]) {
+    /// The colour of node `g`.
+    fn at(&self, g: usize, speed: &[f32], field: &Field) -> [f32; 4] {
+        let by = if self.by.is_waves() && field.waves.is_none() {
+            ColourBy::Speed
+        } else {
+            self.by
+        };
+        self.luts[by as usize].at(self.position(g, speed, field))
+    }
+
+    /// Fits the scales to the shown field in round steps: speed to its 98th
+    /// percentile, η to its largest magnitude, H_s and T_p to their 99th percentiles
+    /// and the dissipation's top to the power of ten over its 99.5th. A scale steps up
+    /// as soon as the field exceeds it and down only once the field fits a step lower
+    /// with a quarter to spare, so it does not flicker at a step's edge.
+    fn fit(&mut self, speed: &[f32], eta: &[f32], waves: Option<&Waves>) {
         fn follow(scale: &mut f32, x: f32, floor: f32) {
             if x > *scale || nice_ceil(1.25 * x) < *scale {
                 *scale = nice_ceil(x).max(floor);
             }
         }
         let stride = (speed.len() / 20_000).max(1);
-        if !self.fixed_speed {
-            let mut sample: Vec<f32> = speed.iter().step_by(stride).copied().collect();
-            if !sample.is_empty() {
-                let at = (0.98 * (sample.len() - 1) as f32) as usize;
-                let (_, p98, _) = sample.select_nth_unstable_by(at, f32::total_cmp);
-                follow(&mut self.speed_max, *p98, 1e-3);
+        let percentile = |field: &[f32], p: f32, of: &dyn Fn(usize) -> f32| {
+            let mut sample: Vec<f32> = (0..field.len()).step_by(stride).map(of).collect();
+            if sample.is_empty() {
+                return None;
             }
+            let at = (p * (sample.len() - 1) as f32) as usize;
+            Some(*sample.select_nth_unstable_by(at, f32::total_cmp).1)
+        };
+        if !self.fixed_speed
+            && let Some(p98) = percentile(speed, 0.98, &|g| speed[g])
+        {
+            follow(&mut self.speed_max, p98, 1e-3);
         }
         let eta_abs = eta
             .iter()
             .step_by(stride)
             .fold(0.0_f32, |m, e| m.max(e.abs()));
         follow(&mut self.eta_max, eta_abs, 1e-2);
+        let Some(w) = waves else { return };
+        if let Some(p99) = percentile(&w.hs, 0.99, &|g| w.hs[g]) {
+            follow(&mut self.hs_max, p99, 0.1);
+        }
+        if let Some(p99) = percentile(&w.tp, 0.99, &|g| w.tp[g]) {
+            follow(&mut self.tp_max, p99, 1.0);
+        }
+        let power = |g: usize| w.whitecapping[g] + w.breaking[g];
+        if let Some(top) = percentile(&w.hs, 0.995, &power) {
+            // A decade up at once, down once the field fits a decade lower with a
+            // quarter to spare
+            let top = top.max(1e-2);
+            let decade = 10f32.powf(top.log10().ceil());
+            if decade > self.dissipation_max || 12.5 * top < self.dissipation_max {
+                self.dissipation_max = decade;
+            }
+        }
     }
 
     pub fn stops(&self) -> &'static [[u8; 3]] {
         match self.by {
             ColourBy::Speed => VIRIDIS,
             ColourBy::Elevation => DIVERGING,
+            ColourBy::WaveHeight => THERMAL,
+            ColourBy::WavePeriod => CIVIDIS,
+            ColourBy::WaveDissipation => ICE,
         }
+    }
+
+    /// The scale's title and its labels at the low end, the middle and the top.
+    pub fn legend(&self) -> (&'static str, [String; 3]) {
+        let linear = |lo: f32, hi: f32| {
+            std::array::from_fn(|i| {
+                let v = lo + (hi - lo) * i as f32 / 2.0;
+                format!("{}", (v * 1000.0).round() / 1000.0)
+            })
+        };
+        match self.by {
+            ColourBy::Speed => ("current speed (m/s)", linear(0.0, self.speed_max)),
+            ColourBy::Elevation => (
+                "surface elevation η (m)",
+                linear(-self.eta_max, self.eta_max),
+            ),
+            ColourBy::WaveHeight => ("significant wave height H_s (m)", linear(0.0, self.hs_max)),
+            ColourBy::WavePeriod => ("peak period T_p (s)", linear(0.0, self.tp_max)),
+            ColourBy::WaveDissipation => (
+                "waves' losses (W/m², log)",
+                std::array::from_fn(|i| {
+                    let decades = DISSIPATION_DECADES * (1.0 - i as f32 / 2.0);
+                    let v = self.dissipation_max / 10f32.powf(decades);
+                    if v >= 1.0 {
+                        format!("{v:.0}")
+                    } else {
+                        format!("{v}")
+                    }
+                }),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn c_cycles_through_the_waves_only_when_the_run_has_them() {
+        let mut by = ColourBy::Speed;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            by = by.next(true);
+            seen.push(by);
+        }
+        assert_eq!(
+            seen,
+            [
+                ColourBy::Elevation,
+                ColourBy::WaveHeight,
+                ColourBy::WavePeriod,
+                ColourBy::WaveDissipation,
+                ColourBy::Speed
+            ]
+        );
+        assert_eq!(ColourBy::Elevation.next(false), ColourBy::Speed);
+        assert_eq!(ColourBy::parse("hs"), Some(ColourBy::WaveHeight));
+        assert_eq!(ColourBy::parse("waves"), None);
+    }
+
+    #[test]
+    fn the_dissipation_scale_follows_in_decades() {
+        let mut colouring = Colouring::new(None, ColourBy::WaveDissipation);
+        let n = 1000;
+        let waves = |power: f32| Waves {
+            hs: vec![1.0; n],
+            tp: vec![8.0; n],
+            whitecapping: vec![power; n],
+            breaking: vec![0.0; n],
+            ..Waves::default()
+        };
+        let still = vec![0.0; n];
+        colouring.fit(&still, &still, Some(&waves(3.0)));
+        assert_eq!(colouring.dissipation_max, 10.0);
+        assert_eq!(colouring.legend().1, ["0.001", "0.1", "10"]);
+        // Up a decade at once, down once a decade lower fits
+        colouring.fit(&still, &still, Some(&waves(30.0)));
+        assert_eq!(colouring.dissipation_max, 100.0);
+        colouring.fit(&still, &still, Some(&waves(9.0)));
+        assert_eq!(colouring.dissipation_max, 100.0);
+        colouring.fit(&still, &still, Some(&waves(0.9)));
+        assert_eq!(colouring.dissipation_max, 1.0);
+        assert_eq!(colouring.hs_max, 1.0);
+        assert_eq!(colouring.tp_max, 10.0);
+    }
+
+    #[test]
+    fn breaking_shares_the_energy_per_period() {
+        // H_s 1 m holds ρg/16 ≈ 628 J/m²; losing 62.8 W/m² over a 10 s period is all of it
+        let energy = 1025.0 * 9.81 / 16.0;
+        assert!((breaking_share(0.1 * energy, 10.0, 1.0) - 1.0).abs() < 1e-5);
+        assert_eq!(breaking_share(5.0, 8.0, 0.0), 0.0);
+        assert_eq!(breaking_share(1e6, 8.0, 0.1), 4.0);
     }
 }
 
@@ -407,32 +600,41 @@ pub(crate) fn spawn(
 }
 
 fn keys(
-    keys: Res<ButtonInput<KeyCode>>,
+    mut acts: MessageReader<Act>,
+    field: Res<Field>,
     mut colouring: ResMut<Colouring>,
     mut style: ResMut<SurfaceStyle>,
     mut opacity: ResMut<WaterOpacity>,
 ) {
-    if keys.just_pressed(KeyCode::KeyC) {
-        colouring.by = match colouring.by {
-            ColourBy::Speed => ColourBy::Elevation,
-            ColourBy::Elevation => ColourBy::Speed,
+    for &Act(action) in acts.read() {
+        let next = match action {
+            Action::NextColour => colouring.by.next(field.waves.is_some()),
+            Action::Colour(by) => by,
+            Action::WaterStyle => {
+                *style = match *style {
+                    SurfaceStyle::Translucent => SurfaceStyle::Opaque,
+                    SurfaceStyle::Opaque => SurfaceStyle::Hidden,
+                    SurfaceStyle::Hidden => SurfaceStyle::Translucent,
+                };
+                continue;
+            }
+            Action::Clearer | Action::Denser => {
+                opacity.step(action == Action::Denser);
+                // Stepping the opacity shows the translucent water
+                if *style != SurfaceStyle::Translucent {
+                    *style = SurfaceStyle::Translucent;
+                }
+                continue;
+            }
+            _ => continue,
         };
-    }
-    if keys.just_pressed(KeyCode::KeyT) {
-        *style = match *style {
-            SurfaceStyle::Translucent => SurfaceStyle::Opaque,
-            SurfaceStyle::Opaque => SurfaceStyle::Hidden,
-            SurfaceStyle::Hidden => SurfaceStyle::Translucent,
-        };
-    }
-    let clearer = keys.any_just_pressed([KeyCode::Minus, KeyCode::NumpadSubtract]);
-    let denser = keys.any_just_pressed([KeyCode::Equal, KeyCode::NumpadAdd]);
-    if clearer || denser {
-        opacity.step(denser);
-        // Stepping the opacity shows the translucent water
-        if *style != SurfaceStyle::Translucent {
-            *style = SurfaceStyle::Translucent;
+        // The waves' maps read on opaque water, not mixed with the bed's colours
+        match (colouring.by.is_waves(), next.is_waves(), *style) {
+            (false, true, SurfaceStyle::Translucent) => *style = SurfaceStyle::Opaque,
+            (true, false, SurfaceStyle::Opaque) => *style = SurfaceStyle::Translucent,
+            _ => {}
         }
+        colouring.by = next;
     }
 }
 
@@ -472,6 +674,21 @@ struct WaterScratch {
     normals: Vec<[f32; 3]>,
     /// Sums of the current (world X, Z) and node counts at each shared place
     current: Vec<[f32; 3]>,
+    /// Sums of H_s and of the breaking's share at each shared place
+    sea: Vec<[f32; 2]>,
+}
+
+/// The share of the waves' energy depth-induced breaking takes per period: its power
+/// `breaking` (W/m²) times the period `tp` (s) over the energy `ρ g H_s²/16`, 0 for no
+/// waves.
+pub fn breaking_share(breaking: f32, tp: f32, hs: f32) -> f32 {
+    const RHO_G: f32 = 1025.0 * 9.81;
+    let energy = RHO_G * hs * hs / 16.0;
+    if energy > 1e-3 {
+        (breaking * tp / energy).clamp(0.0, 4.0)
+    } else {
+        0.0
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // a Bevy system's parameters are its queries
@@ -495,6 +712,7 @@ fn update_water(
         speed,
         normals,
         current,
+        sea,
     } = &mut *scratch;
     // Dry nodes sink just under the bed, out of sight.
     heights.clear();
@@ -511,7 +729,9 @@ fn update_water(
     nodes.normals(heights, frame.vz, normals);
     // Refitting the scales is part of drawing this field: no change detection, or the
     // water would be rewritten every frame.
-    colouring.bypass_change_detection().fit(speed, &field.eta);
+    colouring
+        .bypass_change_detection()
+        .fit(speed, &field.eta, field.waves.as_ref());
 
     let Some(mut mesh) = meshes.get_mut(&water.mesh) else {
         return;
@@ -534,8 +754,8 @@ fn update_water(
     if let Some(VertexAttributeValues::Float32x4(colours)) =
         mesh.attribute_mut(Mesh::ATTRIBUTE_COLOR)
     {
-        for g in 0..n {
-            colours[g] = colouring.at(speed[g], field.eta[g]);
+        for (g, colour) in colours.iter_mut().enumerate().take(n) {
+            *colour = colouring.at(g, speed, &field);
         }
         for (c, &g) in water.wall_nodes.iter().enumerate() {
             colours[n + 2 * c] = colours[g];
@@ -564,6 +784,31 @@ fn update_water(
         for (c, &g) in water.wall_nodes.iter().enumerate() {
             uv[n + 2 * c] = at(g);
             uv[n + 2 * c + 1] = at(g);
+        }
+    }
+    // The model's H_s and its breaking's share per period, averaged at each place as
+    // the current is; 0 without waves
+    sea.clear();
+    sea.resize(water.n_shared, [0.0; 2]);
+    if let Some(w) = &field.waves {
+        for g in 0..n {
+            let s = &mut sea[water.shared[g] as usize];
+            s[0] += w.hs[g];
+            s[1] += breaking_share(w.breaking[g], w.tp[g], w.hs[g]);
+        }
+    }
+    let sea_at = |g: usize| {
+        let place = water.shared[g] as usize;
+        let count = current[place][2];
+        [sea[place][0] / count, sea[place][1] / count]
+    };
+    if let Some(VertexAttributeValues::Float32x2(uv)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_1) {
+        for (g, uv) in uv.iter_mut().enumerate().take(n) {
+            *uv = sea_at(g);
+        }
+        for (c, &g) in water.wall_nodes.iter().enumerate() {
+            uv[n + 2 * c] = sea_at(g);
+            uv[n + 2 * c + 1] = sea_at(g);
         }
     }
     // The depth of the water over the bed, 0 where it is dry

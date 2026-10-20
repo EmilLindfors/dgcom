@@ -1,33 +1,28 @@
-//! What is shown and how far the solver has got (top left), the colour scales of the
-//! water and of the bed's depth (bottom left) and the keys (bottom right; H hides
-//! them). In a 3D run the status also names the layer the water shows, what the
-//! section shows, and the particles of each kind. The photo view ([`crate::photo`])
-//! has no water colour scale; the status names its wind.
+//! What is shown and how far the solver has got (top left, under the menu bar), and
+//! the colour scales of the water and of the bed's depth (bottom left). In a 3D run
+//! the status also names the layer the water shows and the particles of each kind.
+//! The photo view ([`crate::photo`]) has no water colour scale; the status names its
+//! wind. The keys are in the menus and the help popup ([`crate::menubar`]); the
+//! status's hints take their names from the same table ([`Actions`]).
 
 use bevy::prelude::*;
 use bevy::text::FontSize;
 use bevy::ui::{BackgroundGradient, ColorStop, LinearGradient};
 use dg_rs::time::ModelClock;
 
-use crate::camera::{DIGITS, OrbitCamera, Views};
+use crate::actions::{Action, Actions};
+use crate::camera::OrbitCamera;
 use crate::cloud_3d::KINDS;
 use crate::colormap::{SEABED, srgb_at};
 use crate::contours::Contours;
 use crate::field::{Frame, ShownLayer};
-use crate::layers::{Levels, Section, SectionShows};
-use crate::stratification::{SheetShows, Stratification};
+use crate::layers::Levels;
+use crate::menubar::BAR_HEIGHT;
 use crate::particles::{ACTIVE, DEAD, EXITED, Particles, SETTLED, STRANDED};
 use crate::photo::Photo;
 use crate::playback::{Playback, SolverState, Source};
+use crate::stratification::{SheetShows, Stratification};
 use crate::surface::{BedScale, ColourBy, Colouring, SurfaceStyle, WaterOpacity};
-
-const KEYS: &str = "Space pause   [ ] rate   ← → seek   Home/End\n\
-C colour   T water   - = water opacity   B contours   L land   A arrows\n\
-P particles   F close-up   O overview   G gauge trace   H keys\n\
-R photo view   W wind speed   Shift+W wind direction   M menu\n\
-drag orbit   right-drag pan   wheel zoom";
-/// The keys of a 3D run, added to [`KEYS`].
-const KEYS_3D: &str = ", . layer (depth mean, surface … bed)   V section   N stratification sheet";
 
 /// The scenario's one-line description, heading the status.
 #[derive(Resource)]
@@ -40,9 +35,6 @@ pub struct RunClock(pub ModelClock);
 
 #[derive(Component)]
 struct Status;
-
-#[derive(Component)]
-struct Help;
 
 #[derive(Component)]
 struct Bar;
@@ -69,7 +61,7 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn)
-            .add_systems(Update, (status, scale, bed_scale, help, photo_scale));
+            .add_systems(Update, (status, scale, bed_scale, photo_scale));
     }
 }
 
@@ -87,22 +79,7 @@ fn font(size: f32) -> TextFont {
     }
 }
 
-fn spawn(mut commands: Commands, levels: Option<Res<Levels>>, views: Res<Views>) {
-    let mut keys = match levels {
-        Some(_) => format!("{KEYS_3D}\n{KEYS}"),
-        None => KEYS.to_string(),
-    };
-    // The places the number keys frame: `1 name   2 name …`
-    let places: Vec<String> = views
-        .places
-        .iter()
-        .take(DIGITS.len())
-        .enumerate()
-        .map(|(i, (name, _))| format!("{} {name}", i + 1))
-        .collect();
-    if !places.is_empty() {
-        keys = format!("{}\n{keys}", places.join("   "));
-    }
+fn spawn(mut commands: Commands) {
     commands.spawn((
         Status,
         Text::new(""),
@@ -111,24 +88,7 @@ fn spawn(mut commands: Commands, levels: Option<Res<Levels>>, views: Res<Views>)
         Node {
             position_type: PositionType::Absolute,
             left: Val::Px(14.0),
-            top: Val::Px(12.0),
-            ..default()
-        },
-    ));
-    commands.spawn((
-        Help,
-        Text::new(keys),
-        font(13.0),
-        TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
-        shadow(),
-        TextLayout {
-            justify: Justify::Right,
-            ..default()
-        },
-        Node {
-            position_type: PositionType::Absolute,
-            right: Val::Px(14.0),
-            bottom: Val::Px(12.0),
+            top: Val::Px(BAR_HEIGHT + 10.0),
             ..default()
         },
     ));
@@ -199,18 +159,20 @@ fn status(
     title: Res<Title>,
     source: Res<Source>,
     run_clock: Option<Res<RunClock>>,
-    style: Res<SurfaceStyle>,
-    opacity: Res<WaterOpacity>,
+    (style, opacity): (Res<SurfaceStyle>, Res<WaterOpacity>),
     particles: Res<Particles>,
     shown: Res<ShownLayer>,
-    column: Option<(Res<Levels>, Res<Section>)>,
+    levels: Option<Res<Levels>>,
     sheet: Option<Res<Stratification>>,
     photo: Res<Photo>,
     frame: Res<Frame>,
     sun: Option<Res<crate::photo::Sun>>,
+    sea: Option<Res<crate::photo::ShownSea>>,
     camera: Query<&OrbitCamera>,
+    actions: Res<Actions>,
     mut text: Query<&mut Text, With<Status>>,
 ) {
+    let key = |action| actions.key_name(action);
     let Ok(mut text) = text.single_mut() else {
         return;
     };
@@ -298,38 +260,34 @@ fn status(
             playback.bytes() as f64 / 1e6
         );
     }
-    if let Some((levels, section)) = &column {
+    if let Some(levels) = &levels {
         let n = levels.sigma.len();
         s += &match *shown {
-            ShownLayer::DepthMean => "\ncurrent: depth mean (, .)".to_string(),
-            ShownLayer::Level(l) => format!(
-                "\ncurrent: layer {} of {n} from the surface, {:.1} m deep (, .)",
-                n - l,
-                -levels.sigma[l] * levels.depth
+            ShownLayer::DepthMean => format!(
+                "\ncurrent: depth mean ({} {})",
+                key(Action::LayerUp),
+                key(Action::LayerDown)
             ),
-        };
-        s += &match (section.shows, section.speed, section.temperature) {
-            (SectionShows::Speed, Some([lo, hi]), _) => {
-                format!("\nsection: current speed {lo:.2} (purple) to {hi:.2} m/s (yellow) (V)")
-            }
-            (SectionShows::Speed, None, _) => "\nsection: current speed (V)".into(),
-            (SectionShows::Temperature, _, Some([lo, hi])) => {
-                format!("\nsection: temperature {lo:.1} (dark) to {hi:.1} C (yellow) (V)")
-            }
-            (SectionShows::Temperature, _, None) => "\nsection: temperature (V)".into(),
-            (SectionShows::Off, ..) => "\nsection: off (V)".into(),
+            ShownLayer::Level(l) => format!(
+                "\ncurrent: layer {} of {n} from the surface, {:.1} m deep ({} {})",
+                n - l,
+                -levels.sigma[l] * levels.depth,
+                key(Action::LayerUp),
+                key(Action::LayerDown)
+            ),
         };
     }
     if let Some(sheet) = &sheet {
         let (name, unit) = sheet.shows.describe();
         s += &match (sheet.shows, sheet.threshold(), sheet.depth_scale()) {
-            (SheetShows::Off, ..) => "\nsheet: off (N)".into(),
+            (SheetShows::Off, ..) => format!("\nsheet: off ({})", key(Action::Sheet)),
             (_, Some(threshold), Some([shallow, deep])) => format!(
                 "\nsheet: {name} at its strongest, {shallow:.0} (yellow) to {deep:.0} m deep \
-                 (blue);\n  cut out below {threshold:.1e} {unit}; {} columns (N)",
-                sheet.shown_columns
+                 (blue);\n  cut out below {threshold:.1e} {unit}; {} columns ({})",
+                sheet.shown_columns,
+                key(Action::Sheet)
             ),
-            _ => format!("\nsheet: {name} (N)"),
+            _ => format!("\nsheet: {name} ({})", key(Action::Sheet)),
         };
     }
     let counts = particles.counts;
@@ -359,22 +317,36 @@ fn status(
             );
         }
         if !particles.on {
-            s += " (hidden, P)";
+            s += &format!(" (hidden, {})", key(Action::Particles));
         }
     }
     s += &match (photo.on, *style) {
         (true, _) if photo.wind_speed > 0.0 => format!(
-            "\nphoto view (R): wind {:.0} m/s from {} (W, Shift+W), fetch {:.0} km",
+            "\nphoto view ({}): wind {:.0} m/s from {} ({}, {}), fetch {:.0} km",
+            key(Action::Photo),
             photo.wind_speed,
             photo.wind_name(),
+            key(Action::Wind),
+            key(Action::WindFrom),
             photo.fetch / 1e3
         ),
-        (true, _) => "\nphoto view (R): calm (W)".into(),
-        (false, SurfaceStyle::Translucent) => {
-            format!("\nwater {:.0} % opaque (- =)", 100.0 * opacity.0)
+        (true, _) => format!(
+            "\nphoto view ({}): calm ({})",
+            key(Action::Photo),
+            key(Action::Wind)
+        ),
+        (false, SurfaceStyle::Translucent) => format!(
+            "\nwater {:.0} % opaque ({} {})",
+            100.0 * opacity.0,
+            key(Action::Clearer),
+            key(Action::Denser)
+        ),
+        (false, SurfaceStyle::Opaque) => {
+            format!("\nwater opaque ({})", key(Action::WaterStyle))
         }
-        (false, SurfaceStyle::Opaque) => "\nwater opaque (T)".into(),
-        (false, SurfaceStyle::Hidden) => "\nwater hidden (T)".into(),
+        (false, SurfaceStyle::Hidden) => {
+            format!("\nwater hidden ({})", key(Action::WaterStyle))
+        }
     };
     if photo.on
         && let Some(sun) = &sun
@@ -387,8 +359,27 @@ fn status(
         s += &format!(
             "\nsun {:.0}° {} the horizon in the {} ({place})",
             sun.elevation.abs(),
-            if sun.elevation >= 0.0 { "above" } else { "below" },
+            if sun.elevation >= 0.0 {
+                "above"
+            } else {
+                "below"
+            },
             crate::photo::compass(sun.azimuth)
+        );
+    }
+    if photo.on
+        && let Some(sea) = sea.as_ref().and_then(|s| s.0)
+    {
+        // World (cos, sin) is mesh (cos, −sin): the bearing it travels toward, then
+        // where it comes from
+        let toward = sea.toward.cos().atan2(-sea.toward.sin()).to_degrees();
+        let from = (toward as f32 + 180.0).rem_euclid(360.0);
+        s += &format!(
+            "\nthe model's sea here: T_p {:.1} s from the {}, spread {:.0}°; \
+             H_s per pixel, the wind's waves shorter",
+            sea.tp,
+            crate::photo::compass(from),
+            sea.spread.to_degrees()
         );
     }
     // The view as `--eye` gives it, to come back to it
@@ -412,13 +403,14 @@ fn scale(
     mut bar: Query<&mut BackgroundGradient, With<Bar>>,
     mut ticks: Query<(&Tick, &mut Text), Without<ScaleTitle>>,
     mut title: Query<&mut Text, With<ScaleTitle>>,
-    mut shown: Local<Option<(ColourBy, f32, f32)>>,
+    mut shown: Local<Option<(ColourBy, [String; 3])>>,
 ) {
-    let key = (colouring.by, colouring.speed_max, colouring.eta_max);
-    if *shown == Some(key) {
+    let (heading, labels) = colouring.legend();
+    let key = (colouring.by, labels);
+    if shown.as_ref() == Some(&key) {
         return;
     }
-    *shown = Some(key);
+    let labels = &key.1;
     let stops = colouring.stops();
     if let Ok(mut bar) = bar.single_mut() {
         let colours = (0..=16)
@@ -426,21 +418,13 @@ fn scale(
             .collect();
         *bar = LinearGradient::to_right(colours).into();
     }
-    let (heading, lo, hi) = match colouring.by {
-        ColourBy::Speed => ("current speed (m/s)", 0.0, colouring.speed_max),
-        ColourBy::Elevation => (
-            "surface elevation η (m)",
-            -colouring.eta_max,
-            colouring.eta_max,
-        ),
-    };
     if let Ok(mut title) = title.single_mut() {
         title.0 = heading.into();
     }
     for (tick, mut text) in &mut ticks {
-        let v = lo + (hi - lo) * tick.0 as f32 / 2.0;
-        text.0 = format!("{}", (v * 1000.0).round() / 1000.0);
+        text.0.clone_from(&labels[tick.0]);
     }
+    *shown = Some(key);
 }
 
 /// The bed's depth scale, once the bed exists (it is fixed), and its contour interval.
@@ -483,10 +467,7 @@ fn bed_scale(
 type WaterScale = Or<(With<Bar>, With<Tick>, With<ScaleTitle>)>;
 
 /// The water's colour scale has nothing to say in the photo view.
-fn photo_scale(
-    photo: Res<Photo>,
-    mut parts: Query<&mut Visibility, WaterScale>,
-) {
+fn photo_scale(photo: Res<Photo>, mut parts: Query<&mut Visibility, WaterScale>) {
     if !photo.is_changed() {
         return;
     }
@@ -496,17 +477,5 @@ fn photo_scale(
         } else {
             Visibility::Inherited
         };
-    }
-}
-
-fn help(keys: Res<ButtonInput<KeyCode>>, mut help: Query<&mut Visibility, With<Help>>) {
-    if keys.just_pressed(KeyCode::KeyH) {
-        for mut visibility in &mut help {
-            *visibility = if *visibility == Visibility::Hidden {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
-        }
     }
 }

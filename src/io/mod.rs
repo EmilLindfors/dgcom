@@ -148,8 +148,8 @@ pub use profile_series::{ProfileLevels, ProfileSeries};
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
 pub use restart::{Restart3D, RestartError, domain_fingerprint};
 pub use snapshot::{
-    SOLUTION_3D_FIELDS, SnapshotError, SnapshotFrame, SnapshotHeader, SnapshotLevels,
-    SnapshotReader, SnapshotWriter,
+    SOLUTION_3D_FIELDS, SnapshotError, SnapshotFrame, SnapshotHeader, SnapshotLayout,
+    SnapshotLevels, SnapshotReader, SnapshotWriter,
 };
 pub use tide_gauge_reader::{
     TideGaugeFile, TideGaugeFileError, files_to_observation_map, read_tide_gauge_directory,

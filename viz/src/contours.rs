@@ -16,6 +16,7 @@ use bevy::camera::visibility::NoFrustumCulling;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 
+use crate::actions::{Act, Action};
 use crate::camera::OrbitCamera;
 use crate::field::{Frame, Nodes};
 use crate::photo::Photo;
@@ -194,13 +195,14 @@ fn rebuild(
 }
 
 fn toggle(
-    keys: Res<ButtonInput<KeyCode>>,
+    mut acts: MessageReader<Act>,
     photo: Res<Photo>,
     contours: Option<ResMut<Contours>>,
     mut lines: Query<&mut Visibility, With<ContourLines>>,
 ) {
     let Some(mut contours) = contours else { return };
-    if keys.just_pressed(KeyCode::KeyB) {
+    let toggles = acts.read().filter(|a| a.0 == Action::Contours).count();
+    if toggles % 2 == 1 {
         contours.on = !contours.on;
     } else if !photo.is_changed() {
         return;

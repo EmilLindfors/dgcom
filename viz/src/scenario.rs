@@ -102,8 +102,6 @@ pub struct ThreeD {
     /// Horizontal viscosity: constant background (m²/s) and Smagorinsky coefficient
     pub viscosity: f64,
     pub smagorinsky: f64,
-    /// The vertical section drawn through the water: its two ends (m, mesh coordinates)
-    pub section: [[f64; 2]; 2],
     /// Surface light over the site, for the lice larvae
     pub light: ClearSkyLight,
 }
@@ -226,7 +224,6 @@ impl Scenario {
             );
         }
         scenario.bathymetry = Arc::new(bed);
-        let farm = scenario.farm;
         scenario.name = "Fjord farm, 3D: M2 0.8 m, brackish layer over sill water, \
                          two 50 m cages"
             .into();
@@ -243,11 +240,9 @@ impl Scenario {
             roughness: 0.005,
             viscosity: 1.0,
             smagorinsky: 0.2,
-            // Along the fjord, the tide's direction, through both cages
-            section: [[farm[0] - 1_500.0, farm[1]], [farm[0] + 1_500.0, farm[1]]],
             light: ClearSkyLight::new(clock, SITE[0], SITE[1]),
         });
-        // Low, from the side, so that the section stands behind the cages
+        // Low, from the side
         scenario.close_up = CloseUp {
             distance: 900.0,
             yaw: 2.6,
@@ -279,7 +274,6 @@ impl Scenario {
             .to_vec();
         Self {
             name: "Farm channel, 3D: M2 0.5 m/s, 2 C thermocline at 10 m, two 50 m cages".into(),
-            // The section runs along the flow through the first cage
             three_d: Some(ThreeD {
                 sigma: Arc::new(SigmaGrid::new(levels, UniformStretching)),
                 // 10 °C below, 12 °C above, a smooth step at 10 m
@@ -290,10 +284,6 @@ impl Scenario {
                 roughness: 0.005,
                 viscosity: 1.0,
                 smagorinsky: 0.2,
-                section: [
-                    [FARM[0] - 600.0, FARM[1] - 60.0],
-                    [FARM[0] + 600.0, FARM[1] - 60.0],
-                ],
                 light: ClearSkyLight::new(clock, SITE[0], SITE[1]),
             }),
             cages,
@@ -303,7 +293,7 @@ impl Scenario {
             projection: None,
             farm: FARM,
             places: Vec::new(),
-            // Low, from the second cage's side, so the section stands behind the cages
+            // Low, from the second cage's side
             close_up: CloseUp {
                 distance: 800.0,
                 yaw: 2.6,
@@ -439,9 +429,7 @@ impl Scenario {
     /// every station a place the number keys frame,
     /// the cages (`cage=x,y,radius,net_depth,drag_per_length`) and the periods of a
     /// periodic mesh (`periodic=x,y`), and the projection of a mesh on a real coast
-    /// (`projection=local,lat,lon`: [`LocalProjection`] about that point). A 3D file's σ-grid makes it a 3D scenario, with
-    /// its section at `section=x0,y0,x1,y1` (else along x through the point of
-    /// interest). It runs nothing, so its forcing and 3D physics are none.
+    /// (`projection=local,lat,lon`: [`LocalProjection`] about that point). A 3D file's σ-grid makes it a 3D scenario. It runs nothing, so its forcing and 3D physics are none.
     pub fn from_snapshot(header: SnapshotHeader) -> Self {
         let (lo, hi) = header.mesh.vertices.iter().fold(
             ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
@@ -503,17 +491,6 @@ impl Scenario {
             .and_then(numbers)
             .and_then(|p| <[f64; 2]>::try_from(p).ok());
         let three_d = header.levels.as_ref().map(|levels| {
-            let section = header
-                .metadata("section")
-                .and_then(numbers)
-                .and_then(|c| <[f64; 4]>::try_from(c).ok())
-                .map_or(
-                    [
-                        [farm[0] - extent / 10.0, farm[1]],
-                        [farm[0] + extent / 10.0, farm[1]],
-                    ],
-                    |[x0, y0, x1, y1]| [[x0, y0], [x1, y1]],
-                );
             ThreeD {
                 sigma: Arc::new(levels.sigma.clone()),
                 // A replay runs no model: these are not used
@@ -523,7 +500,6 @@ impl Scenario {
                 roughness: 0.0,
                 viscosity: 0.0,
                 smagorinsky: 0.0,
-                section,
                 light: ClearSkyLight::new(header.clock.unwrap_or_default(), 0.0, 0.0),
             }
         });
@@ -534,7 +510,7 @@ impl Scenario {
         let mut bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, 0.0);
         bathymetry.data.copy_from_slice(&header.bathymetry);
         bathymetry.compute_gradients(&ops, &geom);
-        // As Frøya's for its ≈ 60 km; in 3D low, so that the section stands behind
+        // As Frøya's for its ≈ 60 km; in 3D low, to look along the water column
         let (yaw, pitch) = if three_d.is_some() {
             (2.6, 0.28)
         } else {

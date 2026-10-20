@@ -11,7 +11,7 @@ default-run = "dg-viz"
 [workspace]
 
 [dependencies]
-bevy = "0.20.0-rc.1"
+bevy = "0.20.0"
 # The viewer runs the solver in-process and reads no NetCDF: no native HDF5/netCDF-C needed.
 dg-rs = { path = "..", default-features = false, features = ["parallel", "simd"] }
 rayon = "1.10"

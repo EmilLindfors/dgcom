@@ -6,6 +6,26 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The waves in the viewer (TODO F.4, F.3).** A coupled wave run's sea state goes into its snapshot file and the viewer shows it.
+  - Snapshot format version 3 (`io::SnapshotLayout`, `SnapshotHeader::surface`, `SnapshotFrame::surface`): named *surface fields* of one value per node besides η, u and v; versions 1 and 2 still read. `SnapshotWriter::create_with` takes a layout, `write_state` and `write_fields` the surface fields.
+  - `waves::SeaStateFields`, `WaveCoupling2D::sea_state`, `CoupledWaves2D::sea_state`: H_s, T_p, the mean direction (a unit vector), the spread, and the power whitecapping and depth-induced breaking take (W/m²) at the circulation's nodes, the period, direction and spread weighted by the variance.
+  - `froya_real_data wave_coupling= snapshot_minutes=` writes them in every frame, linear in time between the exchanges. The 24 h Frøya storm: no measurable cost (1,582 s wall against 1,588), 633 MB at 10 min.
+  - `dg-viz`: C cycles on to H_s, T_p and the waves' losses (log scale, white where they break), on opaque water (`--colour hs|tp|dissipation`); the arrows under them are the waves' (mean direction, length by H_s); the readout gives H_s, T_p, the direction they come from, the spread and the power lost. The photo view's long waves are the model's sea where the camera looks, scaled per pixel by its H_s, with surf where its waves break; `--wind` gives the shorter waves and whitecaps.
+  - `scripts/dgsnap_check.py` reads version 3 and checks a file's sea state against the run's `wave_points.txt` (the storm: H_s within 0.6 % at four of MET's points, 3.3 % in the lee).
+
+- **A menu bar and a keys popup in the viewer (TODO F.3; `viz/src/actions.rs`, `viz/src/menubar.rs`).** One table of the viewer's actions (key, label, menu, when the run has it, its state) that the keys, the menus and the popup all read; the plugins act on its `Act` messages, not on keys, so the three cannot drift apart.
+  - The bar: Run (back to the list of runs, pause, rate, seek, quit), View (close-up, overview, the named places, the map, let go of the pin), Colour (the colourings as choices, water style and opacity, the 3D layer), Overlays (arrows, contours, land, particles, the stratification sheet, the gauge trace), Photo (the view, its wind) and Help. Each entry shows its key and state; only what the run has is listed. Steps (rate, opacity, layer, wind) keep the menu open.
+  - F1, H or ? opens the keys grouped by menu with each one's state and the mouse's controls, in place of the fixed block of ≈ 30 keys; Esc closes it or a menu before it lets go of a pin. The status's hints take their key names from the table.
+  - Over the bar, a menu or the popup the mouse does not turn the view, zoom, pin or move the map's focus. `--show keys|run|view|colour|overlays|photo|help` opens one at the start, for screenshots.
+  - Gates `every_key_names_one_action`, `shift_picks_the_shifted_entry_and_leaves_the_others`, `a_key_acts_only_where_the_run_has_its_action`, `every_menu_has_entries`.
+- **`froya_real_data` writes `<output>/clock.txt`** (its `Clock:` line), so its VTU folders replay with their dates and gauge without a redirected `run.log`; the viewer and its menu read either (`replay::folder_clock`, gate `a_folders_clock_is_its_clock_file_or_its_log`).
+- **The viewer's gauge trace of an hourly VTU replay is the run's own 10-minute record** (`station_*.txt` within 500 m of the trace's point, `replay::station_record`), where hourly frames clipped the peaks by up to ≈ 3 %. Gate `the_runs_record_of_the_trace_point_is_found`.
+- **`dg-viz --frame-times N`**: N frames timed without vsync at `--at`, mean, median and p95. On an RTX 4060 Laptop at 4000 × 2250 on the 108k-node Frøya mesh: chart view 5.0–5.4 ms, the minimap +1.0 ms, the photo view 19–22 ms.
+
+- **A minimap in the viewer (TODO F.3; `viz/src/minimap.rs`, V, `--minimap on|off`).** The whole domain seen straight down by a second, orthographic camera in a 300 px inset at the bottom left, north up, with the main view's footprint on the sea (clipped to the map) and its focus. The cursor over it gets the readout there; a click moves the main view's focus. The stratification sheet and the current arrows render for the main view only. Not in the photo view.
+
+- **`scripts/dgsnap_check.py`**: a run's snapshot file against the solver's own station records, by an independent decoder of the format. It also reports the temperature range of wet and dry nodes.
+
 - **Wave buoys and a hindcast parent for the spectral wave model's validation (TODO F.4).**
   - `scripts/e39_buoy_series.py`: hourly H_s, T_p, T_m02 and mean direction from the E39 fjord buoys (Statens vegvesen; MET Norway THREDDS, 2016 to April 2024: Sulafjorden, Breisundet, Vartdalsfjorden, Halsafjorden).
   - `scripts/nora3_wave_spectra.py`: boundary spectra for past windows from MET Norway's NORA3 wave hindcast (WAM 3 km, hourly 2D spectra, 1959 to now), at the points of a box and the nearest to given positions, in the layout `io::WaveSpectraFile` reads; H_s from its spectra equals NORA3's gridded H_s.
@@ -464,6 +484,8 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **The viewer is on Bevy 0.20.0** (from 0.20.0-rc.1; `viz/Cargo.toml`, with the lock's other semver-compatible updates). No code changes needed; tests, screenshots and frame times are as before. The terrain's `UV_0` workaround stays: the final release still reads `uv` with only the second UV set.
+
 - **`froya_real_data`'s waves take WAM's sources by default (TODO F.4):** `wave_sources=wam` (was `swan`), and with it `wave_substeps=4 wave_cfl=1.0` (was 1 and 0.5, which `wave_sources=swan` keeps). WAM's integration won the pre-registered Ålesund buoy test (`notes/waves.md`) and halves the wave step's cost.
 - **The shortwave's default water type is Jerlov III (was II; TODO P4.4).** `JerlovWater::default()`, `Hydrostatic3D`'s and `froya_real_data jerlov=`: NorKyst v3's choice, which Sentinel-3/OLCI water colour supports along the coast (Christensen et al. 2026). In the 2025 Frøya run it moved day 1 by ≤ 0.04 °C.
 - **`froya_real_data cliffs3d=` is 20 m by default (was 40; TODO P4.6).** At 40 m the 72 h nested run with MET wind blew up at 37 h from two cliff shores of 0.3–0.5 m beside 24–38 m; at 20 m (1917 shore nodes, 15.3 km² of water at MSL made land, against 6.1 km²) it runs the 72 h with at most 204 steps per half hour. That run answers P4.6's day-2 question: the model has NorKyst's mixing event (domain-mean surface −1.04 °C and +0.30 from 27 to 54 h, NorKyst −1.21 °C and +0.29), but not its diurnal warming (`notes/3d-validation.md`).
@@ -551,6 +573,8 @@ All notable changes to this project should be documented in this file.
 
 ### Removed
 
+- **The viewer's vertical section** (`viz/src/layers.rs`'s `Section`, the V key, `--section`, `ThreeD::section` and the snapshot metadata `section=`, which `examples/farm_3d.rs` no longer writes; TODO F.3). On a real coast it was a thin band through the view that told little. The profiles over the depth at a point are the pinned point's (click, or `--pin X,Y`). `colormap::THERMAL` went with it.
+
 - **The 2D depth-averaged tracer path (T and S in 2D, ≈ 5.6k lines).** `TracerSolution2D`, `TracerState`, `ConservativeTracerState`, the 2D tracer RHS, limiters and fluxes, the `source::tracer` module (2D baroclinic source, surface heat flux, `RiverTracerSource`, relaxation sources), the `coupled_swe_tracer` steppers and `CoupledState2D`, `write_vtk_coupled` (and `write_vtk_series`'s tracer argument), the equations of state's `density_from_tracers`, the whole-mesh `compute_br1_diffusion_rhs_2d`, `examples/norwegian_fjord.rs` and `tests/tracer_2d_test.rs`. Only the legacy coupled stepper ran it (no `Simulation` route), and T/S belong to the 3D model. `TracerBounds` now lives with the 3D tracer limiter, `KuzminParameter2D` with the SWE limiters; `TVBParameter2D` is gone. A passive 2D tracer, if needed, is to be built on `Simulation`.
 
 ### Performance
@@ -626,6 +650,15 @@ All notable changes to this project should be documented in this file.
   - `froya_real_data waves=N` also prints the sources' DIA share and a half-step of each implicit pass alone.
 
 ### Fixed
+
+- **The viewer's WGSL error on every start** (`cannot find declaration of uv` in Bevy's `pbr_fragment`): the terrain's mesh had a second UV set (the photo view's depth) and no first, and Bevy 0.20.0-rc.1's `StandardMaterial` shader then reads an undeclared `uv`. The terrain now carries an unused first set.
+- **The stratification sheet showed in the photo view** over the sea, as the arrows and contours do not; it is a chart overlay and hides there now.
+- **The photo view's round trip has a gate** (`the_chart_view_comes_back_after_the_photo_view`: R twice, twice, restores the chart's materials, light, ambient light, clear colour, sky and camera without HDR, bloom or fog).
+
+- **The viewer (`viz/`) builds again, and its gauge trace and readout show what the model computed (TODO F.3).** An independent `.dgsnap` decoder (numpy, written from the format spec) checked the viewer against the solver's own output. The 72 h nested 3D Frøya snapshot (`output/froya_3day/3d_rk43`) equals the run's f64 station records at Mausund at all 72 frames: ū, v̄ within 1e-10 m/s, η within 5e-7 m.
+  - `dg-viz` read `TimeSeries.data`, which has been private since `TimeSeries` moved to `times()`/`values()`.
+  - The gauge trace's label gave the padded ends of the plot axis as the range: "+1.09 to −1.05 m" for a tide of +0.94 to −0.90 m at Mausund. It now gives the drawn extremes ("highest +0.94, lowest −0.90 m"). Gate `the_range_label_gives_the_drawn_extremes_not_the_axis`.
+  - The pinned point's readout interpolated a partly dry element's tracers through its dry nodes: 14.00 °C at a wet point 7 cm deep whose wet nodes held 10.3–10.4, beside dry nodes at up to 28.8 °C (P4.5). Dry nodes now take the mean of the element's wet ones (`Probe::eval_level_wet`); the viewer then read 10.35 °C, as the decoder predicts. Gate `a_dry_node_takes_its_wet_neighbours_tracer`. The readout also gave a density step (N² 0.23 s⁻²) in that 7 cm column; like the sheet, it now gives steps only in columns at least 2 m deep.
 
 - **A 3D run no longer panics in its last step for a parent that ends with the run (TODO P4.6).** The last step's barotropic window read the parent past `t_end` (0.62 s past the last snapshot of a 72 h parent, after 4.7 h of wall time). `froya_real_data` now checks the parent and the weather to `t_end + Δt_max/3` at setup, with the 3D step capped at 60 s unless `dt_3d=` sets it, and says to cut the parent an hour longer.
 - **The wave dissipation's force is over the wave step taken (TODO F.4).** `CoupledWaves2D::exchange` evaluated `WaveForceForm::Dissipation` over `compute_dt(cfl)`, not over the interval's step (`span / steps`, shorter unless it divides the span); ≈ 0.05 % on the coupled beach. Gate: `the_dissipation_force_is_over_the_wave_step_taken`.

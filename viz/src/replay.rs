@@ -7,7 +7,7 @@
 //!   (`examples/farm_3d.rs snapshot=`, or a live 3D run saved by the viewer) adds the
 //!   σ-grid and u, v, T on every level, which become the snapshots' [`Layers`]. The
 //!   scenario is built from the file alone ([`Scenario::from_snapshot`]: mesh, bed,
-//!   cages, σ-grid, section), so the run's domain data and builder are not needed.
+//!   cages, σ-grid), so the run's domain data and builder are not needed.
 //!   The particles, if the run had them, are in a particle file beside it
 //!   ([`particle_path`], `dg_rs::io::ParticleFileWriter`), and are attached to the
 //!   frames of the same time. A [`SnapshotSink`] writes both from the viewer's own
@@ -44,18 +44,19 @@ use std::time::{Duration, Instant};
 
 use dg_rs::io::{
     ParticleFileReader, ParticleFileWriter, ParticleFrame, SnapshotError, SnapshotFrame,
-    SnapshotReader, SnapshotWriter,
+    SnapshotLayout, SnapshotReader, SnapshotWriter,
 };
 use dg_rs::source::CageFootprint;
 use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
+use dg_rs::waves::SeaStateFields;
 use rayon::prelude::*;
 
 use crate::cloud_3d::KINDS;
 use crate::field::Probe;
 use crate::particles::ParticleSnapshot;
 use crate::scenario::Scenario;
-use crate::solver::{H_DRY, Layers, Snapshot, SolverMessage};
+use crate::solver::{H_DRY, Layers, Snapshot, SolverMessage, Waves};
 
 /// How far (m) the frames' node positions and bed may lie from the scenario's: the
 /// files carry ten significant digits, ≈ 1e-6 m over a domain tens of km wide.
@@ -65,12 +66,12 @@ const TOLERANCE: f64 = 1e-3;
 enum Frames {
     /// VTU files, in time order
     Vtu(Vec<PathBuf>),
-    /// A snapshot file, its number of frames when opened, its layers in 3D and its
-    /// particles
+    /// A snapshot file, its number of frames when opened, where its frames hold the
+    /// layers and the waves, and its particles
     Snapshot(
         Box<SnapshotReader>,
         usize,
-        Option<LayerFields>,
+        FileFields,
         Option<Box<Particles>>,
     ),
 }
@@ -124,8 +125,8 @@ pub struct Replay {
 
 impl Replay {
     /// The `*.vtu` frames in `dir` (in file-name order, which is time order for
-    /// zero-padded numbers), checked against `scenario`. The clock is that of the
-    /// run's `run.log` (its `Clock:` line), if it has one.
+    /// zero-padded numbers), checked against `scenario`. The clock is the run's
+    /// ([`folder_clock`]), if it wrote one.
     ///
     /// The nodes must be the scenario's. A different bed is the run's own (e.g.
     /// smoothed for 3D, `froya_real_data slopes3d=on`): the scenario takes it.
@@ -205,7 +206,7 @@ impl Replay {
             t_first,
             t_last,
             interval,
-            clock: run_clock(&dir.join("run.log")),
+            clock: folder_clock(dir),
             bed: scenario.bathymetry.data.clone(),
             save: None,
         })
@@ -246,6 +247,12 @@ impl Replay {
             }
             None => None,
         };
+        // The sea state, if the run had waves: every field of it, or none
+        let waves = SeaStateFields::NAMES
+            .iter()
+            .map(|name| header.surface_field(name))
+            .collect::<Option<Vec<usize>>>()
+            .map(|at| std::array::from_fn(|i| at[i]));
         let scenario = Scenario::from_snapshot(header);
         // The particles beside it: in 3D of the viewer's kinds, matched by name
         let particles = match ParticleFileReader::open(particle_path(path)) {
@@ -273,7 +280,7 @@ impl Replay {
             Err(e) => return Err(format!("{}: {e}", particle_path(path).display()).into()),
         };
         let replay = Self {
-            frames: Frames::Snapshot(Box::new(reader), n, layers, particles),
+            frames: Frames::Snapshot(Box::new(reader), n, FileFields { layers, waves }, particles),
             t_first,
             t_last,
             interval,
@@ -293,6 +300,7 @@ impl Replay {
             scenario,
             self.clock.as_ref(),
             particles,
+            self.has_waves(),
         )?);
         Ok(())
     }
@@ -308,6 +316,20 @@ impl Replay {
     pub fn has_particles(&self) -> bool {
         matches!(self.frames, Frames::Snapshot(_, _, _, Some(_)))
     }
+
+    /// Whether the replay has the sea state of a run with waves.
+    pub fn has_waves(&self) -> bool {
+        matches!(&self.frames, Frames::Snapshot(_, _, f, _) if f.waves.is_some())
+    }
+}
+
+/// Where a snapshot file's frames hold what the viewer draws besides η, u and v.
+#[derive(Clone, Copy)]
+struct FileFields {
+    layers: Option<LayerFields>,
+    /// Indices into the frame's surface fields of the sea state, in the order of
+    /// `SeaStateFields::NAMES`
+    waves: Option<[usize; 7]>,
 }
 
 /// Where a 3D snapshot file's frames hold what the viewer's [`Layers`] draw.
@@ -337,17 +359,18 @@ pub struct SnapshotSink {
 impl SnapshotSink {
     /// A snapshot file at `path` for the scenario's runs: its mesh, bed and (in 3D)
     /// σ-grid, `clock`, and as metadata the title, the point of interest, the cages
-    /// (`cage=x,y,radius,net_depth,drag_per_length`), the section of a 3D run
-    /// (`section=x0,y0,x1,y1`), the periods of a periodic mesh (`periodic=x,y`) and
+    /// (`cage=x,y,radius,net_depth,drag_per_length`), the periods of a periodic mesh (`periodic=x,y`) and
     /// the projection of a mesh on a real coast (`projection=local,lat,lon`), so
     /// that [`Scenario::from_snapshot`] rebuilds what the viewer draws. With
     /// `particles`, a particle file of the viewer's kinds beside it (3D: [`KINDS`];
-    /// 2D: one kind).
+    /// 2D: one kind). With `waves`, the frames carry the sea state
+    /// (`SeaStateFields::NAMES`), which every snapshot written must then have.
     pub fn create(
         path: &Path,
         scenario: &Scenario,
         clock: Option<&ModelClock>,
         particles: bool,
+        waves: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let title = scenario
             .name
@@ -380,15 +403,12 @@ impl SnapshotSink {
         if let Some(projection) = &scenario.projection {
             metadata.push(("projection", crate::scenario::format_projection(projection)));
         }
-        if let Some(three_d) = &scenario.three_d {
-            let [[x0, y0], [x1, y1]] = three_d.section;
-            metadata.push(("section", format!("{x0},{y0},{x1},{y1}")));
-        }
         let metadata: Vec<(&str, &str)> = metadata.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let levels = scenario
             .three_d
             .as_ref()
             .map(|three_d| (three_d.sigma.as_ref(), &VIEWER_FIELDS[..]));
+        let surface: &[&str] = if waves { &SeaStateFields::NAMES } else { &[] };
         let fields = SnapshotWriter::create_with(
             path,
             &scenario.mesh,
@@ -397,7 +417,7 @@ impl SnapshotSink {
             clock,
             &metadata,
             H_DRY as f64,
-            levels,
+            SnapshotLayout { surface, levels },
         )?;
         let particles = if particles {
             let kinds: Vec<&str> = match scenario.three_d {
@@ -421,21 +441,32 @@ impl SnapshotSink {
 
     /// Append the viewer's snapshot `s`, and its particles.
     pub fn write(&mut self, s: &Snapshot) -> Result<(), SnapshotError> {
+        let waves = s.waves.as_ref().map(Waves::fields);
+        let surface: Vec<&[f32]> = waves.iter().flatten().map(|f| f.as_slice()).collect();
         match &s.layers {
             // A frame without salinity (a file that had none) as uniform 0
             Some(l) if l.salt.is_empty() => {
                 let none = vec![0.0; l.u.len()];
-                self.fields
-                    .write_fields(s.t, &s.eta, &s.u, &s.v, &[&l.u, &l.v, &l.temp, &none])?
+                self.fields.write_fields(
+                    s.t,
+                    &s.eta,
+                    &s.u,
+                    &s.v,
+                    &surface,
+                    &[&l.u, &l.v, &l.temp, &none],
+                )?
             }
             Some(l) => self.fields.write_fields(
                 s.t,
                 &s.eta,
                 &s.u,
                 &s.v,
+                &surface,
                 &[&l.u, &l.v, &l.temp, &l.salt],
             )?,
-            None => self.fields.write_fields(s.t, &s.eta, &s.u, &s.v, &[])?,
+            None => self
+                .fields
+                .write_fields(s.t, &s.eta, &s.u, &s.v, &surface, &[])?,
         }
         if let Some(writer) = self.particles.as_mut() {
             let (p, f) = (&s.particles, &mut self.frame);
@@ -518,7 +549,7 @@ fn read_all(
                 }
             }
         }
-        Frames::Snapshot(mut reader, n, layer_fields, mut particles) => {
+        Frames::Snapshot(mut reader, n, fields, mut particles) => {
             let times = reader.times().map_err(|e| e.to_string())?;
             let matching = particles.as_ref().map(|p| p.matching(&times[..n]));
             let mut frame = SnapshotFrame::default();
@@ -527,7 +558,7 @@ fn read_all(
                     &mut reader,
                     i,
                     &mut frame,
-                    layer_fields,
+                    fields,
                     particles
                         .as_deref_mut()
                         .zip(matching.as_ref().map(|m| m[i])),
@@ -543,13 +574,13 @@ fn read_all(
 }
 
 /// Frame `i` of a snapshot file as the viewer's snapshot (read into `frame`), with
-/// its layers in 3D and its particles (`particles`: the file and the particle frame
-/// of the same time, if any).
+/// its layers in 3D, its waves and its particles (`particles`: the file and the
+/// particle frame of the same time, if any).
 fn file_snapshot(
     reader: &mut SnapshotReader,
     i: usize,
     frame: &mut SnapshotFrame,
-    layer_fields: Option<LayerFields>,
+    fields: FileFields,
     particles: Option<(&mut Particles, Option<usize>)>,
     bed: &[f64],
 ) -> Result<Snapshot, String> {
@@ -557,7 +588,14 @@ fn file_snapshot(
         .read_frame_into(i, frame)
         .map_err(|e| format!("frame {i}: {e}"))?;
     let mut snapshot = snapshot(frame.t, &frame.eta, &frame.u, &frame.v, bed);
-    snapshot.layers = layer_fields.map(|f| Layers {
+    snapshot.waves = fields.waves.map(|at| {
+        let mut waves = Waves::default();
+        for (out, &j) in waves.fields_mut().into_iter().zip(&at) {
+            out.clone_from(&frame.surface[j]);
+        }
+        waves
+    });
+    snapshot.layers = fields.layers.map(|f| Layers {
         n_levels: f.n_levels,
         u: frame.layers[f.u].clone(),
         v: frame.layers[f.v].clone(),
@@ -611,7 +649,7 @@ pub fn serve(replay: Replay, probe: Option<Probe>) -> Result<Served, Box<Replay>
     if replay.save.is_some() || !matches!(replay.frames, Frames::Snapshot(..)) {
         return Err(Box::new(replay));
     }
-    let Frames::Snapshot(mut reader, n, layer_fields, mut particles) = replay.frames else {
+    let Frames::Snapshot(mut reader, n, fields, mut particles) = replay.frames else {
         unreachable!("checked above")
     };
     let (tx, rx) = channel();
@@ -653,7 +691,7 @@ pub fn serve(replay: Replay, probe: Option<Probe>) -> Result<Served, Box<Replay>
                         &mut reader,
                         i,
                         &mut frame,
-                        layer_fields,
+                        fields,
                         particles
                             .as_deref_mut()
                             .zip(matching.as_ref().map(|m| m[i])),
@@ -757,6 +795,7 @@ fn snapshot<T: Copy + Into<f64>>(t: f64, eta: &[T], u: &[T], v: &[T], bed: &[f64
         v: velocity(v),
         particles: ParticleSnapshot::default(),
         layers: None,
+        waves: None,
     }
 }
 
@@ -810,18 +849,122 @@ fn tail(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// The clock of a `froya_real_data` run, from its log's `Clock: t = 0 at … UTC` line.
-fn run_clock(log: &Path) -> Option<ModelClock> {
-    let text = std::fs::read_to_string(log).ok()?;
-    let line = text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Clock: t = 0 at "))?;
-    ModelClock::parse(line.trim_end_matches(" UTC")).ok()
+/// The run's own record of η at the station within [`STATION_REACH`] of `at` (mesh
+/// metres), from the `station_*.txt` files `froya_real_data` writes into `dir`: its
+/// name and (Unix time, η). The run samples every step at the nearest submerged node,
+/// as the trace does, so this is the trace at the solver's resolution (10 min at
+/// Frøya) where hourly VTU frames clip the peaks.
+pub fn station_record(
+    dir: &Path,
+    at: [f64; 2],
+    projection: &impl dg_rs::io::CoordinateProjection,
+) -> Option<StationRecord> {
+    let mut best: Option<(f64, StationRecord)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        if !(name.starts_with("station_") && name.ends_with(".txt")) {
+            continue;
+        }
+        let Ok(file) = dg_rs::io::read_tide_gauge_file(&path) else {
+            continue;
+        };
+        let Some(station) = &file.station else {
+            continue;
+        };
+        let (x, y) = projection.geo_to_xy(station.latitude, station.longitude);
+        let distance = (x - at[0]).hypot(y - at[1]);
+        if distance > STATION_REACH || best.as_ref().is_some_and(|b| b.0 <= distance) {
+            continue;
+        }
+        let series = &file.time_series;
+        let record = series
+            .times()
+            .iter()
+            .copied()
+            .zip(series.values().iter().copied())
+            .collect();
+        best = Some((distance, (station.name.clone(), record)));
+    }
+    best.map(|(_, found)| found)
+}
+
+/// A station's name and its record, (Unix time, η).
+pub type StationRecord = (String, Vec<(f64, f64)>);
+
+/// How far (m) a run's station may be from the trace's point to stand for it.
+const STATION_REACH: f64 = 500.0;
+
+/// The clock of the `froya_real_data` run in `dir`, from the `Clock: t = 0 at … UTC`
+/// line of its `clock.txt` (written since 2026-10-20) or of its `run.log`.
+pub fn folder_clock(dir: &Path) -> Option<ModelClock> {
+    ["clock.txt", "run.log"].iter().find_map(|name| {
+        let text = std::fs::read_to_string(dir.join(name)).ok()?;
+        let line = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Clock: t = 0 at "))?;
+        ModelClock::parse(line.trim_end_matches(" UTC")).ok()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `froya_real_data`'s `clock.txt` dates its frames; a `run.log` still does.
+    #[test]
+    fn a_folders_clock_is_its_clock_file_or_its_log() {
+        let dir = std::env::temp_dir().join(format!("dg-viz-clock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(folder_clock(&dir).is_none());
+        std::fs::write(
+            dir.join("run.log"),
+            "Frøya\n  Clock: t = 0 at 2025-06-14 00:00:00 UTC\n",
+        )
+        .unwrap();
+        let from_log = folder_clock(&dir).map(|c| c.format(0.0));
+        std::fs::write(
+            dir.join("clock.txt"),
+            "Clock: t = 0 at 2025-06-15 00:00:00 UTC\n",
+        )
+        .unwrap();
+        let from_file = folder_clock(&dir).map(|c| c.format(0.0));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(from_log.as_deref().map(|d| &d[..10]), Some("2025-06-14"));
+        assert_eq!(from_file.as_deref().map(|d| &d[..10]), Some("2025-06-15"));
+    }
+
+    /// The trace of an hourly VTU run takes the run's record of its point: the station
+    /// within reach, the nearest of several.
+    #[test]
+    fn the_runs_record_of_the_trace_point_is_found() {
+        use dg_rs::io::{CoordinateProjection, LocalProjection, TideGaugeFile};
+        use dg_rs::{TideGaugeStation, TimeSeries};
+        let dir = std::env::temp_dir().join(format!("dg-viz-station-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let projection = LocalProjection::new(63.87, 8.66);
+        let write = |slug: &str, name: &str, at: [f64; 2], eta: f64| {
+            let (lat, lon) = projection.xy_to_geo(at[0], at[1]);
+            let series = TimeSeries::new(&[1.0e9, 1.0e9 + 600.0], &[eta, -eta]);
+            let file = TideGaugeFile::from_time_series(series)
+                .with_station(TideGaugeStation::new(name, lon, lat));
+            dg_rs::io::write_tide_gauge_file(&dir.join(format!("station_{slug}.txt")), &file)
+                .unwrap();
+        };
+        write("near", "Near", [120.0, -80.0], 0.5);
+        write("nearer", "Nearer", [30.0, 40.0], 0.7);
+        write("far", "Far", [2000.0, 0.0], 0.9);
+        let found = station_record(&dir, [0.0, 0.0], &projection);
+        let none = station_record(&dir, [10_000.0, 0.0], &projection);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (name, record) = found.unwrap();
+        assert_eq!(name, "Nearer");
+        assert_eq!(record.len(), 2);
+        assert!(
+            (record[0].1 - 0.7).abs() < 1e-6 && (record[1].0 - record[0].0 - 600.0).abs() < 1e-6
+        );
+        assert!(none.is_none());
+    }
 
     #[test]
     fn a_snapshot_file_is_served_frame_by_frame() {
@@ -841,7 +984,7 @@ mod tests {
         let mut write = |t: f64| {
             let zero = vec![0.0; n];
             writer
-                .write_fields(t, &vec![t as f32; n], &zero, &zero, &[])
+                .write_fields(t, &vec![t as f32; n], &zero, &zero, &[], &[])
                 .unwrap();
         };
         for &t in &times {
@@ -907,6 +1050,89 @@ mod tests {
         drop(served);
         drop(writer);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A coupled wave run's sea state comes in as the snapshots' waves, field by
+    /// field, and a replay saved again keeps it.
+    #[test]
+    fn a_runs_waves_replay_and_save_again() {
+        use dg_rs::mesh::Mesh2D;
+        use dg_rs::operators::DGOperators2D;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("dg-viz-waves-{}.dgsnap", std::process::id()));
+        let again = dir.join(format!("dg-viz-waves-again-{}.dgsnap", std::process::id()));
+        let mesh = Mesh2D::uniform_rectangle(0.0, 100.0, 0.0, 100.0, 2, 2);
+        let ops = DGOperators2D::new(1);
+        let n = mesh.n_elements * ops.n_nodes;
+        // Field f at node i of the frame at t: its own value
+        let value = |t: f64, f: usize, i: usize| t as f32 + 10.0 * f as f32 + 0.01 * i as f32;
+        let fields = |t: f64| -> Vec<Vec<f32>> {
+            (0..7)
+                .map(|f| (0..n).map(|i| value(t, f, i)).collect())
+                .collect()
+        };
+        let layout = SnapshotLayout {
+            surface: &SeaStateFields::NAMES,
+            levels: None,
+        };
+        let mut writer = SnapshotWriter::create_with(
+            &path,
+            &mesh,
+            &ops,
+            &vec![-5.0; n],
+            None,
+            &[],
+            1e-3,
+            layout,
+        )
+        .unwrap();
+        let zero = vec![0.0; n];
+        for t in [0.0, 600.0] {
+            let f = fields(t);
+            let surface: Vec<&[f32]> = f.iter().map(Vec::as_slice).collect();
+            writer
+                .write_fields(t, &zero, &zero, &zero, &surface, &[])
+                .unwrap();
+        }
+        drop(writer);
+
+        let (mut replay, scenario) = Replay::snapshot(&path).unwrap();
+        assert!(replay.has_waves());
+        replay.save_to(&again, &scenario).unwrap();
+        let messages = spawn(replay, 1);
+        let mut seen = 0;
+        loop {
+            match messages.recv_timeout(Duration::from_secs(10)).unwrap() {
+                SolverMessage::Snapshot(s) => {
+                    let waves = s.waves.expect("the sea state");
+                    for (f, field) in waves.fields().into_iter().enumerate() {
+                        assert_eq!(*field, fields(s.t)[f], "field {f} at {} s", s.t);
+                    }
+                    seen += 1;
+                }
+                SolverMessage::Finished { error, .. } => {
+                    assert!(error.is_none(), "{error:?}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(seen, 2);
+        let mut saved = SnapshotReader::open(&again).unwrap();
+        assert_eq!(saved.header().surface, SeaStateFields::NAMES);
+        assert_eq!(saved.read_frame(1).unwrap().surface, fields(600.0));
+        // A file without the whole sea state has no waves
+        let mut writer =
+            SnapshotWriter::create(&path, &mesh, &ops, &vec![-5.0; n], None, &[], 1e-3).unwrap();
+        writer
+            .write_fields(0.0, &zero, &zero, &zero, &[], &[])
+            .unwrap();
+        drop(writer);
+        assert!(!Replay::snapshot(&path).unwrap().0.has_waves());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&again).unwrap();
     }
 
     const FRAME: &str = r#"<VTKFile>

@@ -148,6 +148,57 @@ pub struct Snapshot {
     pub particles: ParticleSnapshot,
     /// The layers of a 3D run
     pub layers: Option<Layers>,
+    /// The sea state of a run with waves
+    pub waves: Option<Waves>,
+}
+
+/// The sea state at one instant, node by node: a coupled wave run's
+/// (`dg_rs::waves::SeaStateFields`, a snapshot file's surface fields).
+#[derive(Clone, Debug, Default)]
+pub struct Waves {
+    /// Significant wave height H_s (m)
+    pub hs: Vec<f32>,
+    /// Peak period T_p (s), 0 without waves
+    pub tp: Vec<f32>,
+    /// Mean direction travelling to, a unit vector in mesh x and y (0 without waves)
+    pub dir_x: Vec<f32>,
+    pub dir_y: Vec<f32>,
+    /// Directional spread (rad)
+    pub spread: Vec<f32>,
+    /// The power whitecapping and depth-induced breaking take from the waves (W/m²)
+    pub whitecapping: Vec<f32>,
+    pub breaking: Vec<f32>,
+}
+
+impl Waves {
+    /// The fields in the order of `dg_rs::waves::SeaStateFields::NAMES`.
+    pub fn fields(&self) -> [&Vec<f32>; 7] {
+        [
+            &self.hs,
+            &self.tp,
+            &self.dir_x,
+            &self.dir_y,
+            &self.spread,
+            &self.whitecapping,
+            &self.breaking,
+        ]
+    }
+
+    pub fn fields_mut(&mut self) -> [&mut Vec<f32>; 7] {
+        [
+            &mut self.hs,
+            &mut self.tp,
+            &mut self.dir_x,
+            &mut self.dir_y,
+            &mut self.spread,
+            &mut self.whitecapping,
+            &mut self.breaking,
+        ]
+    }
+
+    fn bytes(&self) -> usize {
+        self.fields().iter().map(|f| 4 * f.len()).sum()
+    }
 }
 
 /// The 3D fields at one instant, `[node][level]` in the solver's element-major node
@@ -191,6 +242,7 @@ impl Snapshot {
             v: velocity(hv),
             particles,
             layers: None,
+            waves: None,
         }
     }
 
@@ -210,6 +262,7 @@ impl Snapshot {
                 temp: f32s(&state.temp),
                 salt: f32s(&state.salt),
             }),
+            waves: None,
         }
     }
 
@@ -217,6 +270,7 @@ impl Snapshot {
         4 * (self.eta.len() + self.u.len() + self.v.len())
             + self.particles.bytes()
             + self.layers.as_ref().map_or(0, Layers::bytes)
+            + self.waves.as_ref().map_or(0, Waves::bytes)
     }
 }
 

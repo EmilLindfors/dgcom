@@ -53,7 +53,13 @@ impl Canvas {
     }
 
     /// A straight segment `width` pixels wide from `a` to `b` (without its end dot).
-    pub fn segment(&mut self, (xa, ya): (f32, f32), (xb, yb): (f32, f32), colour: [u8; 3], width: f32) {
+    pub fn segment(
+        &mut self,
+        (xa, ya): (f32, f32),
+        (xb, yb): (f32, f32),
+        colour: [u8; 3],
+        width: f32,
+    ) {
         let r = 0.5 * width;
         let steps = ((xb - xa).abs().max((yb - ya).abs()) / (0.5 * r))
             .ceil()

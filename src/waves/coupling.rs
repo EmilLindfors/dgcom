@@ -52,6 +52,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::boundary::{SWEBoundaryCondition2D, tidal_ramp};
+use crate::equations::RHO_0;
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D, MeshTransfer2D};
 use crate::physics::SWEPhysics2D;
@@ -319,10 +320,110 @@ impl WaveCoupling2D {
         StokesDriftField::new(waves, n).transferred(&self.to_circulation, self.ops.n_nodes)
     }
 
+    /// The sea state of the wave state `n` at the circulation's nodes
+    /// ([`SeaStateFields`]), its dissipation over a wave step `dt` (s; 0 for
+    /// the instantaneous rate, [`WaveModel2D::dissipation`]).
+    pub fn sea_state(&self, waves: &WaveModel2D, n: &WaveSolution, dt: f64) -> SeaStateFields {
+        let params = waves.parameters(n);
+        let rho_g = RHO_0 * waves.g();
+        let sinks = waves.dissipation(n, dt);
+        // The periods, direction and spread weighted by the variance, so a node
+        // without waves (land, a lee) does not pull its neighbours' towards 0
+        let weighted: Vec<[f64; 5]> = params
+            .iter()
+            .map(|p| {
+                let (sin, cos) = p.direction.sin_cos();
+                [p.m0, p.m0 * p.tp, p.m0 * cos, p.m0 * sin, p.m0 * p.spread]
+            })
+            .collect();
+        let weighted = self.to_circulation.apply_components(&weighted);
+        let hs: Vec<f64> = params.iter().map(|p| p.hs).collect();
+        let whitecapping: Vec<f64> = sinks.iter().map(|d| rho_g * d.whitecapping).collect();
+        let breaking: Vec<f64> = sinks.iter().map(|d| rho_g * d.breaking).collect();
+        let mut out = SeaStateFields {
+            hs: self.non_negative(&hs),
+            whitecapping: self.non_negative(&whitecapping),
+            breaking: self.non_negative(&breaking),
+            ..SeaStateFields::default()
+        };
+        for [m0, tp, cos, sin, spread] in weighted {
+            // H_s under a millimetre is no sea to give a period or a direction
+            let (tp, direction, spread) = if m0 > 1e-7 {
+                let r = cos.hypot(sin);
+                let unit = if r > 0.0 {
+                    [cos / r, sin / r]
+                } else {
+                    [0.0; 2]
+                };
+                (tp / m0, unit, spread / m0)
+            } else {
+                (0.0, [0.0; 2], 0.0)
+            };
+            out.tp.push(tp.max(0.0));
+            out.direction.push(direction);
+            out.spread.push(spread.max(0.0));
+        }
+        out
+    }
+
     fn non_negative(&self, field: &[f64]) -> Vec<f64> {
         let mut out = self.to_circulation.apply(field);
         out.iter_mut().for_each(|x| *x = x.max(0.0));
         out
+    }
+}
+
+/// The sea state at a circulation's nodes, for output (a snapshot file's
+/// surface fields, by the names of [`Self::NAMES`]): what a viewer colours
+/// the sea by, points the waves along, and draws the waves and the white
+/// water from. Interpolated from the wave nodes
+/// ([`WaveCoupling2D::to_circulation`]); the period, the direction and the
+/// spread weighted by the variance `m₀`, so land and lees without waves do
+/// not pull a coast's values towards 0, the direction as a vector so it does
+/// not wrap.
+#[derive(Clone, Debug, Default)]
+pub struct SeaStateFields {
+    /// Significant wave height H_s (m)
+    pub hs: Vec<f64>,
+    /// Peak period T_p (s); 0 without waves
+    pub tp: Vec<f64>,
+    /// Mean direction, travelling to, as a unit vector in mesh axes; 0
+    /// without waves
+    pub direction: Vec<[f64; 2]>,
+    /// Directional spread (rad, Kuik et al. 1988)
+    pub spread: Vec<f64>,
+    /// The power whitecapping takes from the waves, `ρ g D_wc` (W/m², ρ =
+    /// [`RHO_0`])
+    pub whitecapping: Vec<f64>,
+    /// The power depth-induced breaking takes, `ρ g D_br` (W/m²)
+    pub breaking: Vec<f64>,
+}
+
+impl SeaStateFields {
+    /// The fields' names in a snapshot file, in [`Self::as_f32`]'s order.
+    pub const NAMES: [&'static str; 7] = [
+        "wave_hs",
+        "wave_tp",
+        "wave_dir_x",
+        "wave_dir_y",
+        "wave_spread",
+        "wave_whitecapping",
+        "wave_breaking",
+    ];
+
+    /// The fields as `f32`, in the order of [`Self::NAMES`].
+    pub fn as_f32(&self) -> [Vec<f32>; 7] {
+        let f32s = |v: &[f64]| v.iter().map(|&x| x as f32).collect::<Vec<f32>>();
+        let along = |c: usize| self.direction.iter().map(|d| d[c] as f32).collect();
+        [
+            f32s(&self.hs),
+            f32s(&self.tp),
+            along(0),
+            along(1),
+            f32s(&self.spread),
+            f32s(&self.whitecapping),
+            f32s(&self.breaking),
+        ]
     }
 }
 
@@ -357,6 +458,8 @@ pub struct CoupledWaves2D {
     /// first exchange)
     last: Option<(WaveForce2D, Vec<f64>)>,
     cfl: f64,
+    /// The waves' step in the last exchange (none before the first)
+    step: Option<f64>,
     z0: f64,
     ramp: Option<f64>,
     force_form: WaveForceForm,
@@ -425,6 +528,7 @@ impl CoupledWaves2D {
             time: t,
             last: None,
             cfl: 0.5,
+            step: None,
             z0: DEFAULT_BED_ROUGHNESS,
             ramp: None,
             force_form: WaveForceForm::default(),
@@ -537,6 +641,14 @@ impl CoupledWaves2D {
         self.boundary.as_ref()
     }
 
+    /// The sea state now (at [`Self::time`]) at the circulation's nodes, its
+    /// dissipation over the last exchange's wave step
+    /// ([`WaveCoupling2D::sea_state`]).
+    pub fn sea_state(&self) -> SeaStateFields {
+        let dt = self.step.unwrap_or_else(|| self.model.compute_dt(self.cfl));
+        self.coupling.sea_state(&self.model, &self.state, dt)
+    }
+
     /// Work counts so far.
     pub fn stats(&self) -> CoupledWavesStats {
         self.stats
@@ -601,6 +713,7 @@ impl CoupledWaves2D {
             self.model.step(&mut self.state, dt, &mut self.workspace);
         }
         self.time = t_next;
+        self.step = Some(dt);
         let stepping = start.elapsed().as_secs_f64();
 
         let start = Instant::now();
@@ -793,6 +906,60 @@ mod tests {
             let got = field.at(ElementIndex::new(p / nn), &w, 0.5);
             let scale = e[0].hypot(e[1]);
             assert!(close(got[0], e[0], scale) && close(got[1], e[1], scale));
+        }
+    }
+
+    /// The sea state for output: on the same mesh the wave model's own
+    /// parameters and dissipation; across meshes, nodes without waves (land)
+    /// lower H_s near them but leave the period and the direction alone.
+    #[test]
+    fn the_sea_state_reaches_the_circulation() {
+        let c = circulation(5, 4, 2);
+        let waves = waves_on(&c, |x, _| -(1.0 + 0.01 * x))
+            .with_sources(crate::waves::SourceTerms::swan_defaults(G));
+        let n = varied_sea(&waves);
+        let coupling = WaveCoupling2D::new(&waves, c.mesh.clone(), c.ops.clone(), c.geom.clone());
+        let sea = coupling.sea_state(&waves, &n, 30.0);
+        let (params, sinks) = (waves.parameters(&n), waves.dissipation(&n, 30.0));
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+        let rho_g = RHO_0 * G;
+        for (p, (q, d)) in params.iter().zip(&sinks).enumerate() {
+            assert!(close(sea.hs[p], q.hs) && close(sea.tp[p], q.tp), "node {p}");
+            assert!(close(sea.spread[p], q.spread), "node {p}");
+            let [x, y] = sea.direction[p];
+            assert!(close(x, q.direction.cos()) && close(y, q.direction.sin()));
+            assert!(close(sea.whitecapping[p], rho_g * d.whitecapping));
+            assert!(close(sea.breaking[p], rho_g * d.breaking));
+        }
+        // 1 m deep at the shallow end: H_s 1.2–1.8 m breaks there
+        assert!(sea.breaking.iter().cloned().fold(0.0, f64::max) > 0.0);
+        let fields = sea.as_f32();
+        assert_eq!(fields.len(), SeaStateFields::NAMES.len());
+        assert!(fields.iter().all(|f| f.len() == sea.hs.len()));
+        assert_eq!(fields[3][7], sea.direction[7][1] as f32);
+
+        // A uniform sea on a coarse P1 mesh, one corner node of it dry
+        let coarse = circulation(3, 2, 1);
+        let waves = waves_on(&coarse, |_, _| -30.0);
+        let mut n = waves.uniform_state(&waves.grid.jonswap(1.2, 6.0, 3.3, 0.4, 6.0));
+        n.spectrum_mut(0).fill(0.0);
+        let own = waves.parameters(&n)[1];
+        let coupling = WaveCoupling2D::new(&waves, c.mesh.clone(), c.ops.clone(), c.geom.clone());
+        let sea = coupling.sea_state(&waves, &n, 30.0);
+        let lowered = sea.hs.iter().filter(|&&h| h < 0.99 * own.hs).count();
+        assert!(lowered > 0 && lowered < sea.hs.len() / 4, "{lowered}");
+        for p in 0..sea.hs.len() {
+            assert!(sea.hs[p] <= own.hs * (1.0 + 1e-12) && sea.hs[p] >= 0.0);
+            if sea.hs[p] > 0.01 {
+                assert!(
+                    (sea.tp[p] - own.tp).abs() < 1e-9 * own.tp,
+                    "T_p {}",
+                    sea.tp[p]
+                );
+                let [x, y] = sea.direction[p];
+                let (sin, cos) = own.direction.sin_cos();
+                assert!((x - cos).abs() < 1e-9 && (y - sin).abs() < 1e-9, "{x}, {y}");
+            }
         }
     }
 

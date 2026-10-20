@@ -14,10 +14,8 @@
 //! Frøya–Smøla–Hitra on the coastline mesh with NorKyst-800 boundary tides, as
 //! `examples/froya_real_data.rs` runs it (its data files in `../data/`), or the
 //! stratified farm channel of `examples/farm_3d.rs` or the farm fjord in 3D: there
-//! the water shows the depth-mean current or any σ-layer's, a vertical section along
-//! the flow through a cage shows the speed or temperature in the water column
-//! ([`layers`]), a sheet at the strongest stratification of every column shows the
-//! pycnocline, halocline or thermocline ([`stratification`]), and lice larvae, faeces
+//! the water shows the depth-mean current or any σ-layer's ([`layers`]), a sheet
+//! at the strongest stratification of every column shows the pycnocline, halocline or thermocline ([`stratification`]), and lice larvae, faeces
 //! and feed are tracked in 3D ([`cloud_3d`]).
 //!
 //! ```bash
@@ -85,8 +83,7 @@
 //! - `--sigma N` σ-levels of a 3D run [16; 12 for `fjord3d`]; `--start TIME` the UTC
 //!   instant of model time 0, for the larvae's daylight [2025-06-15T00:00:00Z]; `--lice
 //!   ladim|johnsen|passive` the larvae's behaviour (`dg_rs::particles::SalmonLice`)
-//!   [ladim]; `--section speed|temperature|off` what the section shows at the start
-//!   [speed]; `--sheet density|salinity|temperature|off` what the stratification
+//!   [ladim]; `--sheet density|salinity|temperature|off` what the stratification
 //!   sheet follows at the start ([`stratification`]) [density]; `--layer
 //!   mean|surface|bed|N` the current the water shows at the start (N: σ-layer from the
 //!   bed, 0) [mean]
@@ -101,6 +98,9 @@
 //! - `--rate R` model seconds shown per second [60; 3600 in a replay]
 //! - `--vz Z` vertical exaggeration [3]; `--speed-max V` fix the speed scale (m/s)
 //!   instead of letting it follow the flow in round steps
+//! - `--colour speed|elevation|hs|tp|dissipation` what the water's colour shows at the
+//!   start (C cycles it; the last three are a run's waves: a snapshot file of a
+//!   coupled wave run, `froya_real_data wave_coupling=`) [speed]
 //! - `--water-alpha A` opacity of the translucent water, 0.05–0.95 [0.4]; lower shows
 //!   more of the bed (its depth scale is in the legend), higher more of the colouring
 //! - `--ramp S` seconds over which the tide ramps up from rest; 0 switches it on at
@@ -116,15 +116,24 @@
 //!   over mesh point X, Y (km), HEIGHT m above mean sea level, looking toward the
 //!   compass BEARING and TILT degrees down (the photo view's status prints the view's
 //!   own; with `--vz 1` the heights are true)
+//! - `--minimap on|off` the map of the whole domain in a corner ([`minimap`]) [on]
 //! - `--photo on|off` start in the photo view [off]; `--wind SPEED,FROM` its wind, in
 //!   m/s at 10 m and the compass degrees it blows from [6,225]; `--fetch KM` the open
 //!   water upwind of the view, which sets how developed its sea is [10]
+//! - `--show keys|run|view|colour|overlays|photo|help` open the keys' help or a menu
+//!   of the menu bar at the start ([`menubar`]), e.g. for a `--screenshot`
+//! - `--frame-times N` time N frames once the shown time reaches `--at` (as a
+//!   screenshot waits), without vsync, print the frame times' mean, median and 95th
+//!   percentile, and end: the cost of a view (the minimap, the photo view) on this
+//!   machine's GPU
 //! - `--screenshot PATH` save a frame once the shown time reaches `--at S` (model
 //!   seconds; default the end of the run) and quit: for checking a change headlessly.
 //!
-//! Keys: see [`hud`] (B: bed contours; L: the terrain; - and =: water opacity; in
-//! 3D , and . the layer shown, V the section, N the stratification sheet).
+//! The menu bar along the top ([`menubar`]) does by mouse what the keys do, F1 (or H,
+//! or ?) lists the keys with what each shows now; both read one table of actions
+//! ([`actions`]).
 
+mod actions;
 mod arrows;
 mod cages;
 mod camera;
@@ -136,6 +145,8 @@ mod hud;
 mod inspect;
 mod layers;
 mod menu;
+mod menubar;
+mod minimap;
 mod particles;
 mod photo;
 mod playback;
@@ -156,6 +167,7 @@ const FONT: &[u8] = include_bytes!("../assets/fonts/FiraMono-Regular.ttf");
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use dg_rs::mesh::PointLocator2D;
@@ -167,7 +179,7 @@ use camera::{CameraPlugin, OrbitCamera, Views};
 use contours::ContoursPlugin;
 use field::{Field, Frame, Nodes, Probe, ShownLayer};
 use hud::{HudPlugin, RunClock, Title};
-use layers::{LayersPlugin, Levels, Section, SectionShows};
+use layers::{LayersPlugin, Levels};
 use particles::{Lice, ParticleConfig, ParticlesPlugin, Periodic};
 use photo::{Photo, PhotoPlugin};
 use playback::{Playback, PlaybackPlugin, SolverChannel, SolverState, Source};
@@ -176,7 +188,7 @@ use scenario::Scenario;
 use site::{SiteDrawing, SitePlugin, Sites};
 use solver::SolverConfig;
 use stratification::{SheetShows, Stratification, StratificationPlugin};
-use surface::{Colouring, SurfacePlugin, WaterOpacity};
+use surface::{ColourBy, Colouring, SurfacePlugin, WaterOpacity};
 use terrain::{Terrain, TerrainPlugin};
 use trace::{Trace, TracePlugin};
 
@@ -204,6 +216,7 @@ struct Args {
     rate: Option<f64>,
     vz: f32,
     speed_max: Option<f32>,
+    colour: ColourBy,
     water_alpha: f32,
     drag: bool,
     ramp: Option<f64>,
@@ -211,12 +224,16 @@ struct Args {
     view: String,
     screenshot: Option<String>,
     at: Option<f64>,
+    /// `--frame-times N`: time N frames without vsync, print them and end
+    frame_times: Option<usize>,
     sigma: Option<usize>,
     start: String,
-    section: SectionShows,
     sheet: SheetShows,
     layer: String,
     photo: Photo,
+    minimap: bool,
+    /// `--show`: the help or a menu open at the start
+    show: actions::Shown,
     /// `--eye`: mesh point (m), height (m), bearing and tilt (degrees)
     eye: Option<([f64; 2], f32, f32, f32)>,
 }
@@ -245,6 +262,7 @@ impl Args {
             rate: None,
             vz: 3.0,
             speed_max: None,
+            colour: ColourBy::Speed,
             water_alpha: WaterOpacity::default().0,
             drag: true,
             ramp: None,
@@ -257,11 +275,13 @@ impl Args {
             view: "farm".into(),
             screenshot: None,
             at: None,
+            frame_times: None,
             sigma: None,
             start: "2025-06-15T00:00:00Z".into(),
-            section: SectionShows::Speed,
             sheet: SheetShows::Density,
             layer: "mean".into(),
+            minimap: true,
+            show: actions::Shown::default(),
             photo: Photo {
                 on: false,
                 wind_speed: 6.0,
@@ -298,6 +318,13 @@ impl Args {
                 "--memory" => args.memory_mb = num(&flag, &value)?,
                 "--rate" => args.rate = Some(num(&flag, &value)?),
                 "--vz" => args.vz = num(&flag, &value)?,
+                "--colour" | "--color" => {
+                    args.colour = ColourBy::parse(&value).ok_or_else(|| {
+                        format!(
+                            "--colour takes speed, elevation, hs, tp or dissipation, not {value}"
+                        )
+                    })?;
+                }
                 "--speed-max" => args.speed_max = Some(num(&flag, &value)?),
                 "--water-alpha" => {
                     args.water_alpha = num(&flag, &value)?;
@@ -330,18 +357,6 @@ impl Args {
                 }
                 "--sigma" => args.sigma = Some(num(&flag, &value)?),
                 "--start" => args.start = value,
-                "--section" => {
-                    args.section = match value.as_str() {
-                        "speed" => SectionShows::Speed,
-                        "temperature" => SectionShows::Temperature,
-                        "off" => SectionShows::Off,
-                        _ => {
-                            return Err(format!(
-                                "--section takes speed, temperature or off, not {value}"
-                            ));
-                        }
-                    }
-                }
                 "--sheet" => {
                     args.sheet = match value.as_str() {
                         "density" => SheetShows::Density,
@@ -356,6 +371,13 @@ impl Args {
                     }
                 }
                 "--layer" => args.layer = value,
+                "--minimap" => {
+                    args.minimap = match value.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("--minimap takes on or off, not {value}")),
+                    }
+                }
                 "--photo" => {
                     args.photo.on = match value.as_str() {
                         "on" => true,
@@ -372,11 +394,19 @@ impl Args {
                         return Err(bad());
                     }
                 }
+                "--show" => {
+                    args.show = actions::Shown::parse(&value).ok_or_else(|| {
+                        format!(
+                            "--show takes keys, run, view, colour, overlays, photo or help,                              not {value}"
+                        )
+                    })?;
+                }
                 "--eye" => args.eye = Some(eye(&value)?),
                 "--fetch" => args.photo.fetch = 1e3 * num::<f32>(&flag, &value)?,
                 "--view" => args.view = value,
                 "--screenshot" => args.screenshot = Some(value),
                 "--at" => args.at = Some(num(&flag, &value)?),
+                "--frame-times" => args.frame_times = Some(num(&flag, &value)?),
                 _ => {
                     return Err(format!(
                         "unknown option {flag} (see the docs at the top of viz/src/main.rs)"
@@ -647,6 +677,7 @@ fn main() -> AppExit {
             &scenario,
             scenario.clock.as_ref(),
             args.particles.per_release > 0,
+            false,
         ) {
             Ok(sink) => {
                 println!("Saving the run to {}", path.display());
@@ -819,24 +850,19 @@ fn main() -> AppExit {
         },
     };
 
-    // The water column of a 3D run: its levels and the section
-    let column = scenario.three_d.as_ref().map(|three_d| {
+    // The water column of a 3D run: its levels
+    let levels = scenario.three_d.as_ref().map(|three_d| {
         let farm = Probe::at(&locator, &scenario, scenario.farm);
         let bed: Vec<f32> = scenario.bathymetry.data.iter().map(|&b| b as f32).collect();
-        let mut section = Section::new(&locator, &scenario, three_d.section);
-        section.shows = args.section;
-        (
-            Levels {
-                sigma: three_d
-                    .sigma
-                    .sigma_rho()
-                    .iter()
-                    .map(|&s| s as f32)
-                    .collect(),
-                depth: farm.map_or(0.0, |p| -p.eval(&bed)),
-            },
-            section,
-        )
+        Levels {
+            sigma: three_d
+                .sigma
+                .sigma_rho()
+                .iter()
+                .map(|&s| s as f32)
+                .collect(),
+            depth: farm.map_or(0.0, |p| -p.eval(&bed)),
+        }
     });
     let top = scenario
         .three_d
@@ -874,11 +900,12 @@ fn main() -> AppExit {
                     },
                     |s| s.name.clone(),
                 );
-                let record = file
-                    .time_series
-                    .data
+                let series = &file.time_series;
+                let record = series
+                    .times()
                     .iter()
-                    .map(|p| (p.time, p.value))
+                    .copied()
+                    .zip(series.values().iter().copied())
                     .collect();
                 Some((name, record))
             }
@@ -891,7 +918,21 @@ fn main() -> AppExit {
     if gauge.is_some() && run_clock.is_none() {
         eprintln!("--gauge needs the run's clock: the gauge is not drawn");
     }
-    let trace = Trace::new(&scenario, &locator, gauge_point, span, gauge, run_clock);
+    let mut trace = Trace::new(&scenario, &locator, gauge_point, span, gauge, run_clock);
+    // VTU frames are hourly: the run's own record of the point, if it wrote one
+    if let (Some(dir), None, Some(clock), Some(projection)) = (
+        args.replay.as_deref().filter(|p| p.is_dir()),
+        snapshot_file,
+        run_clock,
+        scenario.projection,
+    ) && let Some((name, record)) = replay::station_record(dir, gauge_point, &projection)
+    {
+        println!(
+            "Trace: the run's record at {name}, {} samples",
+            record.len()
+        );
+        trace = trace.with_record(&record, clock);
+    }
     let mut inspector = inspect::Inspector::new(
         scenario.mesh.clone(),
         scenario.ops.clone(),
@@ -964,6 +1005,12 @@ fn main() -> AppExit {
         primary_window: Some(Window {
             title: "dg-viz".into(),
             resolution: (1600, 900).into(),
+            // Timed frames are not held to the display's rate
+            present_mode: if args.frame_times.is_some() {
+                bevy::window::PresentMode::AutoNoVsync
+            } else {
+                bevy::window::PresentMode::default()
+            },
             ..default()
         }),
         ..default()
@@ -978,11 +1025,19 @@ fn main() -> AppExit {
     .insert_resource(nodes)
     .insert_resource(cages)
     .insert_resource(arrows)
+    .insert_resource(actions::Actions::new(&views))
+    .insert_resource(args.show)
     .insert_resource(views)
     .insert_resource(Field::default())
     .insert_resource(shown)
     .insert_resource(periodic)
-    .insert_resource(Colouring::new(args.speed_max))
+    .insert_resource(Colouring::new(args.speed_max, args.colour))
+    // The waves' maps read on opaque water, not mixed with the bed's colours
+    .insert_resource(if args.colour.is_waves() {
+        surface::SurfaceStyle::Opaque
+    } else {
+        surface::SurfaceStyle::Translucent
+    })
     .insert_resource(WaterOpacity(args.water_alpha))
     .insert_resource(Title(scenario.name.clone()))
     .insert_resource(Photo {
@@ -1004,11 +1059,22 @@ fn main() -> AppExit {
     .insert_resource(playback)
     .insert_resource(SolverChannel(Mutex::new(channel)))
     .insert_resource(source)
+    .insert_resource(minimap::Minimap::new(
+        frame.world(lo, 0.0).xz().min(frame.world(hi, 0.0).xz()),
+        frame.world(lo, 0.0).xz().max(frame.world(hi, 0.0).xz()),
+        args.minimap,
+    ))
     .insert_resource(Capture {
         path: args.screenshot,
         at: args.at.unwrap_or(t_end),
         frames: None,
     })
+    .insert_resource(FrameTimes {
+        wanted: args.frame_times.unwrap_or(0),
+        at: args.at.unwrap_or(t_end),
+        samples: Vec::new(),
+    })
+    .add_plugins((actions::ActionsPlugin, menubar::MenubarPlugin))
     .add_plugins((
         PlaybackPlugin,
         SurfacePlugin,
@@ -1017,6 +1083,7 @@ fn main() -> AppExit {
         ArrowsPlugin,
         ParticlesPlugin,
         CameraPlugin,
+        minimap::MinimapPlugin,
         HudPlugin,
         TracePlugin,
         TerrainPlugin,
@@ -1027,6 +1094,9 @@ fn main() -> AppExit {
     .add_systems(Startup, move |mut commands: Commands| {
         commands.spawn((
             Camera3d::default(),
+            // The HUD's, not the minimap's
+            IsDefaultUiCamera,
+            RenderLayers::from_layers(&[0, minimap::MAIN_ONLY]),
             Projection::Perspective(PerspectiveProjection {
                 near: 1.0,
                 far: 400_000.0,
@@ -1047,7 +1117,8 @@ fn main() -> AppExit {
     })
     .add_systems(Update, field::interpolate)
     .add_systems(Update, capture.after(field::interpolate))
-    .add_systems(Update, back_to_menu)
+    .add_systems(Last, frame_times)
+    .add_systems(Update, (back_to_menu, jump))
     .add_systems(Last, playback::settle);
     if let Some(clock) = run_clock {
         app.insert_resource(RunClock(clock));
@@ -1058,9 +1129,8 @@ fn main() -> AppExit {
     if let Some(sites) = sites {
         app.insert_resource(sites);
     }
-    if let Some((levels, section)) = column {
+    if let Some(levels) = levels {
         app.insert_resource(levels)
-            .insert_resource(section)
             .insert_resource(Stratification::new(args.sheet))
             .add_plugins((LayersPlugin, StratificationPlugin));
     }
@@ -1068,11 +1138,22 @@ fn main() -> AppExit {
     app.run()
 }
 
-/// M: back to the start menu. A viewer the menu started ends with
+/// M (or Run → Back to the list of runs): back to the start menu; Run → Quit ends. A viewer the menu started ends with
 /// [`menu::BACK_TO_MENU`] and the menu shows again; one started from the command
 /// line opens a menu and ends.
-fn back_to_menu(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppExit>) {
-    if !keys.just_pressed(KeyCode::KeyM) {
+fn back_to_menu(mut acts: MessageReader<actions::Act>, mut exit: MessageWriter<AppExit>) {
+    use actions::{Act, Action};
+    let mut back = false;
+    for &Act(action) in acts.read() {
+        match action {
+            Action::Menu => back = true,
+            Action::Quit => {
+                exit.write(AppExit::Success);
+            }
+            _ => {}
+        }
+    }
+    if !back {
         return;
     }
     if std::env::var_os(menu::MENU_ENV).is_some() {
@@ -1085,6 +1166,70 @@ fn back_to_menu(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppExit
         }
         Err(e) => eprintln!("cannot open the menu: {e}"),
     }
+}
+
+/// F, O and 1 to 9 (or the View menu): the close-up, the whole domain, a named place.
+fn jump(
+    mut acts: MessageReader<actions::Act>,
+    views: Res<Views>,
+    mut cameras: Query<&mut OrbitCamera>,
+) {
+    use actions::{Act, Action};
+    let Ok(mut orbit) = cameras.single_mut() else {
+        return;
+    };
+    for &Act(action) in acts.read() {
+        let to = match action {
+            Action::CloseUp => Some(views.farm),
+            Action::Overview => Some(views.domain),
+            Action::Place(i) => views.places.get(i).map(|(_, view)| *view),
+            _ => None,
+        };
+        if let Some(to) = to {
+            *orbit = to;
+        }
+    }
+}
+
+/// `--frame-times`: how many frames to time, from when, and their times so far (s).
+#[derive(Resource)]
+struct FrameTimes {
+    wanted: usize,
+    at: f64,
+    samples: Vec<f32>,
+}
+
+/// Frames to let pass before timing, for the meshes and pipelines to reach the GPU.
+const WARM_UP: usize = 60;
+
+/// Times `--frame-times` frames once the shown time reaches `--at` (paused there), then
+/// prints their mean, median and 95th percentile (ms) and ends.
+fn frame_times(
+    time: Res<Time<Real>>,
+    field: Res<Field>,
+    mut playback: ResMut<Playback>,
+    mut times: ResMut<FrameTimes>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if times.wanted == 0 || field.t.is_none_or(|t| t < times.at - 1.0) {
+        return;
+    }
+    playback.paused = true;
+    times.samples.push(time.delta_secs());
+    if times.samples.len() < WARM_UP + times.wanted {
+        return;
+    }
+    let mut ms: Vec<f32> = times.samples[WARM_UP..].iter().map(|s| 1e3 * s).collect();
+    ms.sort_by(f32::total_cmp);
+    let mean = ms.iter().sum::<f32>() / ms.len() as f32;
+    println!(
+        "frame times over {} frames: mean {mean:.2} ms, median {:.2} ms, p95 {:.2} ms",
+        ms.len(),
+        ms[ms.len() / 2],
+        ms[(ms.len() * 95 / 100).min(ms.len() - 1)]
+    );
+    times.wanted = 0;
+    exit.write(AppExit::Success);
 }
 
 fn capture(
