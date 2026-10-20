@@ -104,11 +104,12 @@
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [heat=1] [jerlov=III] [mixing=k-epsilon] [band_km=3] [band_minutes=30] [blend=1] [max_closed=0.05] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
-//!     [wave_sources=swan|wam] [wave_integration=] [wave_limiter=] [wave_substeps=1] [wave_cfl=0.5] [wave_hours=0] \
+//!     [wave_sources=wam|swan] [wave_integration=] [wave_limiter=] [wave_substeps=4|1] [wave_cfl=1.0|0.5] [wave_hours=0] \
 //!     [wave_land=absorbing|floored] [wave_force=dissipation|stress] [wave_depth_limit=1] \
 //!     [wave_reference=<file>] \
 //!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] \
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
+//!     [wave_stations=NAME:LON,LAT;…] \
 //!     [levels=0] [tide3d=0] [rk_3d=43|3] [cfl_3d=4|2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] \
 //!     [restart_hours=0] [resume=<file>]
 //! ```
@@ -143,15 +144,20 @@
 //! tide's currents over the shallows otherwise set the waves' step by
 //! frequency shifting (0.6 s against the geographic 7 s at 1 km).
 //!
-//! `wave_sources=wam` integrates the sources as WAM does: implicit in the
-//! DIA's diagonal, with Hersbach & Janssen's growth limiter proportional to
-//! the step (`SourceIntegration::Implicit`, `GrowthLimiter::Rate`), in place
-//! of SWAN's frozen rates and per-step limiter; `wave_integration=frozen|implicit`
-//! and `wave_limiter=ris|rate|rate2` set either part alone (`rate2`: the
-//! limit on the losses too, as ecWAM; breaking stays outside it). Its sources tolerate long
-//! steps, so `wave_substeps=N` runs them once per N propagation steps (each
-//! with its own implicit refraction, shifting and breaking), and `wave_cfl=`
-//! sets the propagation's CFL number (0.5).
+//! `wave_sources=wam` (the default) integrates the sources as WAM does:
+//! implicit in the DIA's diagonal, with Hersbach & Janssen's growth limiter
+//! proportional to the step (`SourceIntegration::Implicit`,
+//! `GrowthLimiter::Rate`); `wave_sources=swan` takes SWAN's frozen rates and
+//! per-step limiter instead. `wave_integration=frozen|implicit` and
+//! `wave_limiter=ris|rate|rate2` set either part alone (`rate2`: the limit on
+//! the losses too, as ecWAM; breaking stays outside it). WAM's sources
+//! tolerate long steps, so `wave_substeps=N` runs them once per N
+//! propagation steps (each with its own implicit refraction, shifting and
+//! breaking; 4 with WAM's sources, 1 with SWAN's), and `wave_cfl=` sets the
+//! propagation's CFL number (1.0 with WAM's, 0.5 with SWAN's). WAM's won the
+//! Ålesund buoy test of `notes/waves.md` (2026-10-20: H_s scatter index
+//! 0.271 against SWAN's 0.284 over the sheltered E39 buoys, a tie by the
+//! pre-set rule, and 0.32 against 0.36 on a 1 km wave grid) at half the cost.
 //!
 //! `wave_land=absorbing` (the default) lets dry land take the waves, as the
 //! coast does (`WaveModel2D::with_absorbing_land`). `wave_land=floored` treats
@@ -187,7 +193,11 @@
 //! `waves::WindSeries`), unless `met=` gives them the weather's. The run's clock (`start=`) must fall in the file's
 //! times. Every output interval our H_s at the parent's points is printed
 //! against the parent's, and at the end the bias and RMSE after twice
-//! `ramp_hours`, with the series in `<output>/wave_points.txt`. For a
+//! `ramp_hours`, with the series in `<output>/wave_points.txt` (H_s ours
+//! and the parent's, and our T_p and mean direction, at each point's
+//! nearest wave node). `wave_stations=NAME:LON,LAT;…` adds points of our
+//! own there, e.g. wave buoys (`scripts/e39_buoy_series.py`), which have
+//! no parent value. For a
 //! storm with its weather, fetch MET Nordic for the same days
 //! (`met_forcing_subset`) and pass it as `met=`.
 //!
@@ -643,7 +653,7 @@ struct Options {
     implicit_refraction: bool,
     /// The sources implicit in the DIA, WAM's integration
     /// (`wave_integration=implicit`), instead of SWAN's frozen rates
-    /// (`frozen`); `wave_sources=wam` sets it with the limiter below
+    /// (`frozen`); `wave_sources=wam` (the default) sets it with the limiter below
     wave_implicit_sources: bool,
     /// Hersbach & Janssen's growth limiter, proportional to the step
     /// (`wave_limiter=rate`; `rate2` caps the losses too, as ecWAM), instead
@@ -682,6 +692,10 @@ struct Options {
     /// wind for the waves, instead of `wave_sea` (`wave_spectra=<file>`,
     /// from `met_wave_subset`)
     wave_spectra: Option<PathBuf>,
+    /// Points where the waves are reported besides the parent's, with
+    /// `wave_spectra=` (`wave_stations=NAME:LON,LAT;…`)
+    #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
+    wave_stations: Vec<(String, f64, f64)>,
     /// Each open-boundary node takes the inverse-distance mean of this many
     /// nearest parent points (`wave_neighbours=`)
     wave_neighbours: usize,
@@ -757,8 +771,8 @@ impl Options {
         };
         // WAM's integration of the sources: both parts below unless one is set
         let wam_sources = match args.get("wave_sources").map(String::as_str) {
-            None | Some("swan") => false,
-            Some("wam") => true,
+            Some("swan") => false,
+            None | Some("wam") => true,
             Some(other) => return Err(format!("wave_sources=swan|wam, not {other}")),
         };
         let constituents = |key: &str, default: &str| -> Result<Vec<&'static str>, String> {
@@ -866,8 +880,8 @@ impl Options {
                 Some("rate2") => Some(GrowthLimiter::RateBothSigns(DEFAULT_RATE_LIMITER)),
                 Some(other) => return Err(format!("wave_limiter=ris|rate|rate2, not {other}")),
             },
-            wave_substeps: get("wave_substeps", 1.0)? as usize,
-            wave_cfl: get("wave_cfl", 0.5)?,
+            wave_substeps: get("wave_substeps", if wam_sources { 4.0 } else { 1.0 })? as usize,
+            wave_cfl: get("wave_cfl", if wam_sources { 1.0 } else { 0.5 })?,
             wave_absorbing_land: match args.get("wave_land").map(String::as_str) {
                 Some("floored") => false,
                 None | Some("absorbing") => true,
@@ -883,6 +897,26 @@ impl Options {
             wave_reference: args.get("wave_reference").map(PathBuf::from),
             wave_coupling: get("wave_coupling", 0.0)?,
             wave_spectra: args.get("wave_spectra").map(PathBuf::from),
+            wave_stations: args
+                .get("wave_stations")
+                .map_or("", String::as_str)
+                .split(';')
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let (name, at) = s.split_once(':').unwrap_or(("", s));
+                    match at
+                        .split(',')
+                        .map(str::parse)
+                        .collect::<Result<Vec<f64>, _>>()
+                    {
+                        Ok(v) if v.len() == 2 => {
+                            let name = if name.is_empty() { at } else { name };
+                            Ok((name.to_string(), v[0], v[1]))
+                        }
+                        _ => Err(format!("bad wave_stations entry {s} (NAME:LON,LAT)")),
+                    }
+                })
+                .collect::<Result<_, _>>()?,
             wave_neighbours: get("wave_neighbours", 2.0)? as usize,
             wave_sea: {
                 let text = args.get("wave_sea").map_or("2.5,10,285", String::as_str);
@@ -2589,8 +2623,22 @@ fn parent_waves(
     let locator = PointLocator2D::new(&domain.mesh);
     let mut located = Vec::new();
     let mut labels = Vec::new();
-    for (p, &[x, y]) in spectra.positions.iter().enumerate() {
-        let label = format!("{:.2}°E {:.2}°N", file.longitude[p], file.latitude[p]);
+    // The parent's points, then the stations of our own
+    let points = (0..spectra.positions.len())
+        .map(|p| {
+            (
+                format!("{:.2}°E {:.2}°N", file.longitude[p], file.latitude[p]),
+                spectra.positions[p],
+            )
+        })
+        .chain(opts.wave_stations.iter().map(|(name, lon, lat)| {
+            (
+                format!("{name} ({lon:.4}°E {lat:.4}°N)"),
+                position(*lon, *lat),
+            )
+        }))
+        .collect::<Vec<_>>();
+    for (label, [x, y]) in points {
         let found = locator.locate([x, y]).map(|point| {
             (
                 point.element.as_usize(),
@@ -2610,12 +2658,15 @@ fn parent_waves(
         labels.push(label);
         located.push(found);
     }
+    let n_points = labels.len();
     let points = WavePoints {
         labels,
         located,
+        n_parent: spectra.positions.len(),
+        east,
         times: spectra.times.clone(),
         hs: file.hs.clone(),
-        series: vec![Vec::new(); spectra.positions.len()],
+        series: vec![Vec::new(); n_points],
     };
     Ok(ParentWaves {
         spectra,
@@ -2640,20 +2691,25 @@ struct WavePoints {
     /// The wave element of each point and the basis weights there (none
     /// outside the wave mesh)
     located: Vec<Option<(usize, Vec<f64>)>>,
-    /// The parent's times (s of model time) and H_s, `[time][point]`
+    /// The parent's points come first, then `wave_stations=`
+    n_parent: usize,
+    /// Geographic east in the mesh axes (rad from the x axis)
+    east: f64,
+    /// The parent's times (s of model time) and H_s, `[time][n_parent]`
     times: Vec<f64>,
     hs: Option<Vec<f64>>,
-    /// Per point: (t, ours, the parent's)
-    series: Vec<Vec<[f64; 3]>>,
+    /// Per point: t, our H_s, the parent's, our T_p and our mean direction
+    /// (coming from, degrees clockwise from north) at the nearest node
+    series: Vec<Vec<[f64; 5]>>,
 }
 
 impl WavePoints {
     /// The parent's H_s at point `p` and time `t`, linear in time.
     fn parent_hs(&self, p: usize, t: f64) -> f64 {
-        let Some(hs) = &self.hs else {
+        let Some(hs) = self.hs.as_ref().filter(|_| p < self.n_parent) else {
             return f64::NAN;
         };
-        let (np, times) = (self.labels.len(), &self.times);
+        let (np, times) = (self.n_parent, &self.times);
         let upper = times.partition_point(|&x| x <= t).clamp(1, times.len() - 1);
         if times.len() == 1 {
             return hs[p];
@@ -2678,8 +2734,26 @@ impl WavePoints {
                     .map(|(i, w)| w * params[k * nn + i].hs)
                     .sum()
             });
-            self.series[p].push([t, ours, parent]);
-            line += &format!(" {} {ours:.2}/{parent:.2} m;", self.labels[p]);
+            // T_p and the direction at the nearest node (the largest weight)
+            let (tp, from) = self.located[p]
+                .as_ref()
+                .map_or((f64::NAN, f64::NAN), |(k, w)| {
+                    let i = (0..w.len())
+                        .max_by(|&a, &b| w[a].total_cmp(&w[b]))
+                        .unwrap_or(0);
+                    let node = &params[k * nn + i];
+                    // Travelling to `direction` (rad from the mesh x axis) is
+                    // coming from the bearing 270° − (direction − east)
+                    let from =
+                        (270.0 - (node.direction - self.east).to_degrees()).rem_euclid(360.0);
+                    (node.tp, from)
+                });
+            self.series[p].push([t, ours, parent, tp, from]);
+            if parent.is_finite() {
+                line += &format!(" {} {ours:.2}/{parent:.2} m;", self.labels[p]);
+            } else {
+                line += &format!(" {} {ours:.2} m;", self.labels[p]);
+            }
         }
         println!("{}", line.trim_end_matches(';'));
     }
@@ -2698,7 +2772,6 @@ impl WavePoints {
                 .map(|s| (s[1], s[2]))
                 .collect();
             if pairs.is_empty() {
-                println!("  {label}: no comparison");
                 continue;
             }
             let n = pairs.len() as f64;
@@ -2714,7 +2787,9 @@ impl WavePoints {
             );
         }
         let mut text = String::from(
-            "# H_s (m) at the parent wave model's points: t (s), then ours and the parent's per point\n# points:",
+            "# The waves at the parent wave model's points and the stations: t (s), then per point \
+             our H_s (m), the parent's (NaN at a station), our T_p (s) and our mean direction \
+             (coming from, degrees clockwise from north)\n# points:",
         );
         for label in &self.labels {
             text += &format!(" {label};");
@@ -2724,7 +2799,8 @@ impl WavePoints {
         for r in 0..rows {
             text += &format!("{:.0}", self.series[0][r][0]);
             for series in &self.series {
-                text += &format!(" {:.4} {:.4}", series[r][1], series[r][2]);
+                let [_, ours, parent, tp, from] = series[r];
+                text += &format!(" {ours:.4} {parent:.4} {tp:.3} {from:.1}");
             }
             text.push('\n');
         }
@@ -4064,19 +4140,19 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     // Warm-up, then the steps timed
     for _ in 0..2 {
-        model.step(&mut n, t, dt, &mut ws);
+        model.step(&mut n, dt, &mut ws);
         t += dt;
     }
     let mut steps = Vec::with_capacity(opts.waves);
     let mut sources = Vec::with_capacity(opts.waves);
     for _ in 0..opts.waves {
         let start = Instant::now();
-        model.step(&mut n, t, dt, &mut ws);
+        model.step(&mut n, dt, &mut ws);
         steps.push(start.elapsed().as_secs_f64());
         t += dt;
         let mut scratch = n.clone();
         let start = Instant::now();
-        model.apply_sources(&mut scratch, dt, &mut ws);
+        model.apply_sources(&mut scratch, dt);
         sources.push(start.elapsed().as_secs_f64());
     }
     // The parts of a step that run node by node, each alone (with its own
@@ -4091,11 +4167,11 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
         }
         1e3 * median(&mut times)
     };
-    let refraction = timed(&mut |s| model.apply_implicit_refraction(s, 0.5 * dt, &mut ws));
-    let shift = timed(&mut |s| model.apply_implicit_frequency_shift(s, 0.5 * dt, &mut ws));
+    let refraction = timed(&mut |s| model.apply_implicit_refraction(s, 0.5 * dt));
+    let shift = timed(&mut |s| model.apply_implicit_frequency_shift(s, 0.5 * dt));
     let with_dia = model.sources.clone();
     model.sources.quadruplets = None;
-    let without_dia = timed(&mut |s| model.apply_sources(s, dt, &mut ws));
+    let without_dia = timed(&mut |s| model.apply_sources(s, dt));
     model.sources = with_dia;
     let (step, source) = (median(&mut steps), median(&mut sources));
     let per_hour = 3600.0 / dt * step;
@@ -4114,7 +4190,7 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
         1e9 * (step - source) / (np * n_components) as f64,
     );
     println!(
-        "  alone, with their transposes: the sources {:.1} ms ({:.1} ms of it the DIA); a half-step \
+        "  alone: the sources {:.1} ms ({:.1} ms of it the DIA); a half-step \
          of implicit refraction {refraction:.1} ms, of frequency shifting {shift:.1} ms",
         1e3 * source,
         1e3 * source - without_dia,
@@ -4129,7 +4205,7 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
         let start = Instant::now();
         while t < end {
             let h = dt.min(end - t);
-            model.step(&mut n, t, h, &mut ws);
+            model.step(&mut n, h, &mut ws);
             t = if end - t <= dt { end } else { t + dt };
         }
         println!(

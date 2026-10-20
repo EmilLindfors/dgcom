@@ -134,8 +134,8 @@ fn shoaling_set_down(wave_mesh: Option<(usize, usize)>) -> (f64, f64, f64) {
     let mut ws = WaveWorkspace::default();
     let dt = waves.compute_dt(0.5);
     let steps = (3.0 * L / (3.0 * dt)).ceil() as usize; // c_g ≥ 3 m/s
-    for s in 0..steps {
-        waves.step(&mut n, s as f64 * dt, dt, &mut ws);
+    for _ in 0..steps {
+        waves.step(&mut n, dt, &mut ws);
     }
 
     // The swell shoals with E c_g constant, exactly at the waves' nodes
@@ -433,8 +433,8 @@ impl Beach {
         let mut ws = WaveWorkspace::default();
         let dt = waves.compute_dt(0.5);
         let steps = (4.0 * Self::L / (2.0 * dt)).ceil() as usize;
-        for s in 0..steps {
-            waves.step(n, s as f64 * dt, dt, &mut ws);
+        for _ in 0..steps {
+            waves.step(n, dt, &mut ws);
         }
     }
 

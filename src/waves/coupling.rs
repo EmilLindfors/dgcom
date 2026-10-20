@@ -435,7 +435,9 @@ impl CoupledWaves2D {
         }
     }
 
-    /// The waves' CFL number ([`WaveModel2D::compute_dt`]; default 0.5).
+    /// The waves' CFL number ([`WaveModel2D::compute_dt`]; default 0.5,
+    /// which SWAN's frozen-rate sources need; 1.0 with WAM's integration,
+    /// [`super::SourceIntegration::Implicit`] and [`super::GrowthLimiter::Rate`]).
     pub fn with_cfl(mut self, cfl: f64) -> Self {
         assert!(cfl > 0.0);
         self.cfl = cfl;
@@ -596,8 +598,7 @@ impl CoupledWaves2D {
                 }
                 None => {}
             }
-            self.model
-                .step(&mut self.state, start, dt, &mut self.workspace);
+            self.model.step(&mut self.state, dt, &mut self.workspace);
         }
         self.time = t_next;
         let stepping = start.elapsed().as_secs_f64();
@@ -711,10 +712,9 @@ mod tests {
     fn varied_sea(waves: &WaveModel2D) -> WaveSolution {
         let mut n = waves.uniform_state(&waves.grid.jonswap(1.2, 6.0, 3.3, 0.4, 6.0));
         let xy = positions(&waves.mesh, &waves.ops);
-        for c in 0..waves.grid.n_components() {
-            for (x, [px, py]) in n.component_mut(c).iter_mut().zip(&xy) {
-                *x *= 1.0 + 0.5 * (px / 300.0).sin() * (py / 250.0).cos();
-            }
+        for (p, [px, py]) in xy.iter().enumerate() {
+            let factor = 1.0 + 0.5 * (px / 300.0).sin() * (py / 250.0).cos();
+            n.spectrum_mut(p).iter_mut().for_each(|x| *x *= factor);
         }
         n
     }

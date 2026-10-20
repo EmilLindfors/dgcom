@@ -165,8 +165,8 @@ fn fetch(grid: &SpectralGrid, sources: SourceTerms, wind: Wind, num: &dyn Fn(&st
     let dt = hours * 3600.0 / steps as f64;
     println!("dt {dt:.2} s, {steps} steps, {} points", model.n_points());
     let clock = std::time::Instant::now();
-    for s in 0..steps {
-        model.step(&mut n, s as f64 * dt, dt, &mut ws);
+    for _ in 0..steps {
+        model.step(&mut n, dt, &mut ws);
     }
     println!("{:.1} s", clock.elapsed().as_secs_f64());
     let xy: Vec<[f64; 2]> = ElementIndex::iter(model.mesh.n_elements)

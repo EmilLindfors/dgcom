@@ -1,9 +1,8 @@
 //! The propagation right-hand side and positivity limiter on the node-major
-//! state (`[point][component]`, component `c = i n_θ + j`), which
-//! [`WaveModel2D::step`] keeps for the whole step: the node passes (implicit
-//! refraction and frequency shifting, sources) work on each node's spectrum,
-//! and the Runge–Kutta stages here, so the state is transposed once in and
-//! once out per step instead of around every node pass.
+//! state ([`super::WaveSolution`], `[point][component]`, component
+//! `c = i n_θ + j`), the layout of the node passes (implicit refraction and
+//! frequency shifting, sources) too, so a step reads and writes the state in
+//! place without transposing it.
 //!
 //! Node-major, a frequency's directions are contiguous at every node, and
 //! they share everything but `cos θ_j`, `sin θ_j` and the action: the
@@ -14,61 +13,23 @@
 //! Every component is computed with the operations, in the order, of the
 //! component-major scalar kernel it replaces, so the step is the same bit for
 //! bit (`the_simd_propagation_is_the_scalar_one`).
+//!
+//! A Runge–Kutta stage is one pass over the elements
+//! ([`WaveModel2D::propagation_stage`]): each element's right-hand side is
+//! written into its rows of the stage value, combined there with the step
+//! start and the previous stage (Shu–Osher form, [`ShuOsherStage`]) and
+//! limited for positivity, so no right-hand side is stored and no separate
+//! combination or limiter pass reads the state again. The state is ≈ 70 MB
+//! at Frøya (10,040 nodes × 900 components), so the passes over it are the
+//! stage's cost: the stage reads its input and the step start and writes the
+//! stage value, where a stored right-hand side, a pass per combination term
+//! and the limiter's read took ≈ 4× the traffic (`notes/waves.md`, F.4).
 
 use crate::mesh::BoundaryTag;
-use crate::time::Integrable;
+use crate::time::ShuOsherStage;
 use crate::types::ElementIndex;
 
 use super::{SpectralAdvection, WaveModel2D, face_flux, for_each_chunk};
-
-/// The wave state node-major, `data[p · n_components + c]`, for the
-/// Runge–Kutta stages of a step.
-#[derive(Clone, Debug, Default)]
-pub(super) struct NodeMajor {
-    pub(super) data: Vec<f64>,
-}
-
-impl Integrable for NodeMajor {
-    fn scale(&mut self, c: f64) {
-        self.data.iter_mut().for_each(|x| *x *= c);
-    }
-
-    fn axpy(&mut self, c: f64, other: &Self) {
-        self.data
-            .iter_mut()
-            .zip(&other.data)
-            .for_each(|(x, y)| *x += c * y);
-    }
-}
-
-/// `out[p · nc + c] = data[c · np + p]` (resized).
-pub(super) fn to_node_major(data: &[f64], np: usize, nc: usize, out: &mut Vec<f64>) {
-    out.resize(np * nc, 0.0);
-    for_each_chunk(
-        out,
-        nc,
-        || (),
-        |_, p, spectrum| {
-            for (c, x) in spectrum.iter_mut().enumerate() {
-                *x = data[c * np + p];
-            }
-        },
-    );
-}
-
-/// `out[c · np + p] = node_major[p · nc + c]`.
-pub(super) fn from_node_major(node_major: &[f64], np: usize, nc: usize, out: &mut [f64]) {
-    for_each_chunk(
-        out,
-        np,
-        || (),
-        |_, c, field| {
-            for (p, x) in field.iter_mut().enumerate() {
-                *x = node_major[p * nc + c];
-            }
-        },
-    );
-}
 
 /// Directions per vector of the geographic term.
 #[cfg(feature = "simd")]
@@ -305,42 +266,96 @@ impl WaveModel2D {
         }
     }
 
-    /// [`WaveModel2D::limit_positivity`] on the node-major state.
-    pub(super) fn limit_positivity_node_major(&self, n: &mut [f64]) {
+    /// One Runge–Kutta stage of the propagation over `dt`, node-major:
+    /// `out = start·u⁽⁰⁾ + input·u⁽ⁱ⁻¹⁾ + beta·dt·L(u⁽ⁱ⁻¹⁾)`, limited for
+    /// positivity, element by element in one pass (see the module docs).
+    /// `u0` is the step start, `previous` the stage before (the right-hand
+    /// side's argument; `u0` in the first stage).
+    ///
+    /// The combination takes the operations of `Integrable::combine` in its
+    /// order, `((a·base) + c₁x₁) + c₂x₂` with `base` the step start unless its
+    /// weight is zero, so it gives the bits of the generic integrators.
+    pub(super) fn propagation_stage(
+        &self,
+        u0: &[f64],
+        previous: &[f64],
+        stage: ShuOsherStage,
+        dt: f64,
+        out: &mut [f64],
+    ) {
         let (nn, nc) = (self.ops.n_nodes, self.grid.n_components());
-        let geom = &*self.geom;
-        let weights = &self.ops.weights;
+        let spectral = !(self.implicit_refraction && self.implicit_frequency_shift);
+        let (base, a, with_previous) = if stage.start != 0.0 {
+            (u0, stage.start, stage.input != 0.0)
+        } else {
+            (previous, stage.input, false)
+        };
+        let beta_dt = stage.beta * dt;
         for_each_chunk(
-            n,
+            out,
             nn * nc,
             || (),
             |_, k, rows| {
-                for c in 0..nc {
-                    let min = (0..nn)
-                        .map(|a| rows[a * nc + c])
-                        .fold(f64::INFINITY, f64::min);
-                    if min >= 0.0 {
-                        continue;
-                    }
-                    let (mut mass, mut area) = (0.0, 0.0);
-                    for a in 0..nn {
-                        let w = weights[a] * geom.jacobian(k, a);
-                        mass += w * rows[a * nc + c];
-                        area += w;
-                    }
-                    let mean = mass / area;
-                    if mean <= 0.0 {
-                        (0..nn).for_each(|a| rows[a * nc + c] = 0.0);
-                        continue;
-                    }
-                    let theta = mean / (mean - min);
-                    for a in 0..nn {
-                        let x = &mut rows[a * nc + c];
-                        *x = (mean + theta * (*x - mean)).max(0.0);
+                // L(u⁽ⁱ⁻¹⁾) into the element's rows
+                self.geographic_element(previous, k, rows);
+                if spectral {
+                    for (a, row) in rows.chunks_exact_mut(nc).enumerate() {
+                        let p = k * nn + a;
+                        self.spectral_node(&previous[p * nc..(p + 1) * nc], p, row);
                     }
                 }
+                let at = k * nn * nc..(k + 1) * nn * nc;
+                let (base, previous) = (&base[at.clone()], &previous[at]);
+                for (q, x) in rows.iter_mut().enumerate() {
+                    let mut value = base[q];
+                    if a != 1.0 {
+                        value *= a;
+                    }
+                    if with_previous {
+                        value += stage.input * previous[q];
+                    }
+                    *x = value + beta_dt * *x;
+                }
+                self.limit_element(k, rows);
             },
         );
+    }
+
+    /// [`WaveModel2D::limit_positivity`] on the node-major state.
+    pub(super) fn limit_positivity_node_major(&self, n: &mut [f64]) {
+        let (nn, nc) = (self.ops.n_nodes, self.grid.n_components());
+        for_each_chunk(n, nn * nc, || (), |_, k, rows| self.limit_element(k, rows));
+    }
+
+    /// The positivity limiter on element `k`'s node-major rows.
+    fn limit_element(&self, k: usize, rows: &mut [f64]) {
+        let (nn, nc) = (self.ops.n_nodes, self.grid.n_components());
+        let geom = &*self.geom;
+        let weights = &self.ops.weights;
+        for c in 0..nc {
+            let min = (0..nn)
+                .map(|a| rows[a * nc + c])
+                .fold(f64::INFINITY, f64::min);
+            if min >= 0.0 {
+                continue;
+            }
+            let (mut mass, mut area) = (0.0, 0.0);
+            for a in 0..nn {
+                let w = weights[a] * geom.jacobian(k, a);
+                mass += w * rows[a * nc + c];
+                area += w;
+            }
+            let mean = mass / area;
+            if mean <= 0.0 {
+                (0..nn).for_each(|a| rows[a * nc + c] = 0.0);
+                continue;
+            }
+            let theta = mean / (mean - min);
+            for a in 0..nn {
+                let x = &mut rows[a * nc + c];
+                *x = (mean + theta * (*x - mean)).max(0.0);
+            }
+        }
     }
 }
 

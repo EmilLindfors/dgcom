@@ -6,7 +6,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Next up
 
-1. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
+1. **F.4** The Ålesund buoy test's two misses: C's swell (a finer wave grid there) and F's south-easterly fetch (a domain reaching further south-east). See Waves.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -69,7 +69,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Waves (F.4) — [notes/waves.md](notes/waves.md)
 
 #### Sources
-- [ ] **F.4** Choose WAM's or SWAN's source scheme from observations (a buoy or ADCP wave record at a sheltered farm), then decide whether `wave_sources=wam wave_substeps=4 wave_cfl=1.0` becomes the default (WAM's is 1.5× cheaper, 6–9 % lower H_s in the lees).
 - [ ] **F.4** Sweep `GrowthLimiter::Rate`'s C (3e-7 and 1e-6 against today's 5e-7) at the lee and Frohavet points and on the fetch/duration gates: is the lee's −9 % the cap or real?
 - [ ] **F.4** Retune whitecapping (Komen δ=1: E* 0.60× KC92, 1.5× Pierson–Moskowitz at 1000 h): try van der Westhuysen 2007 with Yan input or ST6, then tighten the gates.
 - [ ] **F.4** Triads (LTA, Eldeberky 1996) for the surf zone.
@@ -88,7 +87,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **F.4** Check the depth limit's γ against SWAN's very-shallow limiter before trusting the surf zone or a coarse grid's coastal nodes.
 
 #### Validation
-- [ ] **F.4** H_s, T_p and direction skill against the nearest wave buoys (MET/Kystverket, E39 Sulafjorden and Halsafjorden) and MyWave WAM hindcasts, focusing on the lees.
+- [ ] **F.4** Ålesund's C: T_p 13–15 s against 9–10 s observed and H_s halving from 1 km to 500 m wave grid. A 250 m (or 500 m P2) grid there, the boundary's T_p (≈ 1 s long at D) and diffraction are the candidates.
+- [ ] **F.4** Ålesund's F misses the southeasterly wind sea (0.04 against 0.3–0.6 m): the domain's southern edge cuts its 140° fetch at 10–12 km; extend the domain south-east, then look at MET Nordic's wind in the fjord.
 - [ ] **F.4** A 500 m P2 wave grid (`wave_mesh=120,90,2`): are Frohavet (17 % low) and the lee (19 % low) the 1 km grid's or WAM's error?
 - [ ] **F.4** A reflection coefficient for walls (cliffs, quays); waves dying on the coast drive spurious coastal currents.
 - [ ] **F.4** Check which wave nodes along 63.75°N (8.22–8.28°E skerries) are dry at mean and low water (the reef point loses 7.5 cm more with absorbing land under SWAN's sources).
@@ -110,11 +110,10 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **F.4** Low priority: the vertical Stokes velocity (left out, as in OpenDrift/LADiM). Later: cage drag from the orbital velocity.
 
 #### Cost
-- [ ] **F.4** Profile the RK propagation's volume terms, face terms and per-stage positivity scaling (≈ 80 of the 141 ms step), and `compute_dt`'s O(points × components).
-- [ ] **F.4** Sources without the DIA (102 ms on 1 thread): pass the cached `cg` into `advance`, cache the friction's `sinh(kd)` in `set_water_level`, try a vector `exp`.
-- [ ] **F.4** Node-major `WaveSolution` to remove the last two transposes per step (≈ 15 ms per half-step at 24 threads).
-- [ ] **F.4** Fuse adjacent implicit half-passes across steps and between substeps (a pair is 9.6 ms of 141); measure first.
-- [ ] **F.4** Parallelise an exchange's per-node diagnostics (`parameters`, `bed_wave_stress`, `radiation_stress`, `StokesDriftField::new`, wavenumber tables) in one pass per spectrum (an exchange takes 176 ms).
+- [ ] **F.4** Sources without the DIA (84 ms on 1 thread, 9 of the 60 ms bench step at 24; libm 40 % of it, 2026-10-19): pass the cached `cg` into `advance`, cache the friction's `sinh(kd)` in `set_water_level`, try a vector `exp` (≈ 3 ms at 24 threads, not bit for bit).
+- [ ] **F.4** The implicit lanes kernels (`waves/implicit_lanes.rs`) zero or copy ≈ 11 arrays of 72 vectors per batch (memset/memcpy 18 % of the refraction's samples, 37 % of the shift's): build the Thomas coefficients in the sweep, reload the original from the spectrum, solve in place (≈ 2 ms of the 60 ms bench step).
+- [ ] **F.4** Fuse adjacent implicit half-passes across steps and between substeps (a pair was 9.6 ms of 141, now ≈ 9.7 of the 60 ms bench step, all of it the kernels: not bit for bit, a splitting change); measure first.
+- [ ] **F.4** Parallelise an exchange's per-node diagnostics (`parameters`, `bed_wave_stress`, `radiation_stress`, `StokesDriftField::new`, wavenumber tables) in one pass per spectrum (an exchange takes 148 ms, 2.7 wave steps, since 2026-10-19).
 - [ ] **F.4** L2 projection from circulation to waves in `WaveCoupling2D` (`M_c⁻¹ Pᵀ M_f`), replacing the cap in `WaveCoupling2D::currents`.
 - [ ] **F.4** Measure a 2 km P2 wave grid (`wave_mesh=30,23,2`) against 1 km P1 at Frøya, for cost and lee H_s.
 - [ ] **F.4** The 0.04 Hz bin in 150 m sets the 7 s step: check `f_min` 0.05 Hz (≈ 25 % longer step) against a 0.04 Hz run, or LTS by frequency group.
@@ -132,6 +131,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Viewer (F.3) — [notes/viz.md](notes/viz.md)
 
+- [ ] **F.3** `dg-viz` does not build: `viz/src/main.rs:879` reads `TimeSeries.data`, private since `TimeSeries` moved to `times`/`values` (found 2026-10-19; `cd viz && cargo check`).
 - [ ] **F.3** Separate physics from σ-truncation in the fjord3d rest-state flow under GLS (3.6e-5 m/s at 1 h, growing): halve level spacing and κ in turn, compare with Phillips's boundary-layer velocity.
 - [ ] **F.3** Compare the fjord3d cage wake at P1 on 40 m quads with the 2D 20 m run, a 3D P2 run and the integrated `CageDrag2D` drag (3D LTS would allow P2, see P1.3).
 - [ ] **F.3** Write `froya_real_data`'s `Clock:` line to `<output>/run.log` or a `clock.txt` the viewer reads (VTU replays lack date and gauge).
