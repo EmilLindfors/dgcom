@@ -1023,12 +1023,12 @@ impl LayerTransport {
                     source,
                     levels,
                 } = &mut **scratch;
-                // The rivers' volume sources of the layers, the same at
-                // every node of the element
+                // The rivers' volume sources of the layers, per node (their
+                // profiles follow each node's depth)
+                let rivers = barotropic
+                    .and_then(|b| b.rivers)
+                    .filter(|r| !r.rivers.in_element(k).is_empty());
                 source.fill(0.0);
-                if let Some(rivers) = barotropic.and_then(|b| b.rivers) {
-                    rivers.add_layer_rates(k, source);
-                }
                 // Every layer's divergence, `[node][level]`
                 if subcell_elements[k] {
                     for l in 0..nl {
@@ -1070,6 +1070,10 @@ impl LayerTransport {
                         None => -div.iter().sum::<f64>(),
                     };
                     let omega = &mut omega_k[i * (nl + 1)..(i + 1) * (nl + 1)];
+                    if let Some(rivers) = rivers {
+                        source.fill(0.0);
+                        rivers.add_layer_rates(k, i, source);
+                    }
                     omega[0] = 0.0;
                     for l in 0..nl {
                         omega[l + 1] = omega[l] - div[l] - d_sigma[l] * rate + source[l];

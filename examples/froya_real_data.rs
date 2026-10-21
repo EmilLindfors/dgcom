@@ -111,7 +111,7 @@
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [wave_stations=NAME:LON,LAT;…] \
 //!     [levels=0] [tide3d=0] [rk_3d=43|3] [cfl_3d=4|2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] \
-//!     [restart_hours=0] [resume=<file>] [rivers=<file>] [river_snap_km=2] [river_top=0.2]
+//!     [restart_hours=0] [resume=<file>] [rivers=<file>] [river_snap_km=2] [river_profile=tapered:3]
 //! ```
 //!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
@@ -229,7 +229,10 @@
 //! their water's temperature and salinity (`RiverForcing`,
 //! `Hydrostatic3D::with_rivers`), each in the element of its mouth or snapped
 //! onto the mesh from up to `river_snap_km` away (rivers farther off are listed
-//! and left out), entering over the top `river_top` of the column. The stations, the progress
+//! and left out), entering over `river_profile=`: `tapered:D` (the default, D = 3:
+//! the top D metres, per metre falling linearly to zero at D, as NorKyst's
+//! rivers enter), `top:D` (the top D metres, uniformly) or `fraction:F` (the
+//! top fraction F of the column). The stations, the progress
 //! lines and a 3D snapshot file (`snapshot_minutes=`,
 //! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step (60 s by
 //! default; the parent and the weather must cover a third of it past the
@@ -738,13 +741,13 @@ struct Options {
     resume: Option<PathBuf>,
     /// Rivers of the 3D tide (`rivers=<file>`, from `norkyst_river_subset`),
     /// snapped onto the mesh from up to `river_snap_km` away, entering over
-    /// the top `river_top` of the column
+    /// `river_profile=` (`tapered:3`, `top:D`, `fraction:F`)
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     rivers: Option<PathBuf>,
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     river_snap_km: f64,
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
-    river_top: f64,
+    river_profile: dg_rs::source::RiverProfile,
     output: Option<PathBuf>,
 }
 
@@ -856,7 +859,21 @@ impl Options {
             resume: args.get("resume").map(PathBuf::from),
             rivers: args.get("rivers").map(PathBuf::from),
             river_snap_km: get("river_snap_km", 2.0)?,
-            river_top: get("river_top", 0.2)?,
+            river_profile: {
+                use dg_rs::source::RiverProfile;
+                let text = args
+                    .get("river_profile")
+                    .map_or("tapered:3", String::as_str);
+                let bad = || format!("bad river_profile={text}: tapered:D, top:D or fraction:F");
+                let (kind, value) = text.split_once(':').ok_or_else(bad)?;
+                let value: f64 = value.parse().map_err(|_| bad())?;
+                match kind {
+                    "tapered" => RiverProfile::TaperedTopMetres(value),
+                    "top" => RiverProfile::TopMetres(value),
+                    "fraction" => RiverProfile::TopFraction(value),
+                    _ => return Err(bad()),
+                }
+            },
             wave_grid: {
                 let text = args.get("wave_grid").map_or("25,36", String::as_str);
                 let parts: Vec<usize> = text
@@ -3267,7 +3284,7 @@ fn rivers_3d(
     t_end: f64,
 ) -> Result<Option<dg_rs::source::RiverSources>, Box<dyn std::error::Error>> {
     use dg_rs::io::RiverForcing;
-    use dg_rs::source::{RiverProfile, RiverSources};
+    use dg_rs::source::RiverSources;
 
     let Some(path) = &opts.rivers else {
         return Ok(None);
@@ -3291,11 +3308,7 @@ fn rivers_3d(
         )
         .into());
     }
-    let rivers = forcing.rivers(
-        &projection,
-        clock,
-        &RiverProfile::TopFraction(opts.river_top),
-    )?;
+    let rivers = forcing.rivers(&projection, clock, &opts.river_profile)?;
     let (sources, skipped) = RiverSources::on_mesh(
         rivers,
         &domain.mesh,
@@ -3312,12 +3325,12 @@ fn rivers_3d(
     };
     let total: f64 = (0..sources.len()).map(mean).sum();
     println!(
-        "  Rivers: {} of {} from {} ({total:.1} m³/s over the run), over the top {:.0} % of \
-         the column; {} more than {} km from the mesh left out",
+        "  Rivers: {} of {} from {} ({total:.1} m³/s over the run), entering over {:?}; {} \
+         more than {} km from the mesh left out",
         sources.len(),
         forcing.len(),
         path.display(),
-        100.0 * opts.river_top,
+        opts.river_profile,
         skipped.len(),
         opts.river_snap_km
     );
