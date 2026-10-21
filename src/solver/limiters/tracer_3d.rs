@@ -11,6 +11,7 @@ use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::DGSolution2D;
 use crate::solver::core::blocks::{Pooled, for_each_block, reduce_blocks};
+use crate::solver::rhs::UNBOUNDED;
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -148,6 +149,19 @@ impl TracerLimiter3DConfig {
             bounds,
             ..Self::default()
         }
+    }
+
+    /// The temperature's and the salinity's `(min, max)` that the vertical
+    /// advection keeps the water leaving an end layer within
+    /// ([`crate::solver::rhs::AdvectedTracer::range`]): the bounds, if any
+    /// limiter is enabled, else none (a run that does not limit its tracers
+    /// may stratify them beyond the defaults, which are those of seawater).
+    pub fn advection_ranges(&self) -> [(f64, f64); 2] {
+        if self.limiter_type == TracerLimiterType3D::None {
+            return [UNBOUNDED; 2];
+        }
+        let bounds = &self.bounds;
+        [(bounds.t_min, bounds.t_max), (bounds.s_min, bounds.s_max)]
     }
 
     /// Set the policy used when an inventory-weighted average is outside bounds.

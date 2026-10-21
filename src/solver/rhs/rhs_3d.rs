@@ -68,6 +68,10 @@ pub struct Rhs3DConfig<'a> {
     /// Temperature and salinity at rest (`[element][node][level]`), about
     /// which the vertical advection reconstructs, if any (experimental).
     pub tracer_reference: [Option<&'a [f64]>; 2],
+    /// The temperature's and the salinity's physical ranges `(min, max)`, which the
+    /// vertical advection keeps the water leaving an end layer within
+    /// ([`UNBOUNDED`](super::transport_3d::UNBOUNDED) for none).
+    pub tracer_range: [(f64, f64); 2],
 }
 
 /// Overwrite `rhs.u` and `rhs.v` with the velocity tendency of the pointwise
@@ -139,6 +143,7 @@ pub fn compute_transport_rhs_3d(
             bc: config.temp_bc,
             exterior: config.exterior.temp,
             reference: config.tracer_reference[0],
+            range: config.tracer_range[0],
         },
         AdvectedTracer {
             rhs: &mut rhs.salt,
@@ -146,6 +151,7 @@ pub fn compute_transport_rhs_3d(
             bc: config.salt_bc,
             exterior: config.exterior.salt,
             reference: config.tracer_reference[1],
+            range: config.tracer_range[1],
         },
     ];
     apply_tracer_transport_3d(

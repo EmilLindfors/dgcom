@@ -301,6 +301,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P4.3** An r_x1 (Haney) diagnostic on the σ levels and an r_x1 bound for the 3D grid.
 - [ ] **P4.3** The σ-pairs PGF on curvilinear elements (affine metric today; `Hydrostatic3D` asserts affine): the chain rule `rx_i Dr + sx_i Ds`.
 - [ ] **P4.5** The horizontal Kuzmin tracer limiter as the default (`farm_3d`, `Hydrostatic3D`; the P1 farm channel undershoots 0.07 °C without it), after a realistic run over slopes.
+- [ ] **P4.5** Positivity of the tracers beyond one face: the end-layer range bound (2026-10-21) keeps a layer's mean in range only at a vertical Courant number ≤ ½ with no other outflow; the layer's horizontal outflow (DG needs λ ≤ w₁ = ⅙ of the mean) is not added to it (Zhang–Shu's sum). A Courant-aware bound (`BarotropicFlux::euler_dt` is at hand) and a check on a river front over a steep flank at `cfl_3d` 4 (`notes/3d-validation.md`, sill fjord).
+- [ ] **P4.5** Give the turbulence advection its range (`k`, `ψ` ≥ 0 as `AdvectedTracer::range` in `Hydrostatic3D::turbulence_transport_rhs`, now `UNBOUNDED`): the closure resets a non-positive point to no turbulence (`notes/3d-mixing.md` positivity); measure `profile_3d` and the gates first.
 - [ ] **P4.5** Why P3 on 250 m without viscosity ends 3.3e-9 °C out of range (2–8e-12 at P1/P2): the vertical advection's element mean or the Kuzmin P3 bounds?
 - [ ] **P4.5** 3D Smagorinsky on a fjord with a sill and tidal shear (may over-damp a tidal mixed layer; else Leith or Ri-dependent ν).
 - [ ] **P4.5** Rotated/geopotential horizontal diffusion of 3D tracers via BR1 (none exists; `viscosity_3d` is momentum only).
@@ -354,7 +356,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P4.6** The balanced reference sampled at the reference η gives an η/D error under a tide: refresh it or interpolate to current level depths; measure with a tide over the seamount.
 - [ ] **P4.6** At r_x0 0.32 the Kuzmin limiter adds to the error flow: a detector for steep continuous fronts (Persson–Peraire), isopycnal bounds for spice.
 - [ ] **P4.6** The sill fjord 1 km wide is less critical at its mouth (F₁² 0.84, 0.69 without rotation): the exit's expansion, a control seaward of the mouth, or the width mean (`notes/3d-validation.md`).
-- [ ] **P4.6** The 400 m sill fjord's S undershoots to −3.9 at 6.8 h, the front's first arrival at the sill's steep flank, top level, side wall (the 100 m fjord stays ≥ 0): bound it before deep fjords (Hardanger).
 - [ ] **P4.6** The sill fjord's entrainment against Stigebrandt's: P under wind and tidal mixing (the model's P 1.4–1.7 is the outflow's shear alone).
 - [ ] **P4.6** Exact section budgets from the model's own face fluxes, RK-weighted (salt budget off 1–3 % from nodal `H_z u S`); needed for P5.2 farm exchange output.
 - [ ] **P4.6** Periodic meshes: `Mesh2D::elements_at_vertex` has no periodic images, so Kuzmin bounds there are one-sided (also `limiters/swe_2d.rs:260`, `tracer_2d.rs:593`).

@@ -1354,6 +1354,7 @@ where
             metric: self.metric_form(),
             // The vertical reference is locked where the transport needs it
             tracer_reference: [None, None],
+            tracer_range: self.tracer_limiter.advection_ranges(),
         }
     }
 
