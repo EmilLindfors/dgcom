@@ -6,6 +6,12 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **A deep fjord behind a sill against Stigebrandt's two-layer theory (TODO P4.6).** `examples/sill_fjord_3d.rs` (the experiment in `examples/common/sill_fjord.rs`): a 16 km × 500 m × 100 m fjord with a 30 m sill opening into an open basin, a 500 m³/s river at the head, GLS k-ε, Coriolis, 30 stretched levels, 48 h to a steady state. The brackish layer at the mouth against Stigebrandt's (1981) hydraulic control, `u₁M = (Q_f βg s₂/B)^⅓`, `h₁M = (P² Q_f²/(βg s₂ B²))^⅓`, `F₁² = 1`:
+  - At the mouth u₁ 0.96–1.02× the theory's, h₁ 1.08–1.18×, F₁² 0.90–1.13 (base, Q_f 250 and 1000 m³/s, 45 levels, 125 m elements, 400 m deep); inside the fjord 0.35–0.63, subcritical; Knudsen's relations close to 0.95–1.00 at every section. The mouth speed follows Q_f^⅓ over a factor 4 to 3 %. A 1 km wide fjord is less critical (F₁² 0.84).
+  - The brackish layer is the levels fresher than s₂ − 1, as one layer with the kinematic equivalents `(∫u)²/∫u²`, `∫u²/∫u`: split by the sign of the transport, the slow outflow of nearly sea water below the halocline made it 22 m thick at 0.08 m/s.
+  - Gate `a_rivers_brackish_layer_is_critical_at_the_fjord_mouth` (`tests/sill_fjord_test.rs`, slow tier, 90 s in the CI profile): a 4 km version, 12 h.
+  - Found: in a 400 m fjord S undershoots to −3.9 at some step (TODO P4.6).
+
 - **River profiles in metres (TODO P1.6): the top `d` metres whatever the depth, as NorKyst's rivers enter.** `RiverProfile::TopMetres(d)` (uniform per metre) and `RiverProfile::TaperedTopMetres(d)` (per metre falling linearly to zero at `d`, NorKyst-800's shape over its top ≈ 3 m). `TopFraction` put a river into a 400 m fjord over the top 80 m.
   - The level weights are per node of the river's element, from each node's still-water depth (`RiverSources::set_levels(sigma, bathymetry)`, `level_weights(i, node)`, `RiverInflow::add_layer_rates(k, node, out)`), and fixed in time, so Ω, the tracer sources and the turbulence's w-point sources agree at every stage. A column shallower than the profile takes all of it.
   - **`River::new` now enters over `TaperedTopMetres(3.0)`** (was `TopFraction(0.2)`); `RiverProfile::weights` takes the node's depth. `froya_real_data river_profile=tapered:D|top:D|fraction:F` (default `tapered:3`) replaces `river_top=`.

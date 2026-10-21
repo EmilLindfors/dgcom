@@ -353,7 +353,9 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P4.6** Exact vertical PGF/advection energy exchange for curved profiles (the Hermite mean as the advection's face value); does it remove the residual seamount growth?
 - [ ] **P4.6** The balanced reference sampled at the reference η gives an η/D error under a tide: refresh it or interpolate to current level depths; measure with a tide over the seamount.
 - [ ] **P4.6** At r_x0 0.32 the Kuzmin limiter adds to the error flow: a detector for steep continuous fronts (Persson–Peraire), isopycnal bounds for spice.
-- [ ] **P4.6** A Sognefjord-like estuary (sill, stretched levels, GLS, Coriolis) to steady state, against Stigebrandt's (1981) two-layer theory.
+- [ ] **P4.6** The sill fjord 1 km wide is less critical at its mouth (F₁² 0.84, 0.69 without rotation): the exit's expansion, a control seaward of the mouth, or the width mean (`notes/3d-validation.md`).
+- [ ] **P4.6** The 400 m sill fjord's S undershoots to −3.9 at 6.8 h, the front's first arrival at the sill's steep flank, top level, side wall (the 100 m fjord stays ≥ 0): bound it before deep fjords (Hardanger).
+- [ ] **P4.6** The sill fjord's entrainment against Stigebrandt's: P under wind and tidal mixing (the model's P 1.4–1.7 is the outflow's shear alone).
 - [ ] **P4.6** Exact section budgets from the model's own face fluxes, RK-weighted (salt budget off 1–3 % from nodal `H_z u S`); needed for P5.2 farm exchange output.
 - [ ] **P4.6** Periodic meshes: `Mesh2D::elements_at_vertex` has no periodic images, so Kuzmin bounds there are one-sided (also `limiters/swe_2d.rs:260`, `tracer_2d.rs:593`).
 - [ ] **P4.6** The 3D limiter's remaining cost (1.6 ms/call): one buffer of inventory weights per call, T and S in one pass.
