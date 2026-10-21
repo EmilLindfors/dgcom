@@ -718,6 +718,13 @@ pub struct LayerTransport {
     /// relaxation of `η`, `crate::boundary::NestingRelaxation2D`). The
     /// tracers get its water through [`Self::add_volume_sources`].
     pub volume_source: Vec<f64>,
+    /// The longest forward-Euler step of the stages over the water depth,
+    /// `Δt_E/D` at the nodes (s/m, `[element][node]`; zero without a
+    /// barotropic pass, in a column with no water): a layer's explicit
+    /// outflow Courant number is `Δt_E/D · |Ω|/Δσ_l`. Set by
+    /// [`Self::compute`]; the vertical advection bounds the water an end layer
+    /// sheds by it ([`VerticalAdvection::LimitedAkima`]).
+    pub dt_over_depth: Vec<f64>,
     /// σ-thickness `Δσ_l` of the layers (uniform until the first
     /// [`Self::compute`]).
     pub d_sigma: Vec<f64>,
@@ -743,6 +750,7 @@ impl LayerTransport {
             subcell_elements: vec![false; n_elements],
             omega: vec![0.0; n_elements * nn * (n_levels + 1)],
             volume_source: vec![0.0; n_elements * nn],
+            dt_over_depth: vec![0.0; n_elements * nn],
             d_sigma: vec![1.0 / n_levels as f64; n_levels],
             surface_residual: 0.0,
             metric: MetricForm::default(),
@@ -821,6 +829,7 @@ impl LayerTransport {
             subcell_elements,
             omega: layer_omega,
             volume_source,
+            dt_over_depth,
             metric,
             ..
         } = self;
@@ -842,13 +851,17 @@ impl LayerTransport {
         // 1. Nodal layer transports, corrected to DU_avg2
         for_each_block(
             n_elements,
-            [&mut layer_hu[..], &mut layer_hv[..]],
+            [&mut layer_hu[..], &mut layer_hv[..], &mut dt_over_depth[..]],
             || (),
-            |_, k, [hu_k, hv_k]| {
+            |_, k, [hu_k, hv_k, dt_k]| {
                 let bed = bathymetry.element(ElementIndex::new(k));
                 for (i, &b) in bed.iter().enumerate() {
                     let idx = k * nn + i;
                     let depth = state.eta.data[idx] - b;
+                    dt_k[i] = match barotropic {
+                        Some(flux) if depth > 0.0 => flux.euler_dt / depth,
+                        _ => 0.0,
+                    };
                     let column = idx * nl..(idx + 1) * nl;
                     let local = i * nl..(i + 1) * nl;
                     let (mut sum_u, mut sum_v) = (0.0, 0.0);
@@ -1685,14 +1698,22 @@ fn subtract_vertical_flux(
         let idx = k * nn + i;
         let omega = &transport.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
         let column = &field[idx * nl..(idx + 1) * nl];
-        scheme.surface_values(column, omega, &transport.d_sigma, range, slope, flux);
+        let shed = EndLayerShed {
+            range,
+            dt_over_depth: transport.dt_over_depth[idx],
+        };
+        scheme.surface_values(column, omega, &transport.d_sigma, shed, slope, flux);
         if let Some(reference) = reference {
             let reference = &reference[idx * nl..(idx + 1) * nl];
+            let unbounded = EndLayerShed {
+                range: UNBOUNDED,
+                ..shed
+            };
             scheme.surface_values(
                 reference,
                 omega,
                 &transport.d_sigma,
-                UNBOUNDED,
+                unbounded,
                 slope,
                 reference_surface,
             );
@@ -1788,7 +1809,9 @@ pub enum VerticalAdvection {
     /// (that is the profile, not an overshoot), but not the tracer's own
     /// range ([`AdvectedTracer::range`]): the end layer's linear profile is kept
     /// within it, so that a fresh surface layer over a halocline does not shed
-    /// more salt than it has. The limiter adds some
+    /// more salt than it has (and, beyond an outflow Courant number of ½,
+    /// only `(1 − c)/c` of the distance to the bound, so that its mean stays
+    /// in the range: [`in_range`]). The limiter adds some
     /// diffusion at extrema and fronts.
     Tvd,
     /// [`Self::Akima`]'s surface values under [`Self::Tvd`]'s limiter: the
@@ -1825,15 +1848,15 @@ impl VerticalAdvection {
     /// `surface`, for the volume fluxes `omega` (which decide the upwind
     /// side) through layers of σ-thickness `d_sigma`. The bed and surface
     /// pass no flux; their values are zero. `slope` holds `nl` values of
-    /// scratch. `range` is the tracer's physical range, which
-    /// [`Self::Tvd`] and [`Self::LimitedAkima`] keep the water leaving an
-    /// end layer within (see [`in_range`]).
+    /// scratch. `shed` is the tracer's physical range and the stage's
+    /// Courant scale, which [`Self::Tvd`] and [`Self::LimitedAkima`] keep the
+    /// water leaving an end layer within (see [`EndLayerShed`]).
     fn surface_values(
         self,
         column: &[f64],
         omega: &[f64],
         d_sigma: &[f64],
-        range: (f64, f64),
+        shed: EndLayerShed,
         slope: &mut [f64],
         surface: &mut [f64],
     ) {
@@ -1875,7 +1898,8 @@ impl VerticalAdvection {
                         // by the range
                         let increment =
                             end_layer_limited(surface[l] - column[up], column, d_sigma, up, down);
-                        surface[l] = column[up] + in_range(increment, column[up], range);
+                        surface[l] =
+                            column[up] + shed.limit(increment, column[up], omega[l], d_sigma[up]);
                         continue;
                     };
                     surface[l] = column[up]
@@ -1897,7 +1921,8 @@ impl VerticalAdvection {
                         let (a, b) = (d_sigma[up], d_sigma[down]);
                         let increment = a / (a + b) * (column[down] - column[up]);
                         let increment = end_layer_limited(increment, column, d_sigma, up, down);
-                        surface[l] = column[up] + in_range(increment, column[up], range);
+                        surface[l] =
+                            column[up] + shed.limit(increment, column[up], omega[l], d_sigma[up]);
                         continue;
                     };
                     let (a, b, c) = (d_sigma[up], d_sigma[down], d_sigma[far]);
@@ -1951,31 +1976,86 @@ fn tvd_limited(increment: f64, behind: f64, ahead: f64) -> f64 {
     }
 }
 
+/// What keeps the water an end layer sheds within the tracer's physical
+/// range: the range itself and the stage's Courant scale at the column.
+#[derive(Clone, Copy, Debug)]
+struct EndLayerShed {
+    /// The tracer's physical range `(min, max)` ([`UNBOUNDED`] for none).
+    range: (f64, f64),
+    /// `Δt_E/D` of the column ([`LayerTransport::dt_over_depth`]), zero for
+    /// none: the Courant number is not known and taken as small.
+    dt_over_depth: f64,
+}
+
+impl EndLayerShed {
+    /// No range, so nothing to keep.
+    #[cfg(test)]
+    const NONE: Self = Self {
+        range: UNBOUNDED,
+        dt_over_depth: 0.0,
+    };
+
+    /// The `increment` of the surface value out of the end layer (mean
+    /// `mean`, σ-thickness `d_sigma`) through the σ-surface of volume flux
+    /// `omega` (out of the layer), kept within the range at the layer's own
+    /// outflow Courant number `Δt_E |Ω|/(D Δσ)` (see [`in_range`]).
+    fn limit(self, increment: f64, mean: f64, omega: f64, d_sigma: f64) -> f64 {
+        let courant = self.dt_over_depth * omega.abs() / d_sigma;
+        in_range(increment, mean, self.range, courant)
+    }
+}
+
 /// The `increment` of the surface value out of an end layer over its mean
-/// `mean`, kept so that the end layer's profile stays within `range`.
+/// `mean`, kept so that the end layer stays within `range` after a
+/// forward-Euler step in which its outflow is the Courant number `courant`
+/// (`Δt|Ω|/H_z`) of its thickness.
 ///
 /// The surface value `mean + increment` at the layer's inner surface and its
 /// reflection `mean − increment` at the bed or the free surface are the two
 /// ends of the layer's linear profile. The layer loses (gains) the water at
 /// the inner surface's value, so it keeps the part of the profile nearer its
 /// end: its mean changes by `−c δ/(1 − c)` of the increment `δ` at a Courant
-/// number `c` of the water it sheds while it thins, which for `c ≤ ½` (the
-/// interior's monotone bound too) is within `δ`, so a profile within the
-/// range leaves the layer's mean in it. Without the range the end layer's
-/// own gradient ([`end_layer_limited`]) lets the profile reach beyond the
-/// layers' means by half a layer. That is the profile, not an overshoot,
-/// until it reaches a bound of the tracer: the surface layer of fresh river
-/// water (`S` = 0.03 over 0.9 over 1.8) over a halocline has a linear profile
-/// of −0.4 at the surface, and its mean fell to −3.6 within an hour where the
-/// bed rises under it (the landward flank of a 60 m sill in 400 m of water,
-/// `examples/sill_fjord_3d.rs`). The bound matters only within that half
-/// layer of the range; a mean beyond the range keeps only an increment
-/// towards it.
-fn in_range(increment: f64, mean: f64, (min, max): (f64, f64)) -> f64 {
+/// number `c` of the water it sheds while it thins. For `c ≤ ½` (the
+/// interior's monotone bound too) that is within `δ`, so keeping the profile
+/// within the range leaves the layer's mean in it. Beyond ½ the mean stays in
+/// the range only if `δ` is at most `(1 − c)/c` of the distance from the mean
+/// to the bound, which is the same factor that Koren's limiter loses at that
+/// Courant number to stay monotone (`φ ≤ 2(1 − c)/c`); at `c ≥ 1` the layer
+/// keeps only its own mean (first order). The default
+/// [`crate::physics::ImplicitVerticalAdvection`] holds the explicit outflow
+/// of a layer to 0.8, a factor ¼, and without it the step bound allows 1.
+///
+/// Without the range the end layer's own gradient ([`end_layer_limited`])
+/// lets the profile reach beyond the layers' means by half a layer. That is
+/// the profile, not an overshoot, until it reaches a bound of the tracer: the
+/// surface layer of fresh river water (`S` = 0.03 over 0.9 over 1.8) over a
+/// halocline has a linear profile of −0.4 at the surface, and its mean fell
+/// to −3.6 within an hour where the bed rises under it (the landward flank of
+/// a 60 m sill in 400 m of water, `examples/sill_fjord_3d.rs`). The bound
+/// matters only within that distance of the range; a mean beyond the range
+/// keeps only an increment towards it. (The layer's horizontal outflow is not
+/// counted in `c`: its Courant number is a fraction of the vertical one in
+/// thin layers, `TODO.md` P4.5.)
+fn in_range(increment: f64, mean: f64, (min, max): (f64, f64), courant: f64) -> f64 {
+    // Not scaled below ½, where the profile in the range is the bound:
+    // bit for bit as before
+    let share = if courant > 0.5 {
+        (1.0 - courant).max(0.0) / courant
+    } else {
+        1.0
+    };
+    // An infinite distance (no bound) stays infinite at share 0
+    let reach = |distance: f64| {
+        if share < 1.0 && distance.is_finite() {
+            share * distance
+        } else {
+            distance
+        }
+    };
     // `max` and `min`, not `clamp`: the bounds can be NaN beside a NaN mean
     increment
-        .max((mean - max).min(0.0))
-        .min((mean - min).max(0.0))
+        .max(reach((mean - max).min(0.0)))
+        .min(reach((mean - min).max(0.0)))
 }
 
 /// [`tvd_limited`] for the `increment` of the surface value out of the end
@@ -2645,6 +2725,39 @@ mod tests {
         }
     }
 
+    /// The Courant scale the end layers' bound reads is the stage's longest
+    /// Euler step over the water depth at each node, and zero (no Courant
+    /// number known) without a barotropic pass.
+    #[test]
+    fn the_courant_scale_is_the_euler_step_over_the_depth() {
+        let case = Case::closed();
+        let transport = case.transport();
+        assert!(!transport.dt_over_depth.is_empty());
+        for (idx, &scale) in transport.dt_over_depth.iter().enumerate() {
+            let depth = case.state.eta.data[idx] - case.bathymetry.data[idx];
+            assert!(depth > 0.0);
+            assert!(
+                (scale - 1.0 / depth).abs() < 1e-15 * scale,
+                "node {idx}: {scale} against Δt_E/D = {}",
+                1.0 / depth
+            );
+        }
+        let mut alone = LayerTransport::new(case.mesh.n_elements, &case.ops, case.sigma.n_levels());
+        alone.compute(
+            &case.state,
+            None,
+            &case.mesh,
+            &case.ops,
+            &case.geom,
+            &case.sigma,
+            &case.bathymetry,
+            &case.boundaries,
+            &Exterior3D::default(),
+            0.0,
+        );
+        assert!(alone.dt_over_depth.iter().all(|&s| s == 0.0));
+    }
+
     /// At an open face each layer carries the 2D flux in the interior's
     /// vertical profile: `F_l = Q_l·n + Δσ_l (F_2D − Σ_m Q_m·n)`, so the
     /// shear leaves (and enters) with the flow. Before, every layer took the
@@ -3034,9 +3147,12 @@ mod tests {
     /// the σ-surfaces (`omega`, bed first, up positive; no horizontal
     /// transport), `dt` apart: the concentrations after each step
     /// (`H_z' = −δΩ`, `(H_z C)' = −δ(Ω C_s)`), and the column's inventory.
+    /// The column's depth is that of its layers, which no step changes
+    /// (`Ω` is zero at both ends), so `shed`'s `dt_over_depth` is `dt/Σ hz`
+    /// (or zero, for a bound that does not know the Courant number).
     fn euler_steps(
         scheme: VerticalAdvection,
-        range: (f64, f64),
+        shed: EndLayerShed,
         mut column: Vec<f64>,
         mut hz: Vec<f64>,
         omega: &[f64],
@@ -3051,7 +3167,7 @@ mod tests {
         let before: f64 = inventory(&column, &hz);
         let mut history = Vec::new();
         for _ in 0..steps {
-            scheme.surface_values(&column, omega, &d_sigma, range, &mut slope, &mut surface);
+            scheme.surface_values(&column, omega, &d_sigma, shed, &mut slope, &mut surface);
             for l in 0..nl {
                 let q = column[l] * hz[l]
                     - dt * (omega[l + 1] * surface[l + 1] - omega[l] * surface[l]);
@@ -3078,7 +3194,10 @@ mod tests {
     /// layer's salinity only falls by the share of the layer that leaves.
     #[test]
     fn a_surface_layer_shedding_water_over_a_halocline_stays_in_range() {
-        let range = (0.0, 42.0);
+        let shed = EndLayerShed {
+            range: (0.0, 42.0),
+            dt_over_depth: 10.0 / 60.0,
+        };
         // Bed first; all the layers thick against the shedding
         let column = vec![33.0, 33.0, 25.0, 1.8, 0.9, 0.03];
         let hz = vec![10.0; 6];
@@ -3089,7 +3208,7 @@ mod tests {
         for scheme in [VerticalAdvection::LimitedAkima, VerticalAdvection::Tvd] {
             let (history, _) = euler_steps(
                 scheme,
-                UNBOUNDED,
+                EndLayerShed::NONE,
                 column.clone(),
                 hz.clone(),
                 &omega,
@@ -3103,7 +3222,7 @@ mod tests {
                  below zero: the test does not test"
             );
             let (history, _) =
-                euler_steps(scheme, range, column.clone(), hz.clone(), &omega, 10.0, 4);
+                euler_steps(scheme, shed, column.clone(), hz.clone(), &omega, 10.0, 4);
             let bounded = history.iter().map(|c| c[5]).fold(f64::INFINITY, f64::min);
             assert!(
                 bounded >= 0.0,
@@ -3123,7 +3242,10 @@ mod tests {
     /// upward, stays below it.
     #[test]
     fn a_bed_layer_shedding_water_stays_in_range() {
-        let range = (-2.0, 40.0);
+        let shed = EndLayerShed {
+            range: (-2.0, 40.0),
+            dt_over_depth: 10.0 / 60.0,
+        };
         // A bed layer at the top of the range under a steep thermocline
         let column = vec![39.99, 39.1, 38.2, 20.0, 10.0, 5.0];
         let hz = vec![10.0; 6];
@@ -3132,7 +3254,7 @@ mod tests {
         for scheme in [VerticalAdvection::LimitedAkima, VerticalAdvection::Tvd] {
             let (history, _) = euler_steps(
                 scheme,
-                UNBOUNDED,
+                EndLayerShed::NONE,
                 column.clone(),
                 hz.clone(),
                 &omega,
@@ -3148,7 +3270,7 @@ mod tests {
                 "{scheme:?}: {unbounded}: the test does not test"
             );
             let (history, _) =
-                euler_steps(scheme, range, column.clone(), hz.clone(), &omega, 10.0, 4);
+                euler_steps(scheme, shed, column.clone(), hz.clone(), &omega, 10.0, 4);
             let bounded = history
                 .iter()
                 .map(|c| c[0])
@@ -3157,6 +3279,57 @@ mod tests {
                 bounded <= 40.0,
                 "{scheme:?}: the bed layer rose to {bounded}"
             );
+        }
+    }
+
+    /// The same layers at an outflow Courant number beyond ½ (the explicit
+    /// part of the default implicit split reaches 0.8, the step bound
+    /// without it 1): the layer's mean falls by `c δ/(1 − c)` of the
+    /// increment `δ`, which a profile within the range does not bound
+    /// beyond ½. One forward-Euler step, as in a stage.
+    #[test]
+    fn a_layer_shedding_water_at_a_high_courant_number_stays_in_range() {
+        let (dt, depth) = (10.0, 60.0);
+        let surface_column = vec![33.0, 33.0, 25.0, 1.8, 0.9, 0.03];
+        let bed_column = vec![39.99, 39.1, 38.2, 20.0, 10.0, 5.0];
+        let hz = vec![10.0; 6];
+        for courant in [0.55, 0.6, 0.8, 0.95] {
+            for scheme in [VerticalAdvection::LimitedAkima, VerticalAdvection::Tvd] {
+                // `Ω dt/H_z = c` with H_z = 10 m
+                let mut down = vec![0.0; 7];
+                down[5] = -courant;
+                let mut up = vec![0.0; 7];
+                up[1] = courant;
+                for (column, omega, range, end) in [
+                    (&surface_column, &down, (0.0, 42.0), 5),
+                    (&bed_column, &up, (-2.0, 40.0), 0),
+                ] {
+                    let step = |dt_over_depth| {
+                        let shed = EndLayerShed {
+                            range,
+                            dt_over_depth,
+                        };
+                        let (history, _) =
+                            euler_steps(scheme, shed, column.clone(), hz.clone(), omega, dt, 1);
+                        history[0].clone()
+                    };
+                    // Without the Courant number the end layer ends out of the range
+                    let blind = step(0.0);
+                    assert!(
+                        blind[end] < range.0 || blind[end] > range.1,
+                        "{scheme:?}, c = {courant}: the blind bound ended at {} within {range:?}: \
+                         the test does not test",
+                        blind[end]
+                    );
+                    let aware = step(dt / depth);
+                    assert!(
+                        aware
+                            .iter()
+                            .all(|&c| c >= range.0 - 1e-12 && c <= range.1 + 1e-12),
+                        "{scheme:?}, c = {courant}: {aware:?} leaves {range:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -3172,11 +3345,15 @@ mod tests {
                 (omega[0], omega[6]) = (0.0, 0.0);
                 let at = |range| {
                     let (mut slope, mut surface) = ([0.0; 6], [0.0; 7]);
+                    let shed = EndLayerShed {
+                        range,
+                        dt_over_depth: 0.0,
+                    };
                     scheme.surface_values(
                         &column,
                         &omega,
                         &d_sigma,
-                        range,
+                        shed,
                         &mut slope,
                         &mut surface,
                     );
@@ -3187,15 +3364,43 @@ mod tests {
         }
         // A mean beyond the range keeps only an increment towards it: 41 above
         // a range ending at 40 has a profile ending at 41 + 0.3 or 41 - 0.3
-        assert_eq!(in_range(-0.3, 41.0, (-2.0, 40.0)), 0.0);
-        assert_eq!(in_range(0.3, 41.0, (-2.0, 40.0)), 0.3);
-        assert_eq!(in_range(0.3, -3.0, (-2.0, 40.0)), 0.0);
-        assert_eq!(in_range(-0.3, -3.0, (-2.0, 40.0)), -0.3);
+        assert_eq!(in_range(-0.3, 41.0, (-2.0, 40.0), 0.0), 0.0);
+        assert_eq!(in_range(0.3, 41.0, (-2.0, 40.0), 0.0), 0.3);
+        assert_eq!(in_range(0.3, -3.0, (-2.0, 40.0), 0.0), 0.0);
+        assert_eq!(in_range(-0.3, -3.0, (-2.0, 40.0), 0.0), -0.3);
         // The profile's end value `mean − increment` stays within the range
-        assert_eq!(in_range(5.0, 1.0, (0.0, 42.0)), 1.0);
-        assert_eq!(in_range(-5.0, 41.0, (0.0, 42.0)), -1.0);
-        assert_eq!(in_range(0.5, 1.0, (0.0, 42.0)), 0.5);
-        assert_eq!(in_range(0.5, 1.0, UNBOUNDED), 0.5);
+        assert_eq!(in_range(5.0, 1.0, (0.0, 42.0), 0.0), 1.0);
+        assert_eq!(in_range(-5.0, 41.0, (0.0, 42.0), 0.0), -1.0);
+        assert_eq!(in_range(0.5, 1.0, (0.0, 42.0), 0.0), 0.5);
+        assert_eq!(in_range(0.5, 1.0, UNBOUNDED, 0.0), 0.5);
+    }
+
+    /// Up to a Courant number of ½ the range is the profile's, bit for bit; beyond
+    /// it the increment is `(1 − c)/c` of the distance from the mean to the
+    /// bound, none at 1 and above; without a bound nothing changes.
+    #[test]
+    fn the_range_shrinks_with_the_courant_number_beyond_one_half() {
+        let range = (0.0, 42.0);
+        for c in [0.0, 0.25, 0.5] {
+            assert_eq!(in_range(5.0, 1.0, range, c), 1.0, "c = {c}");
+            assert_eq!(in_range(-5.0, 41.0, range, c), -1.0, "c = {c}");
+        }
+        assert!((in_range(5.0, 1.0, range, 0.8) - 0.25).abs() < 1e-15);
+        assert!((in_range(-5.0, 41.0, range, 0.6) + 0.4 / 0.6).abs() < 1e-15);
+        for c in [1.0, 1.5, 100.0] {
+            assert_eq!(in_range(5.0, 1.0, range, c), 0.0, "c = {c}");
+            assert_eq!(in_range(-5.0, 41.0, range, c), 0.0, "c = {c}");
+        }
+        // An increment already inside the share is kept
+        assert_eq!(in_range(0.1, 1.0, range, 0.8), 0.1);
+        // No bound, no Courant number to keep
+        for c in [0.0, 0.8, 3.0] {
+            assert_eq!(in_range(5.0, 1.0, UNBOUNDED, c), 5.0, "c = {c}");
+            assert_eq!(in_range(-5.0, 1.0, UNBOUNDED, c), -5.0, "c = {c}");
+        }
+        // One bound: the other side is free
+        assert_eq!(in_range(-5.0, 1.0, (0.0, f64::INFINITY), 0.8), -5.0);
+        assert!((in_range(5.0, 1.0, (0.0, f64::INFINITY), 0.8) - 0.25).abs() < 1e-15);
     }
 
     /// Surface values of `scheme` on `column` with layers `d_sigma` and a
@@ -3205,7 +3410,8 @@ mod tests {
         let mut omega = vec![w; nl + 1];
         (omega[0], omega[nl]) = (0.0, 0.0);
         let (mut slope, mut surface) = (vec![0.0; nl], vec![f64::NAN; nl + 1]);
-        scheme.surface_values(column, &omega, d_sigma, UNBOUNDED, &mut slope, &mut surface);
+        let none = EndLayerShed::NONE;
+        scheme.surface_values(column, &omega, d_sigma, none, &mut slope, &mut surface);
         surface
     }
 
@@ -3411,7 +3617,8 @@ mod tests {
         let omega = vec![w; nl + 1];
         let (mut slope, mut surface) = (vec![0.0; nl], vec![0.0; nl + 1]);
         let mut rate = |c: &[f64]| -> Vec<f64> {
-            scheme.surface_values(c, &omega, d_sigma, UNBOUNDED, &mut slope, &mut surface);
+            let none = EndLayerShed::NONE;
+            scheme.surface_values(c, &omega, d_sigma, none, &mut slope, &mut surface);
             (surface[0], surface[nl]) = (c[0], c[nl - 1]);
             (0..nl)
                 .map(|l| -w * (surface[l + 1] - surface[l]) / d_sigma[l])
