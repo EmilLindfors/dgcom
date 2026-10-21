@@ -294,44 +294,47 @@ impl RiverSources {
         geom: &GeometricFactors2D,
         max_snap: f64,
     ) -> Result<Self, RiverError> {
-        let locator = PointLocator2D::new(mesh);
-        let boundary_elements: Vec<ElementIndex> = (0..mesh.n_elements)
-            .map(ElementIndex::new)
-            .filter(|&k| (0..4).any(|f| mesh.is_boundary_face(k, f)))
-            .collect();
-        let mut elements = Vec::with_capacity(rivers.len());
-        let mut snapped = Vec::with_capacity(rivers.len());
-        for river in &rivers {
-            let low = river.discharge.min();
-            if low < 0.0 {
-                return Err(RiverError::NegativeDischarge {
-                    name: river.name.clone(),
-                    discharge: low,
-                });
+        let placer = Placer::new(mesh);
+        let placed = rivers
+            .iter()
+            .map(|river| placer.place(river, max_snap))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::placed(rivers, placed, mesh, geom))
+    }
+
+    /// [`Self::new`] for the rivers that can be placed, with the errors of
+    /// those that cannot (a mouth beyond `max_snap`, a negative discharge):
+    /// for rivers selected by a box around a mesh, some of which flow into
+    /// water the mesh does not reach.
+    pub fn on_mesh(
+        rivers: Vec<River>,
+        mesh: &Mesh2D,
+        geom: &GeometricFactors2D,
+        max_snap: f64,
+    ) -> (Self, Vec<RiverError>) {
+        let placer = Placer::new(mesh);
+        let (mut kept, mut placed, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+        for river in rivers {
+            match placer.place(&river, max_snap) {
+                Ok(p) => {
+                    kept.push(river);
+                    placed.push(p);
+                }
+                Err(e) => errors.push(e),
             }
-            let p = river.position;
-            if let Some(point) = locator.locate(p) {
-                elements.push(point.element);
-                snapped.push(0.0);
-                continue;
-            }
-            let (distance, k) = boundary_elements
-                .iter()
-                .map(|&k| (distance_to_quad(&mesh.element_vertices(k), p), k))
-                .min_by(|a, b| a.0.total_cmp(&b.0))
-                .unwrap_or((f64::INFINITY, ElementIndex::new(0)));
-            if !distance.is_finite() || distance > max_snap {
-                return Err(RiverError::OutsideMesh {
-                    name: river.name.clone(),
-                    x: p[0],
-                    y: p[1],
-                    distance,
-                    max_snap,
-                });
-            }
-            elements.push(k);
-            snapped.push(distance);
         }
+        (Self::placed(kept, placed, mesh, geom), errors)
+    }
+
+    /// The rivers in their elements, `placed[i]` = (element, snap
+    /// distance).
+    fn placed(
+        rivers: Vec<River>,
+        placed: Vec<(ElementIndex, f64)>,
+        mesh: &Mesh2D,
+        geom: &GeometricFactors2D,
+    ) -> Self {
+        let (elements, snapped): (Vec<ElementIndex>, Vec<f64>) = placed.into_iter().unzip();
         let inv_area = elements
             .iter()
             .map(|k| 1.0 / geom.area[k.as_usize()])
@@ -349,7 +352,7 @@ impl RiverSources {
             by_element[fill[k.as_usize()]] = i;
             fill[k.as_usize()] += 1;
         }
-        Ok(Self {
+        Self {
             rivers,
             elements,
             inv_area,
@@ -358,7 +361,7 @@ impl RiverSources {
             by_element,
             shape: Vec::new(),
             n_levels: 0,
-        })
+        }
     }
 
     /// Number of rivers.
@@ -440,6 +443,58 @@ impl RiverSources {
     /// Number of levels of [`Self::set_levels`] (0 before).
     pub fn n_levels(&self) -> usize {
         self.n_levels
+    }
+}
+
+/// Finds the element of a river's mouth.
+struct Placer<'m> {
+    mesh: &'m Mesh2D,
+    locator: PointLocator2D<'m>,
+    boundary_elements: Vec<ElementIndex>,
+}
+
+impl<'m> Placer<'m> {
+    fn new(mesh: &'m Mesh2D) -> Self {
+        Self {
+            mesh,
+            locator: PointLocator2D::new(mesh),
+            boundary_elements: (0..mesh.n_elements)
+                .map(ElementIndex::new)
+                .filter(|&k| (0..4).any(|f| mesh.is_boundary_face(k, f)))
+                .collect(),
+        }
+    }
+
+    /// The element holding `river`'s mouth, or the nearest boundary element
+    /// within `max_snap`, with the distance the mouth moves.
+    fn place(&self, river: &River, max_snap: f64) -> Result<(ElementIndex, f64), RiverError> {
+        let low = river.discharge.min();
+        if low < 0.0 {
+            return Err(RiverError::NegativeDischarge {
+                name: river.name.clone(),
+                discharge: low,
+            });
+        }
+        let p = river.position;
+        if let Some(point) = self.locator.locate(p) {
+            return Ok((point.element, 0.0));
+        }
+        let (distance, k) = self
+            .boundary_elements
+            .iter()
+            .map(|&k| (distance_to_quad(&self.mesh.element_vertices(k), p), k))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .unwrap_or((f64::INFINITY, ElementIndex::new(0)));
+        if !distance.is_finite() || distance > max_snap {
+            return Err(RiverError::OutsideMesh {
+                name: river.name.clone(),
+                x: p[0],
+                y: p[1],
+                distance,
+                max_snap,
+            });
+        }
+        Ok((k, distance))
     }
 }
 
@@ -668,6 +723,28 @@ mod tests {
         assert!(matches!(
             RiverSources::new(negative, &mesh, &geom, 50.0),
             Err(RiverError::NegativeDischarge { .. })
+        ));
+
+        // The ones that can be placed, and why the others cannot
+        let rivers = vec![
+            River::new("far", [350.0, 300.0], 1.0),
+            River::new("inside", [150.0, 50.0], 10.0),
+            River::new("dry", [10.0, 10.0], -1.0),
+            River::new("outside", [350.0, 230.0], 1.0),
+        ];
+        let (sources, errors) = RiverSources::on_mesh(rivers, &mesh, &geom, 50.0);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources.river(0).name, "inside");
+        assert_eq!(sources.element(0), inside);
+        assert_eq!(sources.river(1).name, "outside");
+        assert_eq!(sources.element(1), corner);
+        assert_eq!(sources.in_element(corner.as_usize()), &[1]);
+        assert!(matches!(
+            errors.as_slice(),
+            [
+                RiverError::OutsideMesh { .. },
+                RiverError::NegativeDischarge { .. }
+            ]
         ));
     }
 

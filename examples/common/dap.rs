@@ -37,9 +37,9 @@ pub fn attribute_string(var: &Variable, name: &str) -> Option<String> {
 }
 
 /// Retry a DAP request: THREDDS answers 503 under load.
-pub fn retry<T>(
+pub fn retry<T, E: std::fmt::Display>(
     what: &str,
-    mut f: impl FnMut() -> Result<T, netcdf::Error>,
+    mut f: impl FnMut() -> Result<T, E>,
 ) -> Result<T, Box<dyn Error>> {
     for attempt in 1..=5 {
         match f() {
