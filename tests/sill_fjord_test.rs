@@ -82,3 +82,54 @@ fn a_rivers_brackish_layer_is_critical_at_the_fjord_mouth() {
         b.h1
     );
 }
+
+/// Regression test (TODO P4.6): the river's fresh surface layer stays fresh
+/// over the landward flank of a sill in deep water.
+///
+/// In 400 m of water with a 60 m sill the σ-layers thin by a factor of 6
+/// within 1 km of the flank, and the surface layer (0.8 m deep at 400 m)
+/// sheds water into the halocline under it. The salinity left its range
+/// there: the layer's mean went through zero (−3.9 at 6.8 h in the 16 km
+/// fjord, −3.6 here at 2.6 h in a 6 km one) as the vertical advection's
+/// end-layer value took the profile linearly through the three means below
+/// zero at the surface. The end layer's profile is now kept in the
+/// tracer's range (`VerticalAdvection::LimitedAkima`).
+///
+/// The fjord is shortened (4 km, a 2 km basin) so that the front arrives at
+/// the sill at ≈ 1.5 h; S is bounded on [0, 33] to the Kuzmin limiter's
+/// 1e-3, and the front has passed the flank (the surface is fresh there).
+#[test]
+fn a_fresh_surface_layer_stays_in_range_over_a_sills_landward_flank() {
+    let config = Config {
+        length: 4e3,
+        basin: 2e3,
+        band: 1e3,
+        depth: 400.0,
+        sill: 60.0,
+        hours: 2.4,
+        average: 0.4,
+        report: 0.0,
+        ..Config::default()
+    };
+    let outcome = sill_fjord::run(&config, |_| {});
+    assert!(outcome.finite, "the run blew up");
+    let (s_low, s_high) = outcome.salt_range;
+    let (t, [x, y], depth, level) = outcome.salt_min_at;
+    assert!(
+        s_low >= 0.0 && s_high <= S_SEA + 1e-3,
+        "salinity left [0, {S_SEA}]: [{s_low}, {s_high}], lowest at {:.2} h, ({x:.0}, {y:.0}) m, \
+         {depth:.0} m deep, level {level}",
+        t / 3600.0
+    );
+    // The test tests: the front has passed the sill's landward flank
+    let flank = outcome
+        .sections
+        .iter()
+        .find(|s| (s.x - (config.crest() - 1000.0)).abs() < 1e-6)
+        .expect("the flank's section");
+    let surface = flank.profile[0].salt;
+    assert!(
+        surface < 5.0,
+        "S = {surface} at the surface of the sill's flank: the river's water has not passed it"
+    );
+}

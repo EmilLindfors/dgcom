@@ -1503,11 +1503,17 @@ pub struct AdvectedTracer<'a> {
     pub exterior: Option<ExteriorField<'a>>,
     /// The reference stratification of the vertical reconstruction.
     pub reference: Option<&'a [f64]>,
+    /// The tracer's physical range `(min, max)`, which the water leaving an
+    /// end layer stays within ([`UNBOUNDED`] for none).
+    pub range: (f64, f64),
 }
 
+/// The [`AdvectedTracer::range`] of a tracer with no bounds.
+pub const UNBOUNDED: (f64, f64) = (f64::NEG_INFINITY, f64::INFINITY);
+
 impl<'a> AdvectedTracer<'a> {
-    /// `tracer` into `rhs` with `bc`'s exterior values, no parent and no
-    /// reference.
+    /// `tracer` into `rhs` with `bc`'s exterior values, no parent, no
+    /// reference and no range.
     pub fn new(
         rhs: &'a mut [f64],
         tracer: &'a [f64],
@@ -1519,6 +1525,7 @@ impl<'a> AdvectedTracer<'a> {
             bc,
             exterior: None,
             reference: None,
+            range: UNBOUNDED,
         }
     }
 }
@@ -1595,7 +1602,7 @@ pub fn apply_tracer_transport_3d<const N: usize>(
     };
     let fields = tracers
         .each_ref()
-        .map(|t| (t.tracer, t.reference, t.bc, t.exterior));
+        .map(|t| (t.tracer, t.reference, t.bc, t.exterior, t.range));
     let n = mesh.n_elements * nn * nl;
     for_each_block(
         mesh.n_elements,
@@ -1603,7 +1610,7 @@ pub fn apply_tracer_transport_3d<const N: usize>(
         || TransportScratch::take(ops, nl),
         |scratch, k, mut rhs_k| {
             let inflow = |t: usize, f, fi, node, tag, interior, flux, l| {
-                let (_, _, bc, exterior) = fields[t];
+                let (_, _, bc, exterior, _) = fields[t];
                 exterior
                     .and_then(|e: ExteriorField| e.at(tag, node, l))
                     .unwrap_or_else(|| {
@@ -1644,9 +1651,9 @@ pub fn apply_tracer_transport_3d<const N: usize>(
                 }
             }
 
-            for (rhs_k, &(tracer, reference, ..)) in rhs_k.iter_mut().zip(&fields) {
+            for (rhs_k, &(tracer, reference, _, _, range)) in rhs_k.iter_mut().zip(&fields) {
                 subtract_vertical_flux(
-                    rhs_k, tracer, reference, transport, k, nn, vertical, scratch,
+                    rhs_k, tracer, reference, range, transport, k, nn, vertical, scratch,
                 );
             }
         },
@@ -1660,6 +1667,7 @@ fn subtract_vertical_flux(
     rhs_k: &mut [f64],
     field: &[f64],
     reference: Option<&[f64]>,
+    range: (f64, f64),
     transport: &LayerTransport,
     k: usize,
     nn: usize,
@@ -1677,13 +1685,14 @@ fn subtract_vertical_flux(
         let idx = k * nn + i;
         let omega = &transport.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
         let column = &field[idx * nl..(idx + 1) * nl];
-        scheme.surface_values(column, omega, &transport.d_sigma, slope, flux);
+        scheme.surface_values(column, omega, &transport.d_sigma, range, slope, flux);
         if let Some(reference) = reference {
             let reference = &reference[idx * nl..(idx + 1) * nl];
             scheme.surface_values(
                 reference,
                 omega,
                 &transport.d_sigma,
+                UNBOUNDED,
                 slope,
                 reference_surface,
             );
@@ -1776,7 +1785,10 @@ pub enum VerticalAdvection {
     /// The end layers' means can still leave the column's range where a
     /// profile is linear to the end, as the water at the bed or the surface
     /// beyond the end layer's mean is carried into the layer above or below
-    /// (that is the profile, not an overshoot). The limiter adds some
+    /// (that is the profile, not an overshoot), but not the tracer's own
+    /// range ([`AdvectedTracer::range`]): the end layer's linear profile is kept
+    /// within it, so that a fresh surface layer over a halocline does not shed
+    /// more salt than it has. The limiter adds some
     /// diffusion at extrema and fronts.
     Tvd,
     /// [`Self::Akima`]'s surface values under [`Self::Tvd`]'s limiter: the
@@ -1795,8 +1807,9 @@ pub enum VerticalAdvection {
     /// means, which no conservative slope limiter of the nodal values can
     /// change: a P2 lock exchange on 125 m (ν = 10 m²/s) left 7.27 °C in a
     /// layer of a 7.5–12.5 °C range. The bounds have to be on the flux.
-    /// Monotone in the interior up to a vertical Courant number of ½, as
-    /// [`Self::Tvd`]. The tracers' default.
+    /// Monotone in the interior up to a vertical Courant number of ½, and the
+    /// end layers kept within the tracer's range, as [`Self::Tvd`]. The tracers'
+    /// default.
     #[default]
     LimitedAkima,
     /// The mean between the two layer centres of the Hermite cubic with the
@@ -1812,12 +1825,15 @@ impl VerticalAdvection {
     /// `surface`, for the volume fluxes `omega` (which decide the upwind
     /// side) through layers of σ-thickness `d_sigma`. The bed and surface
     /// pass no flux; their values are zero. `slope` holds `nl` values of
-    /// scratch.
+    /// scratch. `range` is the tracer's physical range, which
+    /// [`Self::Tvd`] and [`Self::LimitedAkima`] keep the water leaving an
+    /// end layer within (see [`in_range`]).
     fn surface_values(
         self,
         column: &[f64],
         omega: &[f64],
         d_sigma: &[f64],
+        range: (f64, f64),
         slope: &mut [f64],
         surface: &mut [f64],
     ) {
@@ -1855,9 +1871,11 @@ impl VerticalAdvection {
                 for l in 1..nl {
                     let (up, far, down) = upwind_stencil(l, nl, omega[l]);
                     let Some(far) = far else {
-                        // Out of an end layer: bounded by a ghost layer
-                        surface[l] = column[up]
-                            + end_layer_limited(surface[l] - column[up], column, d_sigma, up, down);
+                        // Out of an end layer: bounded by a ghost layer, and
+                        // by the range
+                        let increment =
+                            end_layer_limited(surface[l] - column[up], column, d_sigma, up, down);
+                        surface[l] = column[up] + in_range(increment, column[up], range);
                         continue;
                     };
                     surface[l] = column[up]
@@ -1878,8 +1896,8 @@ impl VerticalAdvection {
                         // ghost layer
                         let (a, b) = (d_sigma[up], d_sigma[down]);
                         let increment = a / (a + b) * (column[down] - column[up]);
-                        surface[l] =
-                            column[up] + end_layer_limited(increment, column, d_sigma, up, down);
+                        let increment = end_layer_limited(increment, column, d_sigma, up, down);
+                        surface[l] = column[up] + in_range(increment, column[up], range);
                         continue;
                     };
                     let (a, b, c) = (d_sigma[up], d_sigma[down], d_sigma[far]);
@@ -1931,6 +1949,33 @@ fn tvd_limited(increment: f64, behind: f64, ahead: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+/// The `increment` of the surface value out of an end layer over its mean
+/// `mean`, kept so that the end layer's profile stays within `range`.
+///
+/// The surface value `mean + increment` at the layer's inner surface and its
+/// reflection `mean − increment` at the bed or the free surface are the two
+/// ends of the layer's linear profile. The layer loses (gains) the water at
+/// the inner surface's value, so it keeps the part of the profile nearer its
+/// end: its mean changes by `−c δ/(1 − c)` of the increment `δ` at a Courant
+/// number `c` of the water it sheds while it thins, which for `c ≤ ½` (the
+/// interior's monotone bound too) is within `δ`, so a profile within the
+/// range leaves the layer's mean in it. Without the range the end layer's
+/// own gradient ([`end_layer_limited`]) lets the profile reach beyond the
+/// layers' means by half a layer. That is the profile, not an overshoot,
+/// until it reaches a bound of the tracer: the surface layer of fresh river
+/// water (`S` = 0.03 over 0.9 over 1.8) over a halocline has a linear profile
+/// of −0.4 at the surface, and its mean fell to −3.6 within an hour where the
+/// bed rises under it (the landward flank of a 60 m sill in 400 m of water,
+/// `examples/sill_fjord_3d.rs`). The bound matters only within that half
+/// layer of the range; a mean beyond the range keeps only an increment
+/// towards it.
+fn in_range(increment: f64, mean: f64, (min, max): (f64, f64)) -> f64 {
+    // `max` and `min`, not `clamp`: the bounds can be NaN beside a NaN mean
+    increment
+        .max((mean - max).min(0.0))
+        .min((mean - min).max(0.0))
 }
 
 /// [`tvd_limited`] for the `increment` of the surface value out of the end
@@ -2073,7 +2118,9 @@ pub fn apply_momentum_transport_3d(
                 }
             }
             for (rhs_k, field) in rhs_k.iter_mut().zip([u, v]) {
-                subtract_vertical_flux(rhs_k, field, None, transport, k, nn, vertical, scratch);
+                subtract_vertical_flux(
+                    rhs_k, field, None, UNBOUNDED, transport, k, nn, vertical, scratch,
+                );
             }
         },
     );
@@ -2524,6 +2571,7 @@ mod tests {
                     bc,
                     exterior: None,
                     reference: None,
+                    range: UNBOUNDED,
                 }],
                 transport,
                 &self.mesh,
@@ -2811,6 +2859,7 @@ mod tests {
                     bc: &ExtrapolationTracerBC3D,
                     exterior: None,
                     reference: None,
+                    range: UNBOUNDED,
                 }],
                 &transport,
                 &mesh,
@@ -2861,6 +2910,7 @@ mod tests {
                 bc: &ExtrapolationTracerBC3D,
                 exterior: None,
                 reference,
+                range: UNBOUNDED,
             }],
             &transport,
             &mesh,
@@ -2979,6 +3029,175 @@ mod tests {
         }
     }
 
+    /// Forward-Euler steps of a column's layer inventories `H_z C` and
+    /// thicknesses under the vertical advection of `scheme` alone, for `Ω` at
+    /// the σ-surfaces (`omega`, bed first, up positive; no horizontal
+    /// transport), `dt` apart: the concentrations after each step
+    /// (`H_z' = −δΩ`, `(H_z C)' = −δ(Ω C_s)`), and the column's inventory.
+    fn euler_steps(
+        scheme: VerticalAdvection,
+        range: (f64, f64),
+        mut column: Vec<f64>,
+        mut hz: Vec<f64>,
+        omega: &[f64],
+        dt: f64,
+        steps: usize,
+    ) -> (Vec<Vec<f64>>, f64) {
+        let nl = column.len();
+        let d_sigma = vec![1.0 / nl as f64; nl];
+        let (mut slope, mut surface) = (vec![0.0; nl], vec![0.0; nl + 1]);
+        let inventory =
+            |column: &[f64], hz: &[f64]| column.iter().zip(hz).map(|(c, h)| c * h).sum();
+        let before: f64 = inventory(&column, &hz);
+        let mut history = Vec::new();
+        for _ in 0..steps {
+            scheme.surface_values(&column, omega, &d_sigma, range, &mut slope, &mut surface);
+            for l in 0..nl {
+                let q = column[l] * hz[l]
+                    - dt * (omega[l + 1] * surface[l + 1] - omega[l] * surface[l]);
+                hz[l] -= dt * (omega[l + 1] - omega[l]);
+                column[l] = q / hz[l];
+            }
+            history.push(column.clone());
+        }
+        let after: f64 = inventory(&column, &hz);
+        assert!(
+            (after - before).abs() < 1e-12 * before.abs().max(1.0),
+            "{scheme:?}: the column's inventory went from {before} to {after}"
+        );
+        (history, after)
+    }
+
+    /// A surface layer that sheds water downward as the water column thins
+    /// under it (the landward flank of a sill, where the bed rises under the
+    /// brackish layer of a river), over a halocline: the surface layer is
+    /// fresh (0.03) and the layers below salt up linearly. A linear profile
+    /// through the three means is negative at the surface, so the unbounded
+    /// second-order value for the water that leaves takes more salt out of the
+    /// layer than it has, and its mean falls through zero; within the range the
+    /// layer's salinity only falls by the share of the layer that leaves.
+    #[test]
+    fn a_surface_layer_shedding_water_over_a_halocline_stays_in_range() {
+        let range = (0.0, 42.0);
+        // Bed first; all the layers thick against the shedding
+        let column = vec![33.0, 33.0, 25.0, 1.8, 0.9, 0.03];
+        let hz = vec![10.0; 6];
+        // Downward through the surface layer's lower surface only: that layer
+        // thins by a tenth of its thickness per step, the one under it grows
+        let mut omega = vec![0.0; 7];
+        omega[5] = -0.1;
+        for scheme in [VerticalAdvection::LimitedAkima, VerticalAdvection::Tvd] {
+            let (history, _) = euler_steps(
+                scheme,
+                UNBOUNDED,
+                column.clone(),
+                hz.clone(),
+                &omega,
+                10.0,
+                4,
+            );
+            let unbounded = history.iter().map(|c| c[5]).fold(f64::INFINITY, f64::min);
+            assert!(
+                unbounded < -0.01,
+                "{scheme:?}: without the range the surface layer ended at {unbounded}, not \
+                 below zero: the test does not test"
+            );
+            let (history, _) =
+                euler_steps(scheme, range, column.clone(), hz.clone(), &omega, 10.0, 4);
+            let bounded = history.iter().map(|c| c[5]).fold(f64::INFINITY, f64::min);
+            assert!(
+                bounded >= 0.0,
+                "{scheme:?}: the surface layer fell to {bounded}"
+            );
+            // and no other layer leaves the range either
+            for column in &history {
+                assert!(
+                    column.iter().all(|&c| (0.0..=33.0 + 1e-12).contains(&c)),
+                    "{scheme:?}: {column:?}"
+                );
+            }
+        }
+    }
+
+    /// The same at the bed: a bed layer at the range's top, shedding water
+    /// upward, stays below it.
+    #[test]
+    fn a_bed_layer_shedding_water_stays_in_range() {
+        let range = (-2.0, 40.0);
+        // A bed layer at the top of the range under a steep thermocline
+        let column = vec![39.99, 39.1, 38.2, 20.0, 10.0, 5.0];
+        let hz = vec![10.0; 6];
+        let mut omega = vec![0.0; 7];
+        omega[1] = 0.1;
+        for scheme in [VerticalAdvection::LimitedAkima, VerticalAdvection::Tvd] {
+            let (history, _) = euler_steps(
+                scheme,
+                UNBOUNDED,
+                column.clone(),
+                hz.clone(),
+                &omega,
+                10.0,
+                4,
+            );
+            let unbounded = history
+                .iter()
+                .map(|c| c[0])
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                unbounded > 40.01,
+                "{scheme:?}: {unbounded}: the test does not test"
+            );
+            let (history, _) =
+                euler_steps(scheme, range, column.clone(), hz.clone(), &omega, 10.0, 4);
+            let bounded = history
+                .iter()
+                .map(|c| c[0])
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                bounded <= 40.0,
+                "{scheme:?}: the bed layer rose to {bounded}"
+            );
+        }
+    }
+
+    /// Away from the range's ends the bound changes nothing, to the bit, and
+    /// a mean outside the range leaves first order.
+    #[test]
+    fn the_range_leaves_a_column_in_its_interior_alone() {
+        let column = [10.0, 10.5, 11.2, 11.9, 12.1, 12.4];
+        let d_sigma = [1.0 / 6.0; 6];
+        for scheme in [VerticalAdvection::LimitedAkima, VerticalAdvection::Tvd] {
+            for w in [1.0, -1.0] {
+                let mut omega = [w; 7];
+                (omega[0], omega[6]) = (0.0, 0.0);
+                let at = |range| {
+                    let (mut slope, mut surface) = ([0.0; 6], [0.0; 7]);
+                    scheme.surface_values(
+                        &column,
+                        &omega,
+                        &d_sigma,
+                        range,
+                        &mut slope,
+                        &mut surface,
+                    );
+                    surface
+                };
+                assert_eq!(at((-2.0, 40.0)), at(UNBOUNDED), "{scheme:?}, Ω = {w}");
+            }
+        }
+        // A mean beyond the range keeps only an increment towards it: 41 above
+        // a range ending at 40 has a profile ending at 41 + 0.3 or 41 - 0.3
+        assert_eq!(in_range(-0.3, 41.0, (-2.0, 40.0)), 0.0);
+        assert_eq!(in_range(0.3, 41.0, (-2.0, 40.0)), 0.3);
+        assert_eq!(in_range(0.3, -3.0, (-2.0, 40.0)), 0.0);
+        assert_eq!(in_range(-0.3, -3.0, (-2.0, 40.0)), -0.3);
+        // The profile's end value `mean − increment` stays within the range
+        assert_eq!(in_range(5.0, 1.0, (0.0, 42.0)), 1.0);
+        assert_eq!(in_range(-5.0, 41.0, (0.0, 42.0)), -1.0);
+        assert_eq!(in_range(0.5, 1.0, (0.0, 42.0)), 0.5);
+        assert_eq!(in_range(0.5, 1.0, UNBOUNDED), 0.5);
+    }
+
     /// Surface values of `scheme` on `column` with layers `d_sigma` and a
     /// uniform `Ω = w` through the interior surfaces.
     fn surfaces(scheme: VerticalAdvection, column: &[f64], d_sigma: &[f64], w: f64) -> Vec<f64> {
@@ -2986,7 +3205,7 @@ mod tests {
         let mut omega = vec![w; nl + 1];
         (omega[0], omega[nl]) = (0.0, 0.0);
         let (mut slope, mut surface) = (vec![0.0; nl], vec![f64::NAN; nl + 1]);
-        scheme.surface_values(column, &omega, d_sigma, &mut slope, &mut surface);
+        scheme.surface_values(column, &omega, d_sigma, UNBOUNDED, &mut slope, &mut surface);
         surface
     }
 
@@ -3192,7 +3411,7 @@ mod tests {
         let omega = vec![w; nl + 1];
         let (mut slope, mut surface) = (vec![0.0; nl], vec![0.0; nl + 1]);
         let mut rate = |c: &[f64]| -> Vec<f64> {
-            scheme.surface_values(c, &omega, d_sigma, &mut slope, &mut surface);
+            scheme.surface_values(c, &omega, d_sigma, UNBOUNDED, &mut slope, &mut surface);
             (surface[0], surface[nl]) = (c[0], c[nl - 1]);
             (0..nl)
                 .map(|l| -w * (surface[l + 1] - surface[l]) / d_sigma[l])
@@ -3802,6 +4021,7 @@ mod tests {
                 bc: &FixedTracerBC3D::new(-1e6),
                 exterior: exterior.temp,
                 reference: None,
+                range: UNBOUNDED,
             }],
             &transport,
             &case.mesh,
@@ -3889,6 +4109,7 @@ mod tests {
                 bc: &ExtrapolationTracerBC3D,
                 exterior: exterior.temp,
                 reference: None,
+                range: UNBOUNDED,
             }],
             &transport,
             &case.mesh,

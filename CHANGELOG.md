@@ -10,7 +10,7 @@ All notable changes to this project should be documented in this file.
   - At the mouth u₁ 0.96–1.02× the theory's, h₁ 1.08–1.18×, F₁² 0.90–1.13 (base, Q_f 250 and 1000 m³/s, 45 levels, 125 m elements, 400 m deep); inside the fjord 0.35–0.63, subcritical; Knudsen's relations close to 0.95–1.00 at every section. The mouth speed follows Q_f^⅓ over a factor 4 to 3 %. A 1 km wide fjord is less critical (F₁² 0.84).
   - The brackish layer is the levels fresher than s₂ − 1, as one layer with the kinematic equivalents `(∫u)²/∫u²`, `∫u²/∫u`: split by the sign of the transport, the slow outflow of nearly sea water below the halocline made it 22 m thick at 0.08 m/s.
   - Gate `a_rivers_brackish_layer_is_critical_at_the_fjord_mouth` (`tests/sill_fjord_test.rs`, slow tier, 90 s in the CI profile): a 4 km version, 12 h.
-  - Found: in a 400 m fjord S undershoots to −3.9 at some step (TODO P4.6).
+  - Found: in a 400 m fjord S undershoots to −3.9 at some step (TODO P4.6; fixed, below).
 
 - **River profiles in metres (TODO P1.6): the top `d` metres whatever the depth, as NorKyst's rivers enter.** `RiverProfile::TopMetres(d)` (uniform per metre) and `RiverProfile::TaperedTopMetres(d)` (per metre falling linearly to zero at `d`, NorKyst-800's shape over its top ≈ 3 m). `TopFraction` put a river into a 400 m fjord over the top 80 m.
   - The level weights are per node of the river's element, from each node's still-water depth (`RiverSources::set_levels(sigma, bathymetry)`, `level_weights(i, node)`, `RiverInflow::add_layer_rates(k, node, out)`), and fixed in time, so Ω, the tracer sources and the turbulence's w-point sources agree at every stage. A column shallower than the profile takes all of it.
@@ -668,6 +668,11 @@ All notable changes to this project should be documented in this file.
   - `froya_real_data waves=N` also prints the sources' DIA share and a half-step of each implicit pass alone.
 
 ### Fixed
+
+- **The salinity undershoot of a river's surface layer over a steep flank (TODO P4.6).** In the 400 m sill fjord S fell to −3.9 where the brackish front first reached the sill's landward flank. The σ-layers thin there and the surface layer sheds water downward; the end layer's value for the water that leaves (`LimitedAkima` and `Tvd`: its linear profile through the layer means, bounded by its own gradient) lay above its mean, so the layer lost more salt than it had (S = 0.03 over 0.9 over 1.8 has −0.4 at the surface) and its mean went through zero, which no nodal limiter can undo. Independent of the step (`cfl_3d` 1–4).
+  - `AdvectedTracer::range` (new field; `transport_3d::UNBOUNDED` for none): the end layer's profile stays inside the tracer's range, which keeps its mean in range at a vertical Courant number ≤ ½. `Hydrostatic3D` gives the tracers the limiter's bounds when a limiter is enabled (`TracerLimiter3DConfig::advection_ranges`; none without one, as the momentum and the turbulence have none). Away from the range nothing changes, bit for bit. `Rhs3DConfig` has a `tracer_range`.
+  - The 16 km, 48 h fjord: S in [0.020, 33.0] (was −3.9); at the mouth `u₁` 1.03× the theory's, `h₁` 1.08×, F₁² 1.16 (1.02×, 1.08×, 1.13 before).
+  - Gates: `a_surface_layer_shedding_water_over_a_halocline_stays_in_range`, `a_bed_layer_shedding_water_stays_in_range`, `the_range_leaves_a_column_in_its_interior_alone` (the first two fail without the range), and `a_fresh_surface_layer_stays_in_range_over_a_sills_landward_flank` (`tests/sill_fjord_test.rs`, slow tier, 43 s in the CI profile; S reaches −2.8 without the fix).
 
 - **The viewer's WGSL error on every start** (`cannot find declaration of uv` in Bevy's `pbr_fragment`): the terrain's mesh had a second UV set (the photo view's depth) and no first, and Bevy 0.20.0-rc.1's `StandardMaterial` shader then reads an undeclared `uv`. The terrain now carries an unused first set.
 - **The stratification sheet showed in the photo view** over the sea, as the arrows and contours do not; it is a chart overlay and hides there now.
