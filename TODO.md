@@ -232,7 +232,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.6** Fix or delete the unused `LandMask2D::from_coastline_and_bathymetry`.
 - [ ] **P1.6** Count wet as h > 1 cm in the example's η statistics, so mm films don't set "η max".
 - [ ] **P1.6** Cut the atmosphere forcing's memory (≈ 210 MB at 10⁶ nodes): share stencils per element, or drop them after regridding.
-- [ ] **P1.6** A fixed-depth river profile (top d metres) for deep fjords: NorKyst's rivers enter over the top ≈ 3 m, linearly decreasing (`TopFraction(0.2)` is 2–60 m).
 - [ ] **P1.6** River details: river momentum `Q/(width·depth)` for jets at narrow mouths; spreading over elements within a radius if one-element plumes show.
 - [ ] **P1.6** If the wind-driven residual matters at farms: stress from the wind relative to the current, with a stability-dependent COARE drag.
 - [ ] **P1.6** Low priority (< 5 mm): the tidal-potential sign against its docs (`source/swe_2d/tidal.rs:299-305`) and the diurnal Love factor.

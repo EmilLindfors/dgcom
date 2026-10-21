@@ -50,8 +50,8 @@
 
 use thiserror::Error;
 
-use crate::mesh::Mesh2D;
 use crate::mesh::PointLocator2D;
+use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::GeometricFactors2D;
 use crate::solver::SWEState2D;
 use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
@@ -117,21 +117,38 @@ impl RiverSeries {
 
 /// How a river's water is shared out over the σ-levels of a 3D model, as
 /// weights `w_l ≥ 0` with `Σ_l w_l = 1` (ROMS `Qshape`).
+///
+/// The profiles in metres ([`Self::TopMetres`], [`Self::TaperedTopMetres`])
+/// are laid on each node's still-water column `h = −B`: layer `l` spans the
+/// depths `−σ_{l+1/2} h … −σ_{l−1/2} h` below the surface and takes the
+/// profile's share of them. A column shallower than the profile takes all
+/// of it (the share within the column, normalised). The weights stay fixed
+/// in time, so the free surface stretches the profile with the column (by
+/// `(h + η)/h`), as it does the σ-profiles; fixed weights keep the layers'
+/// volume sources, Ω and the tracer sources the same at every stage.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RiverProfile {
     /// In proportion to the layer thickness, `w_l = Δσ_l`.
     DepthUniform,
     /// Over the top fraction `f ∈ (0, 1]` of the column, `σ ∈ [−f, 0]`, in
-    /// proportion to each layer's overlap with it. A river's fresh water
-    /// enters at the surface.
+    /// proportion to each layer's overlap with it. In deep water this goes
+    /// deep: the top 20 % of a 400 m fjord is 80 m.
     TopFraction(f64),
+    /// Over the top `d` metres (`d > 0`), uniformly per metre.
+    TopMetres(f64),
+    /// Over the top `d` metres (`d > 0`), per metre falling linearly from
+    /// the surface to zero at `d`: `2/d (1 − z/d)` at depth `z`. NorKyst-800's
+    /// rivers enter so over the top ≈ 3 m (its `river_Vshape`, whatever the
+    /// depth; `notes/operational.md`, P5.1).
+    TaperedTopMetres(f64),
     /// Given weights per level, bed first; normalised to sum to one.
     Levels(Vec<f64>),
 }
 
 impl RiverProfile {
-    /// The weights on `sigma` (bed first), summing to one.
-    pub fn weights(&self, sigma: &SigmaGrid) -> Result<Vec<f64>, RiverError> {
+    /// The weights on `sigma` (bed first) at a node of still-water depth
+    /// `depth` (m; only the profiles in metres read it), summing to one.
+    pub fn weights(&self, sigma: &SigmaGrid, depth: f64) -> Result<Vec<f64>, RiverError> {
         let d_sigma = sigma.d_sigma();
         let raw: Vec<f64> = match self {
             Self::DepthUniform => d_sigma.to_vec(),
@@ -146,6 +163,28 @@ impl RiverProfile {
                     .windows(2)
                     .map(|w| (w[1].min(0.0) - w[0].max(-f)).max(0.0))
                     .collect()
+            }
+            Self::TopMetres(d) | Self::TaperedTopMetres(d) => {
+                if !(d.is_finite() && *d > 0.0) {
+                    return Err(RiverError::Profile(format!("depth {d} m is not positive")));
+                }
+                // On land or a dry node there is no column to lay the profile
+                // on: the water enters as in a column shallower than it
+                if depth.is_nan() || depth <= 0.0 {
+                    d_sigma.to_vec()
+                } else {
+                    // The profile's share from the surface down to z
+                    let tapered = matches!(self, Self::TaperedTopMetres(_));
+                    let share = |z: f64| {
+                        let x = (z / d).clamp(0.0, 1.0);
+                        if tapered { x * (2.0 - x) } else { x }
+                    };
+                    sigma
+                        .sigma_w()
+                        .windows(2)
+                        .map(|w| share(-w[0] * depth) - share(-w[1] * depth))
+                        .collect()
+                }
             }
             Self::Levels(weights) => {
                 if weights.len() != d_sigma.len() {
@@ -190,7 +229,8 @@ pub struct River {
 
 impl River {
     /// A fresh-water river at `position` with a constant discharge, at 5 °C,
-    /// entering over the top 20 % of the column.
+    /// entering over the top 3 m, tapered as NorKyst-800's
+    /// ([`RiverProfile::TaperedTopMetres`]).
     pub fn new(name: impl Into<String>, position: [f64; 2], discharge: f64) -> Self {
         Self {
             name: name.into(),
@@ -198,7 +238,7 @@ impl River {
             discharge: RiverSeries::constant(discharge),
             temperature: RiverSeries::constant(5.0),
             salinity: RiverSeries::constant(0.0),
-            profile: RiverProfile::TopFraction(0.2),
+            profile: RiverProfile::TaperedTopMetres(3.0),
         }
     }
 
@@ -278,9 +318,10 @@ pub struct RiverSources {
     /// `by_element[offsets[k]..offsets[k + 1]]`.
     offsets: Vec<usize>,
     by_element: Vec<usize>,
-    /// Weights of the levels of a 3D model, `[river][level]` (empty until
-    /// [`Self::set_levels`]).
+    /// Weights of the levels of a 3D model at every node of the river's
+    /// element, `[river][node][level]` (empty until [`Self::set_levels`]).
     shape: Vec<f64>,
+    n_nodes: usize,
     n_levels: usize,
 }
 
@@ -360,6 +401,7 @@ impl RiverSources {
             offsets,
             by_element,
             shape: Vec::new(),
+            n_nodes: 0,
             n_levels: 0,
         }
     }
@@ -418,26 +460,37 @@ impl RiverSources {
             .sum()
     }
 
-    /// Resolve the rivers' vertical profiles on the levels of `sigma` (for a
-    /// 3D model).
-    pub fn set_levels(&mut self, sigma: &SigmaGrid) -> Result<(), RiverError> {
-        let mut shape = Vec::with_capacity(self.len() * sigma.n_levels());
-        for river in &self.rivers {
-            shape.extend(river.profile.weights(sigma)?);
+    /// Resolve the rivers' vertical profiles on the levels of `sigma` at
+    /// every node of their elements, over the still-water depth `−B` of
+    /// `bathymetry` (for a 3D model; see [`RiverProfile`]).
+    pub fn set_levels(
+        &mut self,
+        sigma: &SigmaGrid,
+        bathymetry: &Bathymetry2D,
+    ) -> Result<(), RiverError> {
+        let nn = bathymetry.n_nodes;
+        let mut shape = Vec::with_capacity(self.len() * nn * sigma.n_levels());
+        for (river, k) in self.rivers.iter().zip(&self.elements) {
+            for i in 0..nn {
+                let depth = -bathymetry.data[k.as_usize() * nn + i];
+                shape.extend(river.profile.weights(sigma, depth)?);
+            }
         }
         self.shape = shape;
+        self.n_nodes = nn;
         self.n_levels = sigma.n_levels();
         Ok(())
     }
 
-    /// Weights of river `i` on the levels (bed first), after
-    /// [`Self::set_levels`].
-    pub fn level_weights(&self, i: usize) -> &[f64] {
+    /// Weights of river `i` on the levels (bed first) at node `node` of its
+    /// element, after [`Self::set_levels`].
+    pub fn level_weights(&self, i: usize, node: usize) -> &[f64] {
         assert!(
             self.n_levels > 0,
             "the rivers' levels are not set (RiverSources::set_levels)"
         );
-        &self.shape[i * self.n_levels..(i + 1) * self.n_levels]
+        let start = (i * self.n_nodes + node) * self.n_levels;
+        &self.shape[start..start + self.n_levels]
     }
 
     /// Number of levels of [`Self::set_levels`] (0 before).
@@ -578,12 +631,12 @@ impl RiverInflow<'_> {
             .sum()
     }
 
-    /// Add the layer volume sources `s_l = Σ w_l Q̄/A_k` (m/s) of element `k`
-    /// to `out` (one per level, bed first).
-    pub fn add_layer_rates(&self, k: usize, out: &mut [f64]) {
+    /// Add the layer volume sources `s_l = Σ w_l Q̄/A_k` (m/s) at node
+    /// `node` of element `k` to `out` (one per level, bed first).
+    pub fn add_layer_rates(&self, k: usize, node: usize, out: &mut [f64]) {
         for &i in self.rivers.in_element(k) {
             let rate = self.discharge[i] * self.rivers.inv_area[i];
-            for (o, &w) in out.iter_mut().zip(self.rivers.level_weights(i)) {
+            for (o, &w) in out.iter_mut().zip(self.rivers.level_weights(i, node)) {
                 *o += w * rate;
             }
         }
@@ -603,9 +656,9 @@ impl RiverInflow<'_> {
             let k = self.rivers.element(i).as_usize();
             let rate = self.discharge[i] * self.rivers.inv_area[i];
             let c = concentration(self.rivers.river(i));
-            let weights = self.rivers.level_weights(i);
-            for column in rhs[k * n_nodes * nl..(k + 1) * n_nodes * nl].chunks_exact_mut(nl) {
-                for (r, &w) in column.iter_mut().zip(weights) {
+            let columns = rhs[k * n_nodes * nl..(k + 1) * n_nodes * nl].chunks_exact_mut(nl);
+            for (node, column) in columns.enumerate() {
+                for (r, &w) in column.iter_mut().zip(self.rivers.level_weights(i, node)) {
                     *r += w * rate * c;
                 }
             }
@@ -623,12 +676,13 @@ impl RiverInflow<'_> {
         for i in 0..self.rivers.len() {
             let k = self.rivers.element(i).as_usize();
             let rate = self.discharge[i] * self.rivers.inv_area[i];
-            let weights = self.rivers.level_weights(i);
             let columns = k * n_nodes * nw..(k + 1) * n_nodes * nw;
-            for (r, phi) in rhs[columns.clone()]
+            for (node, (r, phi)) in rhs[columns.clone()]
                 .chunks_exact_mut(nw)
                 .zip(field[columns].chunks_exact(nw))
+                .enumerate()
             {
+                let weights = self.rivers.level_weights(i, node);
                 for j in 0..nw {
                     let below = if j > 0 { weights[j - 1] } else { 0.0 };
                     let above = weights.get(j).copied().unwrap_or(0.0);
@@ -670,21 +724,101 @@ mod tests {
     #[test]
     fn profiles_sum_to_one_where_they_should() {
         let sigma = SigmaGrid::new(5, UniformStretching);
-        let uniform = RiverProfile::DepthUniform.weights(&sigma).unwrap();
+        let uniform = RiverProfile::DepthUniform.weights(&sigma, 10.0).unwrap();
         assert!(uniform.iter().all(|w| (w - 0.2).abs() < 1e-15));
         // Top 30 %: the top layer whole, the next one half
-        let top = RiverProfile::TopFraction(0.3).weights(&sigma).unwrap();
+        let top = RiverProfile::TopFraction(0.3)
+            .weights(&sigma, 10.0)
+            .unwrap();
         let expected = [0.0, 0.0, 0.0, 1.0 / 3.0, 2.0 / 3.0];
         for (w, e) in top.iter().zip(expected) {
             assert!((w - e).abs() < 1e-14, "{top:?}");
         }
         let levels = RiverProfile::Levels(vec![0.0, 0.0, 0.0, 1.0, 3.0])
-            .weights(&sigma)
+            .weights(&sigma, 10.0)
             .unwrap();
         assert_eq!(levels, vec![0.0, 0.0, 0.0, 0.25, 0.75]);
-        assert!(RiverProfile::Levels(vec![1.0; 4]).weights(&sigma).is_err());
-        assert!(RiverProfile::TopFraction(0.0).weights(&sigma).is_err());
-        assert!(RiverProfile::Levels(vec![0.0; 5]).weights(&sigma).is_err());
+        assert!(
+            RiverProfile::Levels(vec![1.0; 4])
+                .weights(&sigma, 10.0)
+                .is_err()
+        );
+        assert!(
+            RiverProfile::TopFraction(0.0)
+                .weights(&sigma, 10.0)
+                .is_err()
+        );
+        assert!(
+            RiverProfile::Levels(vec![0.0; 5])
+                .weights(&sigma, 10.0)
+                .is_err()
+        );
+        assert!(RiverProfile::TopMetres(0.0).weights(&sigma, 10.0).is_err());
+        assert!(
+            RiverProfile::TaperedTopMetres(f64::NAN)
+                .weights(&sigma, 10.0)
+                .is_err()
+        );
+    }
+
+    /// The profiles in metres reach the same depth in any column: the
+    /// top 3 m of 10 m and of 300 m of water.
+    #[test]
+    fn profiles_in_metres_keep_their_depth_in_any_column() {
+        let close = |w: &[f64], e: &[f64]| {
+            assert_eq!(w.len(), e.len());
+            for (w, e) in w.iter().zip(e) {
+                assert!((w - e).abs() < 1e-13, "{w:?} ≠ {e:?}");
+            }
+        };
+        let sigma = SigmaGrid::new(5, UniformStretching);
+        // 10 m: 2 m layers; the top 3 m are the top layer and half the next
+        let w = RiverProfile::TopMetres(3.0).weights(&sigma, 10.0).unwrap();
+        close(&w, &[0.0, 0.0, 0.0, 1.0 / 3.0, 2.0 / 3.0]);
+        // Tapered, 2x − x² of x = z/3: 8/9 above 2 m, 1/9 below
+        let w = RiverProfile::TaperedTopMetres(3.0)
+            .weights(&sigma, 10.0)
+            .unwrap();
+        close(&w, &[0.0, 0.0, 0.0, 1.0 / 9.0, 8.0 / 9.0]);
+        // 300 m: all of it in the top layer (60 m)
+        let w = RiverProfile::TaperedTopMetres(3.0)
+            .weights(&sigma, 300.0)
+            .unwrap();
+        close(&w, &[0.0, 0.0, 0.0, 0.0, 1.0]);
+        // A 1 m column takes the profile's share within it (2/3 − 1/9 = 5/9
+        // of the tapered), normalised; layer l spans the depths 0.8 − 0.2 l
+        // to 1 − 0.2 l
+        let w = RiverProfile::TaperedTopMetres(3.0)
+            .weights(&sigma, 1.0)
+            .unwrap();
+        let share = |z: f64| (z / 3.0) * (2.0 - z / 3.0);
+        let expected: Vec<f64> = (0..5)
+            .map(|l| {
+                let top = 0.8 - 0.2 * l as f64;
+                (share(top + 0.2) - share(top)) / (5.0 / 9.0)
+            })
+            .collect();
+        close(&w, &expected);
+        // Land or a dry node: as the layers' thickness
+        let w = RiverProfile::TopMetres(3.0).weights(&sigma, -2.0).unwrap();
+        close(&w, &[0.2; 5]);
+        // A finer, stretched grid: the share above 3 m is all of it at any depth
+        let sigma = SigmaGrid::new(
+            40,
+            crate::vertical::SongHaidvogelStretching::new(5.0, 0.4, 10.0),
+        );
+        for depth in [10.0, 61.0, 286.0, 800.0] {
+            let w = RiverProfile::TaperedTopMetres(3.0)
+                .weights(&sigma, depth)
+                .unwrap();
+            let sigma_w = sigma.sigma_w();
+            let below: f64 = (0..40)
+                .filter(|&l| -sigma_w[l + 1] * depth >= 3.0)
+                .map(|l| w[l])
+                .sum();
+            assert!(below == 0.0, "{depth} m: {below} below 3 m");
+            assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-14);
+        }
     }
 
     #[test]

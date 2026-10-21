@@ -1841,12 +1841,12 @@ mod tests {
         let case = SlopingTide::new();
         let eos = LinearEOS::default();
         let (k0, nl) = (3.1e-4, case.sigma.n_levels());
-        let rivers = [false, true];
-        for with_river in rivers {
-            let physics = if with_river {
-                case.physics_with_rivers(vec![river(eos.t0, eos.s0)])
-            } else {
-                case.physics()
+        let rivers = [None].into_iter().chain(river_profiles().map(Some));
+        for profile in rivers {
+            let with_river = profile.is_some();
+            let physics = match profile {
+                Some(profile) => case.physics_with_rivers(vec![river(eos.t0, eos.s0, profile)]),
+                None => case.physics(),
             };
             let mut state = case.state(&physics, |_, _| (eos.t0, eos.s0));
             state.tke = w_point_field(&physics, nl, case.axis, |_, j| {
@@ -1928,15 +1928,25 @@ mod tests {
         );
     }
 
-    /// A river into the middle of [`SlopingTide`]'s basin, entering over the
-    /// top 40 % of the column (levels weighted 0, 1/6, 5/6), 20 m³/s: over
+    /// A river into the middle of [`SlopingTide`]'s basin, 20 m³/s: over
     /// the period it raises the basin by ≈ 4.5 cm and its own element by far
     /// more each step.
-    fn river(temperature: f64, salinity: f64) -> River {
+    fn river(temperature: f64, salinity: f64, profile: RiverProfile) -> River {
         River::new("river", [437.5, 25.0], 20.0)
             .with_temperature(RiverSeries::constant(temperature))
             .with_salinity(RiverSeries::constant(salinity))
-            .with_profile(RiverProfile::TopFraction(0.4))
+            .with_profile(profile)
+    }
+
+    /// The river gates' profiles: the top 40 % of the column (levels
+    /// weighted 0, 1/6, 5/6, the same at every node), and NorKyst's tapered
+    /// top 3 m, whose weights differ from node to node of the river's
+    /// element over the sloping bed (7.6–9.6 m deep).
+    fn river_profiles() -> [RiverProfile; 2] {
+        [
+            RiverProfile::TopFraction(0.4),
+            RiverProfile::TaperedTopMetres(3.0),
+        ]
     }
 
     /// TODO P1.6/P5.1 gate: a river of the ambient water keeps uniform
@@ -1946,48 +1956,50 @@ mod tests {
     /// volume grows by exactly `Q·t`.
     #[test]
     fn a_river_of_the_ambient_water_keeps_the_tracers_uniform() {
-        let case = SlopingTide::new();
-        let eos = LinearEOS::default();
-        let (t_river, s_river) = (eos.t0 + 2.3, eos.s0 - 0.9);
-        let physics = case.physics_with_rivers(vec![river(t_river, s_river)]);
-        let mut state = case.state(&physics, |_, _| (t_river, s_river));
-        let volume0 = case.volume(&state);
-        let (mut drift, mut residual, mut omega_scale) = (0.0_f64, 0.0_f64, 0.0_f64);
-        let (mut volume_error, mut step) = (0.0_f64, 0);
-        case.run(&physics, &mut state, |s, p| {
-            step += 1;
-            for t in &s.temp {
-                drift = drift.max((t - t_river).abs());
-            }
-            for salt in &s.salt {
-                drift = drift.max((salt - s_river).abs());
-            }
-            residual = residual.max(p.last_surface_residual());
-            omega_scale = omega_scale.max(s.w.iter().fold(0.0, |m, w| m.max(w.abs())));
-            let expected = volume0 + 20.0 * step as f64 * case.dt();
-            volume_error = volume_error.max((case.volume(s) - expected).abs() / volume0);
-        });
-        let rise = (case.volume(&state) - volume0) / (case.length * 100.0);
-        assert!(
-            rise > 0.04,
-            "test regime: the river raised η by {rise:.3} m"
-        );
-        // Measured 8.9e-13
-        assert!(
-            drift < 1e-11 * eos.s0,
-            "uniform tracers drifted by {drift:.3e} with the river"
-        );
-        assert!(omega_scale > 1e-5, "test regime: Ω {omega_scale:.2e}");
-        // Measured 3.5e-18 against Ω of 6.8e-3 m/s
-        assert!(
-            residual < 1e-10 * omega_scale,
-            "Ω surface residual {residual:.2e} (Ω scale {omega_scale:.2e})"
-        );
-        // Measured 2.0e-14
-        assert!(
-            volume_error < 1e-13,
-            "the volume differs from V₀ + Q·t by {volume_error:.2e} (relative)"
-        );
+        for profile in river_profiles() {
+            let case = SlopingTide::new();
+            let eos = LinearEOS::default();
+            let (t_river, s_river) = (eos.t0 + 2.3, eos.s0 - 0.9);
+            let physics = case.physics_with_rivers(vec![river(t_river, s_river, profile.clone())]);
+            let mut state = case.state(&physics, |_, _| (t_river, s_river));
+            let volume0 = case.volume(&state);
+            let (mut drift, mut residual, mut omega_scale) = (0.0_f64, 0.0_f64, 0.0_f64);
+            let (mut volume_error, mut step) = (0.0_f64, 0);
+            case.run(&physics, &mut state, |s, p| {
+                step += 1;
+                for t in &s.temp {
+                    drift = drift.max((t - t_river).abs());
+                }
+                for salt in &s.salt {
+                    drift = drift.max((salt - s_river).abs());
+                }
+                residual = residual.max(p.last_surface_residual());
+                omega_scale = omega_scale.max(s.w.iter().fold(0.0, |m, w| m.max(w.abs())));
+                let expected = volume0 + 20.0 * step as f64 * case.dt();
+                volume_error = volume_error.max((case.volume(s) - expected).abs() / volume0);
+            });
+            let rise = (case.volume(&state) - volume0) / (case.length * 100.0);
+            assert!(
+                rise > 0.04,
+                "test regime: the river raised η by {rise:.3} m"
+            );
+            // Measured 8.9e-13
+            assert!(
+                drift < 1e-11 * eos.s0,
+                "{profile:?}: uniform tracers drifted by {drift:.3e} with the river"
+            );
+            assert!(omega_scale > 1e-5, "test regime: Ω {omega_scale:.2e}");
+            // Measured 3.5e-18 against Ω of 6.8e-3 m/s
+            assert!(
+                residual < 1e-10 * omega_scale,
+                "Ω surface residual {residual:.2e} (Ω scale {omega_scale:.2e})"
+            );
+            // Measured 2.0e-14
+            assert!(
+                volume_error < 1e-13,
+                "the volume differs from V₀ + Q·t by {volume_error:.2e} (relative)"
+            );
+        }
     }
 
     /// TODO P1.6/P5.1 gate: fresh, warm river water adds exactly `Q·C·t` to
@@ -1995,58 +2007,60 @@ mod tests {
     /// diffusion, and stays near the surface it entered at.
     #[test]
     fn river_water_adds_exactly_its_tracer_inventory() {
-        let case = SlopingTide::new();
-        let (t_river, s_river) = (18.0, 0.0);
-        // The fresh front of the plume is a discontinuity: unlimited P2
-        // overshoots it (0.27 psu above the initial maximum within the
-        // period, where the tide alone gives 0.05)
-        let physics = case
-            .physics_with_rivers(vec![river(t_river, s_river)])
-            .with_tracer_limiter(TracerLimiter3DConfig {
-                limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
-                ..TracerLimiter3DConfig::default()
+        for profile in river_profiles() {
+            let case = SlopingTide::new();
+            let (t_river, s_river) = (18.0, 0.0);
+            // The fresh front of the plume is a discontinuity: unlimited P2
+            // overshoots it (0.27 psu above the initial maximum within the
+            // period, where the tide alone gives 0.05)
+            let physics = case
+                .physics_with_rivers(vec![river(t_river, s_river, profile.clone())])
+                .with_tracer_limiter(TracerLimiter3DConfig {
+                    limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+                    ..TracerLimiter3DConfig::default()
+                });
+            let mut state = case.state(&physics, |x, s| {
+                (
+                    10.0 + 3.0 * x / case.length - 2.0 * s,
+                    33.0 + x / case.length + s,
+                )
             });
-        let mut state = case.state(&physics, |x, s| {
-            (
-                10.0 + 3.0 * x / case.length - 2.0 * s,
-                33.0 + x / case.length + s,
-            )
-        });
-        let t0 = case.inventory(&state, &state.temp);
-        let s0 = case.inventory(&state, &state.salt);
-        let salt_max = state.salt.iter().copied().fold(0.0, f64::max);
-        let (mut max_err, mut step, mut salt_range) = (0.0_f64, 0, (f64::INFINITY, 0.0_f64));
-        case.run(&physics, &mut state, |s, _| {
-            step += 1;
-            let volume = 20.0 * step as f64 * case.dt();
-            max_err = max_err
-                .max((case.inventory(s, &s.temp) - t0 - volume * t_river).abs() / t0)
-                .max((case.inventory(s, &s.salt) - s0 - volume * s_river).abs() / s0);
-            for &salt in &s.salt {
-                salt_range = (salt_range.0.min(salt), salt_range.1.max(salt));
-            }
-        });
-        // Measured 3.5e-15
-        assert!(
-            max_err < 1e-12,
-            "tracer inventory differs from the river input by {max_err:.3e} (relative)"
-        );
-        // The fresh water dilutes, it does not overshoot
-        assert!(
-            salt_range.0 >= -1e-9 && salt_range.1 <= salt_max + 1e-9,
-            "salinity left [0, {salt_max}]: {salt_range:?}"
-        );
-        // Fresher at the top of the river's element than at the bottom
-        let nl = case.sigma.n_levels();
-        let k = physics.rivers.as_ref().unwrap().element(0).as_usize();
-        let column = |i: usize| &state.salt[(k * case.ops.n_nodes + i) * nl..][..nl];
-        let (top, bottom): (f64, f64) = (0..case.ops.n_nodes)
-            .map(|i| (column(i)[nl - 1], column(i)[0]))
-            .fold((0.0, 0.0), |(a, b), (t, bt)| (a + t, b + bt));
-        assert!(
-            top < bottom - 0.1 * case.ops.n_nodes as f64,
-            "river element: top salinity {top:.3} against bottom {bottom:.3} (summed over nodes)"
-        );
+            let t0 = case.inventory(&state, &state.temp);
+            let s0 = case.inventory(&state, &state.salt);
+            let salt_max = state.salt.iter().copied().fold(0.0, f64::max);
+            let (mut max_err, mut step, mut salt_range) = (0.0_f64, 0, (f64::INFINITY, 0.0_f64));
+            case.run(&physics, &mut state, |s, _| {
+                step += 1;
+                let volume = 20.0 * step as f64 * case.dt();
+                max_err = max_err
+                    .max((case.inventory(s, &s.temp) - t0 - volume * t_river).abs() / t0)
+                    .max((case.inventory(s, &s.salt) - s0 - volume * s_river).abs() / s0);
+                for &salt in &s.salt {
+                    salt_range = (salt_range.0.min(salt), salt_range.1.max(salt));
+                }
+            });
+            // Measured 3.5e-15
+            assert!(
+                max_err < 1e-12,
+                "{profile:?}: tracer inventory differs from the river input by {max_err:.3e} (relative)"
+            );
+            // The fresh water dilutes, it does not overshoot
+            assert!(
+                salt_range.0 >= -1e-9 && salt_range.1 <= salt_max + 1e-9,
+                "salinity left [0, {salt_max}]: {salt_range:?}"
+            );
+            // Fresher at the top of the river's element than at the bottom
+            let nl = case.sigma.n_levels();
+            let k = physics.rivers.as_ref().unwrap().element(0).as_usize();
+            let column = |i: usize| &state.salt[(k * case.ops.n_nodes + i) * nl..][..nl];
+            let (top, bottom): (f64, f64) = (0..case.ops.n_nodes)
+                .map(|i| (column(i)[nl - 1], column(i)[0]))
+                .fold((0.0, 0.0), |(a, b), (t, bt)| (a + t, b + bt));
+            assert!(
+                top < bottom - 0.1 * case.ops.n_nodes as f64,
+                "river element: top salinity {top:.3} against bottom {bottom:.3} (summed over nodes)"
+            );
+        }
     }
 
     /// TODO P4.2 gate: the layer momentum moves with the layer transports. A

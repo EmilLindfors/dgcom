@@ -631,7 +631,7 @@ where
     /// # Panics
     /// If a river's profile does not fit the σ-levels.
     pub fn with_rivers(mut self, mut rivers: RiverSources) -> Self {
-        if let Err(error) = rivers.set_levels(&self.sigma) {
+        if let Err(error) = rivers.set_levels(&self.sigma, &self.bathymetry) {
             panic!("Hydrostatic3D::with_rivers: {error}");
         }
         self.rivers = Some(Arc::new(rivers));
