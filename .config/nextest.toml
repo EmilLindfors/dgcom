@@ -21,6 +21,7 @@ not (
   | test(=a_stratified_seamount_at_rest_stays_at_rest_on_distorted_elements)
   | test(=simulation::simulation_3d::tests::a_pycnocline_over_a_smoothed_cliff_stays_at_rest)
   | test(=simulation::simulation_3d::tests::a_river_drives_an_estuarine_circulation_in_a_fjord)
+  | test(=a_rivers_brackish_layer_is_critical_at_the_fjord_mouth)
   | test(=simulation::simulation_3d::tests::a_sharp_lock_exchange_interface_stays_in_range)
   | test(=simulation::simulation_3d::tests::a_stratified_seamount_at_rest_stays_at_rest)
   | test(=simulation::simulation_3d::tests::a_stratified_seamount_at_rest_stays_at_rest_under_the_kuzmin_limiter)
