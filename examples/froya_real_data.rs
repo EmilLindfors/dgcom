@@ -111,7 +111,7 @@
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [wave_stations=NAME:LON,LAT;…] \
 //!     [levels=0] [tide3d=0] [rk_3d=43|3] [cfl_3d=4|2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] \
-//!     [restart_hours=0] [resume=<file>]
+//!     [restart_hours=0] [resume=<file>] [rivers=<file>] [river_snap_km=2] [river_top=0.2]
 //! ```
 //!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
@@ -224,7 +224,12 @@
 //! `jerlov=` water type (III, NorKyst v3's); `heat=0` leaves them out. The vertical mixing
 //! is GLS with Canuto A stability functions, `mixing=k-epsilon` (default),
 //! `k-omega` or `generic` (Umlauf & Burchard's, NorKyst v3's "gen";
-//! Christensen et al. 2026). The stations, the progress
+//! Christensen et al. 2026). `rivers=<file>` (from `norkyst_river_subset`:
+//! NorKyst-800's NVE rivers, daily) adds the rivers as volume sources with
+//! their water's temperature and salinity (`RiverForcing`,
+//! `Hydrostatic3D::with_rivers`), each in the element of its mouth or snapped
+//! onto the mesh from up to `river_snap_km` away (rivers farther off are listed
+//! and left out), entering over the top `river_top` of the column. The stations, the progress
 //! lines and a 3D snapshot file (`snapshot_minutes=`,
 //! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step (60 s by
 //! default; the parent and the weather must cover a third of it past the
@@ -731,6 +736,15 @@ struct Options {
     restart_hours: f64,
     /// Resume the 3D tide from this restart file (`resume=`)
     resume: Option<PathBuf>,
+    /// Rivers of the 3D tide (`rivers=<file>`, from `norkyst_river_subset`),
+    /// snapped onto the mesh from up to `river_snap_km` away, entering over
+    /// the top `river_top` of the column
+    #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
+    rivers: Option<PathBuf>,
+    #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
+    river_snap_km: f64,
+    #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
+    river_top: f64,
     output: Option<PathBuf>,
 }
 
@@ -840,6 +854,9 @@ impl Options {
             debug_3d: args.get("debug_3d").cloned().unwrap_or_default(),
             restart_hours: get("restart_hours", 0.0)?,
             resume: args.get("resume").map(PathBuf::from),
+            rivers: args.get("rivers").map(PathBuf::from),
+            river_snap_km: get("river_snap_km", 2.0)?,
+            river_top: get("river_top", 0.2)?,
             wave_grid: {
                 let text = args.get("wave_grid").map_or("25,36", String::as_str);
                 let parts: Vec<usize> = text
@@ -1901,6 +1918,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if opts.restart_hours > 0.0 || opts.resume.is_some() {
         return Err("restart_hours= and resume= are for the 3D tide (levels=N tide3d=1)".into());
+    }
+    if opts.rivers.is_some() {
+        return Err("rivers= is for the 3D tide (levels=N tide3d=1)".into());
     }
     if opts.wave_coupling > 0.0 && opts.levels > 0 {
         return Err("wave_coupling= is for the 2D tide".into());
@@ -3237,6 +3257,100 @@ impl MeanProfile {
 }
 
 /// The tide in 3D (`levels=N tide3d=1`, TODO P1.3): see the module docs.
+/// The rivers of `rivers=` on the mesh, those whose mouth is within
+/// `river_snap_km` of it (the others are listed and left out).
+#[cfg(feature = "netcdf")]
+fn rivers_3d(
+    domain: &Domain,
+    opts: &Options,
+    clock: &ModelClock,
+    t_end: f64,
+) -> Result<Option<dg_rs::source::RiverSources>, Box<dyn std::error::Error>> {
+    use dg_rs::io::RiverForcing;
+    use dg_rs::source::{RiverProfile, RiverSources};
+
+    let Some(path) = &opts.rivers else {
+        return Ok(None);
+    };
+    let projection = domain
+        .projection
+        .ok_or("rivers= needs a georeferenced domain (the Frøya data files)")?;
+    let forcing = RiverForcing::from_file(path)?;
+    // Daily values: the run must lie within the file's days
+    let (first, last) = forcing.time_range();
+    let (start, end) = (clock.unix(0.0), clock.unix(t_end));
+    if start < first || end > last {
+        return Err(format!(
+            "{}: the rivers run from {} to {}, the run from {} to {} \
+             (`norkyst_river_subset start= days=`)",
+            path.display(),
+            clock.format(clock.model_time(first)),
+            clock.format(clock.model_time(last)),
+            clock.format(0.0),
+            clock.format(t_end)
+        )
+        .into());
+    }
+    let rivers = forcing.rivers(
+        &projection,
+        clock,
+        &RiverProfile::TopFraction(opts.river_top),
+    )?;
+    let (sources, skipped) = RiverSources::on_mesh(
+        rivers,
+        &domain.mesh,
+        &domain.geom,
+        1000.0 * opts.river_snap_km,
+    );
+    // Over the run, hourly
+    let hours = (t_end / 3600.0).ceil().max(1.0) as usize;
+    let mean = |i: usize| {
+        (0..=hours)
+            .map(|h| sources.discharge(i, (h as f64 * 3600.0).min(t_end)))
+            .sum::<f64>()
+            / (hours + 1) as f64
+    };
+    let total: f64 = (0..sources.len()).map(mean).sum();
+    println!(
+        "  Rivers: {} of {} from {} ({total:.1} m³/s over the run), over the top {:.0} % of \
+         the column; {} more than {} km from the mesh left out",
+        sources.len(),
+        forcing.len(),
+        path.display(),
+        100.0 * opts.river_top,
+        skipped.len(),
+        opts.river_snap_km
+    );
+    let mut order: Vec<usize> = (0..sources.len()).collect();
+    order.sort_by(|&a, &b| mean(b).total_cmp(&mean(a)));
+    for &i in order.iter().take(5) {
+        println!(
+            "    river {}: {:.1} m³/s into element {} (snapped {:.0} m)",
+            sources.river(i).name,
+            mean(i),
+            sources.element(i).as_usize(),
+            sources.snap_distance(i)
+        );
+    }
+    for error in skipped.iter().take(5) {
+        println!("    left out: {error}");
+    }
+    Ok(Some(sources))
+}
+
+#[cfg(not(feature = "netcdf"))]
+fn rivers_3d(
+    _domain: &Domain,
+    opts: &Options,
+    _clock: &ModelClock,
+    _t_end: f64,
+) -> Result<Option<dg_rs::source::RiverSources>, Box<dyn std::error::Error>> {
+    match opts.rivers {
+        Some(_) => Err("rivers= needs the `netcdf` feature".into()),
+        None => Ok(None),
+    }
+}
+
 fn tidal_run_3d(
     domain: &Domain,
     opts: &Options,
@@ -3587,6 +3701,9 @@ fn tidal_run_3d(
         physics = physics
             .with_surface_fluxes(fluxes)
             .with_shortwave_absorption(opts.jerlov);
+    }
+    if let Some(rivers) = rivers_3d(domain, opts, &clock, t_end)? {
+        physics = physics.with_rivers(rivers);
     }
     // The horizontal viscosity once per step (`visc_step`, as ROMS)
     if dbg("visc_step") {

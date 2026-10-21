@@ -188,7 +188,9 @@ pub use analysis::{
 };
 
 // I/O types
-pub use io::{AtmosphereField, AtmosphereReader, AtmosphereState, OceanModelReader, OceanState};
+pub use io::{
+    AtmosphereField, AtmosphereReader, AtmosphereState, OceanModelReader, OceanState, RiverForcing,
+};
 pub use io::{
     BathymetryStatistics,
     BedRaster,

@@ -12,6 +12,8 @@
 //! - **Gridded external models**: parent ocean models (`OceanModelReader`) and
 //!   weather models (`AtmosphereReader`) on structured lon/lat grids
 //!   (`GeoGrid`, `FieldSeries`); NetCDF reading requires `netcdf`
+//! - **River forcing**: ROMS river files (NorKyst-800's NVE rivers) as
+//!   `RiverForcing`, for `source::RiverSources`
 //! - **GeoTIFF bathymetry**: Load depth data from GeoTIFF raster files
 //! - **Coastline data**: Load coastline polygons from GSHHS shapefiles
 //! - **Coordinate projections**: Transform between geographic and Cartesian coordinates
@@ -100,6 +102,7 @@ mod particle_file;
 mod profile_series;
 mod projection;
 mod restart;
+mod river_forcing;
 mod snapshot;
 mod tide_gauge_reader;
 mod timeseries_reader;
@@ -147,6 +150,7 @@ pub use particle_file::{ParticleFileReader, ParticleFileWriter, ParticleFrame, s
 pub use profile_series::{ProfileLevels, ProfileSeries};
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
 pub use restart::{Restart3D, RestartError, domain_fingerprint};
+pub use river_forcing::{RiverForcing, RiverMouth, RomsRhoPoints, roms_source_position};
 pub use snapshot::{
     SOLUTION_3D_FIELDS, SnapshotError, SnapshotFrame, SnapshotHeader, SnapshotLayout,
     SnapshotLevels, SnapshotReader, SnapshotWriter,

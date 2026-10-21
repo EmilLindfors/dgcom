@@ -144,7 +144,15 @@ fn read_grid(
 /// mis-time the forcing. A file without a time variable is one
 /// time-invariant snapshot.
 pub(crate) fn read_time(file: &netcdf::File) -> Result<(Vec<f64>, Option<String>), NetCDFError> {
-    for name in ["time", "ocean_time", "Time", "valid_time"] {
+    read_time_named(file, &["time", "ocean_time", "Time", "valid_time"])
+}
+
+/// [`read_time`] from the first of the variables `names` the file has.
+pub(crate) fn read_time_named(
+    file: &netcdf::File,
+    names: &[&str],
+) -> Result<(Vec<f64>, Option<String>), NetCDFError> {
+    for &name in names {
         let Some(var) = file.variable(name) else {
             continue;
         };
