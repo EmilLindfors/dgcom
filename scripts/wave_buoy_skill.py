@@ -11,7 +11,7 @@ buoys' hourly means (`scripts/e39_buoy_series.py`), for one or more runs of
 the baseline (the spectra file of `scripts/nora3_wave_spectra.py`).
 
 The model's samples (every `station_minutes`) are averaged over the same
-hours [t, t + 1 h) as the buoys'. Scores from `after` hours of model time on:
+hours [t, t + 1 h) as the buoys'. Scores the hours from `after` up to `until` of model time:
 bias, RMSE, scatter index SI = RMSE / mean observed, and the correlation r;
 T_p and the mean direction (coming from) are reported as means and the mean
 difference, not scored. The parent counts only within `max_km` of the buoy.
@@ -19,7 +19,7 @@ difference, not scored. The parent counts only within `max_km` of the buoy.
 Usage:
     uv run scripts/wave_buoy_skill.py obs=data/wave_buoys/e39_20240131.txt \\
         start=2024-01-31T00:00:00Z runs=swan:output/alesund_swan,wam:output/alesund_wam \\
-        [parent=data/alesund_nora3_spectra.nc] [after=12] [max_km=5]
+        [parent=data/alesund_nora3_spectra.nc] [after=12] [until=HOURS] [max_km=5]
 """
 import math
 import sys
@@ -77,6 +77,7 @@ def main() -> None:
     args = dict(a.split("=", 1) for a in sys.argv[1:])
     start = datetime.fromisoformat(args["start"].replace("Z", "+00:00")).timestamp()
     after = float(args.get("after", "12")) * 3600.0
+    until = float(args.get("until", "inf")) * 3600.0
     max_km = float(args.get("max_km", "5"))
     obs = {}
     for line in Path(args["obs"]).read_text().splitlines():
@@ -98,13 +99,14 @@ def main() -> None:
                       tp=np.asarray(nc["tp"][:, 0, :]))
 
     print(f"H_s against the buoys' hourly means, from hour {after / 3600:.0f}"
-          f" (bias, RMSE in m; SI = RMSE / mean observed)\n")
+          + (f" to {until / 3600:.0f}" if math.isfinite(until) else "")
+          + f" (bias, RMSE in m; SI = RMSE / mean observed)\n")
     print(f"{'buoy':5s} {'source':14s} {'n':>4s} {'obs':>6s} {'model':>6s} {'bias':>6s} {'RMSE':>6s} {'SI':>6s} {'r':>5s}"
           f"   {'Tp obs/mod':>11s}  {'dir diff':>8s}")
     summary = {}
     for name in sorted(obs, key=lambda n: "DABCFG".find(n[0])):
         rows = np.array(obs[name]["rows"])
-        rows = rows[rows[:, 0] >= after]
+        rows = rows[(rows[:, 0] >= after) & (rows[:, 0] < until)]
         hours, o_hs, o_tp, o_dir = rows.T
         sources = []
         for run, points in series.items():
