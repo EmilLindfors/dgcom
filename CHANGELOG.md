@@ -6,7 +6,7 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
-- **The Ålesund buoy test's two misses, followed up (TODO F.4).** `froya_real_data wave_mesh=FILE.msh[,ORDER]` runs the waves on a Gmsh mesh of their own (e.g. from `gmsh_coastline_mesh.py`, refined around a buoy) besides the uniform `wave_mesh=NX,NY[,ORDER]`; `scripts/wave_buoy_skill.py until=HOURS` ends the scoring window. Findings (`notes/waves.md`, Ålesund):
+- **The Ålesund buoy test's two misses, followed up (TODO F.4, PR #169).** `froya_real_data wave_mesh=FILE.msh[,ORDER]` runs the waves on a Gmsh mesh of their own (e.g. from `gmsh_coastline_mesh.py`, refined around a buoy) besides the uniform `wave_mesh=NX,NY[,ORDER]`; `scripts/wave_buoy_skill.py until=HOURS` ends the scoring window. Findings (`notes/waves.md`, Ålesund):
   - Buoy F's missing south-easterly sea is MET Nordic's wind, not the fetch: a domain extended 17 km south (fetch along 140° 20 km, was 10.5) leaves it at 0.01–0.07 m against 0.35–0.60. The buoy's own anemometer measured 9–12 m/s down Vartdalsfjorden where MET Nordic has 3–6, and with that wind blended into the forcing F's SI goes 0.44 → 0.25, bias 0.
   - The old box's open southern edge let the parent's open-sea spectra into a fjord. The extended box, all land to the south, is the test's domain from now on: on 500 m mean SI over A, B, C and F 0.258.
   - Buoy C's 4–5 s long T_p is not the grid's: a 500 m P2 wave grid (≈ 250 m P1) improves C's timing (r 0.27 → 0.64) but not its period (14.0 s against 9.1) or mean, at 4.4× the cost.
