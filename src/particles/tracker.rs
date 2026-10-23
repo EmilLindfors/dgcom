@@ -93,6 +93,21 @@ pub(super) fn standard_normal_pair(state: &mut u64) -> [f64; 2] {
     [radius * cos, radius * sin]
 }
 
+/// What the 2D random walk spreads, which sets its drift where the depth
+/// varies (see the [module docs](super)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WalkTracer {
+    /// A tracer mixed through the water column, `∂(hc)/∂t = ∇·(hK∇c)`: the
+    /// walk drifts by `K∇h/h` (Dimou & Adams 1993), so a population in
+    /// proportion to the depth stays so. The particles of a depth-averaged
+    /// flow.
+    #[default]
+    DepthIntegrated,
+    /// A tracer per unit area of the surface, `∂c/∂t = ∇·(K∇c)` (floating
+    /// matter): no depth drift, so a uniform areal population stays uniform.
+    Surface,
+}
+
 /// Advects and disperses particles through a DG velocity field (see the
 /// [module docs](super)).
 #[derive(Clone)]
@@ -100,6 +115,7 @@ pub struct ParticleTracker2D<'a> {
     ops: &'a DGOperators2D,
     locator: PointLocator2D<'a>,
     diffusivity: f64,
+    walk_tracer: WalkTracer,
     stranding_depth: Option<f64>,
     reflecting: Vec<BoundaryTag>,
     seed: u64,
@@ -119,6 +135,7 @@ impl<'a> ParticleTracker2D<'a> {
             ops,
             locator: PointLocator2D::new(mesh),
             diffusivity: 0.0,
+            walk_tracer: WalkTracer::default(),
             stranding_depth: None,
             reflecting: vec![BoundaryTag::Wall],
             seed: 0,
@@ -130,6 +147,13 @@ impl<'a> ParticleTracker2D<'a> {
     pub fn with_diffusivity(mut self, diffusivity: f64) -> Self {
         assert!(diffusivity >= 0.0 && diffusivity.is_finite());
         self.diffusivity = diffusivity;
+        self
+    }
+
+    /// What the walk spreads: a depth-integrated tracer (the default) or a
+    /// surface one (see [`WalkTracer`]).
+    pub fn with_walk_tracer(mut self, tracer: WalkTracer) -> Self {
+        self.walk_tracer = tracer;
         self
     }
 
@@ -202,8 +226,14 @@ impl<'a> ParticleTracker2D<'a> {
             .for_each(|p| self.advance(p, field, t, dt));
     }
 
+    /// The walk's diffusivity: the tracker's constant plus the field's `K`.
+    pub(super) fn walk_diffusivity(&self, field: Option<(f64, [f64; 2])>) -> f64 {
+        self.diffusivity + field.map_or(0.0, |(k, _)| k.max(0.0))
+    }
+
     /// Add the random walk over `dt` to `displacement`: the tracker's
-    /// constant diffusivity plus the field's `K` with its drift `∇K Δt`
+    /// constant diffusivity plus the field's `K` with its drift `∇K Δt`, and
+    /// with `depth` (`h` and `∇h` at the particle) the drift `K∇h/h Δt`
     /// (Euler–Maruyama at the start of the step; see
     /// [`super::diffusivity`]).
     pub(super) fn add_walk(
@@ -211,12 +241,19 @@ impl<'a> ParticleTracker2D<'a> {
         displacement: &mut [f64],
         rng: &mut u64,
         field: Option<(f64, [f64; 2])>,
+        depth: Option<(f64, [f64; 2])>,
         dt: f64,
     ) {
-        let (k_field, drift) = field.unwrap_or((0.0, [0.0; 2]));
-        let k = self.diffusivity + k_field.max(0.0);
+        let k = self.walk_diffusivity(field);
+        let drift = field.map_or([0.0; 2], |(_, gradient)| gradient);
         displacement[0] += drift[0] * dt;
         displacement[1] += drift[1] * dt;
+        if let Some((h, gradient)) = depth
+            && h > 0.0
+        {
+            displacement[0] += k * gradient[0] / h * dt;
+            displacement[1] += k * gradient[1] / h * dt;
+        }
         if k > 0.0 {
             let scale = (2.0 * k * dt).sqrt();
             let xi = standard_normal_pair(rng);
@@ -232,6 +269,56 @@ impl<'a> ParticleTracker2D<'a> {
         self.ops
             .interpolation_weights_into(point.r, point.s, weights);
         f(weights)
+    }
+
+    /// Call `f` with the nodal basis values at `point` and their physical
+    /// gradients `[∂ℓ/∂x, ∂ℓ/∂y]` there, through the element's bilinear map.
+    pub(super) fn with_gradient_weights<R>(
+        &self,
+        point: MeshPoint,
+        f: impl FnOnce(&[f64], [&[f64]; 2]) -> R,
+    ) -> R {
+        let n = self.ops.n_nodes;
+        let mut weights = [0.0; MAX_NODES];
+        let (mut d_x, mut d_y) = ([0.0; MAX_NODES], [0.0; MAX_NODES]);
+        let (weights, d_x, d_y) = (&mut weights[..n], &mut d_x[..n], &mut d_y[..n]);
+        self.ops
+            .interpolation_weights_into(point.r, point.s, weights);
+        self.ops
+            .interpolation_gradient_weights_into(point.r, point.s, d_x, d_y);
+        // x(r, s) = a + b r + c s + d r s
+        let [[x0, y0], [x1, y1], [x2, y2], [x3, y3]] =
+            self.locator.mesh().element_vertices(point.element);
+        let (bx, by) = (0.25 * (-x0 + x1 + x2 - x3), 0.25 * (-y0 + y1 + y2 - y3));
+        let (cx, cy) = (0.25 * (-x0 - x1 + x2 + x3), 0.25 * (-y0 - y1 + y2 + y3));
+        let (dx, dy) = (0.25 * (x0 - x1 + x2 - x3), 0.25 * (y0 - y1 + y2 - y3));
+        let (xr, xs) = (bx + dx * point.s, cx + dx * point.r);
+        let (yr, ys) = (by + dy * point.s, cy + dy * point.r);
+        let det = xr * ys - xs * yr;
+        // From ∂/∂r, ∂/∂s to ∂/∂x = (y_s ∂/∂r − y_r ∂/∂s)/J and
+        // ∂/∂y = (x_r ∂/∂s − x_s ∂/∂r)/J, in place
+        for (gx, gy) in d_x.iter_mut().zip(d_y.iter_mut()) {
+            let (dr, ds) = (*gx, *gy);
+            *gx = (ys * dr - yr * ds) / det;
+            *gy = (xr * ds - xs * dr) / det;
+        }
+        f(weights, [d_x, d_y])
+    }
+
+    /// `h` and `∇h` at `point` for the walk's depth drift (`depth` given the
+    /// basis values and gradients there), when the walk spreads (`k > 0`) a
+    /// depth-integrated tracer.
+    pub(super) fn walk_depth(
+        &self,
+        k: f64,
+        depth: impl FnOnce(&[f64], [&[f64]; 2]) -> Option<(f64, [f64; 2])>,
+        point: MeshPoint,
+    ) -> Option<(f64, [f64; 2])> {
+        if k > 0.0 && self.walk_tracer == WalkTracer::DepthIntegrated {
+            self.with_gradient_weights(point, depth)
+        } else {
+            None
+        }
     }
 
     /// Basis of the tracked field.
@@ -302,10 +389,19 @@ impl<'a> ParticleTracker2D<'a> {
         let k4 = self.velocity(field, stage(k3, dt), t + dt);
         let mut displacement =
             [0, 1].map(|d| dt / 6.0 * (k1[d] + 2.0 * k2[d] + 2.0 * k3[d] + k4[d]));
-        let field_k = self.with_weights(p.point, |w| {
-            field.horizontal_diffusivity(p.point.element, w, t)
-        });
-        self.add_walk(&mut displacement, &mut p.rng, field_k, dt);
+        let element = p.point.element;
+        let field_k = self.with_weights(p.point, |w| field.horizontal_diffusivity(element, w, t));
+        let depth = self.walk_depth(
+            self.walk_diffusivity(field_k),
+            |w, g| {
+                Some((
+                    field.depth(element, w, t)?,
+                    field.depth_gradient(element, g, t)?,
+                ))
+            },
+            p.point,
+        );
+        self.add_walk(&mut displacement, &mut p.rng, field_k, depth, dt);
         match self.walk_by(p, displacement) {
             WalkEnd::Inside { position, point } => {
                 p.position = position;
@@ -330,6 +426,40 @@ impl<'a> ParticleTracker2D<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The physical gradient weights differentiate a linear field exactly on
+    /// general (not parallelogram) quadrilaterals, and the value weights
+    /// come with them.
+    #[test]
+    fn gradient_weights_are_exact_on_distorted_elements() {
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 3.0, 0.0, 2.0, 3, 2);
+        for v in &mut mesh.vertices {
+            if (v[0] - 1.0).abs() < 1e-12 && (v[1] - 1.0).abs() < 1e-12 {
+                *v = [1.3, 0.8];
+            }
+        }
+        let ops = DGOperators2D::new(3);
+        let tracker = ParticleTracker2D::new(&mesh, &ops);
+        let f = |[x, y]: [f64; 2]| 3.0 * x - 2.0 * y + 1.0;
+        for k in 0..mesh.n_elements {
+            let k = crate::types::ElementIndex::new(k);
+            let values: Vec<f64> = (0..ops.n_nodes)
+                .map(|i| f(mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i])))
+                .collect();
+            for (r, s) in [(-0.6, 0.2), (0.9, -0.95), (0.0, 0.0)] {
+                let point = MeshPoint { element: k, r, s };
+                let (value, [gx, gy]) = tracker.with_gradient_weights(point, |w, [wx, wy]| {
+                    let dot = |w: &[f64]| w.iter().zip(&values).map(|(a, b)| a * b).sum::<f64>();
+                    (dot(w), [dot(wx), dot(wy)])
+                });
+                assert!((value - f(mesh.reference_to_physical(k, r, s))).abs() < 1e-12);
+                assert!(
+                    (gx - 3.0).abs() < 1e-11 && (gy + 2.0).abs() < 1e-11,
+                    "{gx} {gy}"
+                );
+            }
+        }
+    }
 
     /// Box–Muller on SplitMix64: mean 0, variance 1, uncorrelated pairs.
     #[test]

@@ -6,6 +6,14 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The random walk's depth drift `K∇h/h` (TODO F.2, Dimou & Adams 1993).** A tracer mixed through a water column of varying depth now stays well mixed. Before, the walk spread particles evenly over the area, so they drained from deep water into the shallows.
+  - 2D: `ParticleTracker2D::with_walk_tracer(WalkTracer::DepthIntegrated | Surface)`. **`DepthIntegrated` is the new default**: `∂(hc)/∂t = ∇·(hK∇c)`, with the drift `K∇h/h`. `Surface` is the old walk, for floating matter.
+  - 3D: the walk along σ-surfaces always drifts by `K∇D/D` (layers `D Δσ` thick).
+  - `ParticleVelocity2D`/`3D::depth_gradient` (implemented by `SWEVelocity2D` and `Solution3DVelocity`, forwarded by the wrappers), `DGOperators2D::interpolation_gradient_weights_into` and `polynomial::lagrange_basis_derivative`.
+  - Gates (`tests/particle_depth_drift_test.rs`, depth 0.2–1.8 m on distorted P2 quads; χ² over 64 bins, 99.9 % below 104 at 63 dof):
+    - 2D: 44.7 against 4,698 for the surface walk.
+    - 3D: 57.2 against 5,201 without the drift.
+
 - **The Ålesund buoy test's two misses, followed up (TODO F.4, PR #169).** `froya_real_data wave_mesh=FILE.msh[,ORDER]` runs the waves on a Gmsh mesh of their own (e.g. from `gmsh_coastline_mesh.py`, refined around a buoy) besides the uniform `wave_mesh=NX,NY[,ORDER]`; `scripts/wave_buoy_skill.py until=HOURS` ends the scoring window. Findings (`notes/waves.md`, Ålesund):
   - Buoy F's missing south-easterly sea is MET Nordic's wind, not the fetch: a domain extended 17 km south (fetch along 140° 20 km, was 10.5) leaves it at 0.01–0.07 m against 0.35–0.60. The buoy's own anemometer measured 9–12 m/s down Vartdalsfjorden where MET Nordic has 3–6, and with that wind blended into the forcing F's SI goes 0.44 → 0.25, bias 0.
   - The old box's open southern edge let the parent's open-sea spectra into a fjord. The extended box, all land to the south, is the test's domain from now on: on 500 m mean SI over A, B, C and F 0.258.

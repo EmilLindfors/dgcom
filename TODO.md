@@ -6,7 +6,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Next up
 
-1. **F.2** The random walk's drift K∇h/h for depth-integrated tracers (H_z-weighted for σ-layers): without it particles gather in shallow water at a real site. See Particles.
+1. **F.2** The walk's error against Δt where K or the depth varies within a step, now that the drift has a 1/h term: Euler–Maruyama against Visser's half-drift step or backward Itô. See Particles.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -45,7 +45,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Particles (F.2) — [notes/particles.md](notes/particles.md)
 
-- [ ] **F.2** The walk's drift K∇h/h for depth-integrated tracers, H_z-weighted for σ-layers (Dimou & Adams 1993); the walk is right only for uniform depth.
 - [ ] **F.2** A physical basis for the horizontal K from a site's drifter or dye spreading (connectivity shares move by 9–73 over 0.01–1 m²/s).
 - [ ] **F.2** Check connectivity at the pens converges with mesh refinement under Smagorinsky K.
 - [ ] **F.2** Log K along the larvae's paths, to explain why `kh=smag` keeps more larvae at home (82.5 %) than a constant 0.01 (73.3 %).

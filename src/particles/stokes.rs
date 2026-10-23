@@ -108,6 +108,15 @@ impl<V: ParticleVelocity2D> ParticleVelocity2D for WithStokesDrift2D<'_, V> {
         self.flow.depth(element, weights, t)
     }
 
+    fn depth_gradient(
+        &self,
+        element: ElementIndex,
+        gradient_weights: [&[f64]; 2],
+        t: f64,
+    ) -> Option<[f64; 2]> {
+        self.flow.depth_gradient(element, gradient_weights, t)
+    }
+
     fn horizontal_diffusivity(
         &self,
         element: ElementIndex,
@@ -142,6 +151,15 @@ impl<V: ParticleVelocity3D> ParticleVelocity3D for WithStokesDrift3D<'_, V> {
 
     fn depth(&self, element: ElementIndex, weights: &[f64], t: f64) -> f64 {
         self.flow.depth(element, weights, t)
+    }
+
+    fn depth_gradient(
+        &self,
+        element: ElementIndex,
+        gradient_weights: [&[f64]; 2],
+        t: f64,
+    ) -> Option<[f64; 2]> {
+        self.flow.depth_gradient(element, gradient_weights, t)
     }
 
     fn diffusivity(

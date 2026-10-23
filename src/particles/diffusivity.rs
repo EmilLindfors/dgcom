@@ -21,9 +21,8 @@
 //!
 //! A 3D flow's `K` along each σ-layer is held at the layer centres and linear
 //! in σ between them, like `u`; the drift is the gradient along the
-//! σ-surface. This is the walk of a concentration in water of uniform depth.
-//! Where the depth varies, a depth-integrated or layer-integrated tracer also
-//! needs the drift `K∇D/D` (Dimou & Adams 1993), which is not implemented.
+//! σ-surface. Where the depth varies the trackers add the drift `K∇D/D` as
+//! well (Dimou & Adams 1993; see the [particles module docs](super)).
 //!
 //! # Smagorinsky's diffusivity
 //!
@@ -381,6 +380,15 @@ impl<V: ParticleVelocity2D> ParticleVelocity2D for WithHorizontalDiffusivity2D<'
         self.flow.depth(element, weights, t)
     }
 
+    fn depth_gradient(
+        &self,
+        element: ElementIndex,
+        gradient_weights: [&[f64]; 2],
+        t: f64,
+    ) -> Option<[f64; 2]> {
+        self.flow.depth_gradient(element, gradient_weights, t)
+    }
+
     fn horizontal_diffusivity(
         &self,
         element: ElementIndex,
@@ -414,6 +422,15 @@ impl<V: ParticleVelocity3D> ParticleVelocity3D for WithHorizontalDiffusivity3D<'
 
     fn depth(&self, element: ElementIndex, weights: &[f64], t: f64) -> f64 {
         self.flow.depth(element, weights, t)
+    }
+
+    fn depth_gradient(
+        &self,
+        element: ElementIndex,
+        gradient_weights: [&[f64]; 2],
+        t: f64,
+    ) -> Option<[f64; 2]> {
+        self.flow.depth_gradient(element, gradient_weights, t)
     }
 
     fn diffusivity(

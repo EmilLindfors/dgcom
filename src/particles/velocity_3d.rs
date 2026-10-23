@@ -31,6 +31,18 @@ pub trait ParticleVelocity3D: Sync {
     /// Water depth `D = η − B` (m) at the point.
     fn depth(&self, element: ElementIndex, weights: &[f64], t: f64) -> f64;
 
+    /// Gradient `∇D` of the water depth at the point, where the nodal basis
+    /// has the physical gradients `gradient_weights` (`∂ℓ/∂x`, `∂ℓ/∂y`), for
+    /// the walk's drift `K∇D/D`; `None` (the default) for none.
+    fn depth_gradient(
+        &self,
+        _element: ElementIndex,
+        _gradient_weights: [&[f64]; 2],
+        _t: f64,
+    ) -> Option<[f64; 2]> {
+        None
+    }
+
     /// Vertical eddy diffusivity `K` (m²/s) and its derivative `∂K/∂z`
     /// (m/s) at the point and σ-level; `None` (the default) for none.
     fn diffusivity(
@@ -170,6 +182,20 @@ impl<'a> Solution3DVelocity<'a> {
         }
     }
 
+    /// `∇D = ∇η − ∇B` of snapshot `s` at the point.
+    fn depth_gradient_of(
+        &self,
+        s: &Solution3D,
+        k: usize,
+        gradient_weights: [&[f64]; 2],
+    ) -> [f64; 2] {
+        let n = gradient_weights[0].len();
+        gradient_weights.map(|g| {
+            evaluate(g, &s.eta.data[k * n..(k + 1) * n])
+                - evaluate(g, self.bathymetry.element(ElementIndex::new(k)))
+        })
+    }
+
     fn depth_of(&self, s: &Solution3D, k: usize, weights: &[f64]) -> f64 {
         let n = weights.len();
         evaluate(weights, &s.eta.data[k * n..(k + 1) * n])
@@ -267,6 +293,21 @@ impl ParticleVelocity3D for Solution3DVelocity<'_> {
             return d0;
         }
         (1.0 - a) * d0 + a * self.depth_of(self.after.1, k, weights)
+    }
+
+    fn depth_gradient(
+        &self,
+        element: ElementIndex,
+        gradient_weights: [&[f64]; 2],
+        t: f64,
+    ) -> Option<[f64; 2]> {
+        let (a, k) = (self.fraction(t), element.as_usize());
+        let g0 = self.depth_gradient_of(self.before.1, k, gradient_weights);
+        if a == 0.0 {
+            return Some(g0);
+        }
+        let g1 = self.depth_gradient_of(self.after.1, k, gradient_weights);
+        Some([0, 1].map(|d| (1.0 - a) * g0[d] + a * g1[d]))
     }
 
     fn diffusivity(
