@@ -14,8 +14,8 @@
 
 use crate::basis::{Vandermonde, Vandermonde2D};
 use crate::polynomial::{
-    gauss_lobatto_nodes, gauss_lobatto_weights, lagrange_basis, node_index_1d_to_2d,
-    tensor_product_gll_nodes, tensor_product_gll_weights,
+    gauss_lobatto_nodes, gauss_lobatto_weights, lagrange_basis, lagrange_basis_derivative,
+    node_index_1d_to_2d, tensor_product_gll_nodes, tensor_product_gll_weights,
 };
 use faer::Mat;
 
@@ -265,6 +265,40 @@ impl DGOperators2D {
         }
     }
 
+    /// Derivatives of the nodal basis along r and s at the reference point
+    /// `(r, s)`, `ℓᵢ'(r) ℓⱼ(s)` into `d_r` and `ℓᵢ(r) ℓⱼ'(s)` into `d_s`, in
+    /// node order: `∂u/∂r = Σₖ d_r[k] u[k]` there. Exact for every
+    /// polynomial of degree ≤ N in each of r and s.
+    pub fn interpolation_gradient_weights_into(
+        &self,
+        r: f64,
+        s: f64,
+        d_r: &mut [f64],
+        d_s: &mut [f64],
+    ) {
+        const MAX_1D: usize = 16;
+        assert!(self.n_1d <= MAX_1D, "order {} above 15", self.order);
+        assert_eq!(d_r.len(), self.n_nodes);
+        assert_eq!(d_s.len(), self.n_nodes);
+        let n = self.n_1d;
+        let (mut lr, mut ls) = ([0.0; MAX_1D], [0.0; MAX_1D]);
+        let (mut dlr, mut dls) = ([0.0; MAX_1D], [0.0; MAX_1D]);
+        lagrange_basis(&self.nodes_1d, r, &mut lr[..n]);
+        lagrange_basis(&self.nodes_1d, s, &mut ls[..n]);
+        lagrange_basis_derivative(&self.nodes_1d, r, &mut dlr[..n]);
+        lagrange_basis_derivative(&self.nodes_1d, s, &mut dls[..n]);
+        for (j, (row_r, row_s)) in d_r
+            .chunks_exact_mut(n)
+            .zip(d_s.chunks_exact_mut(n))
+            .enumerate()
+        {
+            for i in 0..n {
+                row_r[i] = dlr[i] * ls[j];
+                row_s[i] = lr[i] * dls[j];
+            }
+        }
+    }
+
     /// [`interpolation_weights_into`](Self::interpolation_weights_into) into a
     /// new vector.
     pub fn interpolation_weights(&self, r: f64, s: f64) -> Vec<f64> {
@@ -491,6 +525,63 @@ mod tests {
                     (u - p(r, s)).abs() < 1e-11,
                     "order {order} at ({r}, {s}): {u} vs {}",
                     p(r, s)
+                );
+            }
+        }
+    }
+
+    /// The point gradient weights differentiate every Q_N polynomial exactly
+    /// at arbitrary points, and are the rows of Dr and Ds at the nodes.
+    #[test]
+    fn interpolation_gradient_weights_are_exact_on_q_n() {
+        for order in 1..=5 {
+            let ops = DGOperators2D::new(order);
+            let term = |a: usize, b: usize| 1.0 + a as f64 - 0.3 * b as f64;
+            let terms = || (0..=order).flat_map(|a| (0..=order).map(move |b| (a, b)));
+            let p = |r: f64, s: f64| {
+                terms()
+                    .map(|(a, b)| term(a, b) * r.powi(a as i32) * s.powi(b as i32))
+                    .sum::<f64>()
+            };
+            let p_r = |r: f64, s: f64| {
+                terms()
+                    .filter(|&(a, _)| a > 0)
+                    .map(|(a, b)| term(a, b) * a as f64 * r.powi(a as i32 - 1) * s.powi(b as i32))
+                    .sum::<f64>()
+            };
+            let p_s = |r: f64, s: f64| {
+                terms()
+                    .filter(|&(_, b)| b > 0)
+                    .map(|(a, b)| term(a, b) * b as f64 * r.powi(a as i32) * s.powi(b as i32 - 1))
+                    .sum::<f64>()
+            };
+            let values: Vec<f64> = (0..ops.n_nodes)
+                .map(|k| p(ops.nodes_r[k], ops.nodes_s[k]))
+                .collect();
+            let (mut d_r, mut d_s) = (vec![0.0; ops.n_nodes], vec![0.0; ops.n_nodes]);
+            for k in 0..ops.n_nodes {
+                ops.interpolation_gradient_weights_into(
+                    ops.nodes_r[k],
+                    ops.nodes_s[k],
+                    &mut d_r,
+                    &mut d_s,
+                );
+                for j in 0..ops.n_nodes {
+                    assert!((d_r[j] - ops.dr[(k, j)]).abs() < 1e-11);
+                    assert!((d_s[j] - ops.ds[(k, j)]).abs() < 1e-11);
+                }
+            }
+            for (r, s) in [(-1.0, 0.3), (0.17, -0.81), (0.5, 0.5), (0.99, 1.0)] {
+                ops.interpolation_gradient_weights_into(r, s, &mut d_r, &mut d_s);
+                let dot = |w: &[f64]| w.iter().zip(&values).map(|(a, b)| a * b).sum::<f64>();
+                let scale = 1.0 + p_r(r, s).abs() + p_s(r, s).abs();
+                assert!(
+                    (dot(&d_r) - p_r(r, s)).abs() < 1e-10 * scale,
+                    "order {order} ∂r"
+                );
+                assert!(
+                    (dot(&d_s) - p_s(r, s)).abs() < 1e-10 * scale,
+                    "order {order} ∂s"
                 );
             }
         }

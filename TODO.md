@@ -6,7 +6,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Next up
 
-1. **F.2** The random walk's drift K∇h/h for depth-integrated tracers (H_z-weighted for σ-layers): without it particles gather in shallow water at a real site. See Particles.
+1. **F.1** A farm-wake case at a real fjord site with real tidal currents through an open boundary: the cages' wake, the residual current, and the depth drift's effect on connectivity, none of which `farm_3d`'s periodic flat channel can show. See Salmon farm.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -45,13 +45,11 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Particles (F.2) — [notes/particles.md](notes/particles.md)
 
-- [ ] **F.2** The walk's drift K∇h/h for depth-integrated tracers, H_z-weighted for σ-layers (Dimou & Adams 1993); the walk is right only for uniform depth.
 - [ ] **F.2** A physical basis for the horizontal K from a site's drifter or dye spreading (connectivity shares move by 9–73 over 0.01–1 m²/s).
 - [ ] **F.2** Check connectivity at the pens converges with mesh refinement under Smagorinsky K.
 - [ ] **F.2** Log K along the larvae's paths, to explain why `kh=smag` keeps more larvae at home (82.5 %) than a constant 0.01 (73.3 %).
 - [ ] **F.2** Draw release points per seed and per batch, so the seed spread measures release uncertainty, not only walk noise.
 - [ ] **F.2** Log the larvae's largest displacement in `farm_3d` before longer runs (the 6 km periodic channel is shorter than the 7.1 km tidal excursion).
-- [ ] **F.2** Measure the Euler–Maruyama error against Δt where K varies over a step; consider Visser's half-drift step or backward Itô (Spivakovskaya et al. 2007).
 - [ ] **F.2** Copepodid infectivity(age, T) (Skern-Mauritzen et al. 2020) next to `SalmonLice::survival`, as the `ConnectivityRecorder::record` weight.
 - [ ] **F.2** Light for lice from `AtmosphereReader` shortwave or cloud cover, salinity/CDOM-linked attenuation (Aksnes et al. 2009), a per-position sun for wide domains.
 - [ ] **F.2** Keep Ω at the w-points in `Solution3D`, so the tracker's dσ/dt matches continuity exactly (a layer-centre average today).

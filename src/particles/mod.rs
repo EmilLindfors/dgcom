@@ -28,16 +28,28 @@
 //! # Dispersion
 //!
 //! With a horizontal diffusivity `K`, each step adds an independent Gaussian
-//! displacement `√(2KΔt) ξ`, `ξ ~ N(0, I₂)` (the Itô form of
-//! `∂c/∂t = ∇·(K∇c)` for constant `K`). Reflection at walls keeps a uniform
-//! areal distribution uniform (Visser 1997's well-mixed condition in 2D).
-//! This is the dispersion of a surface or depth-uniform concentration; a
-//! depth-integrated tracer (`∂(hc)/∂t = ∇·(hK∇c)`) also needs the drift
-//! `K∇h/h` (Dimou & Adams 1993), which is not implemented. A `K` that varies
-//! in space (a field of the flow's, e.g. Smagorinsky's from the model's own
-//! viscosity) adds the drift `∇K Δt` and is added to the tracker's constant
-//! ([`diffusivity`]: [`WithHorizontalDiffusivity2D`],
-//! [`WithHorizontalDiffusivity3D`]).
+//! displacement `√(2KΔt) ξ`, `ξ ~ N(0, I₂)`, and a drift. A tracer mixed
+//! through a water column of depth `h`, `∂(hc)/∂t = ∇·(hK∇c)`, has particles
+//! in proportion to `hc`, and its Itô process is
+//!
+//! ```text
+//! dx = (u + ∇K + K∇h/h) dt + √(2K) dW
+//! ```
+//!
+//! (Dimou & Adams 1993), stepped by Euler–Maruyama with `K`, `h` and their
+//! gradients at the start of the step. Without `K∇h/h` the walk spreads
+//! particles evenly over the area, so a well-mixed tracer leaves the deep
+//! water for the shallows; with it a population in proportion to the depth
+//! stays so (Visser 1997's well-mixed condition). `∇h` is the depth field's
+//! element polynomial's gradient ([`ParticleVelocity2D::depth_gradient`]), and
+//! the step must resolve it, `√(2KΔt) ≪ h/|∇h|`. This is the 2D default
+//! ([`WalkTracer::DepthIntegrated`]); [`WalkTracer::Surface`] drops the depth
+//! drift for matter per unit area of the surface (`∂c/∂t = ∇·(K∇c)`). In 3D the
+//! walk along a σ-surface spreads a concentration whose layer is `D Δσ` thick,
+//! so it drifts by `K∇D/D` always. A `K` that varies in space (a field of the
+//! flow's, e.g. Smagorinsky's from the model's own viscosity) adds the drift
+//! `∇K` and is added to the tracker's constant ([`diffusivity`]:
+//! [`WithHorizontalDiffusivity2D`], [`WithHorizontalDiffusivity3D`]).
 //!
 //! Each particle draws its random numbers from its own SplitMix64 stream,
 //! seeded by the tracker's seed and the particle's id, so a run is
@@ -103,7 +115,7 @@ pub use diffusivity::{
     WithHorizontalDiffusivity2D, WithHorizontalDiffusivity3D,
 };
 pub use stokes::{StokesDrift, WithStokesDrift2D, WithStokesDrift3D};
-pub use tracker::{Particle2D, ParticleStatus, ParticleTracker2D};
+pub use tracker::{Particle2D, ParticleStatus, ParticleTracker2D, WalkTracer};
 pub use tracker_3d::{Particle3D, ParticleTracker3D};
 pub use velocity::{NodalVelocity2D, ParticleVelocity2D, SWEVelocity2D};
 pub use velocity_3d::{ParticleVelocity3D, Solution3DVelocity};

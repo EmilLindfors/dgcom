@@ -33,7 +33,9 @@
 //! collect where `K` is small), and `K` is taken half a drift step away.
 //! It needs `Δt ≪ min 1/|K''|`. The surface and the bed reflect (or the bed
 //! takes the particle with [`ParticleTracker3D::with_bed_settling`]).
-//! Horizontal dispersion is the 2D tracker's constant-K walk.
+//! Horizontal dispersion is the 2D tracker's walk along the σ-surface, with
+//! the drift `K∇D/D` of a concentration in layers `D Δσ` thick (see the
+//! [particles module docs](super)).
 //!
 //! # Behaviour
 //!
@@ -387,11 +389,22 @@ impl<'a> ParticleTracker3D<'a> {
         let k4 = self.velocity(field, point, s, w_p, t + dt);
         let mut displacement =
             [0, 1, 2].map(|d| dt / 6.0 * (k1[d] + 2.0 * k2[d] + 2.0 * k3[d] + k4[d]));
+        let element = h.point.element;
         let field_k = self.with_weights(h.point, |w| {
-            field.horizontal_diffusivity(h.point.element, w, sigma, t)
+            field.horizontal_diffusivity(element, w, sigma, t)
         });
+        let depth = self.horizontal.walk_depth(
+            self.horizontal.walk_diffusivity(field_k),
+            |w, g| {
+                Some((
+                    field.depth(element, w, t),
+                    field.depth_gradient(element, g, t)?,
+                ))
+            },
+            h.point,
+        );
         self.horizontal
-            .add_walk(&mut displacement[..2], &mut h.rng, field_k, dt);
+            .add_walk(&mut displacement[..2], &mut h.rng, field_k, depth, dt);
         match self
             .horizontal
             .walk_by(h, [displacement[0], displacement[1]])

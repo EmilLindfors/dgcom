@@ -25,6 +25,19 @@ pub trait ParticleVelocity2D: Sync {
         None
     }
 
+    /// Gradient `∇h` of the water depth at the same point, where the nodal
+    /// basis has the physical gradients `gradient_weights` (`∂ℓ/∂x`,
+    /// `∂ℓ/∂y`), for the walk's drift `K∇h/h`; `None` (the default) when the
+    /// field has no depth.
+    fn depth_gradient(
+        &self,
+        _element: ElementIndex,
+        _gradient_weights: [&[f64]; 2],
+        _t: f64,
+    ) -> Option<[f64; 2]> {
+        None
+    }
+
     /// Horizontal diffusivity `K` (m²/s) of the walk and its gradient `∇K`
     /// (m/s) at the point; `None` (the default) for the tracker's constant
     /// alone (see [`super::diffusivity`]).
@@ -157,6 +170,21 @@ impl ParticleVelocity2D for SWEVelocity2D<'_> {
         }
         let h1 = evaluate(weights, self.after.1.element_h(element));
         Some((1.0 - a) * h0 + a * h1)
+    }
+
+    fn depth_gradient(
+        &self,
+        element: ElementIndex,
+        gradient_weights: [&[f64]; 2],
+        t: f64,
+    ) -> Option<[f64; 2]> {
+        let a = self.fraction(t);
+        let g0 = gradient_weights.map(|g| evaluate(g, self.before.1.element_h(element)));
+        if a == 0.0 {
+            return Some(g0);
+        }
+        let g1 = gradient_weights.map(|g| evaluate(g, self.after.1.element_h(element)));
+        Some([0, 1].map(|d| (1.0 - a) * g0[d] + a * g1[d]))
     }
 }
 
