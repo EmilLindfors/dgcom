@@ -6,7 +6,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Next up
 
-1. **F.4** A fjord wind: MET Nordic carries Vartdalsfjorden's along-fjord jet at half strength (Ålesund F), and the farm sites' local sea with it. See Waves.
+1. **F.2** The random walk's drift K∇h/h for depth-integrated tracers (H_z-weighted for σ-layers): without it particles gather in shallow water at a real site. See Particles.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -87,7 +87,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **F.4** Check the depth limit's γ against SWAN's very-shallow limiter before trusting the surf zone or a coarse grid's coastal nodes.
 
 #### Validation
-- [ ] **F.4** A fjord wind: at Ålesund's F the buoy measured 9–12 m/s down Vartdalsfjorden where MET Nordic (2.5 km) has 3–6, and with the buoy's wind blended in F's SI went 0.44 → 0.25. Try correcting `met=` toward station/buoy winds, or a downscaled or mass-consistent wind over the topography; check any `met=` against the E39 buoys' anemometers.
+- [ ] **F.4** When a farm's own wind sensor (or a buoy in its fjord) is at hand: blend it into `met=` as Ålesund's attribution test did (F's SI 0.44 → 0.25), as a `froya_real_data` option rather than a scratch file. MEPS and MET Nordic carry along-fjord jets at half strength, and a mass-consistent downscaling does not recover them (2026-10-23).
 - [ ] **F.4** Ålesund's C: T_p 14 s against 9.1 on the 500 m grid at P1 and P2 alike, so not the grid. Candidates: the boundary's swell (≈ 1 s long at D) and diffraction. Also its first-day local sea from 190° (0.5–0.96 m against 0.3–0.5): check the buoy's wind as at F (THREDDS failed on 2026-10-22).
 - [ ] **F.4** A 500 m P2 wave grid (`wave_mesh=120,90,2`): are Frohavet (17 % low) and the lee (19 % low) the 1 km grid's or WAM's error?
 - [ ] **F.4** A reflection coefficient for walls (cliffs, quays); waves dying on the coast drive spurious coastal currents.
