@@ -6,7 +6,7 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
-- **The random walk's depth drift `K∇h/h` (TODO F.2, Dimou & Adams 1993).** A tracer mixed through a water column of varying depth now stays well mixed. Before, the walk spread particles evenly over the area, so they drained from deep water into the shallows.
+- **The random walk's depth drift `K∇h/h` (TODO F.2, PR #171, Dimou & Adams 1993).** A tracer mixed through a water column of varying depth now stays well mixed. Before, the walk spread particles evenly over the area, so they drained from deep water into the shallows.
   - 2D: `ParticleTracker2D::with_walk_tracer(WalkTracer::DepthIntegrated | Surface)`. **`DepthIntegrated` is the new default**: `∂(hc)/∂t = ∇·(hK∇c)`, with the drift `K∇h/h`. `Surface` is the old walk, for floating matter.
   - 3D: the walk along σ-surfaces always drifts by `K∇D/D` (layers `D Δσ` thick).
   - `ParticleVelocity2D`/`3D::depth_gradient` (implemented by `SWEVelocity2D` and `Solution3DVelocity`, forwarded by the wrappers), `DGOperators2D::interpolation_gradient_weights_into` and `polynomial::lagrange_basis_derivative`.
