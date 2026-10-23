@@ -6,7 +6,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Next up
 
-1. **F.4** The Ålesund buoy test's two misses: C's swell (a finer wave grid there) and F's south-easterly fetch (a domain reaching further south-east). See Waves.
+1. **F.4** A fjord wind: MET Nordic carries Vartdalsfjorden's along-fjord jet at half strength (Ålesund F), and the farm sites' local sea with it. See Waves.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -87,8 +87,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **F.4** Check the depth limit's γ against SWAN's very-shallow limiter before trusting the surf zone or a coarse grid's coastal nodes.
 
 #### Validation
-- [ ] **F.4** Ålesund's C: T_p 13–15 s against 9–10 s observed and H_s halving from 1 km to 500 m wave grid. A 250 m (or 500 m P2) grid there, the boundary's T_p (≈ 1 s long at D) and diffraction are the candidates.
-- [ ] **F.4** Ålesund's F misses the southeasterly wind sea (0.04 against 0.3–0.6 m): the domain's southern edge cuts its 140° fetch at 10–12 km; extend the domain south-east, then look at MET Nordic's wind in the fjord.
+- [ ] **F.4** A fjord wind: at Ålesund's F the buoy measured 9–12 m/s down Vartdalsfjorden where MET Nordic (2.5 km) has 3–6, and with the buoy's wind blended in F's SI went 0.44 → 0.25. Try correcting `met=` toward station/buoy winds, or a downscaled or mass-consistent wind over the topography; check any `met=` against the E39 buoys' anemometers.
+- [ ] **F.4** Ålesund's C: T_p 14 s against 9.1 on the 500 m grid at P1 and P2 alike, so not the grid. Candidates: the boundary's swell (≈ 1 s long at D) and diffraction. Also its first-day local sea from 190° (0.5–0.96 m against 0.3–0.5): check the buoy's wind as at F (THREDDS failed on 2026-10-22).
 - [ ] **F.4** A 500 m P2 wave grid (`wave_mesh=120,90,2`): are Frohavet (17 % low) and the lee (19 % low) the 1 km grid's or WAM's error?
 - [ ] **F.4** A reflection coefficient for walls (cliffs, quays); waves dying on the coast drive spurious coastal currents.
 - [ ] **F.4** Check which wave nodes along 63.75°N (8.22–8.28°E skerries) are dry at mean and low water (the reef point loses 7.5 cm more with absorbing land under SWAN's sources).
@@ -119,6 +119,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **F.4** The 0.04 Hz bin in 150 m sets the 7 s step: check `f_min` 0.05 Hz (≈ 25 % longer step) against a 0.04 Hz run, or LTS by frequency group.
 - [ ] **F.4** Mask the wave grid to the coastline mesh's footprint (638 of 10,040 nodes lie outside it).
 - [ ] **F.4** Lower priority: implicit geographic stepping with Gauss–Seidel sweeps (SWAN), fewer components (24 × 25).
+- [ ] **F.4** Local time stepping in the waves (as `MultirateSSPRK3` for the tide): a coastline-fitted wave mesh (`wave_mesh=FILE.msh`) keeps ≈ 100 m edges in narrow sounds and cuts the global step 3–5× against a uniform 500 m grid (Ålesund C, `notes/waves.md`).
 
 #### Wet/dry and forcing
 - [ ] **F.4** Put the coast where the water ends in partly dry elements, with `WetDry`'s shoreline subcells (dry nodes are zeroed today).

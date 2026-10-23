@@ -6,6 +6,11 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The Ålesund buoy test's two misses, followed up (TODO F.4, PR #169).** `froya_real_data wave_mesh=FILE.msh[,ORDER]` runs the waves on a Gmsh mesh of their own (e.g. from `gmsh_coastline_mesh.py`, refined around a buoy) besides the uniform `wave_mesh=NX,NY[,ORDER]`; `scripts/wave_buoy_skill.py until=HOURS` ends the scoring window. Findings (`notes/waves.md`, Ålesund):
+  - Buoy F's missing south-easterly sea is MET Nordic's wind, not the fetch: a domain extended 17 km south (fetch along 140° 20 km, was 10.5) leaves it at 0.01–0.07 m against 0.35–0.60. The buoy's own anemometer measured 9–12 m/s down Vartdalsfjorden where MET Nordic has 3–6, and with that wind blended into the forcing F's SI goes 0.44 → 0.25, bias 0.
+  - The old box's open southern edge let the parent's open-sea spectra into a fjord. The extended box, all land to the south, is the test's domain from now on: on 500 m mean SI over A, B, C and F 0.258.
+  - Buoy C's 4–5 s long T_p is not the grid's: a 500 m P2 wave grid (≈ 250 m P1) improves C's timing (r 0.27 → 0.64) but not its period (14.0 s against 9.1) or mean, at 4.4× the cost.
+
 - **A deep fjord behind a sill against Stigebrandt's two-layer theory (TODO P4.6).** `examples/sill_fjord_3d.rs` (the experiment in `examples/common/sill_fjord.rs`): a 16 km × 500 m × 100 m fjord with a 30 m sill opening into an open basin, a 500 m³/s river at the head, GLS k-ε, Coriolis, 30 stretched levels, 48 h to a steady state. The brackish layer at the mouth against Stigebrandt's (1981) hydraulic control, `u₁M = (Q_f βg s₂/B)^⅓`, `h₁M = (P² Q_f²/(βg s₂ B²))^⅓`, `F₁² = 1`:
   - At the mouth u₁ 0.96–1.02× the theory's, h₁ 1.08–1.18×, F₁² 0.90–1.13 (base, Q_f 250 and 1000 m³/s, 45 levels, 125 m elements, 400 m deep); inside the fjord 0.35–0.63, subcritical; Knudsen's relations close to 0.95–1.00 at every section. The mouth speed follows Q_f^⅓ over a factor 4 to 3 %. A 1 km wide fjord is less critical (F₁² 0.84).
   - The brackish layer is the levels fresher than s₂ − 1, as one layer with the kinematic equivalents `(∫u)²/∫u²`, `∫u²/∫u`: split by the sign of the transport, the slow outflow of nearly sea water below the halocline made it 22 m thick at 0.08 m/s.

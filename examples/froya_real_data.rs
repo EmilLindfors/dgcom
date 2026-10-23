@@ -107,7 +107,7 @@
 //!     [wave_sources=wam|swan] [wave_integration=] [wave_limiter=] [wave_substeps=4|1] [wave_cfl=1.0|0.5] [wave_hours=0] \
 //!     [wave_land=absorbing|floored] [wave_force=dissipation|stress] [wave_depth_limit=1] \
 //!     [wave_reference=<file>] \
-//!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] \
+//!     [wave_mesh=NX,NY[,ORDER]|FILE.msh[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] \
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [wave_stations=NAME:LON,LAT;…] \
 //!     [levels=0] [tide3d=0] [rk_3d=43|3] [cfl_3d=4|2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] \
@@ -120,7 +120,10 @@
 //! implicitly with `implicit=1`): the step, what sets it, and the cost per
 //! model hour. With
 //! `wave_mesh=NX,NY[,ORDER]` the waves run on an NX × NY grid of their own (P1
-//! by default) over the same bed, and the coupling to the run's mesh
+//! by default) over the same bed, or on a Gmsh mesh of their own with
+//! `wave_mesh=FILE.msh[,ORDER]` (refined where the waves need it, e.g.
+//! `gmsh_coastline_mesh.py … farm=LON,LAT farm_size=… farm_radius=…` around a
+//! buoy), and the coupling to the run's mesh
 //! (`WaveCoupling2D`) is built and each exchange timed. `wave_hours=H` runs on
 //! after the timed steps to H model hours; the sea at every node is then
 //! written to `<output>/wave_nodes.txt`, and `wave_reference=<file>` compares
@@ -690,10 +693,10 @@ struct Options {
     /// With `waves=N`, compare the sea at every node with an earlier run's
     /// `wave_nodes.txt` (`wave_reference=<file>`)
     wave_reference: Option<PathBuf>,
-    /// The waves on a grid of their own (`wave_mesh=NX,NY[,ORDER]`, order 1
-    /// by default) instead of the run's mesh, coupled to it by
-    /// `WaveCoupling2D`
-    wave_mesh: Option<[usize; 3]>,
+    /// The waves on a grid of their own (`wave_mesh=NX,NY[,ORDER]` or
+    /// `wave_mesh=FILE.msh[,ORDER]`, order 1 by default) instead of the run's
+    /// mesh, coupled to it by `WaveCoupling2D`
+    wave_mesh: Option<WaveMesh>,
     /// Run the waves with the tide, two-way coupled every this many minutes
     /// (`wave_coupling=`; 0: off)
     wave_coupling: f64,
@@ -887,17 +890,7 @@ impl Options {
             },
             wave_mesh: match args.get("wave_mesh") {
                 None => None,
-                Some(text) => {
-                    let parts: Vec<usize> = text
-                        .split(',')
-                        .map(|v| v.parse().map_err(|_| format!("bad wave_mesh={text}")))
-                        .collect::<Result<_, _>>()?;
-                    match parts[..] {
-                        [nx, ny] => Some([nx, ny, 1]),
-                        [nx, ny, order] => Some([nx, ny, order]),
-                        _ => return Err(format!("wave_mesh=NX,NY[,ORDER], not {text}")),
-                    }
-                }
+                Some(text) => Some(WaveMesh::parse(text)?),
             },
             turning: args
                 .get("turning")
@@ -1098,6 +1091,43 @@ impl Options {
                 .map_or(1.0, |linear| LINEAR_CFL_SAFETY * linear);
         }
         Ok(opts)
+    }
+}
+
+/// The waves' own mesh (`wave_mesh=`): a uniform grid over the box, or a
+/// Gmsh mesh (from `scripts/gmsh_coastline_mesh.py`, e.g. refined around a
+/// buoy or a farm), over the same bed.
+#[derive(Clone)]
+enum WaveMesh {
+    Grid { nx: usize, ny: usize, order: usize },
+    File { path: String, order: usize },
+}
+
+impl WaveMesh {
+    /// `NX,NY[,ORDER]` or `FILE.msh[,ORDER]`, order 1 by default.
+    fn parse(text: &str) -> Result<Self, String> {
+        let bad = || format!("wave_mesh=NX,NY[,ORDER] or FILE.msh[,ORDER], not {text}");
+        let parts: Vec<&str> = text.split(',').collect();
+        if parts[0].ends_with(".msh") {
+            let order = match parts[1..] {
+                [] => 1,
+                [order] => order.parse().map_err(|_| bad())?,
+                _ => return Err(bad()),
+            };
+            return Ok(Self::File {
+                path: parts[0].to_string(),
+                order,
+            });
+        }
+        let numbers: Vec<usize> = parts
+            .iter()
+            .map(|v| v.parse().map_err(|_| bad()))
+            .collect::<Result<_, _>>()?;
+        match numbers[..] {
+            [nx, ny] => Ok(Self::Grid { nx, ny, order: 1 }),
+            [nx, ny, order] => Ok(Self::Grid { nx, ny, order }),
+            _ => Err(bad()),
+        }
     }
 }
 
@@ -1914,11 +1944,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => (None, None),
     };
     domain.close_uncovered_open_faces(&opts)?;
-    let wave_domain = match opts.wave_mesh {
-        Some([nx, ny, order]) if opts.waves > 0 || opts.wave_coupling > 0.0 => {
-            println!("The waves' own grid, {nx} × {ny} at P{order}...");
+    let wave_domain = match &opts.wave_mesh {
+        Some(wave_mesh) if opts.waves > 0 || opts.wave_coupling > 0.0 => {
             let mut wave_opts = opts.clone();
-            (wave_opts.mesh, wave_opts.nx, wave_opts.ny, wave_opts.order) = (None, nx, ny, order);
+            match wave_mesh {
+                WaveMesh::Grid { nx, ny, order } => {
+                    println!("The waves' own grid, {nx} × {ny} at P{order}...");
+                    (wave_opts.mesh, wave_opts.nx, wave_opts.ny) = (None, *nx, *ny);
+                    wave_opts.order = *order;
+                }
+                WaveMesh::File { path, order } => {
+                    println!("The waves' own mesh, {path} at P{order}...");
+                    wave_opts.mesh = Some(path.clone());
+                    wave_opts.order = *order;
+                }
+            }
             let wave_domain =
                 Domain::froya(&wave_opts)?.ok_or("wave_mesh= needs the Frøya data files")?;
             wave_domain.print_summary();
