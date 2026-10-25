@@ -22,6 +22,18 @@
 //!
 //! The face flux is the same on both sides of every interior face, so the
 //! viscous term conserves momentum; it adds nothing to the mass equation.
+//!
+//! It acts on the water only: an element with a node shallower than the
+//! subcell depth (`SWEFormulation2D::WetDry`'s shoreline elements, which run
+//! the subcell update) or at or below the viscosity's `h_min` gets no viscous
+//! term, and a face between it and a wet element is an edge of the viscous
+//! domain: the wet side's gradient copies its own velocity there (zero
+//! gradient) and no viscous flux crosses. That pair is dissipative (see
+//! `diffusion_2d::br1_diffusion_element`) and conserves momentum. Before, the
+//! shoreline elements took the term with their dry nodes' velocity at zero,
+//! and the divergence of the wet nodes' stress put momentum into dry nodes:
+//! at ν = 10 m²/s it pushed films 4 m up a cliff shore of the Frøya coastline
+//! mesh within 2 h (TODO F.1, the Kattholmen ν sweep).
 
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::mesh::Mesh2D;
@@ -34,7 +46,7 @@ use crate::types::ElementIndex;
 use super::diffusion_2d::{
     DiffusionScratch, ScalarGradient2D, br1_diffusion_element, br1_gradient_element,
 };
-use super::swe_2d::{SWE2DRhsConfig, boundary_state};
+use super::swe_2d::{SWE2DRhsConfig, SWEFormulation2D, boundary_state};
 
 /// Per-element scratch of the viscous term (part of the RHS kernel's
 /// per-thread element workspace).
@@ -112,6 +124,9 @@ pub(super) struct ViscousTerm<'a, 'c, BC: SWEBoundaryCondition2D> {
     geom: &'a GeometricFactors2D,
     config: &'a SWE2DRhsConfig<'c, BC>,
     visc: &'c HorizontalViscosity2D,
+    /// Depth (m) below which a node takes its element out of the viscous
+    /// domain: the subcell depth under `WetDry`, else none
+    subcell_depth: f64,
 }
 
 impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
@@ -124,6 +139,10 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
         config: &'a SWE2DRhsConfig<'c, BC>,
     ) -> Option<Self> {
         let visc = config.viscosity?;
+        let subcell_depth = match config.formulation {
+            SWEFormulation2D::WetDry => config.subcell_depth.unwrap_or(config.h_dry),
+            _ => 0.0,
+        };
         Some(Self {
             q,
             mesh,
@@ -131,7 +150,15 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
             geom,
             config,
             visc,
+            subcell_depth,
         })
+    }
+
+    /// Whether element `k` is in the viscous domain: every node deeper than
+    /// the viscosity's `h_min` and not shallower than the subcell depth (see
+    /// the [module documentation](self)).
+    pub(super) fn in_water(&self, k: ElementIndex) -> bool {
+        in_viscous_domain(self.q, self.visc, self.subcell_depth, k)
     }
 
     /// Velocity of the boundary condition's exterior state at boundary node
@@ -168,7 +195,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
 
     /// Pass 1: the BR1 gradients of u and v of element `k` into its rows
     /// `grad_u`, `grad_v` (`n_nodes` each), with the boundary condition
-    /// evaluated at `time`.
+    /// evaluated at `time`; zero outside the viscous domain.
     pub(super) fn gradients(
         &self,
         k: usize,
@@ -177,13 +204,27 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
         grad_u: &mut [ScalarGradient2D],
         grad_v: &mut [ScalarGradient2D],
     ) {
+        let k = ElementIndex::new(k);
+        if !self.in_water(k) {
+            grad_u.fill(ScalarGradient2D::default());
+            grad_v.fill(ScalarGradient2D::default());
+            return;
+        }
         br1_gradient_element(
-            ElementIndex::new(k),
+            k,
             self.mesh,
             self.ops,
             self.geom,
             |j, node| node_velocity(self.q, self.visc, j, node),
-            |k, face, fi, node, _interior| self.boundary_velocity(time, k, face, fi, node),
+            |k, face, fi, node, interior| {
+                // The edge of the viscous domain: zero gradient
+                if self.mesh.neighbor(k, face).is_some() {
+                    interior
+                } else {
+                    self.boundary_velocity(time, k, face, fi, node)
+                }
+            },
+            |j| self.in_water(j),
             &mut scratch.own,
             [grad_u, grad_v],
         );
@@ -200,6 +241,9 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
         hu: &mut [f64],
         hv: &mut [f64],
     ) {
+        if !self.in_water(ElementIndex::new(k)) {
+            return;
+        }
         let n_nodes = self.ops.n_nodes;
         // νh at a node; zero where (nearly) dry
         let coefficient = |j: ElementIndex, node: usize| {
@@ -234,10 +278,14 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
                 ]
             },
             // The fluxes that match the gradients' exterior states (see
-            // `br1_diffusion_element`): a wall mirrors the velocity, so it
+            // `br1_diffusion_element`): the edge of the viscous domain copies
+            // the velocity, so it passes nothing; a wall mirrors it, so it
             // passes the normal stress only; other boundaries prescribe an
             // exterior state and take the interior flux
             |k, face, _fi, (nx, ny), [fu, fv]| {
+                if self.mesh.neighbor(k, face).is_some() {
+                    return [0.0; 2];
+                }
                 let tag = self.mesh.boundary_tag(k, face);
                 let wall = self
                     .config
@@ -251,6 +299,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
                     [fu, fv]
                 }
             },
+            |j| self.in_water(j),
             diffusion,
             [diff_u, diff_v],
         );
@@ -260,6 +309,20 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
             }
         }
     }
+}
+
+/// Whether element `k` of `q` is in the viscous domain of `visc` with the
+/// subcell depth `subcell_depth`: every node deeper than `visc.h_min` and
+/// not shallower than `subcell_depth`.
+pub(super) fn in_viscous_domain(
+    q: &SWESolution2D,
+    visc: &HorizontalViscosity2D,
+    subcell_depth: f64,
+    k: ElementIndex,
+) -> bool {
+    q.element_h(k)
+        .iter()
+        .all(|&h| h > visc.h_min && h >= subcell_depth)
 }
 
 /// Velocity at node `i` of element `k`; zero where the depth is at or below
@@ -330,6 +393,7 @@ pub fn largest_viscosity_swe_2d(
                 geom,
                 |j, node| node_velocity(q, visc, j, node),
                 |_, _, _, _, interior| interior,
+                |_| true,
                 own,
                 [grad_u, grad_v],
             );

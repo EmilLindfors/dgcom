@@ -202,6 +202,7 @@ impl Columns<'_> {
                 }
                 exterior
             },
+            |_| true,
             own,
             gradient.each_mut().map(|g| &mut g[..]),
         );
@@ -427,6 +428,7 @@ pub fn apply_horizontal_viscosity_3d(
                         }
                         _ => [0.0; LANES],
                     },
+                    |_| true,
                     diffusion,
                     out.each_mut().map(|o| &mut o[..]),
                 );

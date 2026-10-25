@@ -27,7 +27,8 @@ pub struct HorizontalViscosity2D {
     pub background: f64,
     /// Smagorinsky's coefficient `C_s` (typically 0.1–0.2; 0 for none).
     pub smagorinsky: f64,
-    /// Minimum depth below which viscosity is disabled (avoids division by tiny h).
+    /// Depth (m) at or below which a node carries no viscosity, and takes
+    /// its element out of the viscous domain (`solver::rhs::swe_2d_viscosity`).
     pub h_min: f64,
 }
 
