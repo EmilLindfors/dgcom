@@ -6,6 +6,12 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **A farm-wake case at a real site: Kattholmen in the Mausund box (TODO F.1).** `froya_real_data site=<site file>` puts the site's cages (`FarmSite::cage_layout`) into the 2D tide as cage drag, runs the same tide without them first (`farm_runs=both|cages`), and reports over the last whole M2 periods after spin-up: the current at the farm, the wake along the current for each direction of the tide, the residual current with and without the cages, and the drag on the farm (`examples/common/farm_site.rs`; `farm_wake.csv` and `farm_cages.csv`, drawn by `scripts/farm_wake_map.py`). With `particles=N` it releases batches in every cage and tracks them online with and without the random walk's depth drift (`walks=depth,surface`, `kh=`, `seeds=`), reporting pen-to-pen and back-to-farm connectivity (`connectivity.csv`). Findings (31 h nested in NorKyst, ν = 1 m²/s, `notes/farm.md`, `notes/particles.md`):
+  - The farm is in slack water in the model (0.04 m/s mean, NorKyst's M2 0.21–0.25 m/s: the island lee, P3.1). The cages slow it by 9 %, the drag is 5.8 kN mean and 15.5 kN at most, the wake is 5–8 % in the farm and ≈ 1 % 150 m beyond its edge, and the residual changes by ≤ 4.7 mm/s, nothing beyond 1 km.
+  - Without the depth drift particles drain onto the drying shores: 7.3 against 0.9 % stranded at the end with K = 0.1 m²/s, 38 against 6.4 % with K = 1. Connectivity moves less, through that loss (other cages +1.3 and +5.8 points with the drift).
+  - `froya_real_data nu=` and `cs=` add horizontal viscosity (constant, Smagorinsky, or both) to the 2D tide.
+  - `CageGrid::RING_160M`: the common 160 m ring in 90 m frame cells, used by the example and the viewer.
+
 - **The random walk's depth drift `K∇h/h` (TODO F.2, PR #171, Dimou & Adams 1993).** A tracer mixed through a water column of varying depth now stays well mixed. Before, the walk spread particles evenly over the area, so they drained from deep water into the shallows.
   - 2D: `ParticleTracker2D::with_walk_tracer(WalkTracer::DepthIntegrated | Surface)`. **`DepthIntegrated` is the new default**: `∂(hc)/∂t = ∇·(hK∇c)`, with the drift `K∇h/h`. `Surface` is the old walk, for floating matter.
   - 3D: the walk along σ-surfaces always drifts by `K∇D/D` (layers `D Δσ` thick).

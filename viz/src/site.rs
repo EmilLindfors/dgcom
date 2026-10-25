@@ -24,12 +24,7 @@ use crate::scenario::Scenario;
 
 /// Frame cells (m), cage radius (m) and net depth (m) when the file gives no cages:
 /// Kattholmen's 180 × 365 m frame holds 2 × 4 cages of 160 m circumference.
-pub const CAGE_GRID: CageGrid = CageGrid {
-    spacing: 90.0,
-    radius: 25.5,
-    net_depth: 20.0,
-    solidity: 0.25,
-};
+pub const CAGE_GRID: CageGrid = CageGrid::RING_160M;
 
 /// Radius (m) of the frame's pipes and of the mooring lines as drawn: thicker than
 /// real, to be seen from a few hundred metres.

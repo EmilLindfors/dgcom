@@ -128,6 +128,16 @@ pub struct CageGrid {
 }
 
 impl CageGrid {
+    /// The common ring of 160 m circumference (radius 25.5 m) in frame cells
+    /// of 90 m, nets 20 m deep of solidity 0.25: Kattholmen's 180 × 365 m
+    /// frame holds 2 × 4 of them.
+    pub const RING_160M: Self = Self {
+        spacing: 90.0,
+        radius: 25.5,
+        net_depth: 20.0,
+        solidity: 0.25,
+    };
+
     /// Cages of `radius` and `net_depth` (m) in frame cells of `spacing` m,
     /// nets of solidity 0.25.
     pub fn new(spacing: f64, radius: f64, net_depth: f64) -> Self {

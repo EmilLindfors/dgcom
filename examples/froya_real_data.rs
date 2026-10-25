@@ -111,7 +111,8 @@
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [wave_stations=NAME:LON,LAT;…] \
 //!     [levels=0] [tide3d=0] [rk_3d=43|3] [cfl_3d=4|2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] \
-//!     [restart_hours=0] [resume=<file>] [rivers=<file>] [river_snap_km=2] [river_profile=tapered:3]
+//!     [restart_hours=0] [resume=<file>] [rivers=<file>] [river_snap_km=2] [river_profile=tapered:3] \
+//!     [nu=0] [cs=0] [site=<file> …]
 //! ```
 //!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
@@ -392,6 +393,37 @@
 //! in shoreline elements up to 0.9 of the subcells' lower limit
 //! (`linear_cfl_subcells_swe_2d`: 0.99 at P2).
 //!
+//! `nu=V` and `cs=C` give the 2D tide a horizontal viscosity: a constant
+//! background of V m²/s plus Smagorinsky's with coefficient C
+//! (`HorizontalViscosity2D`); none by default. A farm's wake needs one: without
+//! it nothing but the bed friction removes a 50–100 m eddy.
+//!
+//! `site=<file>` puts a fish farm into the 2D tide (TODO F.1,
+//! `examples/common/farm_site.rs`): the cages of a Fiskeridirektoratet site
+//! file (`scripts/fiskeridir_site.sh`, e.g. `data/sites/14042.txt`,
+//! Kattholmen) as `CageDrag2D`, after the same tide without them (in
+//! `<output>/no_cages`; `farm_runs=cages` skips it). It reports the current
+//! at the farm, the wake along the current, the residual current with and
+//! without the cages and the drag on the farm over the last whole M2 periods
+//! after `spinup_hours`, and with `particles=N` the pen-to-pen connectivity
+//! of particles released in the cages, tracked online with and without the
+//! random walk's depth drift (`walks=depth,surface`, `kh=`, `seeds=`).
+//! Options: `[farm_runs=both] [cage_spacing=90] [cage_radius=25.5]
+//! [net_depth=20] [solidity=0.25] [farm_window=1500] [farm_grid=20]
+//! [farm_return=500] [particles=0] [release=<spinup_hours>] [releases=4]
+//! [release_every=3.105] [particle_seconds=20] [kh=0.1] [seeds=4]
+//! [walks=depth,surface]`. The Kattholmen case (`data/mausund_kattholmen.msh`
+//! is the Mausund box's coastline mesh refined at the farm, 275 elements
+//! of 11–29 m edges within 170 m of its centre):
+//!
+//! ```bash
+//! froya_real_data mesh=data/mausund_kattholmen.msh bbox=8.45,63.78,8.90,63.95 \
+//!     tides=data/mausund_boundary_tides.txt norkyst=data/froya_norkyst.nc \
+//!     slopes3d=on debug_3d=thin=1 lts=8 hours=31 ramp_hours=3 spinup_hours=6 \
+//!     rest_hours=0 nu=1 site=data/sites/14042.txt particles=200 seeds=4 \
+//!     kh=0.1,1 particle_seconds=10 output=output/kattholmen_farm
+//! ```
+//!
 //! Harmonic validation needs the record after spin-up to resolve the main
 //! constituents: 15 days separate M2/S2 and K1/O1 (`hours=384` with the
 //! default spin-up); N2 needs 28.
@@ -404,6 +436,9 @@
 //!   without the topobathy model, or with `dem=none`
 //! - froya_boundary_tides.txt (tidal atlas, optional)
 //! - tide_gauges/mausund_obs.txt, froya_station_tides.txt (validation, optional)
+
+#[path = "common/farm_site.rs"]
+mod farm_site;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -450,7 +485,8 @@ use dg_rs::solver::{
 };
 use dg_rs::source::{
     AtmosphericPressure2D, CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D,
-    GriddedSurfaceFluxes, GriddedWindStress, ManningFriction2D, WindStress2D,
+    GriddedSurfaceFluxes, GriddedWindStress, HorizontalViscosity2D, ManningFriction2D,
+    WindStress2D,
 };
 use dg_rs::tides::canonical_name;
 use dg_rs::time::{
@@ -464,6 +500,7 @@ use dg_rs::waves::{
     CoupledWaves2D, CoupledWavesStats, DEFAULT_RATE_LIMITER, GrowthLimiter, SeaStateFields,
     SourceIntegration, SourceTerms, SpectralGrid, WaveForceForm, WaveModel2D, Wind,
 };
+use farm_site::{FarmCase, FarmOptions, FarmRecord};
 
 /// Gravitational acceleration (m/s²)
 const G: f64 = 9.81;
@@ -752,6 +789,12 @@ struct Options {
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     river_profile: dg_rs::source::RiverProfile,
     output: Option<PathBuf>,
+    /// The 2D tide's horizontal viscosity: a constant background (`nu=`,
+    /// m²/s) plus Smagorinsky's (`cs=`); none by default
+    nu: f64,
+    cs: f64,
+    /// A fish farm in the 2D tide (`site=`, see `common/farm_site.rs`)
+    farm: Option<FarmOptions>,
 }
 
 /// The 3D model of `levels=N`.
@@ -1075,7 +1118,11 @@ impl Options {
             spinup_hours: get("spinup_hours", 24.0)?,
             gauge_gains: constituents("gauge_gains", "K1,O1,S2")?,
             gauge_ratios: constituents("gauge_ratios", "N2,Q1,P1,K2")?,
+            nu: get("nu", 0.0)?,
+            cs: get("cs", 0.0)?,
+            farm: None,
         };
+        opts.farm = FarmOptions::parse(&args, opts.spinup_hours)?;
         // SSP-RK(4,3)'s stages hold twice SSP-RK3's step where a forward-Euler
         // bound sets it (the shoreline elements' subcells)
         opts.cfl_3d = get(
@@ -1970,6 +2017,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wave_cost(wave_domain.as_ref().unwrap_or(&domain), &domain, &opts);
         return Ok(());
     }
+    if opts.farm.is_some() && opts.levels > 0 {
+        return Err("site= is for the 2D tide".into());
+    }
     if opts.levels > 0 && opts.tide_3d {
         return tidal_run_3d(&domain, &opts, parent, parent_reader);
     }
@@ -1987,9 +2037,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // A fish farm: its cages, and the same tide without them first
+    let farm = match &opts.farm {
+        Some(farm) => {
+            let projection = domain
+                .projection
+                .ok_or("site= needs the Frøya data files")?;
+            let case = FarmCase::new(
+                farm.clone(),
+                &projection,
+                &domain.mesh,
+                &domain.ops,
+                &domain.bathymetry,
+            )?;
+            case.describe(&projection);
+            Some(case)
+        }
+        None => None,
+    };
+
     lake_at_rest(&domain, opts.rest_hours);
     let waves = (opts.wave_coupling > 0.0).then(|| wave_domain.as_ref().unwrap_or(&domain));
-    tidal_run(&domain, &opts, parent, waves)
+    let Some(case) = &farm else {
+        tidal_run(&domain, &opts, parent, waves, None)?;
+        return Ok(());
+    };
+    let output = output_dir(&domain, &opts);
+    let reference = if case.options().reference() {
+        let mut open = opts.clone();
+        open.output = Some(output.join("no_cages"));
+        println!("\nThe tide without the farm's cages...");
+        tidal_run(&domain, &open, parent.clone(), waves, Some((case, false)))?
+    } else {
+        None
+    };
+    println!("\nThe tide with the farm's cages...");
+    let caged = tidal_run(&domain, &opts, parent, waves, Some((case, true)))?
+        .expect("a farm run records the farm");
+    // The last whole M2 periods after the spin-up
+    let t_end = opts.hours * 3600.0;
+    let spinup = 3600.0 * opts.spinup_hours;
+    let periods = ((t_end - spinup) / M2_PERIOD).floor();
+    let window = if periods >= 1.0 {
+        [t_end - periods * M2_PERIOD, t_end]
+    } else {
+        [spinup, t_end]
+    };
+    case.report(
+        reference.as_ref(),
+        &caged,
+        window,
+        &ModelClock::parse(&opts.start)?,
+        &output,
+    )?;
+    Ok(())
+}
+
+/// Where a run writes its output (`output=`, or `output/<domain>`).
+fn output_dir(domain: &Domain, opts: &Options) -> PathBuf {
+    opts.output
+        .clone()
+        .unwrap_or_else(|| Path::new("output").join(domain.name))
 }
 
 /// Walls everywhere and no forcing: the largest spurious current and surface
@@ -2155,12 +2263,15 @@ fn tide_setup(
     })
 }
 
-fn tidal_run(
-    domain: &Domain,
+/// The 2D tide; with `farm`, the farm's cages if its flag is set, and what
+/// the run recorded at the farm.
+fn tidal_run<'a>(
+    domain: &'a Domain,
     opts: &Options,
     parent: Option<OceanModelState>,
     wave_domain: Option<&Domain>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    farm: Option<(&'a FarmCase, bool)>,
+) -> Result<Option<FarmRecord<'a>>, Box<dyn std::error::Error>> {
     let TideSetup {
         t_end,
         clock,
@@ -2191,10 +2302,19 @@ fn tidal_run(
             )
             .with_source(pressure());
     }
+    if opts.nu > 0.0 || opts.cs > 0.0 {
+        builder = builder
+            .with_viscosity(HorizontalViscosity2D::smagorinsky(opts.cs).with_background(opts.nu));
+    }
+    if let Some((case, true)) = farm {
+        builder = builder.with_cage_drag(case.cage_drag(&domain.mesh, &domain.ops));
+    }
+    let mut record =
+        farm.map(|(case, cages)| case.record(&domain.mesh, &domain.ops, &domain.geom, cages));
     let physics: SWEPhysics2D<_> = builder.build();
     if opts.profile > 0 {
         profile_phases(domain, &physics, opts.profile);
-        return Ok(());
+        return Ok(None);
     }
     let (mut waves, mut wave_points) = match wave_domain {
         Some(wave_domain) => {
@@ -2205,10 +2325,7 @@ fn tidal_run(
         None => (None, None),
     };
 
-    let output_dir = opts
-        .output
-        .clone()
-        .unwrap_or_else(|| Path::new("output").join(domain.name));
+    let output_dir = output_dir(domain, opts);
     fs::create_dir_all(&output_dir)?;
     write_clock(&output_dir, &clock)?;
     #[cfg(feature = "netcdf")]
@@ -2246,16 +2363,29 @@ fn tidal_run(
         opts.cfl,
         opts.integrator.ssp_coefficient() * positivity_cfl_swe_2d(opts.order),
     );
+    if opts.nu > 0.0 || opts.cs > 0.0 {
+        println!(
+            "  Horizontal viscosity: {} m²/s plus Smagorinsky's with C_s = {}",
+            opts.nu, opts.cs
+        );
+    }
+    if let Some((_, cages)) = farm {
+        println!(
+            "  Farm: {}, sampled every {} min",
+            if cages { "cages" } else { "no cages" },
+            opts.station_minutes
+        );
+    }
     println!(
         "  time  |  η range (m)     | η max at (x, y km; h m) | max |u| (m/s) at (x, y km; h m) | open water ≥ 3 m (m/s)         | wet nodes | volume change"
     );
 
     let mut q = domain.at_rest();
     let volume0 = domain.volume(&q);
-    // Callbacks sample the stations; every `output_every`-th also writes
-    // output, every `snapshot_every`-th a snapshot frame
+    // Callbacks sample the stations and the farm; every `output_every`-th
+    // also writes output, every `snapshot_every`-th a snapshot frame
     let snapshot_minutes = (opts.snapshot_minutes > 0.0).then_some(opts.snapshot_minutes);
-    let base_minutes = if stations.is_empty() {
+    let base_minutes = if stations.is_empty() && record.is_none() {
         opts.output_minutes
             .min(snapshot_minutes.unwrap_or(f64::INFINITY))
     } else {
@@ -2315,6 +2445,9 @@ fn tidal_run(
     let mut callback = |q: &SWESolution2D, t: f64| {
         for s in &mut stations {
             s.sample(q, &domain.bathymetry, clock.unix(t));
+        }
+        if let Some(record) = record.as_mut() {
+            record.sample(q, t);
         }
         n_callbacks += 1;
         if let (Some(writer), Some(every)) = (snapshot.as_mut(), snapshot_every)
@@ -2457,7 +2590,7 @@ fn tidal_run(
         return Err(e.into());
     }
     println!("Visualize with ParaView: {}/*.vtu", output_dir.display());
-    Ok(())
+    Ok(record)
 }
 
 /// The waves of a tidal run with `wave_coupling=`: the model, its exchange
