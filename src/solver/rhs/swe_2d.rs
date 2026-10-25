@@ -2295,7 +2295,8 @@ mod tests {
 
     /// The whole-mesh BR1 viscosity that the per-element viscous term
     /// replaced (whole-mesh velocity, gradient, coefficient and diffusion
-    /// arrays), added to `rhs`.
+    /// arrays), added to `rhs`: on the elements in the viscous domain, with
+    /// a zero-gradient, no-flux edge toward the others.
     fn reference_viscosity<BC: SWEBoundaryCondition2D>(
         rhs: &mut SWESolution2D,
         q: &SWESolution2D,
@@ -2308,8 +2309,14 @@ mod tests {
         use super::super::diffusion_2d::{
             DiffusionScratch, br1_diffusion_element, compute_br1_gradient_2d,
         };
+        use super::super::swe_2d_viscosity::in_viscous_domain;
 
         let visc = config.viscosity.expect("viscosity");
+        let subcell_depth = match config.formulation {
+            SWEFormulation2D::WetDry => config.subcell_depth.unwrap_or(config.h_dry),
+            _ => 0.0,
+        };
+        let in_water = |k: ElementIndex| in_viscous_domain(q, visc, subcell_depth, k);
         let n_nodes = ops.n_nodes;
         let total_nodes = mesh.n_elements * n_nodes;
         let mut u = vec![0.0; total_nodes];
@@ -2326,7 +2333,10 @@ mod tests {
             }
         }
         let boundary = |component: usize| {
-            move |k: ElementIndex, face: usize, fi: usize, node: usize, _interior: f64| {
+            move |k: ElementIndex, face: usize, fi: usize, node: usize, interior: f64| {
+                if mesh.neighbor(k, face).is_some() {
+                    return interior;
+                }
                 let normal = geom.normal(k.as_usize(), face, fi);
                 let ghost =
                     boundary_state(q, mesh, ops, config, time, k, face, node, normal).state();
@@ -2341,11 +2351,11 @@ mod tests {
                 }
             }
         };
-        let grad_u = compute_br1_gradient_2d(&u, mesh, ops, geom, boundary(0));
-        let grad_v = compute_br1_gradient_2d(&v, mesh, ops, geom, boundary(1));
+        let grad_u = compute_br1_gradient_2d(&u, mesh, ops, geom, boundary(0), in_water);
+        let grad_v = compute_br1_gradient_2d(&v, mesh, ops, geom, boundary(1), in_water);
 
         let mut coeff = vec![0.0; total_nodes];
-        for k in ElementIndex::iter(mesh.n_elements) {
+        for k in ElementIndex::iter(mesh.n_elements).filter(|&k| in_water(k)) {
             let delta = HorizontalViscosity2D::filter_width(geom.area[k.as_usize()], ops.order);
             for i in 0..n_nodes {
                 let flat = k.as_usize() * n_nodes + i;
@@ -2366,7 +2376,7 @@ mod tests {
         // mirrors the velocity and passes the normal stress only
         let (mut diff_u, mut diff_v) = (vec![0.0; total_nodes], vec![0.0; total_nodes]);
         let mut scratch = DiffusionScratch::<2>::new(n_nodes);
-        for k in ElementIndex::iter(mesh.n_elements) {
+        for k in ElementIndex::iter(mesh.n_elements).filter(|&k| in_water(k)) {
             let rows = k.as_usize() * n_nodes..(k.as_usize() + 1) * n_nodes;
             br1_diffusion_element(
                 k,
@@ -2381,10 +2391,14 @@ mod tests {
                         (c * grad_v[flat].dx, c * grad_v[flat].dy),
                     ]
                 },
-                |_, _, _, (nx, ny), [fu, fv]| {
+                |k, face, _, (nx, ny), [fu, fv]| {
+                    if mesh.neighbor(k, face).is_some() {
+                        return [0.0; 2];
+                    }
                     let normal = nx * fu + ny * fv;
                     [nx * normal, ny * normal]
                 },
+                in_water,
                 &mut scratch,
                 [&mut diff_u[rows.clone()], &mut diff_v[rows]],
             );
@@ -2393,6 +2407,77 @@ mod tests {
             rhs.data[1][flat] += diff_u[flat];
             rhs.data[2][flat] += diff_v[flat];
         }
+    }
+
+    /// The viscous term keeps off the shore: on a beach with an along-shore
+    /// shear current, it changes nothing in the shoreline (subcell) and dry
+    /// elements, dissipates kinetic energy, and leaves the mass alone.
+    /// Before, the divergence of the wet nodes' stress put momentum into the
+    /// dry nodes of the shoreline elements, and at ν = 10 m²/s that pushed
+    /// films 4 m up a cliff shore at Frøya (TODO F.1).
+    #[test]
+    fn viscosity_keeps_off_the_shore() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 800.0, 0.0, 400.0, 8, 4);
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        // Shoreline at x = 500 m: the bed rises 1 m per 100 m
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| -5.0 + 0.01 * x);
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let h = (-bathymetry.get(k, i)).max(0.0);
+                let (u, v) = (0.05 * (y / 60.0).sin(), 0.3 * (1.0 - x / 500.0));
+                q.set_state(k, i, SWEState2D::new(h, h * u, h * v));
+            }
+        }
+        let visc = HorizontalViscosity2D::constant(10.0);
+        let inviscid = || {
+            SWE2DRhsConfig::new(&equation, &bc)
+                .with_coriolis(false)
+                .with_formulation(SWEFormulation2D::WetDry)
+                .with_bathymetry(&bathymetry)
+        };
+        let without = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &inviscid(), 0.0);
+        let config = inviscid().with_viscosity(&visc);
+        let with = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+        assert_eq!(with.data[0], without.data[0], "no mass from viscosity");
+
+        let (mut shore, mut water, mut work) = (0, 0, 0.0);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            let wet = q.element_h(k).iter().all(|&h| h >= config.h_dry);
+            let mut changed = false;
+            for i in 0..ops.n_nodes {
+                let flat = k.as_usize() * ops.n_nodes + i;
+                let (dhu, dhv) = (
+                    with.data[1][flat] - without.data[1][flat],
+                    with.data[2][flat] - without.data[2][flat],
+                );
+                changed |= dhu != 0.0 || dhv != 0.0;
+                let state = q.get_state(k, i);
+                if state.h > 0.0 {
+                    let w = ops.weights[i] * geom.jacobian(k.as_usize(), i);
+                    work += w * (state.hu * dhu + state.hv * dhv) / state.h;
+                }
+            }
+            if wet {
+                water += usize::from(changed);
+            } else {
+                shore += 1;
+                assert!(!changed, "element {k:?} has a node shallower than h_dry");
+            }
+        }
+        assert!(
+            shore >= 8,
+            "test regime: {shore} shoreline and dry elements"
+        );
+        assert!(
+            water >= 16,
+            "the viscous term must act in the water: {water}"
+        );
+        assert!(work < 0.0, "viscosity dissipates: {work:.3e}");
     }
 
     /// The per-element viscous term (whole mesh serial and parallel, and the

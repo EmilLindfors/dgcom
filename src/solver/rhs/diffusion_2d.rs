@@ -40,8 +40,9 @@ fn idx(k: ElementIndex, node: usize, n_nodes: usize) -> usize {
 /// discontinuous values on adjacent elements contribute to the gradient
 /// reconstruction. `value(j, node)` are the scalars at a node of element `k`
 /// or of a face neighbour; `boundary_value(k, face, fi, node, interior)` the
-/// exterior values on a boundary face. `own` is scratch for the element's
-/// `n_nodes` values.
+/// exterior values on a boundary face, and on a face whose neighbour `j` is
+/// not `coupled(j)` (the caller tells the two apart by the mesh's neighbour).
+/// `own` is scratch for the element's `n_nodes` values.
 ///
 /// The scalars share each node's `value` and `boundary_value` call (e.g. one
 /// division by `h` and one boundary-condition evaluation for both velocity
@@ -53,6 +54,7 @@ pub(super) fn br1_gradient_element<const N: usize>(
     geom: &GeometricFactors2D,
     value: impl Fn(ElementIndex, usize) -> [f64; N],
     boundary_value: impl Fn(ElementIndex, usize, usize, usize, [f64; N]) -> [f64; N],
+    coupled: impl Fn(ElementIndex) -> bool,
     own: &mut [[f64; N]],
     out: [&mut [ScalarGradient2D]; N],
 ) {
@@ -86,13 +88,16 @@ pub(super) fn br1_gradient_element<const N: usize>(
 
     for face in 0..4 {
         let face_nodes = &ops.face_nodes[face];
+        let neighbor = mesh
+            .neighbor(k, face)
+            .filter(|nb| coupled(ElementIndex::new(nb.element)));
 
         for fi in 0..n_face_nodes {
             let node = face_nodes[fi];
             let normal = geom.normal(k_usize, face, fi);
             let scale = geom.lift_scale(k_usize, face, fi, node);
             let value_int = own[node];
-            let value_ext = if let Some(neighbor) = mesh.neighbor(k, face) {
+            let value_ext = if let Some(neighbor) = &neighbor {
                 let neighbor_nodes = &ops.face_nodes[neighbor.face];
                 let neighbor_node = neighbor_nodes[n_face_nodes - 1 - fi];
                 value(ElementIndex::new(neighbor.element), neighbor_node)
@@ -141,8 +146,9 @@ impl<const N: usize> DiffusionScratch<N> {
 /// elements, so the element-integrated diffusion is conservative across
 /// interior faces.
 ///
-/// On a boundary face the normal flux is `boundary_flux(k, face, fi,
-/// normal, F·n)`, from the interior's `F·n` per scalar. It must match the
+/// On a boundary face, and on a face whose neighbour `j` is not
+/// `coupled(j)`, the normal flux is `boundary_flux(k, face, fi, normal,
+/// F·n)`, from the interior's `F·n` per scalar. It must match the
 /// exterior state the gradient took ([`br1_gradient_element`]'s
 /// `boundary_value`), or the operator is not dissipative: with the strong
 /// form's summation by parts, `Σ u·div(c∇u)` is `−Σ c|∇u|²` plus, on the
@@ -165,6 +171,7 @@ pub(super) fn br1_diffusion_element<const N: usize>(
     geom: &GeometricFactors2D,
     flux: impl Fn(ElementIndex, usize) -> [(f64, f64); N],
     boundary_flux: impl Fn(ElementIndex, usize, usize, (f64, f64), [f64; N]) -> [f64; N],
+    coupled: impl Fn(ElementIndex) -> bool,
     scratch: &mut DiffusionScratch<N>,
     out: [&mut [f64]; N],
 ) {
@@ -211,13 +218,16 @@ pub(super) fn br1_diffusion_element<const N: usize>(
 
     for face in 0..4 {
         let face_nodes = &ops.face_nodes[face];
+        let neighbor = mesh
+            .neighbor(k, face)
+            .filter(|nb| coupled(ElementIndex::new(nb.element)));
 
         for fi in 0..n_face_nodes {
             let node = face_nodes[fi];
             let normal = geom.normal(k_usize, face, fi);
             let lift_scale = geom.lift_scale(k_usize, face, fi, node);
             let lift_entry = ops.lift_row_major[face][node * n_face_nodes + fi];
-            let exterior = mesh.neighbor(k, face).map(|neighbor| {
+            let exterior = neighbor.as_ref().map(|neighbor| {
                 let neighbor_nodes = &ops.face_nodes[neighbor.face];
                 flux(
                     ElementIndex::new(neighbor.element),
@@ -242,7 +252,8 @@ pub(super) fn br1_diffusion_element<const N: usize>(
 
 /// [`br1_gradient_element`] of every element, for `values` given at every
 /// mesh node (whole-mesh arrays: the reference the kernels are tested
-/// against).
+/// against), the faces to elements not `coupled` handled by
+/// `boundary_value`.
 #[cfg(test)]
 pub(super) fn compute_br1_gradient_2d<F>(
     values: &[f64],
@@ -250,6 +261,7 @@ pub(super) fn compute_br1_gradient_2d<F>(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     boundary_value: F,
+    coupled: impl Fn(ElementIndex) -> bool,
 ) -> Vec<ScalarGradient2D>
 where
     F: Fn(ElementIndex, usize, usize, usize, f64) -> f64,
@@ -267,6 +279,7 @@ where
             geom,
             |j, node| [values[idx(j, node, n_nodes)]],
             |k, face, fi, node, [interior]| [boundary_value(k, face, fi, node, interior)],
+            &coupled,
             &mut own,
             [out],
         );
