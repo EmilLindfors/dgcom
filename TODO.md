@@ -6,7 +6,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Next up
 
-1. **F.1** A farm-wake case at a real fjord site with real tidal currents through an open boundary: the cages' wake, the residual current, and the depth drift's effect on connectivity, none of which `farm_3d`'s periodic flat channel can show. See Salmon farm.
+1. **F.1** Choose ν at Kattholmen: the real-site farm case (`froya_real_data site=data/sites/14042.txt`, 2026-10-24) ran with ν = 1 m²/s, and its wake (5–8 % in the farm, ≈ 1 % 150 m beyond) and residual change (≤ 4.7 mm/s) may depend on it. See Salmon farm.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -32,11 +32,12 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Salmon farm and cage drag (F.1) — [notes/farm.md](notes/farm.md)
 
-- [ ] **F.1** Run farm cases with horizontal viscosity (`local_time_stepping_farm nu=1`, 2.1× the inviscid LTS cost) and choose ν: constant 1–10 m²/s or `HorizontalViscosity2D::smagorinsky(cs).with_background(nu)` (Smagorinsky alone ≈ 5e-4 m²/s).
-- [ ] **F.1** A farm-wake case at a real fjord site with real tidal currents through an open boundary (the test fjord has mm/s currents; `farm_3d` is a periodic channel).
+- [ ] **F.1** Choose ν at Kattholmen: rerun the real-site case with `nu=0.1` and `nu=10`, and `cs=0.1 nu=0.1` (`HorizontalViscosity2D::smagorinsky(cs).with_background(nu)`; Smagorinsky alone ≈ 5e-4 m²/s), and compare the wake, the residual's change and the connectivity (≈ 3 h per pair of runs).
+- [ ] **F.1** The Kattholmen case in 3D (`froya_real_data levels=…` with `site=`, refused today): the wake under the nets, the drag (≈ 20 % above 2D in `farm_3d`) and larvae in the surface layer.
+- [ ] **F.1** Rerun Kattholmen when the island lee is settled (P3.1): the farm's current is 0.04 m/s mean, NorKyst's M2 there 0.21–0.25 m/s, so the wake and drag may be 2–5× too small.
 - [ ] **F.1** Net-made wake TKE (`P = Σ λ_l |u_l|²`) as a source in GLS's `k` and `ψ` per caged layer (Beudin et al. 2017, `c_ψ4`).
 - [ ] **F.1** Compare the cage wake with a farm survey or flume data before trusting the default a = 4/(πR) (Løland's r = 1 − 0.46 C_d is left to the resolved flow).
-- [ ] **F.1** Check a site's guessed cage count and size (`FarmSite::cage_layout`, Kattholmen 2 × 4) against an aerial photo or the operator.
+- [ ] **F.1** Check a site's guessed cage count and size (`FarmSite::cage_layout`, Kattholmen 2 × 4) against an aerial photo or the operator; Kattholmen's two southern cages stand on a 9–10 m bed under 20 m nets (the 50 m topobathy), so check the bed at the frame too.
 - [ ] **F.1** Angle dependence C_d(θ) and the lift term, for square cages in oblique flow.
 - [ ] **F.1** Net deformation in strong currents (the net lifts, d_net shrinks).
 - [ ] **F.1** Low priority: a sparse layer-drag buffer over `CageDrag2D::nodes` (`ModeSplitIntegrator` `layer_drag_rate` is dense and zeroed every step by `Hydrostatic3D::layer_drag_into`).

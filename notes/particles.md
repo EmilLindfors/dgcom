@@ -20,7 +20,24 @@
     - `ParticleVelocity2D`/`3D::depth_gradient(element, gradient_weights, t)`: `∇h` of `SWEVelocity2D` and `∇(η − B)` of `Solution3DVelocity`, linear in time like the depth; the wrappers forward it; `None` by default (no drift). The trackers build the basis's physical gradients at the particle (`DGOperators2D::interpolation_gradient_weights_into` from `polynomial::lagrange_basis_derivative`, through the element's bilinear map) only when the walk has a `K`.
     - 2D: `ParticleTracker2D::with_walk_tracer(WalkTracer::DepthIntegrated | Surface)`, `DepthIntegrated` the default (a depth-averaged flow's particles); `Surface` for floating matter. 3D: always.
     - Gates (`tests/particle_depth_drift_test.rs`), the unit square in 8 × 8 distorted P2 quads with the depth 0.2–1.8 m and 16,000 particles in proportion to it, 400 steps of 0.5 s, χ² over 64 bins against `∝ h` (63 dof, 99.9 % below 104): 2D with `K` varying tenfold as well, 44.7 depth-integrated against 4,698 for the surface walk; 3D (uniform in volume, `K_h` 1e-3, the vertical walk on), 57.2 against 5,201 without the depth gradient, and over σ 5.5 (9 dof). Unit tests: `lagrange_basis_derivative` and the point gradient weights exact on Q_N, the physical gradient weights exact for a linear field on non-parallelograms.
-    - The drift needs `√(2KΔt) ≪ h/|∇h|`; it grows as `1/h` toward a drying shore (with a stranding depth particles stop there first). Its effect on a real site's connectivity is not measured: that needs a run at a real fjord site (F.1's real-site item).
+    - The drift needs `√(2KΔt) ≪ h/|∇h|`; it grows as `1/h` toward a drying shore (with a stranding depth particles stop there first). Its effect on a real site's connectivity was not measured until F.1's real-site case (below).
+    - At a real site (2026-10-24, F.1's Kattholmen case: `froya_real_data site=data/sites/14042.txt particles=200 seeds=4 kh=0.1,1 particle_seconds=10`):
+      - Setup: 200 particles per cage, in 4 batches a quarter of an M2 period apart from 6 h, tracked online to 31 h on the same flow and seeds with the drift and without (`walks=depth,surface`). Particles strand in water under 5 cm and float again when it deepens.
+      - Means over the batches ± standard error of 4 seeds:
+
+        | walk, K (m²/s) | own cage again | another cage | exposure to the other cages | back at the farm | stranded at 31 h | within 1 km at 31 h |
+        |---|---|---|---|---|---|---|
+        | depth, 0.1 | 8.27 ± 0.15 % | 56.22 ± 0.25 % | 680 ± 5 s | 8.70 ± 0.20 % | 0.9 % | 18.2 % |
+        | surface, 0.1 | 7.77 ± 0.18 % | 54.94 ± 0.20 % | 649 ± 4 s | 8.00 ± 0.10 % | 7.3 % | 21.1 % |
+        | depth, 1 | 43.67 ± 0.38 % | 74.46 ± 0.17 % | 705 ± 5 s | 11.34 ± 0.25 % | 6.4 % | 17.1 % |
+        | surface, 1 | 38.96 ± 0.50 % | 68.69 ± 0.16 % | 567 ± 5 s | 6.62 ± 0.08 % | 38.1 % | 36.8 % |
+
+      - The drift's main effect is where the particles end up. Without it they drain into the shallows and gather on the drying shores: stranded at 31 h 7.3 against 0.9 % at K = 0.1 (z 64) and 38 against 6.4 % at K = 1 (z 136). The active ones are also 0.9–3.4 m shallower on average.
+      - Connectivity changes less, and through that loss: the surface walk's lower shares are the particles it has put ashore.
+        - K = 0.1: own and other cage +0.5 and +1.3 points with the drift (z 2.1 and 4.0), exposure +5 %.
+        - K = 1: +4.7 and +5.8 points (z 7.5 and 25), exposure +24 %, back at the farm 11.3 against 6.6 %.
+      - K itself moves the shares far more (own cage again 8 → 44 % from K = 0.1 to 1, as in `farm_3d`), so K's basis (below) still comes first. The surface walk is only right for floating matter.
+      - In this weak current (0.04 m/s mean at the farm) particles stay near the farm for hours (median age at the first contact with another cage 0.4–0.9 h), and none leave the domain in 25 h.
   - Curved (isoparametric) elements, once P1.3 has them: the walk assumes straight faces, and `inverse_bilinear` the bilinear map.
   - ~~Particle output (positions per snapshot) for the viewer (F.3)~~ done 2026-10-03 (`io::ParticleFileWriter`, see F.3); ~~connectivity statistics between farms~~ done 2026-10-03 (online, below).
   - A higher-order time interpolation between snapshots (cubic, as for the nesting fields in P1.5) when the output interval is long against the tidal period.
