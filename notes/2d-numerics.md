@@ -70,6 +70,16 @@
   - Also found: `test_standing_wave_period` timed the peaks of η at one node, 0.9 % off, under a 5 % tolerance, and skipped the check when it found fewer than two peaks. It now times the zero crossings of the cos(kx) mode amplitude: 3e-5, asserted to 1e-4.
   - [ ] `tests/swe_2d_test.rs` has three overlapping long-run conservation tests on the legacy stepper (`test_long_term_stability`, `test_long_time_conservation`, `test_long_run_mass_conservation`); merge them into one on `Simulation` when the examples and tests move off the legacy steppers (P6).
 
+### Horizontal viscosity at the shoreline (found and fixed 2026-10-25)
+
+The F.1 ν sweep at Kattholmen (`froya_real_data site=data/sites/14042.txt nu=10`, `notes/farm.md`) put water on land: within 2 h, η = +4.7 m on films of 2–20 cm at (−4.8, −0.9) km, running at 0.2–0.5 m/s. Element 8373 there is a cliff shore whose nodes span −0.55 to +4.64 m; at ν = 0.1 its land nodes stay dry and still (the wet node 0.02 m/s against 0.61 at ν = 10). At 5 h a 1.47 m/s current stood in 3 m of water 120 m from the farm's centre.
+
+Cause: the BR1 viscous term (`solver/rhs/swe_2d_viscosity.rs`) ran in the shoreline (subcell) elements. Dry nodes entered the gradient with u = 0 and carried no stress (νh = 0), but the divergence at a dry node differentiates its wet neighbours' stress, so dry nodes got momentum, and the subcell update moved water with it.
+
+Fix: viscosity on the water only. An element with a node shallower than the subcell depth (`WetDry`) or at or below `HorizontalViscosity2D::h_min` gets no viscous term; a face from a wet element toward it copies the wet side's velocity in the gradient (zero gradient) and passes no viscous flux, the pair that keeps BR1 dissipative (`diffusion_2d::br1_diffusion_element`, `R = I`), and conserves momentum. The BR1 helpers take a `coupled` neighbour predicate; the 3D viscosity (thin columns at rest, `viscosity_3d.rs`) passes `|_| true`. Gate `viscosity_keeps_off_the_shore` (a beach at ν = 10: no change in shoreline or dry elements, dissipative, no mass); it fails on the old kernel. The earlier Kattholmen run (ν = 1, 2026-10-24) used the old kernel; the sweep reruns it.
+
+The shoreline elements now have no lateral momentum diffusion at all: their first-order subcells dissipate more than any ν in use.
+
 ### Walled wet nodes keep their velocity (found 2026-10-11; the wall fixed 2026-10-15)
 
 On the Frøya coastline day in 3D (`froya_real_data mesh=data/froya_coast.msh … tide3d=1 slopes3d=on cfl_3d=1`), element 7790 held a depth-mean ū of 3.3–3.8 m/s (4.2 m/s at the surface) from 5 to 10 h, through the whole ebb. It set the 3D step, at ≈ 1850 s wall per model hour against ≈ 820 without it.
