@@ -56,8 +56,27 @@ Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 a
     - Particles: the depth drift's effect on connectivity is in `notes/particles.md` (F.2, the depth drift).
   - Caveats:
     - The two southern cages stand on a 9–10 m bed (the others on 20–42 m), so their 20 m nets act over the whole column. Check the bed at the frame and the cage layout before trusting their share.
-    - ν is 1 m²/s, unchosen (below); the wake's length and the residual's change may depend on it.
+    - ν = 1 m²/s sets these numbers (the ν sweep, below): at that ν the farm's current is half of what it is at 0.1.
     - 2D: `farm_3d`'s 3D drag was ≈ 20 % above 2D in a surface-intensified current, and the wake sits in the net's 20 m.
+  - ν, chosen 2026-10-25: `cs=0.1 nu=0.1` (Smagorinsky's C_s = 0.1, as the 3D default, over a 0.1 m²/s background). The same case at ν = 10, 1, 0.1 and C_s 0.1 + ν 0.1, after the shoreline viscosity fix (PR #173), four runs at once on 6 threads each (3.3–4.2 h per run):
+
+    | | ν = 10 | ν = 1 | ν = 0.1 | C_s 0.1 + ν 0.1 |
+    |---|---|---|---|---|
+    | current at the centre without cages, mean / largest (m/s) | 0.013 / 0.025 | 0.039 / 0.099 | 0.083 / 0.322 | 0.087 / 0.260 |
+    | M2 major axis at the NorKyst point (NorKyst 0.246 m/s) | 0.037 | 0.075 | 0.12–0.13 | 0.083–0.087 |
+    | farm's mean speed, cages / open (m/s) | 0.017 / 0.017 | 0.041 / 0.045 | 0.076 / 0.095 | 0.070 / 0.093 |
+    | drag on the farm, mean / largest (kN) | 1.0 / 2.4 | 5.9 / 15.4 | 24.0 / 83.3 | 18.6 / 66.6 |
+    | wake area over 5 %, each way (ha) | 3.3 / 0.2 | 13.0 / 9.0 | 196 / 249 † | 181 / 240 † |
+    | residual change within 250 m, mean / largest (mm/s) | 0.1 / 1.2 | 1.9 / 4.7 | 17 / 35 † | 13 / 30 † |
+    | RMS of u_cages − u_open at 26 h, within 0.5 km / at 1–2 km (m/s) | 0.0001 / 0.0001 | 0.004 / 0.0005 | 0.117 / 0.105 | 0.095 / 0.106 |
+    | particles, depth walk K = 0.1: own cage / another / within 1 km at 31 h (%) | 31 / 77 / 93 | 8.4 / 56 / 18 | 11 / 57 / 11 | 14 / 61 / 8.5 |
+
+    - ν ≥ 1 sets the farm's current. From ν = 10 to 1 to 0.1 the mean current at the farm goes 0.013 → 0.039 → 0.083 m/s; the island lee's eddies, which carry the flow past the farm, are damped. At ν = 1 the farm-scale Péclet number is UL/ν ≈ 0.04 · 100 / 1 ≈ 4, so viscosity, not the cages, shapes the wake; at 0.1 it is ≈ 80. The physical estimates are lower still: Elder's depth-mean 0.07 u* h ≈ 0.004–0.01 m²/s (u* = 0.002–0.005 m/s, h = 30 m), Okubo's (1971) diffusivity at 100 m, 0.0103 L^1.15 cm²/s ≈ 0.04 m²/s.
+    - The new kernel leaves ν = 1 where it was: drag 5.9 against 5.8 kN, the wake and the connectivity within 0.5 points of the 2026-10-24 run (results above).
+    - † Below ν = 1 the paired runs decorrelate. The cages' disturbance grows through the eddying lee until the two runs no longer share their eddies: the RMS velocity difference reaches 70–110 % of the RMS speed within 2 km by 26–31 h (at ν = 1 3–4 % within 500 m, nothing beyond 2 km). So at ν = 0.1 the wake table (−105 % "deficit" 100 m up-current), the wake areas and the residual change measure the eddies' divergence, not the farm. The drag and the speeds at the cage centres are local, and stand: the cages slow the farm by 20–25 %, against 9 % at ν = 1. A wake measure with a noise floor is the next step (TODO F.1).
+    - Smagorinsky's part adds little at the farm (`(0.1 · Δ)²|S|` ≈ 1e-3 m²/s on 10 m node spacing) and more on the coarse offshore elements; it is chosen for consistency with the 3D path's horizontal viscosity, not for a measured difference at the farm.
+    - The NorKyst point's M2 phase is 60–90° off at every ν, so ν is not the whole island-lee question (P3.1). Its 1-day fits have R² 0.52–0.79 at ν ≤ 0.1, where the eddies are.
+    - ν = 10 is also suspect locally: element 1183, a shoreline element 250 m north-west of the farm's centre (nodes from 1 cm on a −0.89 m bed to 18 m), runs at 0.2–0.8 m/s from 6 h, and its film node reaches the 20 m/s cap at 31 h (still at ν ≤ 1; P1.2 in `notes/2d-numerics.md`).
 - [ ] Follow-ups:
   - The rear net sees the cage-mean velocity; Løland's velocity reduction behind a panel (r = 1 − 0.46 C_d) is left to the resolved flow. Compare the wake with a farm survey or published flume data before trusting the default a = 4/(πR).
   - Angle dependence (C_d(θ)) and the lift term: irrelevant for a circular cage averaged over its perimeter, not for square cages in oblique flow.
@@ -75,4 +94,4 @@ Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 a
     - The persistence comes from the model, not the ocean: without horizontal viscosity nothing removes a 50–100 m eddy but bottom friction (≈ 1e-7 /s at 90 m) and weak upwind dissipation (the largest anomaly within 300 m: 9.0 → 7.3 mm/s over 2 h). With ν = 1 m²/s (`with_viscosity`, global stepping) it decays with e-folding ≈ 1000 s ≈ L²/ν: −3.5 → −1.5 → −1.1 mm/s at 10/20/30 min (largest 4.5 → 1.9 → 1.3), and the background flow is unchanged (no-drag velocities equal to 0.01 mm/s).
     - With a 1 h ramp (`HarmonicTide::with_ramp_up`) there is no surge: flood peaks at 19 mm/s at the farm and the drag takes 0.35–0.65 mm/s (3–4 %) off it. Still inviscid, that deficit then does not decay after the flow reverses (−0.67 mm/s at 2 h).
     - Done 2026-09-28: the tide ramps up over 1 h in `examples/local_time_stepping_farm.rs` (`ramp=`) and in the viewer (`--ramp`). At 15 min, local stepping still does 2.60× less RHS work, and local and global agree to 1.6e-6 m/s.
-    - To do: run farm cases with viscosity (affordable under LTS since 2026-09-28: `local_time_stepping_farm nu=1`, 2.1× the inviscid LTS cost), and choose ν (constant 1–10 m²/s or Smagorinsky with a background: at these shears Smagorinsky alone gives ν ≈ (0.1·20 m)²·|S| ≈ 5e-4 m²/s, i.e. nothing; the combination is `HorizontalViscosity2D::smagorinsky(cs).with_background(nu)` since 2026-10-02, P2.5). The real-site case (Kattholmen, 2026-10-24, below) ran with ν = 1 m²/s; ν is still to choose there.
+    - To do: run farm cases with viscosity (affordable under LTS since 2026-09-28: `local_time_stepping_farm nu=1`, 2.1× the inviscid LTS cost), and choose ν (constant 1–10 m²/s or Smagorinsky with a background: at these shears Smagorinsky alone gives ν ≈ (0.1·20 m)²·|S| ≈ 5e-4 m²/s, i.e. nothing; the combination is `HorizontalViscosity2D::smagorinsky(cs).with_background(nu)` since 2026-10-02, P2.5). The real-site case (Kattholmen, 2026-10-24, below) ran with ν = 1 m²/s; the sweep there (2026-10-25) chose `cs=0.1 nu=0.1`, because ν ≥ 1 sets the farm's current.

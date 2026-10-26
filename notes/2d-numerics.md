@@ -80,6 +80,8 @@ Fix: viscosity on the water only. An element with a node shallower than the subc
 
 The shoreline elements now have no lateral momentum diffusion at all: their first-order subcells dissipate more than any ν in use.
 
+Still open at large ν (the sweep, 2026-10-25): element 1183, 250 m north-west of the Kattholmen farm, has nodes from a −0.89 m bed to −19 m. Its shallow node is 0.29 m deep and still at 18 h. At 31 h it is 1.2 cm deep, above the 1 mm subcell depth, so the element is in the viscous domain, and that node is at the 20 m/s cap, its neighbours at 0.2–0.8 m/s. At ν = 1 the same element is still (≤ 0.014 m/s at 31 h), and the cages do not change it at ν = 10. Suspects: the velocity form's 1/h, which amplifies the viscous momentum at a 1 cm node, and the element moving in and out of the viscous domain as the node crosses the threshold between stages or LTS levels. Fix candidates: a viscous depth threshold scaled with ν (e.g. `h_min` ≈ ν Δt / Δx, or a fixed 0.1 m), or νh tapered to zero over a depth band instead of switched off. Not urgent at the chosen ν (0.1 m²/s), where the element is calm.
+
 ### Walled wet nodes keep their velocity (found 2026-10-11; the wall fixed 2026-10-15)
 
 On the Frøya coastline day in 3D (`froya_real_data mesh=data/froya_coast.msh … tide3d=1 slopes3d=on cfl_3d=1`), element 7790 held a depth-mean ū of 3.3–3.8 m/s (4.2 m/s at the surface) from 5 to 10 h, through the whole ebb. It set the 3D step, at ≈ 1850 s wall per model hour against ≈ 820 without it.

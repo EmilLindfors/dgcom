@@ -6,7 +6,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Next up
 
-1. **F.1** Choose ν at Kattholmen: the real-site farm case (`froya_real_data site=data/sites/14042.txt`, 2026-10-24) ran with ν = 1 m²/s, and its wake (5–8 % in the farm, ≈ 1 % 150 m beyond) and residual change (≤ 4.7 mm/s) may depend on it. See Salmon farm.
+1. **F.1** A wake measure with a noise floor at Kattholmen: at the chosen `cs=0.1 nu=0.1` the cage and open runs decorrelate in the eddying lee, so the paired wake and residual change are noise (2026-10-25). See Salmon farm.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -32,9 +32,9 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Salmon farm and cage drag (F.1) — [notes/farm.md](notes/farm.md)
 
-- [ ] **F.1** Choose ν at Kattholmen: rerun the real-site case with `nu=0.1` and `nu=10`, and `cs=0.1 nu=0.1` (`HorizontalViscosity2D::smagorinsky(cs).with_background(nu)`; Smagorinsky alone ≈ 5e-4 m²/s), and compare the wake, the residual's change and the connectivity (≈ 3 h per pair of runs).
+- [ ] **F.1** A wake measure with a noise floor: at ν ≤ 0.1 the cages' disturbance decorrelates the eddies (RMS u_cages − u_open 70–110 % of the speed within 2 km by 26 h), so the paired deficit and residual change measure the divergence. Run a third, near-zero-drag run (`solidity=0.0025`) against the open one for the floor, and report the cage effect where it exceeds it; or the deficit of mean speeds, not of paired samples (`farm_site.rs` wake loop).
 - [ ] **F.1** The Kattholmen case in 3D (`froya_real_data levels=…` with `site=`, refused today): the wake under the nets, the drag (≈ 20 % above 2D in `farm_3d`) and larvae in the surface layer.
-- [ ] **F.1** Rerun Kattholmen when the island lee is settled (P3.1): the farm's current is 0.04 m/s mean, NorKyst's M2 there 0.21–0.25 m/s, so the wake and drag may be 2–5× too small.
+- [ ] **F.1** Rerun Kattholmen when the island lee is settled (P3.1): at ν = 0.1 (with or without Smagorinsky) the farm's current is 0.08–0.09 m/s mean, 0.26–0.32 at most (0.04 at ν = 1), and the NorKyst point's M2 0.08–0.13 m/s against NorKyst's 0.25, 60–90° off in phase at every ν.
 - [ ] **F.1** Net-made wake TKE (`P = Σ λ_l |u_l|²`) as a source in GLS's `k` and `ψ` per caged layer (Beudin et al. 2017, `c_ψ4`).
 - [ ] **F.1** Compare the cage wake with a farm survey or flume data before trusting the default a = 4/(πR) (Løland's r = 1 − 0.46 C_d is left to the resolved flow).
 - [ ] **F.1** Check a site's guessed cage count and size (`FarmSite::cage_layout`, Kattholmen 2 × 4) against an aerial photo or the operator; Kattholmen's two southern cages stand on a 9–10 m bed under 20 m nets (the 50 m topobathy), so check the bed at the frame too.
@@ -167,6 +167,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.1** Specialise hot paths through the kernel split: a `const N` kernel for fixed-size products; skip `reference_to_physical` + `SourceContext2D` for sources that need neither (P2.2).
 - [ ] **P1.7** Merge the three legacy long-run conservation tests in `tests/swe_2d_test.rs` into one on `Simulation` when tests move off the legacy steppers.
 - [ ] **P1.2** Only if friction's first-order error matters on flats: second-order IMEX for point-implicit friction (13–32 % above exact decay at dt·Λ ≈ 3).
+- [ ] **P1.2** Viscosity on 1 cm films at large ν: at ν = 10 a Kattholmen shoreline element (1183) with a 1.2 cm node above the 1 mm subcell depth runs at 0.2–0.8 m/s and its film node at the 20 m/s cap (still at ν ≤ 1). Scale the viscous depth threshold with ν, or taper νh over a depth band.
 - [ ] **P1.2** Lower priority: convex DG/FV blending (Hennemann–Gassner) so one node below `h_dry` doesn't switch a whole element to subcells.
 
 ## Geometry and meshes (P1.3) — [notes/geometry-mesh.md](notes/geometry-mesh.md)
@@ -385,6 +386,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P6** Prune ~200 root re-exports to a `prelude`; export `Simulation3D`.
 - [ ] **P6** Feature-gate `tiff`/`shapefile`/`geo` behind `geodata`.
 - [ ] **P6** Retire the mostly dead `solver/simd/` with the `Standard` kernel (P1.2).
+- [ ] **P6** `froya_real_data` ignores unknown `key=value` options: a binary built before `site=`/`nu=` existed ran a farm sweep as plain tides (2026-10-25). Record the keys `Options::parse` reads (`args.get`, `get`, `constituents`) and reject the rest after it.
 - [ ] **P6** Decide crate vs repo name and a `dg-core`/`roms-rs` split.
 - [ ] **P6** Characteristic-based limiting for 2D SWE (likely subsumed by P1.2).
 - [ ] **P6** Low priority: faer 0.23 → 0.24 (setup-time solves only).
