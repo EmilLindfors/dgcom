@@ -396,7 +396,10 @@
 //! `nu=V` and `cs=C` give the 2D tide a horizontal viscosity: a constant
 //! background of V m²/s plus Smagorinsky's with coefficient C
 //! (`HorizontalViscosity2D`); none by default. A farm's wake needs one: without
-//! it nothing but the bed friction removes a 50–100 m eddy.
+//! it nothing but the bed friction removes a 50–100 m eddy. At Kattholmen
+//! `cs=0.1 nu=0.1` (TODO F.1, `notes/farm.md`): ν ≥ 1 halves the farm's
+//! current, while at 0.1 the lee eddies, so the cage and open runs
+//! decorrelate and the paired wake is noise beyond the cages.
 //!
 //! `site=<file>` puts a fish farm into the 2D tide (TODO F.1,
 //! `examples/common/farm_site.rs`): the cages of a Fiskeridirektoratet site
@@ -420,8 +423,8 @@
 //! froya_real_data mesh=data/mausund_kattholmen.msh bbox=8.45,63.78,8.90,63.95 \
 //!     tides=data/mausund_boundary_tides.txt norkyst=data/froya_norkyst.nc \
 //!     slopes3d=on debug_3d=thin=1 lts=8 hours=31 ramp_hours=3 spinup_hours=6 \
-//!     rest_hours=0 nu=1 site=data/sites/14042.txt particles=200 seeds=4 \
-//!     kh=0.1,1 particle_seconds=10 output=output/kattholmen_farm
+//!     rest_hours=0 cs=0.1 nu=0.1 site=data/sites/14042.txt particles=200 \
+//!     seeds=4 kh=0.1,1 particle_seconds=10 output=output/kattholmen_farm
 //! ```
 //!
 //! Harmonic validation needs the record after spin-up to resolve the main

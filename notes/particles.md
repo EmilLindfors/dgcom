@@ -38,6 +38,7 @@
         - K = 1: +4.7 and +5.8 points (z 7.5 and 25), exposure +24 %, back at the farm 11.3 against 6.6 %.
       - K itself moves the shares far more (own cage again 8 → 44 % from K = 0.1 to 1, as in `farm_3d`), so K's basis (below) still comes first. The surface walk is only right for floating matter.
       - In this weak current (0.04 m/s mean at the farm) particles stay near the farm for hours (median age at the first contact with another cage 0.4–0.9 h), and none leave the domain in 25 h.
+      - ν matters more than the drift (F.1's ν sweep, 2026-10-25, `notes/farm.md`). Depth walk, K = 0.1, own cage / another / within 1 km at 31 h: 31 / 77 / 93 % at ν = 10, 8.4 / 56 / 18 % at ν = 1, 11 / 57 / 11 % at ν = 0.1, 14 / 61 / 8.5 % with C_s 0.1 + ν 0.1. The faster eddying flow at low ν carries the particles further. The drift's effect holds at every ν: stranded at 31 h 6.5–12.7 points fewer with it at K = 0.1 and 29–47 at K = 1.
   - Curved (isoparametric) elements, once P1.3 has them: the walk assumes straight faces, and `inverse_bilinear` the bilinear map.
   - ~~Particle output (positions per snapshot) for the viewer (F.3)~~ done 2026-10-03 (`io::ParticleFileWriter`, see F.3); ~~connectivity statistics between farms~~ done 2026-10-03 (online, below).
   - A higher-order time interpolation between snapshots (cubic, as for the nesting fields in P1.5) when the output interval is long against the tidal period.
