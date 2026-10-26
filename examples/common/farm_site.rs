@@ -13,14 +13,26 @@
 //! farm. Over the analysis window (the last whole number of M2 periods after
 //! `spinup_hours`) the report gives
 //! - the current at the farm: speed, principal axis, residual;
-//! - the wake: the relative speed deficit `1 − |u_cages|/|u_open|` along the
-//!   current through the farm's centre, up- and down-current, for each
-//!   direction of the tide, and the area where it exceeds 5, 10 and 20 %;
+//! - the wake: the relative speed deficit `1 − Σ|u_cages|/Σ|u_open|` over
+//!   the samples, along the current through the farm's centre, up- and
+//!   down-current, for each direction of the tide, and the mean area where
+//!   a sample's deficit exceeds 5, 10 and 20 %;
 //! - the residual current (the window's mean) with and without the cages;
-//! - the drag on the farm, `F = ρ₀ ∫ Λ h u dA`.
+//! - the drag on the farm, `F = ρ₀ ∫ Λ h u dA`;
+//! - how far the run with cages departs from the one without over time: the
+//!   RMS of `u_cages − u_open` over the RMS speed, near the farm and further.
 //!
-//! `<output>/farm_wake.csv` has the grid's fields for maps, and
-//! `farm_cages.csv` the cages (`scripts/farm_wake_map.py` draws them).
+//! Where the flow sheds eddies the cages' disturbance grows until the two
+//! runs no longer share them, and the comparison measures that divergence
+//! as well as the farm (`notes/farm.md`, the ν sweep). `farm_control=F`
+//! (e.g. 0.01) runs the cages a third time at F times their drag (into
+//! `<output>/control`, after the open run): its departure from the open run
+//! is mostly divergence, so it is the noise floor, reported beside every
+//! wake and residual number.
+//!
+//! `<output>/farm_wake.csv` has the grid's fields for maps (with a control,
+//! its `floor_` columns), and `farm_cages.csv` the cages
+//! (`scripts/farm_wake_map.py` draws them).
 //!
 //! With `particles=N`, the run with cages releases N particles in each cage
 //! (a sunflower pattern over its footprint) at `release` hours (default
@@ -82,6 +94,10 @@ const RAY: [f64; 15] = [
     -400.0, -200.0, -100.0, 0.0, 50.0, 100.0, 150.0, 200.0, 300.0, 400.0, 600.0, 800.0, 1000.0,
     1200.0, 1400.0,
 ];
+/// The runs' departure from the open one is reported within this distance
+/// (m) of the farm's centre and beyond it, every `DIVERGENCE_EVERY` s
+const DIVERGENCE_RADIUS: f64 = 500.0;
+const DIVERGENCE_EVERY: f64 = 3.0 * 3600.0;
 /// Particles strand in water shallower than this (m)
 const STRANDING_DEPTH: f64 = 0.05;
 const M2_PERIOD: f64 = 12.420_601 * 3600.0;
@@ -92,6 +108,8 @@ pub struct FarmOptions {
     site: PathBuf,
     /// Run the tide without the cages first
     reference: bool,
+    /// The control run's share of the cages' drag (0: no control run)
+    control: f64,
     grid: CageGrid,
     /// Half-width (m) and spacing (m) of the sampled window
     window: f64,
@@ -159,6 +177,7 @@ impl FarmOptions {
                 "cages" => false,
                 other => return Err(format!("bad farm_runs={other}: both or cages")),
             },
+            control: get("farm_control", 0.0)?,
             grid,
             window: get("farm_window", 1500.0)?,
             spacing: get("farm_grid", 20.0)?,
@@ -178,6 +197,12 @@ impl FarmOptions {
         if !(options.spacing > 0.0 && options.window > options.spacing) {
             return Err("farm_grid= must be positive and below farm_window=".into());
         }
+        if !(0.0..1.0).contains(&options.control) {
+            return Err("farm_control= is a share of the drag in [0, 1)".into());
+        }
+        if options.control > 0.0 && !options.reference {
+            return Err("farm_control= needs the run without the cages (farm_runs=both)".into());
+        }
         Ok(Some(options))
     }
 
@@ -185,6 +210,20 @@ impl FarmOptions {
     pub fn reference(&self) -> bool {
         self.reference
     }
+
+    /// Whether a control run at a share of the drag follows the open one.
+    pub fn control(&self) -> bool {
+        self.control > 0.0
+    }
+}
+
+/// Which of a farm case's runs: without the cages, the control at
+/// `farm_control` times their drag, or with them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FarmRun {
+    Open,
+    Control,
+    Cages,
 }
 
 /// A farm site on a mesh: its cages, and the probes the runs sample.
@@ -301,9 +340,28 @@ impl FarmCase {
         &self.options
     }
 
-    /// The cages' drag on `mesh` at the order of `ops`.
-    pub fn cage_drag(&self, mesh: &Mesh2D, ops: &DGOperators2D) -> CageDrag2D {
-        CageDrag2D::new(mesh, ops, &self.cages)
+    /// The cages' drag in `run` on `mesh` at the order of `ops` (none in the
+    /// open run).
+    pub fn cage_drag(
+        &self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        run: FarmRun,
+    ) -> Option<CageDrag2D> {
+        let share = match run {
+            FarmRun::Open => return None,
+            FarmRun::Control => self.options.control,
+            FarmRun::Cages => 1.0,
+        };
+        let cages: Vec<NetCage> = self
+            .cages
+            .iter()
+            .map(|c| NetCage {
+                drag_per_length: share * c.drag_per_length,
+                ..c.clone()
+            })
+            .collect();
+        Some(CageDrag2D::new(mesh, ops, &cages))
     }
 
     /// The site and its cages.
@@ -339,21 +397,20 @@ impl FarmCase {
         );
     }
 
-    /// What a run records at the farm, with the cages (and the particles) or
-    /// without them.
+    /// What `run` records at the farm (the particles with the cages only).
     pub fn record<'a>(
         &'a self,
         mesh: &'a Mesh2D,
         ops: &'a DGOperators2D,
         geom: &'a GeometricFactors2D,
-        cages: bool,
+        run: FarmRun,
     ) -> FarmRecord<'a> {
-        let particles =
-            (cages && self.options.particles > 0).then(|| FarmParticles::new(self, mesh, ops));
+        let particles = (run == FarmRun::Cages && self.options.particles > 0)
+            .then(|| FarmParticles::new(self, mesh, ops));
         FarmRecord {
             case: self,
-            cages,
-            drag: cages.then(|| (self.cage_drag(mesh, ops), geom)),
+            run,
+            drag: self.cage_drag(mesh, ops, run).map(|drag| (drag, geom)),
             n_nodes: ops.n_nodes,
             times: Vec::new(),
             grid: Vec::new(),
@@ -403,7 +460,7 @@ impl FarmCase {
 /// What one run records at the farm at every callback.
 pub struct FarmRecord<'a> {
     case: &'a FarmCase,
-    cages: bool,
+    run: FarmRun,
     drag: Option<(CageDrag2D, &'a GeometricFactors2D)>,
     n_nodes: usize,
     times: Vec<f64>,
@@ -413,7 +470,7 @@ pub struct FarmRecord<'a> {
     /// (`[time × cage]`)
     centre: Vec<[f64; 2]>,
     cage_speed: Vec<f64>,
-    /// The drag on the farm (N), with the cages
+    /// The drag on the farm (N), with cages
     force: Vec<[f64; 2]>,
     particles: Option<FarmParticles<'a>>,
 }
@@ -489,6 +546,19 @@ impl FarmRecord<'_> {
         }
         mean
     }
+
+    /// The mean speed over samples `range` at each grid point (NaN where
+    /// any sample was dry).
+    fn mean_speed(&self, range: std::ops::Range<usize>) -> Vec<f64> {
+        let count = range.len() as f64;
+        let mut mean = vec![0.0; self.case.probes.len()];
+        for k in range {
+            for (m, v) in mean.iter_mut().zip(self.sample_grid(k)) {
+                *m += (v[0] as f64).hypot(v[1] as f64) / count;
+            }
+        }
+        mean
+    }
 }
 
 /// Heading (degrees clockwise from north) the vector `[east, north]` points to.
@@ -521,17 +591,19 @@ fn median(values: &mut [f64]) -> f64 {
 
 impl FarmCase {
     /// The farm's report (see the module docs) over the analysis window
-    /// `window` (s), from the run with cages and, if any, the one without;
-    /// the CSV files go to `output`.
+    /// `window` (s), from the run with cages and, if any, the one without
+    /// and the control; the CSV files go to `output`.
     pub fn report(
         &self,
         reference: Option<&FarmRecord>,
+        control: Option<&FarmRecord>,
         caged: &FarmRecord,
         window: [f64; 2],
         clock: &ModelClock,
         output: &Path,
     ) -> std::io::Result<()> {
-        assert!(caged.cages);
+        assert_eq!(caged.run, FarmRun::Cages);
+        assert!(control.is_none_or(|c| c.run == FarmRun::Control && reference.is_some()));
         let range = caged.window(window);
         println!(
             "\nFarm {} {}: analysis over {:.2}–{:.2} h ({} samples, {:.2} M2 periods)",
@@ -566,6 +638,12 @@ impl FarmCase {
             current(reference, "no cages");
         }
         current(caged, "cages");
+        if let Some(control) = control {
+            current(
+                control,
+                &format!("control, {} of the drag", self.options.control),
+            );
+        }
         // Principal axis of the open flow at the centre
         let centre = &open.centre[open.window(window)];
         let n = centre.len() as f64;
@@ -606,18 +684,22 @@ impl FarmCase {
                 .collect()
         };
         if let Some(reference) = reference {
-            let (with, without) = (mean_speeds(caged), mean_speeds(reference));
-            let ratios: Vec<String> = with
-                .iter()
-                .zip(&without)
-                .map(|(a, b)| format!("{:.2}", a / b))
-                .collect();
-            println!(
-                "  Mean speed at the cage centres, cages over no cages: {} (farm {:.3} against {:.3} m/s)",
-                ratios.join(", "),
-                with.iter().sum::<f64>() / n_cages as f64,
-                without.iter().sum::<f64>() / n_cages as f64
-            );
+            let without = mean_speeds(reference);
+            for (record, label) in [(Some(caged), "cages"), (control, "control")] {
+                let Some(record) = record else { continue };
+                let with = mean_speeds(record);
+                let ratios: Vec<String> = with
+                    .iter()
+                    .zip(&without)
+                    .map(|(a, b)| format!("{:.2}", a / b))
+                    .collect();
+                println!(
+                    "  Mean speed at the cage centres, {label} over no cages: {} (farm {:.3} against {:.3} m/s)",
+                    ratios.join(", "),
+                    with.iter().sum::<f64>() / n_cages as f64,
+                    without.iter().sum::<f64>() / n_cages as f64
+                );
+            }
         }
 
         // Drag on the farm
@@ -638,7 +720,7 @@ impl FarmCase {
 
         let mut csv = BufWriter::new(File::create(output.join("farm_wake.csv"))?);
         if let Some(reference) = reference {
-            self.report_wake(reference, caged, window, axis, &mut csv)?;
+            self.report_wake(reference, control, caged, window, axis, &mut csv)?;
         } else {
             let residual = caged.residual(range.clone());
             writeln!(csv, "x_m,y_m,residual_u,residual_v")?;
@@ -677,52 +759,73 @@ impl FarmCase {
         Ok(())
     }
 
-    /// The wake and the residual, cages against no cages.
+    /// The wake and the residual, cages (and the control) against no cages.
     fn report_wake(
         &self,
         reference: &FarmRecord,
+        control: Option<&FarmRecord>,
         caged: &FarmRecord,
         window: [f64; 2],
         axis: [f64; 2],
         csv: &mut impl std::io::Write,
     ) -> std::io::Result<()> {
-        let range = caged.window(window);
-        let open_range = reference.window(window);
-        if open_range != range
-            || reference.times[range.clone()]
-                .iter()
-                .zip(&caged.times[range.clone()])
-                .any(|(a, b)| (a - b).abs() > 1e-6)
-        {
+        let same_times = |record: &FarmRecord| {
+            record.times.len() == reference.times.len()
+                && record
+                    .times
+                    .iter()
+                    .zip(&reference.times)
+                    .all(|(a, b)| (a - b).abs() <= 1e-6)
+        };
+        if !same_times(caged) || control.is_some_and(|c| !same_times(c)) {
             println!("  the runs were sampled at different times: no wake");
             return Ok(());
         }
-        let n_points = self.probes.len();
-        let spacing = self.options.spacing;
-        // Per direction of the tide (along the axis, against it): the sum
-        // and count of the relative deficit along the ray, the samples, the
-        // mean direction, the area over 5/10/20 %, and the mean deficit map
-        let mut ray = [[(0.0, 0usize); RAY.len()]; 2];
+        let range = caged.window(window);
+        let runs: Vec<(&FarmRecord, &str)> = std::iter::once((caged, "cages"))
+            .chain(control.map(|c| (c, "control")))
+            .collect();
+
+        // How far the runs depart from the open one over time
+        println!(
+            "  Departure from the open run: RMS |u − u_open| over RMS |u_open|, within \
+             {DIVERGENCE_RADIUS:.0} m of the centre | beyond it"
+        );
+        let labels: Vec<String> = runs.iter().map(|(_, l)| format!("{l:>15}")).collect();
+        println!("          time | {}", labels.join(" | "));
+        let mut next = DIVERGENCE_EVERY;
+        for (k, &t) in reference.times.iter().enumerate() {
+            if t < next - 1e-6 {
+                continue;
+            }
+            next += DIVERGENCE_EVERY;
+            let cells: Vec<String> = runs
+                .iter()
+                .map(|(run, _)| {
+                    let [near, far] = self.divergence(reference, run, k);
+                    format!("{near:7.3} {far:7.3}")
+                })
+                .collect();
+            println!("    {:8.2} h | {}", t / 3600.0, cells.join(" | "));
+        }
+
+        // The direction of the open current at the centre per sample: its
+        // class (along the principal axis or against it) and unit vector
+        let classes: Vec<Option<(usize, [f64; 2])>> = range
+            .clone()
+            .map(|k| {
+                let u = reference.centre[k];
+                let s = speed(u);
+                (s >= MIN_SPEED).then(|| {
+                    let d = [u[0] / s, u[1] / s];
+                    (usize::from(d[0] * axis[0] + d[1] * axis[1] < 0.0), d)
+                })
+            })
+            .collect();
         let mut samples = [0usize; 2];
         let mut direction = [[0.0; 2]; 2];
         let mut edge = [0.0; 2];
-        let mut area = [[0.0; 3]; 2];
-        let mut deficit_map = vec![[(0.0f64, 0u32); 2]; n_points];
-        let mut mean_speed = vec![[0.0f64; 2]; n_points];
-        for k in range.clone() {
-            let open = reference.sample_grid(k);
-            let cages = caged.sample_grid(k);
-            for (m, (a, b)) in mean_speed.iter_mut().zip(open.iter().zip(cages)) {
-                m[0] += (a[0] as f64).hypot(a[1] as f64) / range.len() as f64;
-                m[1] += (b[0] as f64).hypot(b[1] as f64) / range.len() as f64;
-            }
-            let u = reference.centre[k];
-            let s = speed(u);
-            if s < MIN_SPEED {
-                continue;
-            }
-            let d = [u[0] / s, u[1] / s];
-            let class = usize::from(d[0] * axis[0] + d[1] * axis[1] < 0.0);
+        for &(class, d) in classes.iter().flatten() {
             samples[class] += 1;
             direction[class][0] += d[0];
             direction[class][1] += d[1];
@@ -731,37 +834,20 @@ impl FarmCase {
                 .iter()
                 .map(|(c, r)| (c[0] - self.centre[0]) * d[0] + (c[1] - self.centre[1]) * d[1] + r)
                 .fold(f64::NEG_INFINITY, f64::max);
-            for (j, &distance) in RAY.iter().enumerate() {
-                let p = [
-                    self.centre[0] + distance * d[0],
-                    self.centre[1] + distance * d[1],
-                ];
-                if let (Some(a), Some(b)) = (self.at(open, p), self.at(cages, p))
-                    && speed(a) >= POINT_MIN_SPEED
-                {
-                    ray[class][j].0 += 1.0 - speed(b) / speed(a);
-                    ray[class][j].1 += 1;
-                }
-            }
-            for (i, (a, b)) in open.iter().zip(cages).enumerate() {
-                let (a, b) = ([a[0] as f64, a[1] as f64], [b[0] as f64, b[1] as f64]);
-                if a[0].is_nan() || b[0].is_nan() || speed(a) < POINT_MIN_SPEED {
-                    continue;
-                }
-                let r = 1.0 - speed(b) / speed(a);
-                for (level, threshold) in [0.05, 0.1, 0.2].iter().enumerate() {
-                    if r > *threshold {
-                        area[class][level] += spacing * spacing;
-                    }
-                }
-                deficit_map[i][class].0 += r;
-                deficit_map[i][class].1 += 1;
-            }
         }
+        let wakes: Vec<Wake> = runs
+            .iter()
+            .map(|(run, _)| self.wake(reference, run, range.clone(), &classes))
+            .collect();
         let headings = [0, 1].map(|c| heading(direction[c]));
         println!(
-            "  Wake: relative speed deficit 1 − |u_cages|/|u_open| along the current through the \
-             farm's centre (samples with ≥ {MIN_SPEED} m/s there)"
+            "  Wake: relative speed deficit 1 − Σ|u_cages|/Σ|u_open| over the samples, along the \
+             current through the farm's centre (samples with ≥ {MIN_SPEED} m/s there){}",
+            if control.is_some() {
+                "; the control's beside it"
+            } else {
+                ""
+            }
         );
         println!(
             "    toward {:.0}°: {} samples, farm edge {:.0} m down-current; toward {:.0}°: {} samples, edge {:.0} m",
@@ -772,40 +858,52 @@ impl FarmCase {
             samples[1],
             edge[1] / samples[1].max(1) as f64
         );
-        println!(
-            "    distance (m) | toward {:.0}° | toward {:.0}°",
-            headings[0], headings[1]
-        );
+        let columns: Vec<String> = (0..2)
+            .flat_map(|c| {
+                runs.iter().map(move |(_, label)| match *label {
+                    "cages" => format!("toward {:.0}°", headings[c]),
+                    other => other.to_string(),
+                })
+            })
+            .map(|h| format!("{h:>11}"))
+            .collect();
+        println!("    distance (m) | {}", columns.join(" | "));
         for (j, distance) in RAY.iter().enumerate() {
-            let cell = |c: usize| {
-                let (sum, count) = ray[c][j];
-                if count == 0 {
-                    "      —".to_string()
-                } else {
-                    format!("{:6.2} %", 100.0 * sum / count as f64)
-                }
-            };
-            println!("    {distance:12.0} | {:>11} | {:>11}", cell(0), cell(1));
+            let cells: Vec<String> = (0..2)
+                .flat_map(|c| wakes.iter().map(move |w| w.ray[c][j]))
+                .map(|sums| match Wake::deficit(sums) {
+                    d if d.is_nan() => format!("{:>11}", "—"),
+                    d => format!("{:9.2} %", 100.0 * d),
+                })
+                .collect();
+            println!("    {distance:12.0} | {}", cells.join(" | "));
         }
         for c in 0..2 {
             let n = samples[c].max(1) as f64;
+            let areas: Vec<String> = wakes
+                .iter()
+                .map(|w| {
+                    let [a, b, d] = w.area[c].map(|a| a / n / 1e4);
+                    format!("{a:.1} / {b:.1} / {d:.1} ha")
+                })
+                .collect();
             println!(
-                "    toward {:.0}°: mean area of the wake over 5 / 10 / 20 % {:.1} / {:.1} / {:.1} ha",
+                "    toward {:.0}°: mean area of the wake over 5 / 10 / 20 % {}",
                 headings[c],
-                area[c][0] / n / 1e4,
-                area[c][1] / n / 1e4,
-                area[c][2] / n / 1e4
+                match areas.as_slice() {
+                    [cages, control] => format!("{cages} (control {control})"),
+                    _ => areas.join(""),
+                }
             );
         }
 
         // The residual current with and without the cages
         let open_residual = reference.residual(range.clone());
-        let caged_residual = caged.residual(range.clone());
         let at_centre = |field: &[[f64; 2]]| {
             let f: Vec<[f32; 2]> = field.iter().map(|v| [v[0] as f32, v[1] as f32]).collect();
             self.at(&f, self.centre).unwrap_or([f64::NAN; 2])
         };
-        let (a, b) = (at_centre(&open_residual), at_centre(&caged_residual));
+        let (a, b) = (at_centre(&open_residual), at_centre(&wakes[0].residual));
         println!(
             "  Residual current at the farm's centre: {:.4} m/s toward {:.0}° without the cages, \
              {:.4} m/s toward {:.0}° with them",
@@ -815,66 +913,202 @@ impl FarmCase {
             heading(b)
         );
         for radius in [250.0, 500.0, 1000.0] {
-            let (mut sum, mut sum_open, mut count, mut largest) = (0.0, 0.0, 0, (0.0, [0.0; 2]));
-            for (i, (a, b)) in open_residual.iter().zip(&caged_residual).enumerate() {
+            // Per run: the summed and the largest change, and where
+            let mut sum_open = 0.0;
+            let mut changes = vec![(0.0, 0.0, [0.0; 2]); wakes.len()];
+            let mut count = 0;
+            for (i, a) in open_residual.iter().enumerate() {
                 let p = self.point(i);
                 let r = [p[0] - self.centre[0], p[1] - self.centre[1]];
-                if a[0].is_nan() || b[0].is_nan() || speed(r) > radius {
+                if a[0].is_nan()
+                    || wakes.iter().any(|w| w.residual[i][0].is_nan())
+                    || speed(r) > radius
+                {
                     continue;
                 }
-                let change = speed([b[0] - a[0], b[1] - a[1]]);
-                sum += change;
                 sum_open += speed(*a);
                 count += 1;
-                if change > largest.0 {
-                    largest = (change, r);
+                for (change, w) in changes.iter_mut().zip(&wakes) {
+                    let b = w.residual[i];
+                    let c = speed([b[0] - a[0], b[1] - a[1]]);
+                    change.0 += c;
+                    if c > change.1 {
+                        (change.1, change.2) = (c, r);
+                    }
                 }
             }
-            if count > 0 {
-                println!(
-                    "    within {radius:.0} m: residual speed {:.4} m/s without the cages, mean \
-                     change {:.4} m/s, largest {:.4} m/s at ({:+.0}, {:+.0}) m",
-                    sum_open / count as f64,
-                    sum / count as f64,
-                    largest.0,
-                    largest.1[0],
-                    largest.1[1]
-                );
+            if count == 0 {
+                continue;
             }
+            let n = count as f64;
+            let describe = |(sum, largest, at): (f64, f64, [f64; 2])| {
+                format!(
+                    "mean change {:.4} m/s, largest {largest:.4} m/s at ({:+.0}, {:+.0}) m",
+                    sum / n,
+                    at[0],
+                    at[1]
+                )
+            };
+            println!(
+                "    within {radius:.0} m: residual speed {:.4} m/s without the cages, {}{}",
+                sum_open / n,
+                describe(changes[0]),
+                changes
+                    .get(1)
+                    .map_or(String::new(), |&c| format!("; control {}", describe(c)))
+            );
         }
 
-        writeln!(
+        let open_speed = reference.mean_speed(range.clone());
+        let caged_speed = caged.mean_speed(range.clone());
+        let control_speed = control.map(|c| c.mean_speed(range.clone()));
+        write!(
             csv,
             "x_m,y_m,residual_u_open,residual_v_open,residual_u_cages,residual_v_cages,\
              speed_open,speed_cages,deficit_{:.0},deficit_{:.0}",
             headings[0], headings[1]
         )?;
-        for i in 0..n_points {
+        if control.is_some() {
+            write!(
+                csv,
+                ",residual_u_control,residual_v_control,speed_control,\
+                 floor_deficit_{:.0},floor_deficit_{:.0}",
+                headings[0], headings[1]
+            )?;
+        }
+        writeln!(csv)?;
+        for i in 0..self.probes.len() {
             let p = self.point(i);
-            let deficit = |c: usize| {
-                let (sum, count) = deficit_map[i][c];
-                if count == 0 {
-                    f64::NAN
-                } else {
-                    sum / count as f64
-                }
-            };
-            writeln!(
+            let deficit = |w: &Wake, c: usize| Wake::deficit(w.map[i][c]);
+            write!(
                 csv,
                 "{:.1},{:.1},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4}",
                 p[0] - self.centre[0],
                 p[1] - self.centre[1],
                 open_residual[i][0],
                 open_residual[i][1],
-                caged_residual[i][0],
-                caged_residual[i][1],
-                mean_speed[i][0],
-                mean_speed[i][1],
-                deficit(0),
-                deficit(1)
+                wakes[0].residual[i][0],
+                wakes[0].residual[i][1],
+                open_speed[i],
+                caged_speed[i],
+                deficit(&wakes[0], 0),
+                deficit(&wakes[0], 1)
             )?;
+            if let (Some(w), Some(s)) = (wakes.get(1), &control_speed) {
+                write!(
+                    csv,
+                    ",{:.5},{:.5},{:.4},{:.4},{:.4}",
+                    w.residual[i][0],
+                    w.residual[i][1],
+                    s[i],
+                    deficit(w, 0),
+                    deficit(w, 1)
+                )?;
+            }
+            writeln!(csv)?;
         }
         Ok(())
+    }
+
+    /// The wake of `other` against `reference` over the samples `range`,
+    /// whose direction classes are `classes`.
+    fn wake(
+        &self,
+        reference: &FarmRecord,
+        other: &FarmRecord,
+        range: std::ops::Range<usize>,
+        classes: &[Option<(usize, [f64; 2])>],
+    ) -> Wake {
+        let cell = self.options.spacing * self.options.spacing;
+        let mut wake = Wake {
+            ray: [[[0.0; 2]; RAY.len()]; 2],
+            area: [[0.0; 3]; 2],
+            map: vec![[[0.0; 2]; 2]; self.probes.len()],
+            residual: other.residual(range.clone()),
+        };
+        for (k, class) in range.zip(classes) {
+            let Some((class, d)) = *class else {
+                continue;
+            };
+            let (open, with) = (reference.sample_grid(k), other.sample_grid(k));
+            for (j, &distance) in RAY.iter().enumerate() {
+                let p = [
+                    self.centre[0] + distance * d[0],
+                    self.centre[1] + distance * d[1],
+                ];
+                if let (Some(a), Some(b)) = (self.at(open, p), self.at(with, p))
+                    && speed(a) >= POINT_MIN_SPEED
+                {
+                    wake.ray[class][j][0] += speed(a);
+                    wake.ray[class][j][1] += speed(b);
+                }
+            }
+            for (i, (a, b)) in open.iter().zip(with).enumerate() {
+                let (a, b) = ([a[0] as f64, a[1] as f64], [b[0] as f64, b[1] as f64]);
+                if a[0].is_nan() || b[0].is_nan() || speed(a) < POINT_MIN_SPEED {
+                    continue;
+                }
+                let r = 1.0 - speed(b) / speed(a);
+                for (level, threshold) in [0.05, 0.1, 0.2].iter().enumerate() {
+                    if r > *threshold {
+                        wake.area[class][level] += cell;
+                    }
+                }
+                wake.map[i][class][0] += speed(a);
+                wake.map[i][class][1] += speed(b);
+            }
+        }
+        wake
+    }
+
+    /// How far `other` departs from `reference` at sample `k`: the RMS of
+    /// their velocity difference over the RMS speed of `reference`, at the
+    /// grid points within `DIVERGENCE_RADIUS` of the centre and beyond it.
+    fn divergence(&self, reference: &FarmRecord, other: &FarmRecord, k: usize) -> [f64; 2] {
+        // Per zone: Σ|u − u_open|², Σ|u_open|²
+        let mut sums = [[0.0; 2]; 2];
+        for (i, (a, b)) in reference
+            .sample_grid(k)
+            .iter()
+            .zip(other.sample_grid(k))
+            .enumerate()
+        {
+            if a[0].is_nan() || b[0].is_nan() {
+                continue;
+            }
+            let p = self.point(i);
+            let far = speed([p[0] - self.centre[0], p[1] - self.centre[1]]) > DIVERGENCE_RADIUS;
+            let (a, b) = ([a[0] as f64, a[1] as f64], [b[0] as f64, b[1] as f64]);
+            let zone = &mut sums[usize::from(far)];
+            zone[0] += (b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2);
+            zone[1] += a[0] * a[0] + a[1] * a[1];
+        }
+        sums.map(|[difference, open]| (difference / open).sqrt())
+    }
+}
+
+/// One run's wake against the open run (`FarmCase::wake`).
+struct Wake {
+    /// Per direction class and distance along the ray: Σ|u_open| and Σ|u|
+    /// over the samples
+    ray: [[[f64; 2]; RAY.len()]; 2],
+    /// Per direction class: the summed area (m²) over 5, 10 and 20 %
+    area: [[f64; 3]; 2],
+    /// Per grid point and direction class: Σ|u_open| and Σ|u|
+    map: Vec<[[f64; 2]; 2]>,
+    /// The run's residual current per grid point
+    residual: Vec<[f64; 2]>,
+}
+
+impl Wake {
+    /// The relative deficit `1 − Σ|u|/Σ|u_open|` of summed speeds (NaN
+    /// without samples).
+    fn deficit([open, with]: [f64; 2]) -> f64 {
+        if open > 0.0 {
+            1.0 - with / open
+        } else {
+            f64::NAN
+        }
     }
 }
 
