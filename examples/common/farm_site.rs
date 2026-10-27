@@ -25,10 +25,12 @@
 //! Where the flow sheds eddies the cages' disturbance grows until the two
 //! runs no longer share them, and the comparison measures that divergence
 //! as well as the farm (`notes/farm.md`, the ν sweep). `farm_control=F`
-//! (e.g. 0.01) runs the cages a third time at F times their drag (into
+//! runs the cages a third time at F times their drag (into
 //! `<output>/control`, after the open run): its departure from the open run
 //! is mostly divergence, so it is the noise floor, reported beside every
-//! wake and residual number.
+//! wake and residual number. A smaller disturbance diverges later, so F
+//! must be large enough to diverge within the window: at Kattholmen 0.1
+//! does by 27–30 h, 0.01 not in 31 h.
 //!
 //! `<output>/farm_wake.csv` has the grid's fields for maps (with a control,
 //! its `floor_` columns), and `farm_cages.csv` the cages

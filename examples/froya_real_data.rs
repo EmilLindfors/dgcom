@@ -399,7 +399,7 @@
 //! it nothing but the bed friction removes a 50–100 m eddy. At Kattholmen
 //! `cs=0.1 nu=0.1` (TODO F.1, `notes/farm.md`): ν ≥ 1 halves the farm's
 //! current, while at 0.1 the lee eddies, so the cage and open runs
-//! decorrelate and the paired wake is noise beyond the cages.
+//! decorrelate and the wake needs the control run's noise floor.
 //!
 //! `site=<file>` puts a fish farm into the 2D tide (TODO F.1,
 //! `examples/common/farm_site.rs`): the cages of a Fiskeridirektoratet site
@@ -413,7 +413,7 @@
 //! random walk's depth drift (`walks=depth,surface`, `kh=`, `seeds=`).
 //! `farm_control=F` adds a control run at F times the cages' drag (in
 //! `<output>/control`), whose departure from the open run is the wake's
-//! noise floor where the flow sheds eddies.
+//! noise floor where the flow sheds eddies (0.1 at Kattholmen).
 //! Options: `[farm_runs=both] [farm_control=0] [cage_spacing=90] [cage_radius=25.5]
 //! [net_depth=20] [solidity=0.25] [farm_window=1500] [farm_grid=20]
 //! [farm_return=500] [particles=0] [release=<spinup_hours>] [releases=4]
@@ -426,8 +426,8 @@
 //! froya_real_data mesh=data/mausund_kattholmen.msh bbox=8.45,63.78,8.90,63.95 \
 //!     tides=data/mausund_boundary_tides.txt norkyst=data/froya_norkyst.nc \
 //!     slopes3d=on debug_3d=thin=1 lts=8 hours=31 ramp_hours=3 spinup_hours=6 \
-//!     rest_hours=0 cs=0.1 nu=0.1 site=data/sites/14042.txt particles=200 \
-//!     seeds=4 kh=0.1,1 particle_seconds=10 output=output/kattholmen_farm
+//!     rest_hours=0 cs=0.1 nu=0.1 site=data/sites/14042.txt farm_control=0.1 \
+//!     particles=200 seeds=4 kh=0.1,1 particle_seconds=10 output=output/kattholmen_farm
 //! ```
 //!
 //! Harmonic validation needs the record after spin-up to resolve the main

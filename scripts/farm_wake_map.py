@@ -8,10 +8,10 @@
 # ///
 """
 Maps of a farm case's wake and residual current (TODO F.1), from the
-`farm_wake.csv` that `froya_real_data site=<file>` writes: the mean relative
-speed deficit 1 − |u_cages|/|u_open| for each direction of the tide, and
-the residual current (the analysis window's mean) without the cages and its
-change with them, with the cages of `farm_cages.csv`.
+`farm_wake.csv` that `froya_real_data site=<file>` writes: the relative
+deficit of the summed speeds 1 − Σ|u_cages|/Σ|u_open| for each direction of
+the tide, and the residual current (the analysis window's mean) without the
+cages and its change with them, with the cages of `farm_cages.csv`.
 
     uv run scripts/farm_wake_map.py output/kattholmen_farm [out=<file.png>] [extent=800]
 """
@@ -61,7 +61,7 @@ def main() -> None:
         d = 100 * field(name)[sub]
         im = ax.pcolormesh(X, Y, d, cmap="RdBu_r", vmin=-20, vmax=20, shading="auto")
         ax.contour(X, Y, d, levels=[5, 10, 20], colors="k", linewidths=0.6)
-        ax.set_title(f"Mean speed deficit (%), current toward {name.split('_')[1]}°")
+        ax.set_title(f"Speed deficit (%), current toward {name.split('_')[1]}°")
         fig.colorbar(im, ax=ax, shrink=0.8)
 
     u0, v0 = field("residual_u_open")[sub], field("residual_v_open")[sub]
