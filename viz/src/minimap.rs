@@ -16,6 +16,7 @@ use bevy::window::PrimaryWindow;
 use crate::actions::{Act, Action};
 use crate::camera::{Inset, OrbitCamera, OverUi};
 use crate::photo::Photo;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 
 /// The map's longer side (logical px), at most this share of the window's height.
 const SIZE: f32 = 300.0;
@@ -93,15 +94,20 @@ pub struct MinimapPlugin;
 impl Plugin for MinimapPlugin {
     fn build(&self, app: &mut App) {
         app.init_gizmo_group::<Footprint>()
-            .init_resource::<Inset>()
-            .init_resource::<OverUi>()
-            .add_systems(Startup, spawn)
-            .add_systems(Update, (keys, place, footprint, click).chain());
+            .init_run_resource::<Inset>()
+            .init_run_resource::<OverUi>()
+            .run_resource::<Minimap>()
+            .add_systems(OnEnter(Screen::Viewer), spawn)
+            .add_systems(
+                Update,
+                (keys, place, footprint, click).chain().in_set(Viewing),
+            );
     }
 }
 
 fn spawn(mut commands: Commands, map: Res<Minimap>, mut gizmos: ResMut<GizmoConfigStore>) {
     commands.spawn((
+        RUN,
         MapCamera,
         Camera3d::default(),
         Camera {

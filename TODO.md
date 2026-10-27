@@ -135,7 +135,9 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 - [ ] **F.3** Separate physics from σ-truncation in the fjord3d rest-state flow under GLS (3.6e-5 m/s at 1 h, growing): halve level spacing and κ in turn, compare with Phillips's boundary-layer velocity.
 - [ ] **F.3** Compare the fjord3d cage wake at P1 on 40 m quads with the 2D 20 m run, a 3D P2 run and the integrated `CageDrag2D` drag (3D LTS would allow P2, see P1.3).
-- [ ] **F.3** Switch runs in one window: build scenario, terrain and resources `OnEnter` a run state (the plugins' `Startup` systems there, their entities despawned and the solver thread stopped on leaving; `Inspector::new` leaks its mesh for a `'static` locator); keep terrain between replays of one domain. Then the menu bar's Run menu can open another run or file and save a snapshot, and "Back to the list of runs" is a state change, not a new process.
+- [ ] **F.3** Run → Save a snapshot file mid-run: hand a `SnapshotSink` to the running solver (it writes from the next frame) after writing the frames the playback holds; Run → Open a file by a dialog (`rfd`?) besides dropping one on the window.
+- [ ] **F.3** The viewer's working set grows ≈ 10–40 MB a run (527 MB in the menu, 682 → 720 → 732 MB back from three runs): find what a run leaves (assets, pipelines, allocator) with a longer `--menu --script` cycle.
+- [ ] **F.3** A system's `Local` outlives its run (the stale-cache bug fixed 2026-10-27): keep run state in run resources; `photo::switch`'s `chart_clear` and `minimap`/`camera` drag state are still `Local`s (harmless today).
 - [ ] **F.3** More menu options: threads, order, LTS levels, particles, sites (`data/sites/*.txt`), places, terrain patches.
 - [ ] **F.3** Report to Bevy: `pbr_fragment.wesl` reads `uv` with only `VERTEX_UVS_B` set (a mesh with `UV_1` and no `UV_0`; still so in 0.20.0); `terrain.rs` carries an unused `UV_0` until then.
 - [ ] **F.3** The 15-day Frøya run with 10-minute frames (≈ 4 h, 2.3k frames) for on-demand replay.

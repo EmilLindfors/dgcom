@@ -24,8 +24,13 @@
 //!
 //! Without options (or with `--menu`) the viewer opens its start menu ([`menu`]): the
 //! scenarios to run and the saved runs under `../output` to replay, with the common
-//! options, and M in the viewer returns to it (`--menu --screenshot PATH` saves the
-//! menu's window and ends).
+//! options (`--menu --screenshot PATH` saves the menu's window and ends; `--menu
+//! --script FILE` presses keys and saves the window as [`script`] says). The menu, a
+//! run being built and the run are screens of one window ([`screen`]): M in the
+//! viewer (Run → Back to the list of runs) stops the run and shows the list again,
+//! Run → Restart builds the run anew, and a snapshot file or a folder of VTU frames
+//! dropped on the window replays it. A run started from the command line comes back
+//! to the menu the same way.
 //!
 //! Options (defaults in brackets):
 //! - `--scenario fjord|fjord3d|froya|channel` [fjord, given any other option]. Frøya reads
@@ -144,6 +149,7 @@ mod field;
 mod hud;
 mod inspect;
 mod layers;
+mod loading;
 mod menu;
 mod menubar;
 mod minimap;
@@ -153,6 +159,8 @@ mod playback;
 mod plot;
 mod replay;
 mod scenario;
+mod screen;
+mod script;
 mod site;
 mod solver;
 mod stratification;
@@ -164,7 +172,7 @@ mod trace;
 /// whole, where Bevy bundles a subset without Norwegian letters.
 const FONT: &[u8] = include_bytes!("../assets/fonts/FiraMono-Regular.ttf");
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use bevy::camera::visibility::RenderLayers;
@@ -180,11 +188,13 @@ use contours::ContoursPlugin;
 use field::{Field, Frame, Nodes, Probe, ShownLayer};
 use hud::{HudPlugin, RunClock, Title};
 use layers::{LayersPlugin, Levels};
+use loading::LoadingPlugin;
 use particles::{Lice, ParticleConfig, ParticlesPlugin, Periodic};
 use photo::{Photo, PhotoPlugin};
 use playback::{Playback, PlaybackPlugin, SolverChannel, SolverState, Source};
 use replay::Replay;
 use scenario::Scenario;
+use screen::{RUN, RunResources, Screen, ScreenPlugin, Viewing};
 use site::{SiteDrawing, SitePlugin, Sites};
 use solver::SolverConfig;
 use stratification::{SheetShows, Stratification, StratificationPlugin};
@@ -239,7 +249,8 @@ struct Args {
 }
 
 impl Args {
-    fn parse() -> Result<Self, String> {
+    /// The options `given` (the command line's, or the menu's for a run it starts).
+    fn parse(given: &[String]) -> Result<Self, String> {
         let mut args = Self {
             scenario: None,
             replay: None,
@@ -291,7 +302,7 @@ impl Args {
             },
             eye: None,
         };
-        let mut it = std::env::args().skip(1);
+        let mut it = given.iter().cloned();
         while let Some(flag) = it.next() {
             let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
@@ -397,7 +408,8 @@ impl Args {
                 "--show" => {
                     args.show = actions::Shown::parse(&value).ok_or_else(|| {
                         format!(
-                            "--show takes keys, run, view, colour, overlays, photo or help,                              not {value}"
+                            "--show takes keys, run, view, colour, overlays, photo or help, \
+                             not {value}"
                         )
                     })?;
                 }
@@ -422,6 +434,21 @@ fn num<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
     value
         .parse()
         .map_err(|_| format!("bad value for {flag}: {value}"))
+}
+
+/// Why a run could not be built or started, and the exit code it gives on the
+/// command line (2 for a bad option, 1 for a file that cannot be read or written).
+#[derive(Debug)]
+pub struct Failed {
+    pub message: String,
+    pub code: u8,
+}
+
+fn fail(code: u8, message: impl Into<String>) -> Failed {
+    Failed {
+        message: message.into(),
+        code,
+    }
 }
 
 /// `--screenshot`: the frame to save, and how many frames since the shown time reached it.
@@ -478,419 +505,367 @@ fn install_font(app: &mut App) {
         .expect("the default font's handle");
 }
 
-fn main() -> AppExit {
-    let repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-    let given: Vec<String> = std::env::args().skip(1).collect();
-    match given.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] | ["--menu"] => return menu::run(repo, None, install_font),
-        ["--menu", "--screenshot", path] => {
-            return menu::run(repo, Some(path.into()), install_font);
-        }
-        _ => {}
-    }
-    let args = match Args::parse() {
-        Ok(args) => args,
-        Err(e) => {
-            eprintln!("{e}");
-            return AppExit::from_code(2);
-        }
-    };
-    // A snapshot file holds its own domain; VTU frames are of a Frøya run unless
-    // told otherwise
-    let snapshot_file = args.replay.as_deref().filter(|p| p.is_file());
-    let (mut scenario, replay) = if let Some(path) = snapshot_file {
-        match Replay::snapshot(path) {
-            Ok((replay, scenario)) => (scenario, Some(replay)),
-            Err(e) => {
-                eprintln!("cannot replay {}: {e}", path.display());
-                return AppExit::from_code(1);
-            }
-        }
-    } else {
-        let scenario_name = args.scenario.clone().unwrap_or_else(|| {
-            if args.replay.is_some() {
-                "froya"
-            } else {
-                "fjord"
-            }
-            .into()
-        });
-        // The 3D fjord at P1 on 12 levels, ≈ 4× cheaper than P2 on 16
-        let (order, sigma) = match scenario_name.as_str() {
-            "fjord3d" => (args.order.unwrap_or(1), args.sigma.unwrap_or(12)),
-            _ => (args.order.unwrap_or(2), args.sigma.unwrap_or(16)),
-        };
-        let built = match scenario_name.as_str() {
-            "fjord" => {
-                let mesh = args
-                    .mesh
-                    .clone()
-                    .unwrap_or_else(|| repo.join("tests/data/gmsh/fjord_farm.msh"));
-                Scenario::fjord_farm(&mesh, order)
-            }
-            "froya" => {
-                let data = repo.join("data");
-                let mesh = args
-                    .mesh
-                    .clone()
-                    .unwrap_or_else(|| data.join("froya_coast.msh"));
-                println!(
-                    "Building Frøya from {} (the bed projection takes a while)...",
-                    data.display()
-                );
-                Scenario::froya(
-                    &mesh,
-                    &data.join("froya_topobathy.tif"),
-                    &data.join("froya_boundary_tides.txt"),
-                    order,
-                    args.hours * 3600.0,
-                )
-            }
-            "channel" => match ModelClock::parse(&args.start) {
-                Ok(clock) => Ok(Scenario::farm_channel(order, sigma, clock)),
-                Err(e) => Err(format!("--start {}: {e}", args.start).into()),
-            },
-            "fjord3d" => match ModelClock::parse(&args.start) {
-                Ok(clock) => {
+/// The options a run was started with, for Run → Restart.
+#[derive(Resource)]
+pub struct RunArgs(pub Vec<String>);
+
+/// A run, built ([`Run::build`], which may take a while and runs off the main thread
+/// from the menu) and not yet shown: everything the viewer's plugins read, and what
+/// feeds them, started by [`Run::start`].
+pub struct Run {
+    given: Vec<String>,
+    args: Args,
+    scenario: Scenario,
+    replay: Option<Replay>,
+    frame: Frame,
+    nodes: Nodes,
+    cages: CageLayout,
+    arrows: Arrows,
+    views: Views,
+    start: OrbitCamera,
+    shown: ShownLayer,
+    periodic: Periodic,
+    levels: Option<Levels>,
+    trace: Trace,
+    inspector: inspect::Inspector,
+    terrain: Option<Terrain>,
+    sites: Option<Sites>,
+    run_clock: Option<ModelClock>,
+    /// The mesh's bounds (m)
+    bounds: ([f64; 2], [f64; 2]),
+}
+
+impl Run {
+    /// Build the run the options `given` ask for, under the dg-rs checkout `repo`.
+    pub fn build(given: Vec<String>, repo: &Path) -> Result<Self, Failed> {
+        let args = Args::parse(&given).map_err(|e| fail(2, e))?;
+        // A snapshot file holds its own domain; VTU frames are of a Frøya run unless
+        // told otherwise
+        let snapshot_file = args.replay.as_deref().filter(|p| p.is_file());
+        let (mut scenario, replay) = if let Some(path) = snapshot_file {
+            let (replay, scenario) = Replay::snapshot(path)
+                .map_err(|e| fail(1, format!("cannot replay {}: {e}", path.display())))?;
+            (scenario, Some(replay))
+        } else {
+            let scenario_name = args.scenario.clone().unwrap_or_else(|| {
+                if args.replay.is_some() {
+                    "froya"
+                } else {
+                    "fjord"
+                }
+                .into()
+            });
+            // The 3D fjord at P1 on 12 levels, ≈ 4× cheaper than P2 on 16
+            let (order, sigma) = match scenario_name.as_str() {
+                "fjord3d" => (args.order.unwrap_or(1), args.sigma.unwrap_or(12)),
+                _ => (args.order.unwrap_or(2), args.sigma.unwrap_or(16)),
+            };
+            let clock = || {
+                ModelClock::parse(&args.start)
+                    .map_err(|e| fail(2, format!("--start {}: {e}", args.start)))
+            };
+            let built = match scenario_name.as_str() {
+                "fjord" => {
+                    let mesh = args
+                        .mesh
+                        .clone()
+                        .unwrap_or_else(|| repo.join("tests/data/gmsh/fjord_farm.msh"));
+                    Scenario::fjord_farm(&mesh, order)
+                }
+                "froya" => {
+                    let data = repo.join("data");
+                    let mesh = args
+                        .mesh
+                        .clone()
+                        .unwrap_or_else(|| data.join("froya_coast.msh"));
+                    println!(
+                        "Building Frøya from {} (the bed projection takes a while)...",
+                        data.display()
+                    );
+                    Scenario::froya(
+                        &mesh,
+                        &data.join("froya_topobathy.tif"),
+                        &data.join("froya_boundary_tides.txt"),
+                        order,
+                        args.hours * 3600.0,
+                    )
+                }
+                "channel" => Ok(Scenario::farm_channel(order, sigma, clock()?)),
+                "fjord3d" => {
                     let mesh = args
                         .mesh
                         .clone()
                         .unwrap_or_else(|| repo.join("tests/data/gmsh/fjord_farm_3d.msh"));
-                    Scenario::fjord_farm_3d(&mesh, order, sigma, clock)
+                    Scenario::fjord_farm_3d(&mesh, order, sigma, clock()?)
                 }
-                Err(e) => Err(format!("--start {}: {e}", args.start).into()),
-            },
-            other => {
-                eprintln!("unknown scenario {other}: fjord, fjord3d, froya or channel");
-                return AppExit::from_code(2);
-            }
-        };
-        let mut scenario = match built {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("cannot build the {scenario_name} scenario: {e}");
-                return AppExit::from_code(1);
-            }
-        };
-        let replay = match args
-            .replay
-            .as_deref()
-            .map(|d| Replay::vtu(d, &mut scenario))
-        {
-            None => None,
-            Some(Ok(replay)) => Some(replay),
-            Some(Err(e)) => {
-                eprintln!(
-                    "cannot replay {}: {e}",
-                    args.replay.as_ref().unwrap().display()
-                );
-                return AppExit::from_code(1);
-            }
-        };
-        (scenario, replay)
-    };
-    if let Some(origin) = &args.origin {
-        match scenario::parse_projection(&format!("local,{origin}")) {
-            Some(projection) => scenario.projection = Some(projection),
-            None => {
-                eprintln!("--origin takes LAT,LON in degrees, not {origin}");
-                return AppExit::from_code(2);
-            }
-        }
-    }
-    // The gauge trace stays at the scenario's point of interest when a site takes the
-    // close-up
-    let gauge_point = scenario.farm;
-    // The scenario's own framing, for its stations and `--place`s
-    let place_framing = scenario.close_up;
-    // Fish farm sites: their cages join the scenario's, the close-up frames the first
-    let mut sites = Vec::new();
-    let mut site_places = Vec::new();
-    for path in &args.sites {
-        let Some(projection) = scenario.projection else {
-            eprintln!(
-                "--site {}: the domain has no projection (--origin LAT,LON)",
-                path.display()
-            );
-            return AppExit::from_code(2);
-        };
-        let site = match dg_rs::io::read_farm_site_file(path) {
-            Ok(site) => site,
-            Err(e) => {
-                eprintln!("cannot read the site {}: {e}", path.display());
-                return AppExit::from_code(1);
-            }
-        };
-        let cages = site::site_cages(&site, &projection, &scenario.cages);
-        println!(
-            "Site {} {}: {} cages added",
-            site.number,
-            site.name,
-            cages.len()
-        );
-        if sites.is_empty() {
-            scenario.farm = site::site_centre(&site, &projection);
-            scenario.close_up = scenario::CloseUp {
-                distance: 700.0,
-                yaw: 0.7,
-                pitch: 0.45,
-                arrow_spacing: 25.0,
-                arrow_radius: 600.0,
+                other => {
+                    return Err(fail(
+                        2,
+                        format!("unknown scenario {other}: fjord, fjord3d, froya or channel"),
+                    ));
+                }
             };
-        }
-        scenario.cages.extend(cages);
-        site_places.push((site.name.clone(), site::site_centre(&site, &projection)));
-        sites.push(site);
-    }
-    let mut replay = replay;
-    if let Some(replay) = &mut replay {
-        println!(
-            "Replaying {} frames of {}, {} s apart, t = {} to {} s",
-            replay.frames(),
-            args.replay.as_ref().unwrap().display(),
-            replay.interval,
-            replay.t_first,
-            replay.t_last
-        );
-        let title = scenario
-            .name
-            .split(':')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        if let Some(path) = &args.save_snapshot {
-            if let Err(e) = replay.save_to(path, &scenario) {
-                eprintln!("cannot write {}: {e}", path.display());
-                return AppExit::from_code(1);
-            }
-            println!("Saving the frames to {}", path.display());
-        }
-        scenario.name = match replay.clock {
-            Some(clock) => format!("{title}: replay from {} UTC", &clock.format(0.0)[..16]),
-            None => format!("{title}: replay"),
+            let mut scenario = built
+                .map_err(|e| fail(1, format!("cannot build the {scenario_name} scenario: {e}")))?;
+            let replay = match args.replay.as_deref() {
+                None => None,
+                Some(dir) => Some(
+                    Replay::vtu(dir, &mut scenario)
+                        .map_err(|e| fail(1, format!("cannot replay {}: {e}", dir.display())))?,
+                ),
+            };
+            (scenario, replay)
         };
-    }
-    // A live run saved as it runs
-    let live_save = match (&replay, &args.save_snapshot) {
-        (None, Some(path)) => match replay::SnapshotSink::create(
-            path,
-            &scenario,
-            scenario.clock.as_ref(),
-            args.particles.per_release > 0,
-            false,
-        ) {
-            Ok(sink) => {
-                println!("Saving the run to {}", path.display());
-                Some(sink)
-            }
-            Err(e) => {
-                eprintln!("cannot write {}: {e}", path.display());
-                return AppExit::from_code(1);
-            }
-        },
-        _ => None,
-    };
-    if let Some(ramp) = args.ramp {
-        scenario.forcing.ramp = ramp;
-    }
-    if !sites.is_empty() {
-        let names: Vec<&str> = sites.iter().map(|s| s.name.as_str()).collect();
-        scenario.name = format!("{} + {}", scenario.name, names.join(", "));
-    }
-
-    let (lo, hi) = scenario.mesh.vertices.iter().fold(
-        ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
-        |(lo, hi), v| {
-            (
-                [lo[0].min(v[0]), lo[1].min(v[1])],
-                [hi[0].max(v[0]), hi[1].max(v[1])],
-            )
-        },
-    );
-    let frame = Frame {
-        origin: [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])],
-        vz: args.vz,
-    };
-    let nodes = Nodes::new(&scenario, &frame);
-    let locator = PointLocator2D::new(&scenario.mesh);
-    let cages = CageLayout(
-        scenario
-            .cages
-            .iter()
-            .map(|cage| {
-                let (c0, c1) = cage.footprint.bounding_box();
-                let centre = [0.5 * (c0[0] + c1[0]), 0.5 * (c0[1] + c1[1])];
-                (cage.clone(), Probe::at(&locator, &scenario, centre))
-            })
-            .collect(),
-    );
-    // The land and sea around a domain on a real coast
-    let terrain_paths: Option<Vec<PathBuf>> = match args.terrain.as_deref() {
-        Some("none") => None,
-        Some(list) => Some(list.split(',').map(PathBuf::from).collect()),
-        None => Some(vec![repo.join("data/froya_topobathy.tif")]).filter(|p| p[0].is_file()),
-    };
-    let terrain = match (terrain_paths, &scenario.projection) {
-        (Some(paths), Some(projection)) => {
-            let started = std::time::Instant::now();
-            let built = Terrain::build(
-                &paths,
-                projection,
-                args.terrain_margin,
-                &scenario,
-                &nodes,
-                &locator,
-                &frame,
+        if let Some(origin) = &args.origin {
+            scenario.projection = Some(
+                scenario::parse_projection(&format!("local,{origin}")).ok_or_else(|| {
+                    fail(
+                        2,
+                        format!("--origin takes LAT,LON in degrees, not {origin}"),
+                    )
+                })?,
             );
-            match built {
-                Ok(terrain) => {
-                    let grids: Vec<String> = terrain
-                        .grids()
-                        .iter()
-                        .map(|([nx, ny], dx)| format!("{nx} x {ny} at {dx:.1} m"))
-                        .collect();
-                    println!(
-                        "Terrain: {}, built in {:.1} s",
-                        grids.join(" + "),
-                        started.elapsed().as_secs_f64()
-                    );
-                    Some(terrain)
-                }
-                Err(e) => {
-                    eprintln!("no terrain: {e}");
-                    None
+        }
+        // The gauge trace stays at the scenario's point of interest when a site takes
+        // the close-up
+        let gauge_point = scenario.farm;
+        // The scenario's own framing, for its stations and `--place`s
+        let place_framing = scenario.close_up;
+        // Fish farm sites: their cages join the scenario's, the close-up frames the first
+        let mut sites = Vec::new();
+        let mut site_places = Vec::new();
+        for path in &args.sites {
+            let Some(projection) = scenario.projection else {
+                return Err(fail(
+                    2,
+                    format!(
+                        "--site {}: the domain has no projection (--origin LAT,LON)",
+                        path.display()
+                    ),
+                ));
+            };
+            let site = dg_rs::io::read_farm_site_file(path)
+                .map_err(|e| fail(1, format!("cannot read the site {}: {e}", path.display())))?;
+            let cages = site::site_cages(&site, &projection, &scenario.cages);
+            println!(
+                "Site {} {}: {} cages added",
+                site.number,
+                site.name,
+                cages.len()
+            );
+            if sites.is_empty() {
+                scenario.farm = site::site_centre(&site, &projection);
+                scenario.close_up = scenario::CloseUp {
+                    distance: 700.0,
+                    yaw: 0.7,
+                    pitch: 0.45,
+                    arrow_spacing: 25.0,
+                    arrow_radius: 600.0,
+                };
+            }
+            scenario.cages.extend(cages);
+            site_places.push((site.name.clone(), site::site_centre(&site, &projection)));
+            sites.push(site);
+        }
+        if let Some(ramp) = args.ramp {
+            scenario.forcing.ramp = ramp;
+        }
+        if !sites.is_empty() {
+            let names: Vec<&str> = sites.iter().map(|s| s.name.as_str()).collect();
+            scenario.name = format!("{} + {}", scenario.name, names.join(", "));
+        }
+
+        let (lo, hi) = scenario.mesh.vertices.iter().fold(
+            ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
+            |(lo, hi), v| {
+                (
+                    [lo[0].min(v[0]), lo[1].min(v[1])],
+                    [hi[0].max(v[0]), hi[1].max(v[1])],
+                )
+            },
+        );
+        let frame = Frame {
+            origin: [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])],
+            vz: args.vz,
+        };
+        let nodes = Nodes::new(&scenario, &frame);
+        let locator = PointLocator2D::new(&scenario.mesh);
+        let cages = CageLayout(
+            scenario
+                .cages
+                .iter()
+                .map(|cage| {
+                    let (c0, c1) = cage.footprint.bounding_box();
+                    let centre = [0.5 * (c0[0] + c1[0]), 0.5 * (c0[1] + c1[1])];
+                    (cage.clone(), Probe::at(&locator, &scenario, centre))
+                })
+                .collect(),
+        );
+        // The land and sea around a domain on a real coast
+        let terrain_paths: Option<Vec<PathBuf>> = match args.terrain.as_deref() {
+            Some("none") => None,
+            Some(list) => Some(list.split(',').map(PathBuf::from).collect()),
+            None => Some(vec![repo.join("data/froya_topobathy.tif")]).filter(|p| p[0].is_file()),
+        };
+        let terrain = match (terrain_paths, &scenario.projection) {
+            (Some(paths), Some(projection)) => {
+                let started = std::time::Instant::now();
+                let built = Terrain::build(
+                    &paths,
+                    projection,
+                    args.terrain_margin,
+                    &scenario,
+                    &nodes,
+                    &locator,
+                    &frame,
+                );
+                match built {
+                    Ok(terrain) => {
+                        let grids: Vec<String> = terrain
+                            .grids()
+                            .iter()
+                            .map(|([nx, ny], dx)| format!("{nx} x {ny} at {dx:.1} m"))
+                            .collect();
+                        println!(
+                            "Terrain: {}, built in {:.1} s",
+                            grids.join(" + "),
+                            started.elapsed().as_secs_f64()
+                        );
+                        Some(terrain)
+                    }
+                    Err(e) => {
+                        eprintln!("no terrain: {e}");
+                        None
+                    }
                 }
             }
-        }
-        (Some(_), None) if args.terrain.is_some() => {
-            eprintln!("no terrain: the domain has no projection (--origin LAT,LON)");
-            None
-        }
-        _ => None,
-    };
-    let sites = scenario.projection.map(|projection| {
-        Sites(
-            sites
-                .iter()
-                .map(|site| SiteDrawing::new(site, &projection, &scenario, &nodes, &locator))
-                .collect(),
-        )
-    });
-    let arrows = Arrows::new(
-        &locator,
-        &scenario,
-        48,
-        scenario.close_up.arrow_spacing,
-        scenario.close_up.arrow_radius,
-    );
-    println!(
-        "{}: {} elements (P{}), {} nodes; {} + {} current arrows",
-        scenario.name,
-        scenario.mesh.n_elements,
-        scenario.ops.order,
-        nodes.len(),
-        arrows.count().0,
-        arrows.count().1
-    );
+            (Some(_), None) if args.terrain.is_some() => {
+                eprintln!("no terrain: the domain has no projection (--origin LAT,LON)");
+                None
+            }
+            _ => None,
+        };
+        let sites = scenario.projection.map(|projection| {
+            Sites(
+                sites
+                    .iter()
+                    .map(|site| SiteDrawing::new(site, &projection, &scenario, &nodes, &locator))
+                    .collect(),
+            )
+        });
+        let arrows = Arrows::new(
+            &locator,
+            &scenario,
+            48,
+            scenario.close_up.arrow_spacing,
+            scenario.close_up.arrow_radius,
+        );
 
-    let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]) as f32;
-    // A place framed as `close_up` frames the point of interest
-    let framed = |at: [f64; 2], close_up: &scenario::CloseUp| OrbitCamera {
-        focus: frame.world(at, 0.0),
-        yaw: close_up.yaw,
-        pitch: close_up.pitch,
-        distance: close_up.distance,
-    };
-    // The run's stations and the `--place`s as the scenario frames its point of
-    // interest, the sites as the farm close-up
-    let places = scenario
-        .places
-        .iter()
-        .map(|(name, at)| (name.clone(), framed(*at, &place_framing)))
-        .chain(
-            site_places
-                .iter()
-                .map(|(name, at)| (name.clone(), framed(*at, &scenario.close_up))),
-        )
-        .chain(
-            args.places
-                .iter()
-                .map(|(name, at)| (name.clone(), framed(*at, &place_framing))),
-        )
-        .collect();
-    let views = Views {
-        farm: framed(scenario.farm, &scenario.close_up),
-        places,
-        domain: OrbitCamera {
-            focus: Vec3::ZERO,
-            yaw: 0.35,
-            pitch: 0.7,
-            distance: 0.85 * extent,
-        },
-    };
-    let start = match args.eye {
-        Some((at, height, bearing, tilt)) => photo::eye_view(&frame, at, height, bearing, tilt),
-        None => match args.view.as_str() {
-            "farm" => views.farm,
-            "domain" => views.domain,
-            n => match n
-                .parse::<usize>()
-                .ok()
-                .and_then(|n| views.places.get(n.wrapping_sub(1)))
-            {
-                Some((_, view)) => *view,
-                None => {
-                    eprintln!(
-                        "--view takes farm, domain or a place's number (1 to {}), not {n}",
-                        views.places.len()
-                    );
-                    return AppExit::from_code(2);
+        let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]) as f32;
+        // A place framed as `close_up` frames the point of interest
+        let framed = |at: [f64; 2], close_up: &scenario::CloseUp| OrbitCamera {
+            focus: frame.world(at, 0.0),
+            yaw: close_up.yaw,
+            pitch: close_up.pitch,
+            distance: close_up.distance,
+        };
+        // The run's stations and the `--place`s as the scenario frames its point of
+        // interest, the sites as the farm close-up
+        let places = scenario
+            .places
+            .iter()
+            .map(|(name, at)| (name.clone(), framed(*at, &place_framing)))
+            .chain(
+                site_places
+                    .iter()
+                    .map(|(name, at)| (name.clone(), framed(*at, &scenario.close_up))),
+            )
+            .chain(
+                args.places
+                    .iter()
+                    .map(|(name, at)| (name.clone(), framed(*at, &place_framing))),
+            )
+            .collect();
+        let views = Views {
+            farm: framed(scenario.farm, &scenario.close_up),
+            places,
+            domain: OrbitCamera {
+                focus: Vec3::ZERO,
+                yaw: 0.35,
+                pitch: 0.7,
+                distance: 0.85 * extent,
+            },
+        };
+        let start = match args.eye {
+            Some((at, height, bearing, tilt)) => photo::eye_view(&frame, at, height, bearing, tilt),
+            None => match args.view.as_str() {
+                "farm" => views.farm,
+                "domain" => views.domain,
+                n => match n
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| views.places.get(n.wrapping_sub(1)))
+                {
+                    Some((_, view)) => *view,
+                    None => {
+                        return Err(fail(
+                            2,
+                            format!(
+                                "--view takes farm, domain or a place's number (1 to {}), \
+                                 not {n}",
+                                views.places.len()
+                            ),
+                        ));
+                    }
+                },
+            },
+        };
+
+        // The water column of a 3D run: its levels
+        let levels = scenario.three_d.as_ref().map(|three_d| {
+            let farm = Probe::at(&locator, &scenario, scenario.farm);
+            let bed: Vec<f32> = scenario.bathymetry.data.iter().map(|&b| b as f32).collect();
+            Levels {
+                sigma: three_d
+                    .sigma
+                    .sigma_rho()
+                    .iter()
+                    .map(|&s| s as f32)
+                    .collect(),
+                depth: farm.map_or(0.0, |p| -p.eval(&bed)),
+            }
+        });
+        let top = scenario
+            .three_d
+            .as_ref()
+            .map_or(0, |three_d| three_d.sigma.n_levels() - 1);
+        let shown = match args.layer.as_str() {
+            "mean" => ShownLayer::DepthMean,
+            "surface" => ShownLayer::Level(top),
+            "bed" => ShownLayer::Level(0),
+            n => match n.parse::<usize>() {
+                Ok(l) if l <= top => ShownLayer::Level(l),
+                _ => {
+                    return Err(fail(
+                        2,
+                        format!("--layer takes mean, surface, bed or 0 to {top}, not {n}"),
+                    ));
                 }
             },
-        },
-    };
+        };
+        let periodic = Periodic(scenario.periodic.map(|p| p.map(|x| x as f32)));
 
-    // The water column of a 3D run: its levels
-    let levels = scenario.three_d.as_ref().map(|three_d| {
-        let farm = Probe::at(&locator, &scenario, scenario.farm);
-        let bed: Vec<f32> = scenario.bathymetry.data.iter().map(|&b| b as f32).collect();
-        Levels {
-            sigma: three_d
-                .sigma
-                .sigma_rho()
-                .iter()
-                .map(|&s| s as f32)
-                .collect(),
-            depth: farm.map_or(0.0, |p| -p.eval(&bed)),
-        }
-    });
-    let top = scenario
-        .three_d
-        .as_ref()
-        .map_or(0, |three_d| three_d.sigma.n_levels() - 1);
-    let shown = match args.layer.as_str() {
-        "mean" => ShownLayer::DepthMean,
-        "surface" => ShownLayer::Level(top),
-        "bed" => ShownLayer::Level(0),
-        n => match n.parse::<usize>() {
-            Ok(l) if l <= top => ShownLayer::Level(l),
-            _ => {
-                eprintln!("--layer takes mean, surface, bed or 0 to {top}, not {n}");
-                return AppExit::from_code(2);
-            }
-        },
-    };
-    let periodic = Periodic(scenario.periodic.map(|p| p.map(|x| x as f32)));
-
-    // The model times the gauge trace covers, and the run's clock
-    let (span, run_clock) = match &replay {
-        Some(replay) => ([replay.t_first, replay.t_last], replay.clock),
-        None => ([0.0, args.hours * 3600.0], scenario.clock),
-    };
-    let gauge = match &args.gauge {
-        None => None,
-        Some(path) => match dg_rs::io::read_tide_gauge_file(path) {
-            Ok(file) => {
+        // The model times the gauge trace covers, and the run's clock
+        let (span, run_clock) = match &replay {
+            Some(replay) => ([replay.t_first, replay.t_last], replay.clock),
+            None => ([0.0, args.hours * 3600.0], scenario.clock),
+        };
+        let gauge = match &args.gauge {
+            None => None,
+            Some(path) => {
+                let file = dg_rs::io::read_tide_gauge_file(path).map_err(|e| {
+                    fail(1, format!("cannot read the gauge {}: {e}", path.display()))
+                })?;
                 let name = file.station.as_ref().map_or_else(
                     || {
                         path.file_stem()
@@ -909,96 +884,355 @@ fn main() -> AppExit {
                     .collect();
                 Some((name, record))
             }
-            Err(e) => {
-                eprintln!("cannot read the gauge {}: {e}", path.display());
-                return AppExit::from_code(1);
-            }
-        },
-    };
-    if gauge.is_some() && run_clock.is_none() {
-        eprintln!("--gauge needs the run's clock: the gauge is not drawn");
-    }
-    let mut trace = Trace::new(&scenario, &locator, gauge_point, span, gauge, run_clock);
-    // VTU frames are hourly: the run's own record of the point, if it wrote one
-    if let (Some(dir), None, Some(clock), Some(projection)) = (
-        args.replay.as_deref().filter(|p| p.is_dir()),
-        snapshot_file,
-        run_clock,
-        scenario.projection,
-    ) && let Some((name, record)) = replay::station_record(dir, gauge_point, &projection)
-    {
-        println!(
-            "Trace: the run's record at {name}, {} samples",
-            record.len()
+        };
+        if gauge.is_some() && run_clock.is_none() {
+            eprintln!("--gauge needs the run's clock: the gauge is not drawn");
+        }
+        let mut trace = Trace::new(&scenario, &locator, gauge_point, span, gauge, run_clock);
+        // VTU frames are hourly: the run's own record of the point, if it wrote one
+        if let (Some(dir), None, Some(clock), Some(projection)) = (
+            args.replay.as_deref().filter(|p| p.is_dir()),
+            snapshot_file,
+            run_clock,
+            scenario.projection,
+        ) && let Some((name, record)) = replay::station_record(dir, gauge_point, &projection)
+        {
+            println!(
+                "Trace: the run's record at {name}, {} samples",
+                record.len()
+            );
+            trace = trace.with_record(&record, clock);
+        }
+        let mut inspector = inspect::Inspector::new(
+            scenario.mesh.clone(),
+            scenario.ops.clone(),
+            scenario.projection,
+            &scenario.bathymetry.data,
+            scenario.three_d.as_ref().map(|three_d| {
+                three_d
+                    .sigma
+                    .sigma_rho()
+                    .iter()
+                    .map(|&s| s as f32)
+                    .collect()
+            }),
         );
-        trace = trace.with_record(&record, clock);
+        if let Some(at) = args.pin {
+            inspector.pin(at);
+        }
+        drop(locator);
+        Ok(Self {
+            given,
+            args,
+            scenario,
+            replay,
+            frame,
+            nodes,
+            cages,
+            arrows,
+            views,
+            start,
+            shown,
+            periodic,
+            levels,
+            trace,
+            inspector,
+            terrain,
+            sites,
+            run_clock,
+            bounds: (lo, hi),
+        })
     }
-    let mut inspector = inspect::Inspector::new(
-        scenario.mesh.clone(),
-        scenario.ops.clone(),
-        scenario.projection,
-        &scenario.bathymetry.data,
-        scenario.three_d.as_ref().map(|three_d| {
-            three_d
-                .sigma
-                .sigma_rho()
-                .iter()
-                .map(|&s| s as f32)
-                .collect()
-        }),
-    );
 
-    // A snapshot file is read on demand: its frame times, and where to ask for frames
-    let mut on_demand = None;
-    let (channel, source, t_end, interval, rate) = match replay {
-        Some(replay) => {
-            let source = Source::Replay {
-                name: args
+    /// Start the run's solver or replay and hand the run to the viewer: its
+    /// resources. The viewer's plugins spawn its entities on entering
+    /// [`Screen::Viewer`].
+    pub fn start(self, world: &mut World) -> Result<(), Failed> {
+        let Self {
+            given,
+            args,
+            mut scenario,
+            replay,
+            frame,
+            nodes,
+            cages,
+            arrows,
+            views,
+            start,
+            shown,
+            periodic,
+            levels,
+            trace,
+            inspector,
+            terrain,
+            sites,
+            run_clock,
+            bounds: (lo, hi),
+        } = self;
+        // A snapshot file is read on demand: its frame times, and where to ask for frames
+        let mut on_demand = None;
+        let (channel, source, t_end, interval, rate) = match replay {
+            Some(mut replay) => {
+                let shown_name = args
                     .replay
                     .as_ref()
                     .and_then(|d| d.file_name())
-                    .map_or(String::new(), |n| n.to_string_lossy().into_owned()),
-                frames: replay.frames(),
-                t_last: replay.t_last,
-            };
-            let (t_end, interval) = (replay.t_last, replay.interval);
-            let channel = match replay::serve(replay, trace.probe().cloned()) {
-                Ok(served) => {
-                    on_demand = Some((served.times, served.requests));
-                    served.messages
+                    .map_or(String::new(), |n| n.to_string_lossy().into_owned());
+                println!(
+                    "Replaying {} frames of {}, {} s apart, t = {} to {} s",
+                    replay.frames(),
+                    args.replay
+                        .as_ref()
+                        .map_or(String::new(), |p| p.display().to_string()),
+                    replay.interval,
+                    replay.t_first,
+                    replay.t_last
+                );
+                if let Some(path) = &args.save_snapshot {
+                    replay
+                        .save_to(path, &scenario)
+                        .map_err(|e| fail(1, format!("cannot write {}: {e}", path.display())))?;
+                    println!("Saving the frames to {}", path.display());
                 }
-                Err(replay) => replay::spawn(*replay, args.threads),
-            };
-            (
-                channel,
-                source,
-                t_end,
-                interval,
-                args.rate.unwrap_or(3600.0),
-            )
-        }
-        None => {
-            let t_end = args.hours * 3600.0;
-            let channel = solver::spawn(
-                &scenario,
-                SolverConfig {
+                let title = scenario
+                    .name
+                    .split(':')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                scenario.name = match replay.clock {
+                    Some(clock) => {
+                        format!("{title}: replay from {} UTC", &clock.format(0.0)[..16])
+                    }
+                    None => format!("{title}: replay"),
+                };
+                let source = Source::Replay {
+                    name: shown_name,
+                    frames: replay.frames(),
+                    t_last: replay.t_last,
+                };
+                let (t_end, interval) = (replay.t_last, replay.interval);
+                let messages = match replay::serve(replay, trace.probe().cloned()) {
+                    Ok(served) => {
+                        on_demand = Some((served.times, served.requests));
+                        served.messages
+                    }
+                    Err(replay) => replay::spawn(*replay, args.threads),
+                };
+                let channel = SolverChannel {
+                    messages: Mutex::new(messages),
+                    stop: None,
+                };
+                (
+                    channel,
+                    source,
                     t_end,
-                    interval: args.interval,
-                    levels: args.levels,
-                    threads: args.threads,
-                    drag: args.drag,
-                    particles: args.particles,
-                },
-                live_save,
-            );
-            let rate = args.rate.unwrap_or(60.0);
-            (channel, Source::Solver, t_end, args.interval, rate)
+                    interval,
+                    args.rate.unwrap_or(3600.0),
+                )
+            }
+            None => {
+                // A live run saved as it runs
+                let save = match &args.save_snapshot {
+                    Some(path) => {
+                        if let Some(dir) = path.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        let sink = replay::SnapshotSink::create(
+                            path,
+                            &scenario,
+                            scenario.clock.as_ref(),
+                            args.particles.per_release > 0,
+                            false,
+                        )
+                        .map_err(|e| fail(1, format!("cannot write {}: {e}", path.display())))?;
+                        println!("Saving the run to {}", path.display());
+                        Some(sink)
+                    }
+                    None => None,
+                };
+                let t_end = args.hours * 3600.0;
+                let (messages, stop) = solver::spawn(
+                    &scenario,
+                    SolverConfig {
+                        t_end,
+                        interval: args.interval,
+                        levels: args.levels,
+                        threads: args.threads,
+                        drag: args.drag,
+                        particles: args.particles,
+                    },
+                    save,
+                );
+                let channel = SolverChannel {
+                    messages: Mutex::new(messages),
+                    stop: Some(stop),
+                };
+                (
+                    channel,
+                    Source::Solver,
+                    t_end,
+                    args.interval,
+                    args.rate.unwrap_or(60.0),
+                )
+            }
+        };
+        println!(
+            "{}: {} elements (P{}), {} nodes; {} + {} current arrows",
+            scenario.name,
+            scenario.mesh.n_elements,
+            scenario.ops.order,
+            nodes.len(),
+            arrows.count().0,
+            arrows.count().1
+        );
+        let mut playback = Playback::new(rate, interval, args.memory_mb << 20);
+        if let Some((times, requests)) = on_demand {
+            playback = playback.read_on_demand(times, requests);
         }
-    };
-    let mut playback = Playback::new(rate, interval, args.memory_mb << 20);
-    if let Some((times, requests)) = on_demand {
-        playback = playback.read_on_demand(times, requests);
+
+        world.insert_resource(RunArgs(given));
+        world.insert_resource(ClearColor(Color::srgb(0.05, 0.065, 0.08)));
+        world.insert_resource(GlobalAmbientLight {
+            color: Color::srgb(0.75, 0.85, 1.0),
+            brightness: 350.0,
+            ..default()
+        });
+        world.insert_resource(frame);
+        world.insert_resource(nodes);
+        world.insert_resource(cages);
+        world.insert_resource(arrows);
+        world.insert_resource(actions::Actions::new(&views));
+        world.insert_resource(args.show);
+        world.insert_resource(views);
+        world.insert_resource(Field::default());
+        world.insert_resource(shown);
+        world.insert_resource(periodic);
+        world.insert_resource(Colouring::new(args.speed_max, args.colour));
+        // The waves' maps read on opaque water, not mixed with the bed's colours
+        world.insert_resource(if args.colour.is_waves() {
+            surface::SurfaceStyle::Opaque
+        } else {
+            surface::SurfaceStyle::Translucent
+        });
+        world.insert_resource(WaterOpacity(args.water_alpha));
+        world.insert_resource(Title(scenario.name.clone()));
+        world.insert_resource(Photo {
+            // The real sun stands over the domain's centre
+            place: scenario.projection.map(|p| {
+                let [x, y] = frame.origin;
+                let (lat, lon) = dg_rs::io::CoordinateProjection::xy_to_geo(&p, x, y);
+                [lat, lon]
+            }),
+            ..args.photo.clone()
+        });
+        world.insert_resource(trace);
+        world.insert_resource(inspector);
+        world.insert_resource(playback);
+        world.insert_resource(channel);
+        world.insert_resource(source);
+        world.insert_resource(minimap::Minimap::new(
+            frame.world(lo, 0.0).xz().min(frame.world(hi, 0.0).xz()),
+            frame.world(lo, 0.0).xz().max(frame.world(hi, 0.0).xz()),
+            args.minimap,
+        ));
+        world.insert_resource(Capture {
+            path: args.screenshot,
+            at: args.at.unwrap_or(t_end),
+            frames: None,
+        });
+        world.insert_resource(FrameTimes {
+            wanted: args.frame_times.unwrap_or(0),
+            at: args.at.unwrap_or(t_end),
+            samples: Vec::new(),
+        });
+        if let Some(clock) = run_clock {
+            world.insert_resource(RunClock(clock));
+        }
+        if let Some(terrain) = terrain {
+            world.insert_resource(terrain);
+        }
+        if let Some(sites) = sites {
+            world.insert_resource(sites);
+        }
+        if let Some(levels) = levels {
+            world.insert_resource(levels);
+            world.insert_resource(Stratification::new(args.sheet));
+        }
+        world.insert_resource(StartView(start));
+        Ok(())
     }
+}
+
+/// The view a run starts from.
+#[derive(Resource)]
+struct StartView(OrbitCamera);
+
+/// The run's camera and sun, once the screen before it (and its camera) is gone.
+fn spawn_view(mut commands: Commands, start: Res<StartView>) {
+    let start = start.0;
+    commands.spawn((
+        RUN,
+        Camera3d::default(),
+        // The HUD's, not the minimap's
+        IsDefaultUiCamera,
+        RenderLayers::from_layers(&[0, minimap::MAIN_ONLY]),
+        Projection::Perspective(PerspectiveProjection {
+            near: 1.0,
+            far: 400_000.0,
+            ..default()
+        }),
+        start.transform(),
+        start,
+    ));
+    // Sun from the south-west, 35° up.
+    commands.spawn((
+        RUN,
+        DirectionalLight {
+            illuminance: 9_000.0,
+            shadow_maps_enabled: false,
+            ..default()
+        },
+        Transform::from_xyz(-1.0, 1.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+}
+
+fn main() -> AppExit {
+    let repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    // `viz/..` resolved, without Windows' verbatim `\\?\` prefix
+    let repo = match std::fs::canonicalize(&repo) {
+        Ok(path) => match path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+            Some(plain) => PathBuf::from(plain),
+            None => path,
+        },
+        Err(_) => repo,
+    };
+    let given: Vec<String> = std::env::args().skip(1).collect();
+    // The menu: alone, saving its window, or following a script
+    enum MenuWith {
+        Nothing,
+        Screenshot(PathBuf),
+        Script(PathBuf),
+    }
+    let menu_with = match given.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] | ["--menu"] => Some(MenuWith::Nothing),
+        ["--menu", "--screenshot", path] => Some(MenuWith::Screenshot(path.into())),
+        ["--menu", "--script", path] => Some(MenuWith::Script(path.into())),
+        _ => None,
+    };
+    // A run from the command line is built before the window opens, so that a bad
+    // option ends at once with its exit code
+    let run = match menu_with {
+        Some(_) => None,
+        None => match Run::build(given, &repo) {
+            Ok(run) => Some(run),
+            Err(e) => {
+                eprintln!("{}", e.message);
+                return AppExit::from_code(e.code);
+            }
+        },
+    };
+    let timed = run.as_ref().is_some_and(|r| r.args.frame_times.is_some());
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -1006,7 +1240,7 @@ fn main() -> AppExit {
             title: "dg-viz".into(),
             resolution: (1600, 900).into(),
             // Timed frames are not held to the display's rate
-            present_mode: if args.frame_times.is_some() {
+            present_mode: if timed {
                 bevy::window::PresentMode::AutoNoVsync
             } else {
                 bevy::window::PresentMode::default()
@@ -1016,65 +1250,15 @@ fn main() -> AppExit {
         ..default()
     }))
     .insert_resource(ClearColor(Color::srgb(0.05, 0.065, 0.08)))
-    .insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.75, 0.85, 1.0),
-        brightness: 350.0,
-        ..default()
-    })
-    .insert_resource(frame)
-    .insert_resource(nodes)
-    .insert_resource(cages)
-    .insert_resource(arrows)
-    .insert_resource(actions::Actions::new(&views))
-    .insert_resource(args.show)
-    .insert_resource(views)
-    .insert_resource(Field::default())
-    .insert_resource(shown)
-    .insert_resource(periodic)
-    .insert_resource(Colouring::new(args.speed_max, args.colour))
-    // The waves' maps read on opaque water, not mixed with the bed's colours
-    .insert_resource(if args.colour.is_waves() {
-        surface::SurfaceStyle::Opaque
-    } else {
-        surface::SurfaceStyle::Translucent
-    })
-    .insert_resource(WaterOpacity(args.water_alpha))
-    .insert_resource(Title(scenario.name.clone()))
-    .insert_resource(Photo {
-        // The real sun stands over the domain's centre
-        place: scenario.projection.map(|p| {
-            let [x, y] = frame.origin;
-            let (lat, lon) = dg_rs::io::CoordinateProjection::xy_to_geo(&p, x, y);
-            [lat, lon]
-        }),
-        ..args.photo.clone()
-    })
-    .insert_resource(trace)
-    .insert_resource({
-        if let Some(at) = args.pin {
-            inspector.pin(at);
-        }
-        inspector
-    })
-    .insert_resource(playback)
-    .insert_resource(SolverChannel(Mutex::new(channel)))
-    .insert_resource(source)
-    .insert_resource(minimap::Minimap::new(
-        frame.world(lo, 0.0).xz().min(frame.world(hi, 0.0).xz()),
-        frame.world(lo, 0.0).xz().max(frame.world(hi, 0.0).xz()),
-        args.minimap,
+    .insert_resource(loading::Repo(repo.clone()))
+    .insert_resource(menu::Menu::new(repo))
+    .add_plugins((
+        ScreenPlugin,
+        menu::MenuPlugin,
+        LoadingPlugin,
+        actions::ActionsPlugin,
+        menubar::MenubarPlugin,
     ))
-    .insert_resource(Capture {
-        path: args.screenshot,
-        at: args.at.unwrap_or(t_end),
-        frames: None,
-    })
-    .insert_resource(FrameTimes {
-        wanted: args.frame_times.unwrap_or(0),
-        at: args.at.unwrap_or(t_end),
-        samples: Vec::new(),
-    })
-    .add_plugins((actions::ActionsPlugin, menubar::MenubarPlugin))
     .add_plugins((
         PlaybackPlugin,
         SurfacePlugin,
@@ -1090,81 +1274,86 @@ fn main() -> AppExit {
         SitePlugin,
         inspect::InspectPlugin,
         PhotoPlugin,
+        LayersPlugin,
     ))
-    .add_systems(Startup, move |mut commands: Commands| {
-        commands.spawn((
-            Camera3d::default(),
-            // The HUD's, not the minimap's
-            IsDefaultUiCamera,
-            RenderLayers::from_layers(&[0, minimap::MAIN_ONLY]),
-            Projection::Perspective(PerspectiveProjection {
-                near: 1.0,
-                far: 400_000.0,
-                ..default()
-            }),
-            start.transform(),
-            start,
-        ));
-        // Sun from the south-west, 35° up.
-        commands.spawn((
-            DirectionalLight {
-                illuminance: 9_000.0,
-                shadow_maps_enabled: false,
-                ..default()
-            },
-            Transform::from_xyz(-1.0, 1.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
-        ));
-    })
-    .add_systems(Update, field::interpolate)
-    .add_systems(Update, capture.after(field::interpolate))
-    .add_systems(Last, frame_times)
-    .add_systems(Update, (back_to_menu, jump))
-    .add_systems(Last, playback::settle);
-    if let Some(clock) = run_clock {
-        app.insert_resource(RunClock(clock));
-    }
-    if let Some(terrain) = terrain {
-        app.insert_resource(terrain);
-    }
-    if let Some(sites) = sites {
-        app.insert_resource(sites);
-    }
-    if let Some(levels) = levels {
-        app.insert_resource(levels)
-            .insert_resource(Stratification::new(args.sheet))
-            .add_plugins((LayersPlugin, StratificationPlugin));
+    .add_plugins(StratificationPlugin)
+    .run_resource::<RunArgs>()
+    .run_resource::<Frame>()
+    .run_resource::<Nodes>()
+    .run_resource::<Views>()
+    .run_resource::<Field>()
+    .run_resource::<ShownLayer>()
+    .run_resource::<Capture>()
+    .run_resource::<FrameTimes>()
+    .run_resource::<StartView>()
+    .add_systems(OnEnter(Screen::Viewer), spawn_view)
+    .add_systems(
+        Update,
+        (
+            field::interpolate,
+            capture.after(field::interpolate),
+            back_to_menu,
+            jump,
+        )
+            .in_set(Viewing),
+    )
+    .add_systems(Last, (frame_times, playback::settle).in_set(Viewing));
+    match run {
+        Some(run) => {
+            app.insert_state(Screen::Viewer);
+            if let Err(e) = run.start(app.world_mut()) {
+                eprintln!("{}", e.message);
+                return AppExit::from_code(e.code);
+            }
+        }
+        None => {
+            app.init_state::<Screen>();
+            match menu_with {
+                Some(MenuWith::Screenshot(path)) => menu::screenshot(&mut app, path),
+                Some(MenuWith::Script(path)) => {
+                    if let Err(e) = script::run(&mut app, &path) {
+                        eprintln!("{e}");
+                        return AppExit::from_code(2);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
     install_font(&mut app);
     app.run()
 }
 
-/// M (or Run → Back to the list of runs): back to the start menu; Run → Quit ends. A viewer the menu started ends with
-/// [`menu::BACK_TO_MENU`] and the menu shows again; one started from the command
-/// line opens a menu and ends.
-fn back_to_menu(mut acts: MessageReader<actions::Act>, mut exit: MessageWriter<AppExit>) {
+/// M (or Run → Back to the list of runs): stop the run and show the list of runs;
+/// Run → Restart builds the run anew from its options; Run → Quit ends.
+fn back_to_menu(
+    mut acts: MessageReader<actions::Act>,
+    title: Res<Title>,
+    given: Res<RunArgs>,
+    mut menu: ResMut<menu::Menu>,
+    mut commands: Commands,
+    mut next: ResMut<NextState<Screen>>,
+    mut exit: MessageWriter<AppExit>,
+) {
     use actions::{Act, Action};
-    let mut back = false;
     for &Act(action) in acts.read() {
         match action {
-            Action::Menu => back = true,
+            Action::Menu => {
+                menu.say(format!("Back from {}.", title.0), false);
+                next.set(Screen::Menu);
+            }
+            Action::Restart => {
+                commands.insert_resource(loading::Launch {
+                    args: given.0.clone(),
+                    title: title.0.clone(),
+                });
+                next.set(Screen::Loading);
+            }
             Action::Quit => {
                 exit.write(AppExit::Success);
             }
             _ => {}
         }
-    }
-    if !back {
-        return;
-    }
-    if std::env::var_os(menu::MENU_ENV).is_some() {
-        exit.write(AppExit::from_code(menu::BACK_TO_MENU));
-        return;
-    }
-    match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).spawn()) {
-        Ok(_) => {
-            exit.write(AppExit::Success);
-        }
-        Err(e) => eprintln!("cannot open the menu: {e}"),
     }
 }
 

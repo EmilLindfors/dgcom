@@ -20,6 +20,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use dg_rs::source::{CageFootprint, NetCage};
 
 use crate::field::{Field, Frame, Probe};
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 
 /// World units per repeat of the net texture.
 const NET_TILE: f32 = 2.0;
@@ -39,8 +40,12 @@ pub struct CagesPlugin;
 
 impl Plugin for CagesPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn)
-            .add_systems(Update, ride.after(crate::field::interpolate));
+        app.add_systems(OnEnter(Screen::Viewer), spawn)
+            .add_systems(
+                Update,
+                ride.after(crate::field::interpolate).in_set(Viewing),
+            )
+            .run_resource::<CageLayout>();
     }
 }
 
@@ -90,6 +95,7 @@ fn spawn(
             }
         };
         let mut entity = commands.spawn((
+            RUN,
             Name::new("Cage"),
             Cage(probe.clone()),
             Transform::from_translation(frame.world(centre, 0.0)),

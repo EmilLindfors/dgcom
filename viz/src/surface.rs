@@ -36,6 +36,7 @@ use crate::colormap::{CIVIDIS, DIVERGING, ICE, Lut, SEABED, THERMAL, VIRIDIS};
 use crate::field::{Field, Frame, Nodes};
 use crate::photo::{Photo, PhotoPart};
 use crate::playback::Playback;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 use crate::solver::{H_DRY, Waves};
 use crate::terrain::{GroundColours, Terrain};
 
@@ -43,15 +44,16 @@ pub struct SurfacePlugin;
 
 impl Plugin for SurfacePlugin {
     fn build(&self, app: &mut App) {
-        // Translucent, unless the app chose (opaque under a wave colouring)
-        if !app.world().contains_resource::<SurfaceStyle>() {
-            app.insert_resource(SurfaceStyle::Translucent);
-        }
-        app.init_resource::<WaterOpacity>()
-            .add_systems(Startup, spawn)
+        // Each run sets its colouring, style and opacity (`crate::Run`)
+        app.run_resource::<SurfaceStyle>()
+            .run_resource::<WaterOpacity>()
+            .run_resource::<Colouring>()
+            .run_resource::<BedScale>()
+            .run_resource::<Water>()
+            .add_systems(OnEnter(Screen::Viewer), spawn)
             .add_systems(
                 Update,
-                (keys, style, update_water.after(crate::field::interpolate)),
+                (keys, style, update_water.after(crate::field::interpolate)).in_set(Viewing),
             );
     }
 }
@@ -553,6 +555,7 @@ pub(crate) fn spawn(
     }
     let bed_mesh = meshes.add(bed.mesh());
     commands.spawn((
+        RUN,
         Name::new("Bed"),
         PhotoPart::Bed,
         Mesh3d(bed_mesh.clone()),
@@ -580,6 +583,7 @@ pub(crate) fn spawn(
     });
     let mesh = meshes.add(water.mesh());
     commands.spawn((
+        RUN,
         Name::new("Water"),
         WaterSurface,
         PhotoPart::Sea,

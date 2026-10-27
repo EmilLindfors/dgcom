@@ -35,6 +35,7 @@ use crate::cloud_3d::KINDS;
 use crate::colormap::{Lut, PLASMA};
 use crate::field::Frame;
 use crate::playback::Playback;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 
 /// Longest tracking step (s); a snapshot interval is split into steps no longer.
 pub const MAX_STEP: f64 = 10.0;
@@ -268,8 +269,13 @@ pub struct ParticlesPlugin;
 
 impl Plugin for ParticlesPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn)
-            .add_systems(Update, (toggle, draw.after(crate::field::interpolate)));
+        app.add_systems(OnEnter(Screen::Viewer), spawn)
+            .add_systems(
+                Update,
+                (toggle, draw.after(crate::field::interpolate)).in_set(Viewing),
+            )
+            .run_resource::<Particles>()
+            .run_resource::<Periodic>();
     }
 }
 
@@ -289,6 +295,7 @@ fn spawn(
         .with_inserted_indices(Indices::U32(Vec::new())),
     );
     commands.spawn((
+        RUN,
         Name::new("Particles"),
         Cloudlet,
         Mesh3d(mesh.clone()),

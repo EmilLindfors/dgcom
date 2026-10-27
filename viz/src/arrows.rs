@@ -18,6 +18,7 @@ use crate::colormap::{Lut, VIRIDIS};
 use crate::field::{Field, Frame, Probe};
 use crate::photo::Photo;
 use crate::scenario::Scenario;
+use crate::screen::{RunResources, Viewing};
 use crate::surface::{ColourBy, Colouring};
 
 /// Metres of lift above the surface, as a share of the grid spacing.
@@ -124,7 +125,11 @@ pub struct ArrowsPlugin;
 
 impl Plugin for ArrowsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (toggle, draw.after(crate::field::interpolate)));
+        app.add_systems(
+            Update,
+            (toggle, draw.after(crate::field::interpolate)).in_set(Viewing),
+        )
+        .run_resource::<Arrows>();
     }
 }
 

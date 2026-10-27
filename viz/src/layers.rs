@@ -9,6 +9,7 @@ use bevy::prelude::*;
 
 use crate::actions::{Act, Action};
 use crate::field::ShownLayer;
+use crate::screen::{RunResources, Viewing};
 
 /// The σ-levels of a 3D run: layer centres from the bed up, for the legend.
 #[derive(Resource, Clone, Debug)]
@@ -22,7 +23,11 @@ pub struct LayersPlugin;
 
 impl Plugin for LayersPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, keys);
+        app.add_systems(
+            Update,
+            keys.run_if(resource_exists::<Levels>).in_set(Viewing),
+        )
+        .run_resource::<Levels>();
     }
 }
 

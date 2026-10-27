@@ -2,6 +2,9 @@
 //!
 //! Provides a high-level interface for running time-dependent simulations.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::physics::PhysicsModule;
 use crate::time::{Integrable, MultirateStats, MultirateStepper, StageWorkspace, TimeIntegrator};
 
@@ -31,6 +34,19 @@ pub struct SimulationConfig {
     /// time stepping (see `IntegratorInfo::ssp_scheme`). The result is the
     /// same bit for bit; `false` runs the whole-state stages instead.
     pub fused_stages: bool,
+    /// Set from another thread to end the run before its next step (e.g. by a
+    /// viewer that no longer shows it); the run then returns as stopped.
+    pub stop: Option<Arc<AtomicBool>>,
+}
+
+impl SimulationConfig {
+    /// The result of a run that `stop` ended at `t`, if it did.
+    pub(crate) fn stopped(&self, t: f64, n_steps: usize) -> Option<SimulationResult> {
+        self.stop
+            .as_ref()
+            .filter(|stop| stop.load(Ordering::Relaxed))
+            .map(|_| SimulationResult::failure(t, n_steps, format!("Stopped at t = {t:.1} s")))
+    }
 }
 
 impl Default for SimulationConfig {
@@ -43,6 +59,7 @@ impl Default for SimulationConfig {
             max_steps: None,
             verbose: false,
             fused_stages: true,
+            stop: None,
         }
     }
 }
@@ -194,6 +211,13 @@ where
         self
     }
 
+    /// End the run before the next step once `stop` is set (see
+    /// [`SimulationConfig::stop`]).
+    pub fn with_stop(mut self, stop: Arc<AtomicBool>) -> Self {
+        self.config.stop = Some(stop);
+        self
+    }
+
     /// Enable verbose output.
     pub fn verbose(mut self) -> Self {
         self.config.verbose = true;
@@ -334,6 +358,9 @@ where
                     n_steps,
                     format!("Maximum step limit ({}) reached", max_steps),
                 );
+            }
+            if let Some(stopped) = self.config.stopped(t, n_steps) {
+                return stopped;
             }
 
             // Compute time step (with local time stepping, assign the levels
@@ -662,6 +689,29 @@ mod tests {
                 "callback {k} at {t}, expected {expected}"
             );
         }
+    }
+
+    /// A run ends before the step after its stop flag is set, at the time it had
+    /// reached, and says it stopped.
+    #[test]
+    fn a_run_ends_when_its_stop_flag_is_set() {
+        let (physics, mut state) = create_test_setup();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sim = Simulation::new(physics, SSPRK3)
+            .with_cfl(0.5)
+            .with_callback_interval(0.002)
+            .with_stop(stop.clone());
+        let mut times = Vec::new();
+        let result = sim.run_with_callback(&mut state, 0.0, 1.0, |_, t| {
+            times.push(t);
+            if times.len() == 3 {
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+        assert!(!result.success);
+        assert_eq!(result.final_time, 0.004);
+        assert_eq!(times, [0.0, 0.002, 0.004]);
+        assert!(result.error.unwrap().starts_with("Stopped"));
     }
 
     #[test]

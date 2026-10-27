@@ -20,13 +20,15 @@
 //! forward by ten snapshots, Home and End jump to the oldest and newest.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bevy::prelude::*;
 
 use crate::actions::{Act, Action};
+use crate::screen::{RunResources, Screen, Viewing};
 use crate::solver::{Snapshot, SolverMessage};
 
 /// Where the snapshots come from.
@@ -234,20 +236,40 @@ impl Playback {
     }
 }
 
-/// The receiving end of the solver's channel (a `Receiver` is `Send` but not `Sync`).
+/// The receiving end of the solver's channel (a `Receiver` is `Send` but not `Sync`),
+/// and the live solver's stop flag.
 #[derive(Resource)]
-pub struct SolverChannel(pub Mutex<Receiver<SolverMessage>>);
+pub struct SolverChannel {
+    pub messages: Mutex<Receiver<SolverMessage>>,
+    /// Set on leaving the run: the solver ends after the step it is on. A replay's
+    /// reading threads have none: they end once the channel is gone.
+    pub stop: Option<Arc<AtomicBool>>,
+}
 
 pub struct PlaybackPlugin;
 
 impl Plugin for PlaybackPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(PreUpdate, (receive, keys, advance, request).chain());
+        app.add_systems(
+            PreUpdate,
+            (receive, keys, advance, request).chain().in_set(Viewing),
+        )
+        .run_resource::<Playback>()
+        .run_resource::<Source>()
+        .run_resource::<SolverChannel>()
+        .add_systems(OnExit(Screen::Viewer), stop);
+    }
+}
+
+/// Leaving the run stops its solver.
+fn stop(channel: Option<Res<SolverChannel>>) {
+    if let Some(stop) = channel.as_ref().and_then(|c| c.stop.as_ref()) {
+        stop.store(true, Ordering::Relaxed);
     }
 }
 
 fn receive(channel: Res<SolverChannel>, mut playback: ResMut<Playback>) {
-    let rx = channel.0.lock().expect("solver channel");
+    let rx = channel.messages.lock().expect("solver channel");
     loop {
         match rx.try_recv() {
             Ok(SolverMessage::Snapshot(snapshot)) => {

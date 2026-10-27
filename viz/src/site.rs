@@ -21,6 +21,7 @@ use dg_rs::source::NetCage;
 
 use crate::field::{Field, Frame, Nodes, Probe};
 use crate::scenario::Scenario;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 
 /// Frame cells (m), cage radius (m) and net depth (m) when the file gives no cages:
 /// Kattholmen's 180 × 365 m frame holds 2 × 4 cages of 160 m circumference.
@@ -138,8 +139,12 @@ pub struct SitePlugin;
 
 impl Plugin for SitePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn)
-            .add_systems(Update, ride.after(crate::field::interpolate));
+        app.add_systems(OnEnter(Screen::Viewer), spawn)
+            .add_systems(
+                Update,
+                ride.after(crate::field::interpolate).in_set(Viewing),
+            )
+            .run_resource::<Sites>();
     }
 }
 
@@ -178,6 +183,7 @@ fn spawn(
         let origin = frame.world(site.centre, 0.0);
         let local = |p: [f64; 2], z: f32| frame.world(p, z) - origin;
         let mut root = commands.spawn((
+            RUN,
             Name::new("Farm site"),
             SiteRoot(site.probe.clone()),
             Transform::from_translation(origin),

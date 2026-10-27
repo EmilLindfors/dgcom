@@ -99,6 +99,13 @@ where
         self
     }
 
+    /// End the run before the next step once `stop` is set (see
+    /// [`SimulationConfig::stop`]).
+    pub fn with_stop(mut self, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.config.stop = Some(stop);
+        self
+    }
+
     /// Enable verbose output.
     pub fn verbose(mut self) -> Self {
         self.config.verbose = true;
@@ -234,6 +241,9 @@ where
                     n_steps,
                     format!("Maximum step limit ({}) reached", max_steps),
                 );
+            }
+            if let Some(stopped) = self.config.stopped(t, n_steps) {
+                return stopped;
             }
 
             // Compute time step (3D CFL)

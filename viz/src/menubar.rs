@@ -19,6 +19,7 @@ use bevy::ui::{RelativeCursorPosition, UiSystems};
 
 use crate::actions::{Act, Action, Actions, Context, Menu, Shown, State};
 use crate::camera::OverUi;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 
 /// The bar's height (logical px): the HUD's panels start below it.
 pub const BAR_HEIGHT: f32 = 28.0;
@@ -62,16 +63,27 @@ struct PopupBody;
 #[derive(Component)]
 struct Blocks;
 
+/// What the open menu and the popup were last filled with: they are rebuilt only when
+/// that changes. A run's own, as its menus are.
+#[derive(Resource, Default)]
+struct Filled {
+    menu: Option<(Menu, Vec<Row>)>,
+    popup: Option<Vec<Group>>,
+}
+
 pub struct MenubarPlugin;
 
 impl Plugin for MenubarPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<OverUi>()
-            .add_systems(Startup, spawn)
-            .add_systems(PreUpdate, over_ui.after(UiSystems::Focus))
+        app.init_run_resource::<OverUi>()
+            .init_run_resource::<Filled>()
+            .add_systems(OnEnter(Screen::Viewer), spawn)
+            .add_systems(PreUpdate, over_ui.after(UiSystems::Focus).in_set(Viewing))
             .add_systems(
                 Update,
-                (help, clicks, show_menus, fill_menu, fill_popup, highlight).chain(),
+                (help, clicks, show_menus, fill_menu, fill_popup, highlight)
+                    .chain()
+                    .in_set(Viewing),
             );
     }
 }
@@ -86,6 +98,7 @@ fn font(size: f32) -> TextFont {
 fn spawn(mut commands: Commands) {
     commands
         .spawn((
+            RUN,
             Blocks,
             RelativeCursorPosition::default(),
             GlobalZIndex(10),
@@ -147,6 +160,7 @@ fn spawn(mut commands: Commands) {
     // The popup: a panel in the middle of the window
     commands
         .spawn((
+            RUN,
             Popup,
             Visibility::Hidden,
             GlobalZIndex(20),
@@ -314,14 +328,15 @@ fn fill_menu(
     actions: Res<Actions>,
     context: Context,
     dropdowns: Query<(Entity, &Dropdown)>,
-    mut filled: Local<Option<(Menu, Vec<Row>)>>,
+    mut filled: ResMut<Filled>,
 ) {
     let Some(menu) = shown.menu else {
-        *filled = None;
+        filled.menu = None;
         return;
     };
     let rows = rows(&actions, &context, menu);
     if filled
+        .menu
         .as_ref()
         .is_some_and(|(m, r)| *m == menu && *r == rows)
     {
@@ -390,7 +405,7 @@ fn fill_menu(
             });
         }
     });
-    *filled = Some((menu, rows));
+    filled.menu = Some((menu, rows));
 }
 
 /// A group of the popup: its heading and its lines (key, label, state).
@@ -439,13 +454,13 @@ fn fill_popup(
     actions: Res<Actions>,
     context: Context,
     body: Query<Entity, With<PopupBody>>,
-    mut filled: Local<Option<Vec<Group>>>,
+    mut filled: ResMut<Filled>,
 ) {
     if !shown.help {
         return;
     }
     let groups = groups(&actions, &context);
-    if filled.as_ref() == Some(&groups) {
+    if filled.popup.as_ref() == Some(&groups) {
         return;
     }
     let Ok(body) = body.single() else { return };
@@ -498,7 +513,7 @@ fn fill_popup(
             });
         }
     });
-    *filled = Some(groups);
+    filled.popup = Some(groups);
 }
 
 /// The open menu's title and the entry under the mouse lit.

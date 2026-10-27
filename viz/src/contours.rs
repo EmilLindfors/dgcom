@@ -20,14 +20,17 @@ use crate::actions::{Act, Action};
 use crate::camera::OrbitCamera;
 use crate::field::{Frame, Nodes};
 use crate::photo::Photo;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 use crate::surface::nice_ceil;
 
 pub struct ContoursPlugin;
 
 impl Plugin for ContoursPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn)
-            .add_systems(Update, (toggle, rebuild));
+        app.add_systems(OnEnter(Screen::Viewer), spawn)
+            .add_systems(Update, (toggle, rebuild).in_set(Viewing))
+            .run_resource::<Contours>()
+            .run_resource::<Segments>();
     }
 }
 
@@ -159,6 +162,7 @@ fn spawn(
     let width = 1.0;
     let mesh = meshes.add(ribbons(&lines, width));
     commands.spawn((
+        RUN,
         Name::new("Bed contours"),
         ContourLines,
         Mesh3d(mesh.clone()),

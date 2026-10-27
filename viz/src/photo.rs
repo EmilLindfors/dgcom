@@ -74,6 +74,7 @@ use crate::camera::OrbitCamera;
 use crate::field::{Field, Frame, Nodes};
 use crate::hud::RunClock;
 use crate::playback::Playback;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 use crate::surface::SurfaceStyle;
 
 /// Waves the shader sums.
@@ -115,12 +116,16 @@ impl Plugin for PhotoPlugin {
         embedded_asset!(app, "shaders/water.wesl");
         app.add_plugins(MaterialPlugin::<WaterMaterial>::default())
             .add_systems(
-                Startup,
+                OnEnter(Screen::Viewer),
                 setup
                     .after(crate::surface::spawn)
                     .after(crate::terrain::spawn),
             )
-            .add_systems(Update, (keys, switch, animate).chain());
+            .add_systems(Update, (keys, switch, animate).chain().in_set(Viewing))
+            .run_resource::<Photo>()
+            .run_resource::<Sun>()
+            .run_resource::<PhotoMaterials>()
+            .run_resource::<ShownSea>();
     }
 }
 
@@ -588,6 +593,7 @@ fn setup(
 ) {
     let sky = materials.add(WaterMaterial::new(2.0));
     commands.spawn((
+        RUN,
         Name::new("Sky"),
         SkyDome,
         Mesh3d(meshes.add(Sphere::new(1.0).mesh().uv(48, 24))),

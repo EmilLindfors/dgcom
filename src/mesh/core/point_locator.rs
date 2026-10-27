@@ -30,6 +30,9 @@
 //! sizes do not vary by orders of magnitude, and a few more candidates on
 //! graded ones (a large element spans several buckets).
 
+use std::ops::Deref;
+use std::sync::Arc;
+
 use super::Mesh2D;
 use crate::types::ElementIndex;
 
@@ -95,7 +98,7 @@ pub fn inverse_bilinear(vertices: &[[f64; 2]; 4], p: [f64; 2]) -> Option<[f64; 2
 /// Finds the element holding a point (see the module docs).
 #[derive(Clone)]
 pub struct PointLocator2D<'a> {
-    mesh: &'a Mesh2D,
+    mesh: MeshRef<'a>,
     /// Lower-left corner of the bucket grid
     origin: [f64; 2],
     /// Buckets per unit length in x and y
@@ -121,9 +124,40 @@ fn bounding_box(vertices: &[[f64; 2]; 4]) -> [f64; 4] {
     )
 }
 
+/// The mesh a locator searches: borrowed ([`PointLocator2D::new`]) or shared
+/// ([`PointLocator2D::shared`]).
+#[derive(Clone)]
+enum MeshRef<'a> {
+    Borrowed(&'a Mesh2D),
+    Shared(Arc<Mesh2D>),
+}
+
+impl Deref for MeshRef<'_> {
+    type Target = Mesh2D;
+
+    fn deref(&self) -> &Mesh2D {
+        match self {
+            MeshRef::Borrowed(mesh) => mesh,
+            MeshRef::Shared(mesh) => mesh,
+        }
+    }
+}
+
+impl PointLocator2D<'static> {
+    /// Bucket the elements of a shared mesh: the locator holds the mesh, so it
+    /// can outlive the scope that built it (e.g. live in an application's state).
+    pub fn shared(mesh: Arc<Mesh2D>) -> Self {
+        Self::build(MeshRef::Shared(mesh))
+    }
+}
+
 impl<'a> PointLocator2D<'a> {
     /// Bucket the elements of `mesh`.
     pub fn new(mesh: &'a Mesh2D) -> Self {
+        Self::build(MeshRef::Borrowed(mesh))
+    }
+
+    fn build(mesh: MeshRef<'a>) -> Self {
         let boxes: Vec<[f64; 4]> = ElementIndex::iter(mesh.n_elements)
             .map(|k| bounding_box(&mesh.element_vertices(k)))
             .collect();
@@ -192,8 +226,8 @@ impl<'a> PointLocator2D<'a> {
     }
 
     /// The mesh being searched.
-    pub fn mesh(&self) -> &'a Mesh2D {
-        self.mesh
+    pub fn mesh(&self) -> &Mesh2D {
+        &self.mesh
     }
 
     /// Bucket `(i, j)` holding `(x, y)`, clamped to the grid.
@@ -362,6 +396,21 @@ mod tests {
 
     /// Vertices and face points belong to one of their elements, and the
     /// coordinates map back to the point.
+    /// A locator holding its mesh finds what one borrowing it finds, after the
+    /// scope that built it has dropped its own handle on the mesh.
+    #[test]
+    fn a_shared_locator_holds_its_mesh() {
+        let mesh = distorted_mesh(13, 7);
+        let borrowed = PointLocator2D::new(&mesh);
+        let shared = PointLocator2D::shared(std::sync::Arc::new(mesh.clone()));
+        for k in ElementIndex::iter(mesh.n_elements) {
+            let p = mesh.reference_to_physical(k, 0.37, -0.81);
+            let (a, b) = (borrowed.locate(p).unwrap(), shared.locate(p).unwrap());
+            assert_eq!((a.element, a.r, a.s), (b.element, b.r, b.s));
+        }
+        assert_eq!(shared.mesh().n_elements, mesh.n_elements);
+    }
+
     #[test]
     fn locates_vertices_and_face_points() {
         let mesh = distorted_mesh(6, 5);
