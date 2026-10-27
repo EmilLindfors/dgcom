@@ -399,7 +399,7 @@
 //! it nothing but the bed friction removes a 50–100 m eddy. At Kattholmen
 //! `cs=0.1 nu=0.1` (TODO F.1, `notes/farm.md`): ν ≥ 1 halves the farm's
 //! current, while at 0.1 the lee eddies, so the cage and open runs
-//! decorrelate and the paired wake is noise beyond the cages.
+//! decorrelate and the wake needs the control run's noise floor.
 //!
 //! `site=<file>` puts a fish farm into the 2D tide (TODO F.1,
 //! `examples/common/farm_site.rs`): the cages of a Fiskeridirektoratet site
@@ -411,7 +411,10 @@
 //! after `spinup_hours`, and with `particles=N` the pen-to-pen connectivity
 //! of particles released in the cages, tracked online with and without the
 //! random walk's depth drift (`walks=depth,surface`, `kh=`, `seeds=`).
-//! Options: `[farm_runs=both] [cage_spacing=90] [cage_radius=25.5]
+//! `farm_control=F` adds a control run at F times the cages' drag (in
+//! `<output>/control`), whose departure from the open run is the wake's
+//! noise floor where the flow sheds eddies (0.1 at Kattholmen).
+//! Options: `[farm_runs=both] [farm_control=0] [cage_spacing=90] [cage_radius=25.5]
 //! [net_depth=20] [solidity=0.25] [farm_window=1500] [farm_grid=20]
 //! [farm_return=500] [particles=0] [release=<spinup_hours>] [releases=4]
 //! [release_every=3.105] [particle_seconds=20] [kh=0.1] [seeds=4]
@@ -423,8 +426,8 @@
 //! froya_real_data mesh=data/mausund_kattholmen.msh bbox=8.45,63.78,8.90,63.95 \
 //!     tides=data/mausund_boundary_tides.txt norkyst=data/froya_norkyst.nc \
 //!     slopes3d=on debug_3d=thin=1 lts=8 hours=31 ramp_hours=3 spinup_hours=6 \
-//!     rest_hours=0 cs=0.1 nu=0.1 site=data/sites/14042.txt particles=200 \
-//!     seeds=4 kh=0.1,1 particle_seconds=10 output=output/kattholmen_farm
+//!     rest_hours=0 cs=0.1 nu=0.1 site=data/sites/14042.txt farm_control=0.1 \
+//!     particles=200 seeds=4 kh=0.1,1 particle_seconds=10 output=output/kattholmen_farm
 //! ```
 //!
 //! Harmonic validation needs the record after spin-up to resolve the main
@@ -503,7 +506,7 @@ use dg_rs::waves::{
     CoupledWaves2D, CoupledWavesStats, DEFAULT_RATE_LIMITER, GrowthLimiter, SeaStateFields,
     SourceIntegration, SourceTerms, SpectralGrid, WaveForceForm, WaveModel2D, Wind,
 };
-use farm_site::{FarmCase, FarmOptions, FarmRecord};
+use farm_site::{FarmCase, FarmOptions, FarmRecord, FarmRun};
 
 /// Gravitational acceleration (m/s²)
 const G: f64 = 9.81;
@@ -2066,16 +2069,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let output = output_dir(&domain, &opts);
+    let run_into = |dir: &str, label: &str, run: FarmRun| {
+        let mut sub = opts.clone();
+        sub.output = Some(output.join(dir));
+        println!("\nThe tide {label}...");
+        tidal_run(&domain, &sub, parent.clone(), waves, Some((case, run)))
+    };
     let reference = if case.options().reference() {
-        let mut open = opts.clone();
-        open.output = Some(output.join("no_cages"));
-        println!("\nThe tide without the farm's cages...");
-        tidal_run(&domain, &open, parent.clone(), waves, Some((case, false)))?
+        run_into("no_cages", "without the farm's cages", FarmRun::Open)?
+    } else {
+        None
+    };
+    let control = if case.options().control() {
+        run_into(
+            "control",
+            "with the control's share of the cages' drag",
+            FarmRun::Control,
+        )?
     } else {
         None
     };
     println!("\nThe tide with the farm's cages...");
-    let caged = tidal_run(&domain, &opts, parent, waves, Some((case, true)))?
+    let caged = tidal_run(&domain, &opts, parent, waves, Some((case, FarmRun::Cages)))?
         .expect("a farm run records the farm");
     // The last whole M2 periods after the spin-up
     let t_end = opts.hours * 3600.0;
@@ -2088,6 +2103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     case.report(
         reference.as_ref(),
+        control.as_ref(),
         &caged,
         window,
         &ModelClock::parse(&opts.start)?,
@@ -2266,14 +2282,14 @@ fn tide_setup(
     })
 }
 
-/// The 2D tide; with `farm`, the farm's cages if its flag is set, and what
-/// the run recorded at the farm.
+/// The 2D tide; with `farm`, that run of the farm case (its cages' drag, if
+/// any), and what the run recorded at the farm.
 fn tidal_run<'a>(
     domain: &'a Domain,
     opts: &Options,
     parent: Option<OceanModelState>,
     wave_domain: Option<&Domain>,
-    farm: Option<(&'a FarmCase, bool)>,
+    farm: Option<(&'a FarmCase, FarmRun)>,
 ) -> Result<Option<FarmRecord<'a>>, Box<dyn std::error::Error>> {
     let TideSetup {
         t_end,
@@ -2309,11 +2325,12 @@ fn tidal_run<'a>(
         builder = builder
             .with_viscosity(HorizontalViscosity2D::smagorinsky(opts.cs).with_background(opts.nu));
     }
-    if let Some((case, true)) = farm {
-        builder = builder.with_cage_drag(case.cage_drag(&domain.mesh, &domain.ops));
+    if let Some(drag) = farm.and_then(|(case, run)| case.cage_drag(&domain.mesh, &domain.ops, run))
+    {
+        builder = builder.with_cage_drag(drag);
     }
     let mut record =
-        farm.map(|(case, cages)| case.record(&domain.mesh, &domain.ops, &domain.geom, cages));
+        farm.map(|(case, run)| case.record(&domain.mesh, &domain.ops, &domain.geom, run));
     let physics: SWEPhysics2D<_> = builder.build();
     if opts.profile > 0 {
         profile_phases(domain, &physics, opts.profile);
@@ -2372,10 +2389,14 @@ fn tidal_run<'a>(
             opts.nu, opts.cs
         );
     }
-    if let Some((_, cages)) = farm {
+    if let Some((_, run)) = farm {
         println!(
             "  Farm: {}, sampled every {} min",
-            if cages { "cages" } else { "no cages" },
+            match run {
+                FarmRun::Open => "no cages",
+                FarmRun::Control => "control",
+                FarmRun::Cages => "cages",
+            },
             opts.station_minutes
         );
     }

@@ -6,7 +6,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Next up
 
-1. **F.1** A wake measure with a noise floor at Kattholmen: at the chosen `cs=0.1 nu=0.1` the cage and open runs decorrelate in the eddying lee, so the paired wake and residual change are noise (2026-10-25). See Salmon farm.
+1. **F.1** The wake before the runs diverge at Kattholmen: against the 10 % control's floor (2026-10-27) the cages' slowdown and the westward wake within 200 m stand, while half the wake area and most of the residual change are noise. See Salmon farm.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -32,7 +32,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Salmon farm and cage drag (F.1) — [notes/farm.md](notes/farm.md)
 
-- [ ] **F.1** A wake measure with a noise floor: at ν ≤ 0.1 the cages' disturbance decorrelates the eddies (RMS u_cages − u_open 70–110 % of the speed within 2 km by 26 h), so the paired deficit and residual change measure the divergence. Run a third, near-zero-drag run (`solidity=0.0025`) against the open one for the floor, and report the cage effect where it exceeds it; or the deficit of mean speeds, not of paired samples (`farm_site.rs` wake loop).
+- [ ] **F.1** The wake before the runs diverge: start the cages from the open run's state at several phases of the tide and compare over the first ≈ 6 h, where the departure is the farm's (0.11 within 500 m at 6 h, the 10 % control's 0.02). Needs 2D restarts (P5.3) in `froya_real_data`.
+- [ ] **F.1** A spread for the wake's floor: two 10 % controls (`farm_control=0.1`, `solidity=0.06`) differ by 10–20 % in wake area and 2× in residual change, so test the cage effect against several controls (different F or start times), not one.
 - [ ] **F.1** The Kattholmen case in 3D (`froya_real_data levels=…` with `site=`, refused today): the wake under the nets, the drag (≈ 20 % above 2D in `farm_3d`) and larvae in the surface layer.
 - [ ] **F.1** Rerun Kattholmen when the island lee is settled (P3.1): at ν = 0.1 (with or without Smagorinsky) the farm's current is 0.08–0.09 m/s mean, 0.26–0.32 at most (0.04 at ν = 1), and the NorKyst point's M2 0.08–0.13 m/s against NorKyst's 0.25, 60–90° off in phase at every ν.
 - [ ] **F.1** Net-made wake TKE (`P = Σ λ_l |u_l|²`) as a source in GLS's `k` and `ψ` per caged layer (Beudin et al. 2017, `c_ψ4`).
