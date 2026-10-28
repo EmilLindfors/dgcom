@@ -299,7 +299,8 @@
 //! then continues from the file's time to `hours=`: the snapshot file drops
 //! the frames written after the restart and goes on, and the stations' report
 //! covers the whole run. A resumed run's outputs equal the uninterrupted
-//! run's, byte for byte. `restart_keep=1` keeps every restart, as
+//! run's, byte for byte, with the same `hours=` (the nodal factors are
+//! taken at half the run, TODO P1.5). `restart_keep=1` keeps every restart, as
 //! `<output>/<domain>_<hours>h.restart`, for branching from a spun-up state.
 //!
 //! `levels=N` (N > 0) times `steps_3d=` (10) mode-split steps of the 3D model
@@ -445,7 +446,11 @@
 //! starts the open, control and caged runs from the same state at 12 h and
 //! compares them over 12–18 h, before the eddying lee lets them diverge (the
 //! farm's samples start at the restart; `release=` defaults to
-//! `spinup_hours`).
+//! `spinup_hours`). A resumed run equals the uninterrupted one only with
+//! the same `hours=`: the tides' nodal factors are taken at half the run
+//! (TODO P1.5), so a branch to an earlier end has a slightly different
+//! boundary tide (1 h after a 6 h restart, 0.05–0.1 % of the RMS velocity), the
+//! same in its open, control and caged runs.
 //!
 //! Harmonic validation needs the record after spin-up to resolve the main
 //! constituents: 15 days separate M2/S2 and K1/O1 (`hours=384` with the
