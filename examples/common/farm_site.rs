@@ -97,7 +97,8 @@ const RAY: [f64; 15] = [
     1200.0, 1400.0,
 ];
 /// The runs' departure from the open one is reported within this distance
-/// (m) of the farm's centre and beyond it, every `DIVERGENCE_EVERY` s
+/// (m) of the farm's centre and beyond it, every `DIVERGENCE_EVERY` s (hourly
+/// over records of up to 12 h, such as a branch run's)
 const DIVERGENCE_RADIUS: f64 = 500.0;
 const DIVERGENCE_EVERY: f64 = 3.0 * 3600.0;
 /// Particles strand in water shallower than this (m)
@@ -795,12 +796,23 @@ impl FarmCase {
         );
         let labels: Vec<String> = runs.iter().map(|(_, l)| format!("{l:>15}")).collect();
         println!("          time | {}", labels.join(" | "));
-        let mut next = DIVERGENCE_EVERY;
+        // From the record's start (a branch run's restart), hourly over a
+        // short run
+        let (first, last) = match reference.times.as_slice() {
+            [first, .., last] => (*first, *last),
+            _ => (0.0, 0.0),
+        };
+        let every = if last - first <= 4.0 * DIVERGENCE_EVERY {
+            DIVERGENCE_EVERY / 3.0
+        } else {
+            DIVERGENCE_EVERY
+        };
+        let mut next = first + every;
         for (k, &t) in reference.times.iter().enumerate() {
             if t < next - 1e-6 {
                 continue;
             }
-            next += DIVERGENCE_EVERY;
+            next += every;
             let cells: Vec<String> = runs
                 .iter()
                 .map(|(run, _)| {

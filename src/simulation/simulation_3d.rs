@@ -15,7 +15,7 @@
 //! the uninterrupted run's do; its first callback repeats the restart's time.
 
 use crate::boundary::SWEBoundaryCondition2D;
-use crate::io::{Restart3D, RestartError, domain_fingerprint};
+use crate::io::{DriverData, Restart3D, RestartError, domain_fingerprint_3d};
 use crate::physics::eos::EquationOfState;
 use crate::physics::hydrostatic_3d::Hydrostatic3D;
 use crate::physics::traits::PhysicsModule; // For 2D trait bounds
@@ -149,7 +149,7 @@ where
                 s.n_elements, s.n_nodes, s.n_levels, expected.0, expected.1, expected.2
             )));
         }
-        let domain = domain_fingerprint(&physics.mesh, &physics.bathymetry.data, &physics.sigma);
+        let domain = domain_fingerprint_3d(&physics.mesh, &physics.bathymetry.data, &physics.sigma);
         if restart.domain != domain {
             return Err(RestartError::Domain(format!(
                 "its mesh, bed or σ-grid differ (fingerprint {:016x}, this run {domain:016x})",
@@ -422,12 +422,11 @@ where
 {
     Restart3D {
         time: t,
-        domain: domain_fingerprint(&physics.mesh, &physics.bathymetry.data, &physics.sigma),
+        domain: domain_fingerprint_3d(&physics.mesh, &physics.bathymetry.data, &physics.sigma),
         state: state.clone(),
         slow_forcing: integrator.slow_forcing_record(),
         vertical_reference: physics.vertical_reference(),
-        metadata: Vec::new(),
-        extra: Vec::new(),
+        driver: DriverData::default(),
     }
 }
 

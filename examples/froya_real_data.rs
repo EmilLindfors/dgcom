@@ -111,7 +111,7 @@
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [wave_stations=NAME:LON,LAT;…] \
 //!     [levels=0] [tide3d=0] [rk_3d=43|3] [cfl_3d=4|2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] \
-//!     [restart_hours=0] [resume=<file>] [rivers=<file>] [river_snap_km=2] [river_profile=tapered:3] \
+//!     [restart_hours=0] [restart_keep=0] [resume=<file>] [rivers=<file>] [river_snap_km=2] [river_profile=tapered:3] \
 //!     [nu=0] [cs=0] [site=<file> …]
 //! ```
 //!
@@ -299,7 +299,9 @@
 //! then continues from the file's time to `hours=`: the snapshot file drops
 //! the frames written after the restart and goes on, and the stations' report
 //! covers the whole run. A resumed run's outputs equal the uninterrupted
-//! run's, byte for byte.
+//! run's, byte for byte, with the same `hours=` (the nodal factors are
+//! taken at half the run, TODO P1.5). `restart_keep=1` keeps every restart, as
+//! `<output>/<domain>_<hours>h.restart`, for branching from a spun-up state.
 //!
 //! `levels=N` (N > 0) times `steps_3d=` (10) mode-split steps of the 3D model
 //! on the domain instead of the tidal run: N surface-stretched σ-levels, GLS
@@ -430,6 +432,26 @@
 //!     particles=200 seeds=4 kh=0.1,1 particle_seconds=10 output=output/kattholmen_farm
 //! ```
 //!
+//! The 2D tide stops and resumes too (`Restart2D`): `restart_hours=H`
+//! writes `<output>/<domain>.restart` at the first callback at or after
+//! every H model hours (`restart_keep=1`: every one, as
+//! `<output>/<domain>_<hours>h.restart`), with the state, the station
+//! records and the output counters. `resume=<file>` checks the domain's
+//! fingerprint (mesh and bed) and continues from the file's time: the
+//! snapshot file and the stations as in 3D, the VTU frames numbered on, and
+//! the NetCDF output in a new `froya_from_<hours>h.nc` beside the stopped
+//! run's. The waves' spectra are not kept (no `wave_coupling=`). The physics
+//! is the command line's, so a farm run can branch from an open run's state:
+//! `resume=<open>/froya_012.00h.restart site=… spinup_hours=12 hours=18`
+//! starts the open, control and caged runs from the same state at 12 h and
+//! compares them over 12–18 h, before the eddying lee lets them diverge (the
+//! farm's samples start at the restart; `release=` defaults to
+//! `spinup_hours`). A resumed run equals the uninterrupted one only with
+//! the same `hours=`: the tides' nodal factors are taken at half the run
+//! (TODO P1.5), so a branch to an earlier end has a slightly different
+//! boundary tide (1 h after a 6 h restart, 0.05–0.1 % of the RMS velocity), the
+//! same in its open, control and caged runs.
+//!
 //! Harmonic validation needs the record after spin-up to resolve the main
 //! constituents: 15 days separate M2/S2 and K1/O1 (`hours=384` with the
 //! default spin-up); N2 needs 28.
@@ -471,9 +493,10 @@ use dg_rs::io::WaveSpectraFile;
 #[cfg(feature = "netcdf")]
 use dg_rs::io::{AtmosphereReader, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig};
 use dg_rs::io::{
-    BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
-    LocalProjection, OceanModelReader, SnapshotLayout, SnapshotWriter, TideGaugeFile, east_axis,
-    read_adcp_file, read_tide_gauge_file, write_adcp_file, write_tide_gauge_file, write_vtk_swe,
+    BedRaster, CoastlineData, CoordinateProjection, DriverData, GeoBoundingBox, GeoTiffBathymetry,
+    LocalProjection, OceanModelReader, Restart2D, RestartError, SnapshotLayout, SnapshotWriter,
+    TideGaugeFile, east_axis, read_adcp_file, read_tide_gauge_file, write_adcp_file,
+    write_tide_gauge_file, write_vtk_swe,
 };
 use dg_rs::mesh::{
     Bathymetry2D, BoundaryTag, ElementSlopeBound, Mesh2D, MeshPoint, PointLocator2D,
@@ -780,10 +803,14 @@ struct Options {
     /// (`bt_levels=`, 2; 0: global substeps)
     bt_levels: usize,
     debug_3d: String,
-    /// Write a restart of the 3D tide every this many model hours
-    /// (`restart_hours=`; 0: none), at the first progress line at or after it
+    /// Write a restart of the tide every this many model hours
+    /// (`restart_hours=`; 0: none), at the first callback (in 3D, progress
+    /// line) at or after it
     restart_hours: f64,
-    /// Resume the 3D tide from this restart file (`resume=`)
+    /// Keep every restart, named by its time (`restart_keep=1`), instead of
+    /// replacing one file
+    restart_keep: bool,
+    /// Resume the tide from this restart file (`resume=`)
     resume: Option<PathBuf>,
     /// Rivers of the 3D tide (`rivers=<file>`, from `norkyst_river_subset`),
     /// snapped onto the mesh from up to `river_snap_km` away, entering over
@@ -908,6 +935,7 @@ impl Options {
             },
             debug_3d: args.get("debug_3d").cloned().unwrap_or_default(),
             restart_hours: get("restart_hours", 0.0)?,
+            restart_keep: get("restart_keep", 0.0)? != 0.0,
             resume: args.get("resume").map(PathBuf::from),
             rivers: args.get("rivers").map(PathBuf::from),
             river_snap_km: get("river_snap_km", 2.0)?,
@@ -1248,6 +1276,124 @@ impl Station {
         self.eta.push(p.eta);
         self.u_east.push(p.u * c + p.v * s);
         self.v_north.push(-p.u * s + p.v * c);
+    }
+}
+
+/// Keep the stations' names and records in a restart's driver data.
+fn save_stations(stations: &[Station], driver: &mut DriverData) {
+    for (j, station) in stations.iter().enumerate() {
+        driver.set_metadata(&format!("station.{j}"), station.name.as_str());
+        for (field, values) in [
+            ("times", &station.times),
+            ("eta", &station.eta),
+            ("u_east", &station.u_east),
+            ("v_north", &station.v_north),
+        ] {
+            driver.set_extra(&format!("station.{j}.{field}"), values.clone());
+        }
+    }
+}
+
+/// Continue the stations' records from a restart's driver data, which must
+/// have the same stations.
+fn restore_stations(stations: &mut [Station], driver: &DriverData) -> Result<(), String> {
+    for (j, station) in stations.iter_mut().enumerate() {
+        if driver.metadata(&format!("station.{j}")) != Some(station.name.as_str()) {
+            return Err(format!(
+                "station {j} is {}, the restart's {:?}",
+                station.name,
+                driver.metadata(&format!("station.{j}"))
+            ));
+        }
+        let record = |field: &str| {
+            driver
+                .extra(&format!("station.{j}.{field}"))
+                .map(<[f64]>::to_vec)
+                .ok_or(format!("the restart has no station.{j}.{field}"))
+        };
+        station.times = record("times")?;
+        station.eta = record("eta")?;
+        station.u_east = record("u_east")?;
+        station.v_north = record("v_north")?;
+    }
+    if driver
+        .metadata(&format!("station.{}", stations.len()))
+        .is_some()
+    {
+        return Err("the restart has more stations than this run".into());
+    }
+    Ok(())
+}
+
+/// When and where a run writes its restarts (`restart_hours=`,
+/// `restart_keep=`): at the first callback (in 3D, progress line) at or
+/// after every multiple of the interval, to `<output>/<domain>.restart`, or
+/// with `restart_keep=1` to `<output>/<domain>_<hours>h.restart` per time.
+struct RestartSchedule {
+    dir: PathBuf,
+    name: String,
+    keep: bool,
+    interval: f64,
+    next: f64,
+}
+
+impl RestartSchedule {
+    /// The schedule of `opts` for a run from `t_start` (s); `None` without
+    /// `restart_hours=`.
+    fn new(output_dir: &Path, domain: &Domain, opts: &Options, t_start: f64) -> Option<Self> {
+        let interval = 3600.0 * opts.restart_hours;
+        (interval > 0.0).then(|| {
+            let schedule = Self {
+                dir: output_dir.to_path_buf(),
+                name: domain.name.to_string(),
+                keep: opts.restart_keep,
+                interval,
+                next: ((t_start / interval).floor() + 1.0) * interval,
+            };
+            let path = match schedule.keep {
+                true => schedule
+                    .dir
+                    .join(format!("{}_<hours>h.restart", schedule.name)),
+                false => schedule.path(t_start),
+            };
+            println!(
+                "  Restart file: {} every {} h",
+                path.display(),
+                opts.restart_hours
+            );
+            schedule
+        })
+    }
+
+    /// Whether a restart is due at `t`.
+    fn due(&self, t: f64) -> bool {
+        t >= self.next - 1e-6
+    }
+
+    fn path(&self, t: f64) -> PathBuf {
+        match self.keep {
+            true => self
+                .dir
+                .join(format!("{}_{:06.2}h.restart", self.name, t / 3600.0)),
+            false => self.dir.join(format!("{}.restart", self.name)),
+        }
+    }
+
+    /// Write `write`'s restart for time `t` and move on to the next
+    /// multiple. A long run goes on without a restart it could not write.
+    fn write(&mut self, t: f64, write: impl FnOnce(&Path) -> Result<(), RestartError>) {
+        let path = self.path(t);
+        match write(&path) {
+            Ok(()) => println!(
+                "         restart at {:.2} h → {}",
+                t / 3600.0,
+                path.display()
+            ),
+            Err(e) => println!("         WARNING: no restart at {:.2} h: {e}", t / 3600.0),
+        }
+        while self.next <= t + 1e-6 {
+            self.next += self.interval;
+        }
     }
 }
 
@@ -2029,8 +2175,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if opts.levels > 0 && opts.tide_3d {
         return tidal_run_3d(&domain, &opts, parent, parent_reader);
     }
-    if opts.restart_hours > 0.0 || opts.resume.is_some() {
-        return Err("restart_hours= and resume= are for the 3D tide (levels=N tide3d=1)".into());
+    if (opts.restart_hours > 0.0 || opts.resume.is_some()) && opts.levels > 0 {
+        return Err(
+            "restart_hours= and resume= are for the 2D tide and the 3D tide (tide3d=1)".into(),
+        );
+    }
+    if (opts.restart_hours > 0.0 || opts.resume.is_some()) && opts.wave_coupling > 0.0 {
+        return Err("restart_hours= and resume= do not keep the coupled waves' spectra".into());
     }
     if opts.rivers.is_some() {
         return Err("rivers= is for the 3D tide (levels=N tide3d=1)".into());
@@ -2092,9 +2243,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nThe tide with the farm's cages...");
     let caged = tidal_run(&domain, &opts, parent, waves, Some((case, FarmRun::Cages)))?
         .expect("a farm run records the farm");
-    // The last whole M2 periods after the spin-up
+    // The last whole M2 periods after the spin-up (and after the restart of
+    // a branch run, `resume=`)
     let t_end = opts.hours * 3600.0;
-    let spinup = 3600.0 * opts.spinup_hours;
+    let t_start = match &opts.resume {
+        Some(path) => Restart2D::read(path)?.time,
+        None => 0.0,
+    };
+    let spinup = (3600.0 * opts.spinup_hours).max(t_start);
     let periods = ((t_end - spinup) / M2_PERIOD).floor();
     let window = if periods >= 1.0 {
         [t_end - periods * M2_PERIOD, t_end]
@@ -2348,10 +2504,43 @@ fn tidal_run<'a>(
     let output_dir = output_dir(domain, opts);
     fs::create_dir_all(&output_dir)?;
     write_clock(&output_dir, &clock)?;
+    // A resumed run (`resume=`): the state, the time, the stations' records
+    // and the output counters continue the file's, under the physics built
+    // above (a branch run may add the farm's cages to an open run's state)
+    let restart = match &opts.resume {
+        Some(path) => {
+            let restart = Restart2D::read(path)?;
+            physics.check_restart(&restart)?;
+            println!(
+                "  Resuming from {} at {:.2} h (written by: {})",
+                path.display(),
+                restart.time / 3600.0,
+                restart.driver.metadata("command").unwrap_or("?")
+            );
+            restore_stations(&mut stations, &restart.driver)?;
+            Some(restart)
+        }
+        None => None,
+    };
+    let t_start = restart.as_ref().map_or(0.0, |r| r.time);
+    // The callbacks and VTU frames so far, and the initial volume
+    let counters = match &restart {
+        Some(restart) => match restart.driver.extra("driver.counters") {
+            Some(&[n, frame, volume]) => Some((n as usize, frame as usize, volume)),
+            _ => return Err("the restart has no driver.counters".into()),
+        },
+        None => None,
+    };
+    #[cfg(feature = "netcdf")]
+    let netcdf_name = match restart {
+        // The stopped run's file stays as it is
+        Some(_) => format!("froya_from_{:06.2}h.nc", t_start / 3600.0),
+        None => "froya.nc".to_string(),
+    };
     #[cfg(feature = "netcdf")]
     let mut netcdf = match &domain.projection {
         Some(projection) => Some(NetCDFWriter::create(
-            NetCDFWriterConfig::new(output_dir.join("froya.nc").to_string_lossy())
+            NetCDFWriterConfig::new(output_dir.join(netcdf_name).to_string_lossy())
                 .with_title("Frøya–Smøla–Hitra tidal run")
                 .with_institution("dg-rs")
                 .with_clock(clock),
@@ -2404,8 +2593,15 @@ fn tidal_run<'a>(
         "  time  |  η range (m)     | η max at (x, y km; h m) | max |u| (m/s) at (x, y km; h m) | open water ≥ 3 m (m/s)         | wet nodes | volume change"
     );
 
-    let mut q = domain.at_rest();
-    let volume0 = domain.volume(&q);
+    let fingerprint = physics.domain_fingerprint();
+    let (mut q, n_callbacks_done, frames_done, volume0) = match (restart, counters) {
+        (Some(restart), Some((n, frame, volume))) => (restart.state, n, frame, volume),
+        _ => {
+            let q = domain.at_rest();
+            let volume = domain.volume(&q);
+            (q, 0, 0, volume)
+        }
+    };
     // Callbacks sample the stations and the farm; every `output_every`-th
     // also writes output, every `snapshot_every`-th a snapshot frame
     let snapshot_minutes = (opts.snapshot_minutes > 0.0).then_some(opts.snapshot_minutes);
@@ -2429,9 +2625,25 @@ fn tidal_run<'a>(
         }
     }
     let snapshot_every = snapshot_minutes.map(every);
+    let snapshot_path = output_dir.join(format!("{}.dgsnap", domain.name));
     let mut snapshot = match snapshot_every {
+        // A resumed run continues its file, without the frames the stopped
+        // run wrote after the restart
+        Some(every) if t_start > 0.0 && snapshot_path.exists() => {
+            println!(
+                "  Snapshot file: {} every {} min, continued after {:.2} h",
+                snapshot_path.display(),
+                every as f64 * base_minutes,
+                t_start / 3600.0
+            );
+            Some(SnapshotWriter::append(
+                &snapshot_path,
+                t_start,
+                WetDryConfig::DEFAULT_H_DRY,
+            )?)
+        }
         Some(every) => {
-            let path = output_dir.join(format!("{}.dgsnap", domain.name));
+            let path = snapshot_path.clone();
             println!(
                 "  Snapshot file: {} every {} min",
                 path.display(),
@@ -2462,16 +2674,25 @@ fn tidal_run<'a>(
     };
     // The waves' sea state for the snapshot frames
     let sea = (waves.is_some() && snapshot.is_some()).then(|| RefCell::new(SeaStates::default()));
-    let mut n_callbacks = 0;
-    let mut frame = 0;
+    let mut n_callbacks = n_callbacks_done;
+    let mut frame = frames_done;
     let mut write_error = None;
+    let mut restarts = RestartSchedule::new(&output_dir, domain, opts, t_start);
+    let command = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    // A resumed run's first callback is at the restart's time, which the
+    // stopped run sampled and wrote out; only the farm (not in the restart)
+    // records from it
+    let mut at_restart = t_start > 0.0;
     let start = Instant::now();
     let mut callback = |q: &SWESolution2D, t: f64| {
-        for s in &mut stations {
-            s.sample(q, &domain.bathymetry, clock.unix(t));
-        }
         if let Some(record) = record.as_mut() {
             record.sample(q, t);
+        }
+        if std::mem::take(&mut at_restart) {
+            return;
+        }
+        for s in &mut stations {
+            s.sample(q, &domain.bathymetry, clock.unix(t));
         }
         n_callbacks += 1;
         if let (Some(writer), Some(every)) = (snapshot.as_mut(), snapshot_every)
@@ -2483,50 +2704,65 @@ fn tidal_run<'a>(
                 write_error.get_or_insert(e.to_string());
             }
         }
-        if (n_callbacks - 1) % output_every != 0 {
-            return;
-        }
-        let stats = domain.stats(q);
-        let (x, y, h) = stats.fastest;
-        let (xo, yo, ho) = stats.open_fastest;
-        println!(
-            "{:6.2} h | [{:+.3}, {:+.3}] | ({:6.1}, {:6.1}; {:.3}) | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {:5.2} at ({:6.1}, {:6.1}; {ho:6.1}) | {:9} | {:+.3e}",
-            t / 3600.0,
-            stats.eta.0,
-            stats.eta.1,
-            stats.highest.0 / 1e3,
-            stats.highest.1 / 1e3,
-            stats.highest.2,
-            stats.speed,
-            x / 1e3,
-            y / 1e3,
-            stats.open_speed,
-            xo / 1e3,
-            yo / 1e3,
-            stats.wet,
-            domain.volume(q) / volume0 - 1.0
-        );
-        let path = output_dir.join(format!("{}_{frame:04}.vtu", domain.name));
-        let written = write_vtk_swe(
-            &path,
-            &domain.mesh,
-            &domain.ops,
-            q,
-            Some(&domain.bathymetry),
-            t,
-            WetDryConfig::DEFAULT_H_DRY,
-        );
-        if let Err(e) = written {
-            write_error.get_or_insert(e.to_string());
-        }
-        #[cfg(feature = "netcdf")]
-        if let Some(writer) = netcdf.as_mut() {
-            let (h, eta, u, v) = netcdf_fields(domain, q);
-            if let Err(e) = writer.write_timestep(t, &h, &eta, Some(&u), Some(&v)) {
+        if (n_callbacks - 1) % output_every == 0 {
+            let stats = domain.stats(q);
+            let (x, y, h) = stats.fastest;
+            let (xo, yo, ho) = stats.open_fastest;
+            println!(
+                "{:6.2} h | [{:+.3}, {:+.3}] | ({:6.1}, {:6.1}; {:.3}) | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {:5.2} at ({:6.1}, {:6.1}; {ho:6.1}) | {:9} | {:+.3e}",
+                t / 3600.0,
+                stats.eta.0,
+                stats.eta.1,
+                stats.highest.0 / 1e3,
+                stats.highest.1 / 1e3,
+                stats.highest.2,
+                stats.speed,
+                x / 1e3,
+                y / 1e3,
+                stats.open_speed,
+                xo / 1e3,
+                yo / 1e3,
+                stats.wet,
+                domain.volume(q) / volume0 - 1.0
+            );
+            let path = output_dir.join(format!("{}_{frame:04}.vtu", domain.name));
+            let written = write_vtk_swe(
+                &path,
+                &domain.mesh,
+                &domain.ops,
+                q,
+                Some(&domain.bathymetry),
+                t,
+                WetDryConfig::DEFAULT_H_DRY,
+            );
+            if let Err(e) = written {
                 write_error.get_or_insert(e.to_string());
             }
+            #[cfg(feature = "netcdf")]
+            if let Some(writer) = netcdf.as_mut() {
+                let (h, eta, u, v) = netcdf_fields(domain, q);
+                if let Err(e) = writer.write_timestep(t, &h, &eta, Some(&u), Some(&v)) {
+                    write_error.get_or_insert(e.to_string());
+                }
+            }
+            frame += 1;
         }
-        frame += 1;
+        if let Some(restarts) = restarts.as_mut().filter(|r| r.due(t)) {
+            let mut restart = Restart2D {
+                time: t,
+                domain: fingerprint,
+                state: q.clone(),
+                driver: DriverData::default(),
+            };
+            let driver = &mut restart.driver;
+            driver.set_metadata("command", command.as_str());
+            save_stations(&stations, driver);
+            driver.set_extra(
+                "driver.counters",
+                vec![n_callbacks as f64, frame as f64, volume0],
+            );
+            restarts.write(t, |path| restart.write(path));
+        }
     };
     // The waves' steps and wall time since the last line
     let mut since = (0.0, CoupledWavesStats::default());
@@ -2548,12 +2784,12 @@ fn tidal_run<'a>(
         let sim = Simulation::new(physics, Multirate::with_base(opts.integrator, opts.lts))
             .with_cfl(opts.cfl)
             .with_callback_interval(interval);
-        run_tide(sim, &mut q, t_end, coupling, &mut callback)
+        run_tide(sim, &mut q, t_start, t_end, coupling, &mut callback)
     } else {
         let sim = Simulation::new(physics, opts.integrator)
             .with_cfl(opts.cfl)
             .with_callback_interval(interval);
-        run_tide(sim, &mut q, t_end, coupling, &mut callback)
+        run_tide(sim, &mut q, t_start, t_end, coupling, &mut callback)
     };
     if let Some(e) = write_error {
         return Err(e.into());
@@ -2565,7 +2801,7 @@ fn tidal_run<'a>(
         if result.success { "Done" } else { "FAILED" },
         result.final_time / 3600.0,
         result.n_steps,
-        result.final_time / steps as f64,
+        (result.final_time - t_start) / steps as f64,
         start.elapsed().as_secs_f64(),
         1e3 * start.elapsed().as_secs_f64() / steps as f64,
         clips
@@ -2666,11 +2902,13 @@ impl SeaStates {
     }
 }
 
-/// Run the tide to `t_end`, with the waves of `coupling` exchanging every
-/// interval if any. Returns the result and the negative-depth clips.
+/// Run the tide from `t_start` to `t_end`, with the waves of `coupling`
+/// exchanging every interval if any. Returns the result and the
+/// negative-depth clips.
 fn run_tide<BC, I>(
     mut sim: Simulation<SWESolution2D, SWEPhysics2D<BC>, I>,
     q: &mut SWESolution2D,
+    t_start: f64,
     t_end: f64,
     coupling: Option<Coupling<'_>>,
     callback: impl FnMut(&SWESolution2D, f64),
@@ -2680,7 +2918,7 @@ where
     I: TimeIntegrator<SWESolution2D>,
 {
     let result = match coupling {
-        None => sim.run_with_callback(q, 0.0, t_end, callback),
+        None => sim.run_with_callback(q, t_start, t_end, callback),
         Some(Coupling {
             waves,
             interval,
@@ -2689,7 +2927,7 @@ where
             sea,
         }) => sim.run_with_exchange(
             q,
-            0.0,
+            t_start,
             t_end,
             interval,
             |physics, q, t, t_next| {
@@ -3960,34 +4198,9 @@ fn tidal_run_3d(
                 "  Resuming from {} at {:.2} h (written by: {})",
                 path.display(),
                 restart.time / 3600.0,
-                restart.metadata("command").unwrap_or("?")
+                restart.driver.metadata("command").unwrap_or("?")
             );
-            for (j, station) in stations.iter_mut().enumerate() {
-                if restart.metadata(&format!("station.{j}")) != Some(station.name.as_str()) {
-                    return Err(format!(
-                        "station {j} is {}, the restart's {:?}",
-                        station.name,
-                        restart.metadata(&format!("station.{j}"))
-                    )
-                    .into());
-                }
-                let record = |field: &str| {
-                    restart
-                        .extra(&format!("station.{j}.{field}"))
-                        .map(<[f64]>::to_vec)
-                        .ok_or(format!("the restart has no station.{j}.{field}"))
-                };
-                station.times = record("times")?;
-                station.eta = record("eta")?;
-                station.u_east = record("u_east")?;
-                station.v_north = record("v_north")?;
-            }
-            if restart
-                .metadata(&format!("station.{}", stations.len()))
-                .is_some()
-            {
-                return Err("the restart has more stations than this run".into());
-            }
+            restore_stations(&mut stations, &restart.driver)?;
             Some(restart)
         }
         None => None,
@@ -4059,7 +4272,7 @@ fn tidal_run_3d(
     // The callbacks so far and the next sample time, continued by a resumed
     // run (its first callback repeats the restart's time, already sampled)
     let (n_callbacks_done, next_sample_at) = match &restart {
-        Some(restart) => match restart.extra("driver.counters") {
+        Some(restart) => match restart.driver.extra("driver.counters") {
             Some(&[n, next]) => (n as usize, next),
             _ => return Err("the restart has no driver.counters".into()),
         },
@@ -4075,18 +4288,7 @@ fn tidal_run_3d(
     let mut binding: Option<(&str, TimeStepLimit)> = None;
     // A restart every `restart_hours`, at the first progress line at or after
     // each multiple (`resume=` continues from it)
-    let restart_path = output_dir.join(format!("{}.restart", domain.name));
-    let restart_interval = 3600.0 * opts.restart_hours;
-    let mut next_restart = if restart_interval > 0.0 {
-        println!(
-            "  Restart file: {} every {} h",
-            restart_path.display(),
-            opts.restart_hours
-        );
-        ((t_start / restart_interval).floor() + 1.0) * restart_interval
-    } else {
-        f64::INFINITY
-    };
+    let mut restarts = RestartSchedule::new(&output_dir, domain, opts, t_start);
     let command = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     let callback =
         |s: &Solution3D,
@@ -4292,33 +4494,13 @@ fn tidal_run_3d(
                 column / nn,
                 start.elapsed().as_secs_f64()
             );
-            if t >= next_restart - 1e-6 {
+            if let Some(restarts) = restarts.as_mut().filter(|r| r.due(t)) {
                 let mut restart = run.restart(s, t);
-                restart.set_metadata("command", command.as_str());
-                for (j, station) in stations.iter().enumerate() {
-                    restart.set_metadata(&format!("station.{j}"), station.name.as_str());
-                    for (field, values) in [
-                        ("times", &station.times),
-                        ("eta", &station.eta),
-                        ("u_east", &station.u_east),
-                        ("v_north", &station.v_north),
-                    ] {
-                        restart.set_extra(&format!("station.{j}.{field}"), values.clone());
-                    }
-                }
-                restart.set_extra("driver.counters", vec![n_callbacks as f64, next_sample]);
-                match restart.write(&restart_path) {
-                    Ok(()) => println!(
-                        "         restart at {:.2} h → {}",
-                        t / 3600.0,
-                        restart_path.display()
-                    ),
-                    // A long run goes on without it
-                    Err(e) => println!("         WARNING: no restart at {:.2} h: {e}", t / 3600.0),
-                }
-                while next_restart <= t + 1e-6 {
-                    next_restart += restart_interval;
-                }
+                let driver = &mut restart.driver;
+                driver.set_metadata("command", command.as_str());
+                save_stations(&stations, driver);
+                driver.set_extra("driver.counters", vec![n_callbacks as f64, next_sample]);
+                restarts.write(t, |path| restart.write(path));
             }
         };
     let integrator = ModeSplitIntegrator::new()

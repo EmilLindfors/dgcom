@@ -6,7 +6,7 @@
 //! - **VTK output**: Solution visualization in ParaView (VTU format)
 //! - **Snapshot files**: compact f32 frames of a 2D or 3D run with its mesh, bed and
 //!   σ-grid, for replay; **particle files** with the particles alongside
-//! - **Restart files**: a 3D run's full state between two steps (`Restart3D`),
+//! - **Restart files**: a 2D or 3D run's full state between two steps (`Restart2D`, `Restart3D`),
 //!   to resume it bit for bit
 //! - **NetCDF I/O**: CF-conventions output (requires `netcdf` feature)
 //! - **Gridded external models**: parent ocean models (`OceanModelReader`) and
@@ -149,7 +149,9 @@ pub use ocean_model::{OceanModelReader, OceanState};
 pub use particle_file::{ParticleFileReader, ParticleFileWriter, ParticleFrame, status_code};
 pub use profile_series::{ProfileLevels, ProfileSeries};
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
-pub use restart::{Restart3D, RestartError, domain_fingerprint};
+pub use restart::{
+    DriverData, Restart2D, Restart3D, RestartError, domain_fingerprint_2d, domain_fingerprint_3d,
+};
 pub use river_forcing::{RiverForcing, RiverMouth, RomsRhoPoints, roms_source_position};
 pub use snapshot::{
     SOLUTION_3D_FIELDS, SnapshotError, SnapshotFrame, SnapshotHeader, SnapshotLayout,

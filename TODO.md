@@ -6,7 +6,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Next up
 
-1. **F.1** The wake before the runs diverge at Kattholmen: against the 10 % control's floor (2026-10-27) the cages' slowdown and the westward wake within 200 m stand, while half the wake area and most of the residual change are noise. See Salmon farm.
+1. **P1.5** Nodal factors that do not depend on the run's length (`OceanModelState::with_tidal_correction`, `TidalAtlas::tides_at`, `HarmonicTide::with_nodal_corrections` take them at half of `hours=`), so a branch or resume to another end reproduces the open run byte for byte. See Boundaries and nesting.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -32,8 +32,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Salmon farm and cage drag (F.1) — [notes/farm.md](notes/farm.md)
 
-- [ ] **F.1** The wake before the runs diverge: start the cages from the open run's state at several phases of the tide and compare over the first ≈ 6 h, where the departure is the farm's (0.11 within 500 m at 6 h, the 10 % control's 0.02). Needs 2D restarts (P5.3) in `froya_real_data`.
-- [ ] **F.1** A spread for the wake's floor: two 10 % controls (`farm_control=0.1`, `solidity=0.06`) differ by 10–20 % in wake area and 2× in residual change, so test the cage effect against several controls (different F or start times), not one.
+- [ ] **F.1** A spread for the wake's floor: two 10 % controls (`farm_control=0.1`, `solidity=0.06`) differ by 10–20 % in wake area and 2× in residual change, so test the cage effect against several controls (different F or start times), not one, in runs longer than ≈ 6 h (within 6 h of a branch the 10 % control responds linearly, 0.13–0.19 of the cages).
 - [ ] **F.1** The Kattholmen case in 3D (`froya_real_data levels=…` with `site=`, refused today): the wake under the nets, the drag (≈ 20 % above 2D in `farm_3d`) and larvae in the surface layer.
 - [ ] **F.1** Rerun Kattholmen when the island lee is settled (P3.1): at ν = 0.1 (with or without Smagorinsky) the farm's current is 0.08–0.09 m/s mean, 0.26–0.32 at most (0.04 at ν = 1), and the NorKyst point's M2 0.08–0.13 m/s against NorKyst's 0.25, 60–90° off in phase at every ν.
 - [ ] **F.1** Net-made wake TKE (`P = Σ λ_l |u_l|²`) as a source in GLS's `k` and `ψ` per caged layer (Beudin et al. 2017, `c_ψ4`).
@@ -218,7 +217,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.5 / P4.2** A point-implicit nesting relaxation band, 2D and 3D, so FRS-like τ ≈ Δt works (explicit today: τ 30 min against 0.25–10 s steps).
 - [ ] **P1.5 / P4.2** Read parent snapshots lazily around the current time, 2D (`OceanModelReader`) and 3D (`from_file_with_profiles`, 46 MB per field for 3 days), for months of forcing or OPeNDAP.
 - [ ] **P1.5** Correct NorKyst's own M2/S2 (0.3–1 cm, 10–20 min lag) in the corrected atlas from another reference (gauges along the boundary, TPXO/FES).
-- [ ] **P1.5** `OceanModelState::with_tidal_correction` takes its nodal f/u at half the run's length, so the correction depends on `hours=` (a resume to 71.99 h of a 72 h run differs by 0.01 m/s in the progress lines): nodal factors at each snapshot's time, or a fixed reference time.
+- [ ] **P1.5** `OceanModelState::with_tidal_correction` takes its nodal f/u at half the run's length, so the correction depends on `hours=` (a resume to 71.99 h of a 72 h run differs by 0.01 m/s in the progress lines; F.1's branch runs to t0 + 6 h are 0.05–0.1 % of the RMS velocity off the 18 h open run after 1 h, byte-identical with `hours=18`): nodal factors at each snapshot's time, or a fixed reference time.
 - [ ] **P1.4** Velocity from z-levels stops at 300 m: extend to full depth.
 - [ ] **P1.4** Measure `io::depth_average_z`'s error (z-levels, 300 m cap) against the NorKyst v3 hindcast's `ubar_eastward`/`vbar_northward` (`romshindcast/norkyst_v3/norkyst_v3_sdepth_aggr.ncml`, hourly 2012-01 to 2025-08) at the Frøya boundary cells (`notes/norkyst-issues.md` §7).
 - [ ] **P1.5** `NestingRelaxation2D` relaxes the level at every band node ≥ 5 cm deep, puddles cut off by land included (Mausund element 58: a 5 cm puddle filled at 3e-7 m per step towards NorKyst's level): relax only water connected to the open faces, or momentum only in shore elements.
@@ -372,10 +371,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 - [ ] **P5.1** Delete the superseded `Discharge2D`/`ConstantDischarge2D` (and the `River` tag's boundary dispatch) with P6.
 - [ ] **P5.1** River mouths from NVE's river network: NorKyst's are its 800 m coastline faces, snapped 1.6–1.9 km onto the Frøya coastline mesh.
-- [ ] **P5.3** Refuse a restart resumed with different physics options (compare them, or a configuration hash).
-- [ ] **P5.3** Numbered restart copies (`restart_keep=`) or per-time names, for spin-up branching.
+- [ ] **P5.3** Refuse a restart resumed with different physics options (compare them, or a configuration hash), except those a branch run changes (`site=` cages in 2D).
 - [ ] **P5.2** A ROMS variable-name mapping for `NetCDFWriter` (CF-1.8 today).
-- [ ] **P5.3** 2D restarts (`Simulation`, `SWESolution2D`, the multirate stepper's state).
 - [ ] **P5.3** A NetCDF export of restarts (`ocean_rst.nc`) once P5.2's conventions are settled.
 - [ ] **P5.4** The operational pipeline: run scripts, monitoring/alerting, THREDDS/OPeNDAP serving.
 
