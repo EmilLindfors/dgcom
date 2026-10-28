@@ -21,6 +21,7 @@ use crate::menubar::BAR_HEIGHT;
 use crate::particles::{ACTIVE, DEAD, EXITED, Particles, SETTLED, STRANDED};
 use crate::photo::Photo;
 use crate::playback::{Playback, SolverState, Source};
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 use crate::stratification::{SheetShows, Stratification};
 use crate::surface::{BedScale, ColourBy, Colouring, SurfaceStyle, WaterOpacity};
 
@@ -60,8 +61,14 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn)
-            .add_systems(Update, (status, scale, bed_scale, photo_scale));
+        app.add_systems(OnEnter(Screen::Viewer), spawn)
+            .add_systems(
+                Update,
+                (status, scale, bed_scale, photo_scale).in_set(Viewing),
+            )
+            .run_resource::<Title>()
+            .run_resource::<RunClock>()
+            .init_run_resource::<Scales>();
     }
 }
 
@@ -81,6 +88,7 @@ fn font(size: f32) -> TextFont {
 
 fn spawn(mut commands: Commands) {
     commands.spawn((
+        RUN,
         Status,
         Text::new(""),
         font(15.0),
@@ -93,15 +101,18 @@ fn spawn(mut commands: Commands) {
         },
     ));
     commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(14.0),
-            bottom: Val::Px(14.0),
-            width: Val::Px(260.0),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(4.0),
-            ..default()
-        })
+        .spawn((
+            RUN,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(14.0),
+                bottom: Val::Px(14.0),
+                width: Val::Px(260.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(4.0),
+                ..default()
+            },
+        ))
         .with_children(|scale| {
             scale.spawn((BedTitle, Text::new("bed depth (m)"), font(13.0), shadow()));
             scale.spawn((
@@ -398,16 +409,24 @@ fn status(
     }
 }
 
+/// What the run's colour scales were last drawn with: the water's colouring and
+/// labels, and whether the bed's (fixed) is drawn.
+#[derive(Resource, Default)]
+struct Scales {
+    water: Option<(ColourBy, [String; 3])>,
+    bed: bool,
+}
+
 fn scale(
     colouring: Res<Colouring>,
     mut bar: Query<&mut BackgroundGradient, With<Bar>>,
     mut ticks: Query<(&Tick, &mut Text), Without<ScaleTitle>>,
     mut title: Query<&mut Text, With<ScaleTitle>>,
-    mut shown: Local<Option<(ColourBy, [String; 3])>>,
+    mut shown: ResMut<Scales>,
 ) {
     let (heading, labels) = colouring.legend();
     let key = (colouring.by, labels);
-    if shown.as_ref() == Some(&key) {
+    if shown.water.as_ref() == Some(&key) {
         return;
     }
     let labels = &key.1;
@@ -424,7 +443,7 @@ fn scale(
     for (tick, mut text) in &mut ticks {
         text.0.clone_from(&labels[tick.0]);
     }
-    *shown = Some(key);
+    shown.water = Some(key);
 }
 
 /// The bed's depth scale, once the bed exists (it is fixed), and its contour interval.
@@ -434,7 +453,7 @@ fn bed_scale(
     mut bar: Query<&mut BackgroundGradient, With<BedBar>>,
     mut ticks: Query<(&BedTick, &mut Text), Without<BedTitle>>,
     mut title: Query<&mut Text, With<BedTitle>>,
-    mut done: Local<bool>,
+    mut shown: ResMut<Scales>,
 ) {
     if let (Some(contours), Ok(mut title)) = (contours, title.single_mut()) {
         let heading = if contours.on {
@@ -447,10 +466,10 @@ fn bed_scale(
         }
     }
     let Some(bed) = bed else { return };
-    if *done {
+    if shown.bed {
         return;
     }
-    *done = true;
+    shown.bed = true;
     if let Ok(mut bar) = bar.single_mut() {
         let colours = (0..=16)
             .map(|i| ColorStop::from(Color::from(srgb_at(SEABED, i as f32 / 16.0))))

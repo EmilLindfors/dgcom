@@ -1,26 +1,20 @@
-//! The start menu: pick a model run or a saved run, and the viewer starts it.
+//! The start menu: pick a model run or a saved run, and the viewer shows it.
 //!
-//! `dg-viz` without arguments (or with `--menu`) opens this window instead of a
+//! `dg-viz` without arguments (or with `--menu`) opens on this screen instead of a
 //! scenario. It lists the scenarios the viewer can run live (the fjord farm, Frøya,
 //! the 3D farm channel, the fjord farm in 3D) and the saved runs found under
 //! `../output` (snapshot files, `*.dgsnap`, and folders of VTU frames,
 //! `froya_NNNN.vtu`), newest first, with the
 //! common options: model hours, the starting view, the photo view, the Mausund
 //! gauge in the trace and saving the run as a snapshot file. A file or folder
-//! dropped on the window is replayed directly.
+//! dropped on the window is replayed directly, here or in the viewer.
 //!
-//! The viewer builds a scenario once, before its app starts, so the menu does not
-//! build it in-process: it starts the viewer as a child process with the matching
-//! options ([`Menu::command`], also printed as a `cargo run` line to repeat it),
-//! hides its window, and shows it again when the viewer ends. M in the viewer ends
-//! it with [`BACK_TO_MENU`]; closing the viewer's window closes the menu too, and a
-//! viewer that fails shows its last error lines here. Every run starts in a fresh
-//! process, so nothing of a solver or its memory outlives it.
+//! Starting the selection hands its options ([`Menu::command`], also printed as a
+//! `cargo run` line to repeat it) to [`crate::loading`], which builds the run in the
+//! same window; M in the viewer stops the run and comes back here, and a run that
+//! cannot start comes back with its error ([`Menu::say`]).
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
@@ -33,11 +27,8 @@ use bevy::winit::{UpdateMode, WinitSettings};
 use dg_rs::io::SnapshotReader;
 use dg_rs::time::ModelClock;
 
-/// Set in the environment of a viewer the menu started: M then returns to it.
-pub const MENU_ENV: &str = "DG_VIZ_MENU";
-
-/// The exit code with which a viewer asks its menu to show again.
-pub const BACK_TO_MENU: u8 = 10;
+use crate::loading::Launch;
+use crate::screen::Screen;
 
 /// Height (logical pixels) of the window outside the saved runs' rows, and of a
 /// row: the rows that fit are shown, and the list scrolls.
@@ -54,71 +45,73 @@ const BACKGROUND: Color = Color::srgb(0.05, 0.065, 0.08);
 const PANEL: Color = Color::srgb(0.075, 0.095, 0.115);
 const SELECTED: Color = Color::srgba(0.25, 0.6, 0.75, 0.35);
 const HOVERED: Color = Color::srgba(1.0, 1.0, 1.0, 0.06);
-const ACCENT: Color = Color::srgb(0.45, 0.8, 0.9);
-const DIM: Color = Color::srgba(1.0, 1.0, 1.0, 0.55);
-const FAINT: Color = Color::srgba(1.0, 1.0, 1.0, 0.3);
+pub const ACCENT: Color = Color::srgb(0.45, 0.8, 0.9);
+pub const DIM: Color = Color::srgba(1.0, 1.0, 1.0, 0.55);
+pub const FAINT: Color = Color::srgba(1.0, 1.0, 1.0, 0.3);
 const ERROR: Color = Color::srgb(1.0, 0.5, 0.45);
 
-/// Opens the menu window (see the module docs); `repo` is the dg-rs checkout. With
-/// `screenshot`, saves the window there once drawn and ends (a headless check).
-pub fn run(
-    repo: PathBuf,
-    screenshot: Option<PathBuf>,
-    install_font: impl FnOnce(&mut App),
-) -> AppExit {
-    // `viz/..` resolved, without Windows' verbatim `\\?\` prefix
-    let repo = match std::fs::canonicalize(&repo) {
-        Ok(path) => match path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
-            Some(plain) => PathBuf::from(plain),
-            None => path,
-        },
-        Err(_) => repo,
-    };
-    let mut menu = Menu::new(repo);
-    menu.rescan();
-    let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "dg-viz".into(),
-            resolution: (1200, 780).into(),
-            ..default()
-        }),
-        ..default()
-    }))
-    // Wakes four times a second without input, to see a viewer end while hidden
-    .insert_resource(WinitSettings {
+pub struct MenuPlugin;
+
+impl Plugin for MenuPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(OnEnter(Screen::Menu), enter)
+            .add_systems(
+                Update,
+                (keys, mouse, fit, draw, highlight)
+                    .chain()
+                    .run_if(in_state(Screen::Menu)),
+            )
+            .add_systems(Update, dropped.run_if(not(in_state(Screen::Loading))))
+            // The list and a run being built wake four times a second without
+            // input; a run is drawn every frame
+            .add_systems(OnEnter(Screen::Loading), react)
+            .add_systems(
+                OnEnter(Screen::Viewer),
+                |mut winit: ResMut<WinitSettings>| *winit = WinitSettings::default(),
+            );
+    }
+}
+
+fn react(mut winit: ResMut<WinitSettings>) {
+    *winit = WinitSettings {
         focused_mode: UpdateMode::reactive(Duration::from_millis(250)),
         unfocused_mode: UpdateMode::reactive_low_power(Duration::from_millis(250)),
-    })
-    .insert_resource(ClearColor(BACKGROUND))
-    .insert_resource(menu)
-    .insert_resource(Running::default())
-    .add_systems(Startup, |mut commands: Commands| {
-        commands.spawn(Camera2d);
-    })
-    .add_systems(
+    };
+}
+
+/// The list again, looked for anew (a run may have saved one).
+fn enter(
+    mut commands: Commands,
+    mut menu: ResMut<Menu>,
+    winit: ResMut<WinitSettings>,
+    mut clear: ResMut<ClearColor>,
+) {
+    commands.spawn((DespawnOnExit(Screen::Menu), Camera2d));
+    clear.0 = BACKGROUND;
+    react(winit);
+    menu.rescan();
+}
+
+/// `--menu --screenshot PATH`: save the menu once drawn, and end (a headless check).
+pub fn screenshot(app: &mut App, path: PathBuf) {
+    app.add_systems(
         Update,
-        (keys, mouse, dropped, watch, fit, draw, highlight).chain(),
+        move |mut frames: Local<u32>,
+              mut winit: ResMut<WinitSettings>,
+              mut commands: Commands,
+              mut exit: MessageWriter<AppExit>| {
+            *frames += 1;
+            if *frames == 1 {
+                *winit = WinitSettings::game();
+            } else if *frames == 10 {
+                commands
+                    .spawn(Screenshot::primary_window())
+                    .observe(save_to_disk(path.clone()));
+            } else if *frames == 40 {
+                exit.write(AppExit::Success);
+            }
+        },
     );
-    if let Some(path) = screenshot {
-        app.insert_resource(WinitSettings::game()).add_systems(
-            Update,
-            move |mut frames: Local<u32>,
-                  mut commands: Commands,
-                  mut exit: MessageWriter<AppExit>| {
-                *frames += 1;
-                if *frames == 10 {
-                    commands
-                        .spawn(Screenshot::primary_window())
-                        .observe(save_to_disk(path.clone()));
-                } else if *frames == 40 {
-                    exit.write(AppExit::Success);
-                }
-            },
-        );
-    }
-    install_font(&mut app);
-    app.run()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -194,7 +187,7 @@ enum Target {
 struct MenuRoot;
 
 #[derive(Resource)]
-struct Menu {
+pub struct Menu {
     repo: PathBuf,
     /// The live scenarios, then the saved runs, newest first
     entries: Vec<Entry>,
@@ -210,19 +203,8 @@ struct Menu {
     last_click: Option<(usize, Instant)>,
 }
 
-/// A viewer the menu started: its process, what it shows, and the last lines of
-/// its standard error.
-struct Viewer {
-    child: Child,
-    title: String,
-    errors: Arc<Mutex<Vec<String>>>,
-}
-
-#[derive(Resource, Default)]
-struct Running(Option<Viewer>);
-
 impl Menu {
-    fn new(repo: PathBuf) -> Self {
+    pub fn new(repo: PathBuf) -> Self {
         let has = |p: &str| repo.join(p).is_file();
         let froya_missing = [
             "data/froya_coast.msh",
@@ -310,6 +292,13 @@ impl Menu {
             .unwrap_or(self.selected.min(self.entries.len() - 1));
         self.scroll = self.scroll.min(self.n_saved().saturating_sub(self.visible));
         self.reveal();
+        self.dirty = true;
+    }
+
+    /// A line under the lists, replacing the last: how a run went, or why it could
+    /// not start.
+    pub fn say(&mut self, line: String, error: bool) {
+        self.status = vec![(line, error)];
         self.dirty = true;
     }
 
@@ -606,25 +595,14 @@ fn font(size: f32) -> TextFont {
     }
 }
 
-/// Start the selection in a viewer and hide the menu.
-fn launch(menu: &mut Menu, running: &mut Running, window: &mut Window) {
-    if running.0.is_some() {
-        return;
-    }
+/// Build the selection and show it ([`crate::loading`]).
+fn launch(menu: &mut Menu, commands: &mut Commands, next: &mut NextState<Screen>) {
     if let Some(missing) = &menu.entry().missing {
-        menu.status = vec![(format!("{}: {missing}", menu.entry().title), true)];
-        menu.dirty = true;
+        let line = format!("{}: {missing}", menu.entry().title);
+        menu.say(line, true);
         return;
     }
     let args = menu.command();
-    if let Some(dir) = args
-        .iter()
-        .skip_while(|a| *a != "--save-snapshot")
-        .nth(1)
-        .and_then(|p| Path::new(p).parent())
-    {
-        let _ = std::fs::create_dir_all(dir);
-    }
     let quoted: Vec<String> = args
         .iter()
         .map(|a| {
@@ -636,113 +614,19 @@ fn launch(menu: &mut Menu, running: &mut Running, window: &mut Window) {
         })
         .collect();
     println!("dg-viz: cargo run --release -- {}", quoted.join(" "));
-    let spawned = std::env::current_exe().and_then(|exe| {
-        Command::new(exe)
-            .args(&args)
-            .env(MENU_ENV, "1")
-            .stderr(Stdio::piped())
-            .spawn()
-    });
-    let mut child = match spawned {
-        Ok(child) => child,
-        Err(e) => {
-            menu.status = vec![(format!("cannot start the viewer: {e}"), true)];
-            menu.dirty = true;
-            return;
-        }
-    };
-    // Echo the viewer's errors, keeping the last few for the menu
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    if let Some(stderr) = child.stderr.take() {
-        let errors = errors.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                eprintln!("{line}");
-                let mut errors = errors.lock().unwrap();
-                errors.push(line);
-                let n = errors.len();
-                if n > 6 {
-                    errors.drain(..n - 6);
-                }
-            }
-        });
-    }
     let title = menu.entry().title.clone();
-    menu.status = vec![(
-        format!("{title} is running (M in the viewer comes back here)"),
-        false,
-    )];
-    menu.dirty = true;
-    running.0 = Some(Viewer {
-        child,
-        title,
-        errors,
-    });
-    window.visible = false;
-}
-
-/// See a viewer end: M brings the menu back, a closed window closes it, a failure
-/// shows its errors.
-fn watch(
-    mut menu: ResMut<Menu>,
-    mut running: ResMut<Running>,
-    mut window: Single<&mut Window, With<PrimaryWindow>>,
-    mut exit: MessageWriter<AppExit>,
-) {
-    let Some(Viewer {
-        child,
-        title,
-        errors,
-    }) = running.0.as_mut()
-    else {
-        return;
-    };
-    let status = match child.try_wait() {
-        Ok(None) => return,
-        Ok(Some(status)) => status,
-        Err(e) => {
-            menu.status = vec![(format!("lost the viewer: {e}"), true)];
-            running.0 = None;
-            window.visible = true;
-            menu.dirty = true;
-            return;
-        }
-    };
-    let code = status.code();
-    if code == Some(0) {
-        exit.write(AppExit::Success);
-        return;
-    }
-    // Give the error thread a moment to read the last lines
-    std::thread::sleep(Duration::from_millis(50));
-    menu.status = if code == Some(BACK_TO_MENU as i32) {
-        vec![(format!("Back from {title}."), false)]
-    } else {
-        let mut lines = vec![(
-            format!(
-                "{title} stopped ({}):",
-                code.map_or("killed".into(), |c| format!("exit code {c}"))
-            ),
-            true,
-        )];
-        lines.extend(errors.lock().unwrap().iter().map(|l| (l.clone(), true)));
-        lines
-    };
-    running.0 = None;
-    window.visible = true;
-    menu.rescan();
+    menu.say(format!("Started {title}."), false);
+    commands.insert_resource(Launch { args, title });
+    next.set(Screen::Loading);
 }
 
 fn keys(
     keys: Res<ButtonInput<KeyCode>>,
     mut menu: ResMut<Menu>,
-    mut running: ResMut<Running>,
-    mut window: Single<&mut Window, With<PrimaryWindow>>,
+    mut commands: Commands,
+    mut next: ResMut<NextState<Screen>>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if running.0.is_some() {
-        return;
-    }
     let n = menu.entries.len();
     let s = menu.selected;
     if keys.just_pressed(KeyCode::ArrowDown) {
@@ -760,7 +644,7 @@ fn keys(
     } else if keys.just_pressed(KeyCode::End) {
         menu.select(n - 1);
     } else if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter) {
-        launch(&mut menu, &mut running, &mut window);
+        launch(&mut menu, &mut commands, &mut next);
     } else if keys.just_pressed(KeyCode::F5) {
         menu.rescan();
         menu.status = vec![(format!("{} saved runs found.", menu.n_saved()), false)];
@@ -779,8 +663,8 @@ fn mouse(
     mut wheel: MessageReader<MouseWheel>,
     rows: Query<(&Target, &RelativeCursorPosition)>,
     mut menu: ResMut<Menu>,
-    mut running: ResMut<Running>,
-    mut window: Single<&mut Window, With<PrimaryWindow>>,
+    mut commands: Commands,
+    mut next: ResMut<NextState<Screen>>,
 ) {
     let lines: f32 = wheel
         .read()
@@ -789,9 +673,6 @@ fn mouse(
             MouseScrollUnit::Pixel => w.y / 40.0,
         })
         .sum();
-    if running.0.is_some() {
-        return;
-    }
     if lines.abs() >= 0.5 {
         let max = menu.n_saved().saturating_sub(menu.visible);
         let to = (menu.scroll as f32 - lines.round()).clamp(0.0, max as f32) as usize;
@@ -819,21 +700,21 @@ fn mouse(
             menu.last_click = Some((i, Instant::now()));
             if double {
                 menu.last_click = None;
-                launch(&mut menu, &mut running, &mut window);
+                launch(&mut menu, &mut commands, &mut next);
             }
         }
         Target::Choice(choice) => menu.cycle(choice),
-        Target::Launch => launch(&mut menu, &mut running, &mut window),
+        Target::Launch => launch(&mut menu, &mut commands, &mut next),
     }
 }
 
 /// A snapshot file, or a folder of VTU frames (or one frame of it), dropped on the
-/// window is replayed.
+/// window is replayed, with the menu's options; in the viewer, in place of its run.
 fn dropped(
     mut drops: MessageReader<FileDragAndDrop>,
     mut menu: ResMut<Menu>,
-    mut running: ResMut<Running>,
-    mut window: Single<&mut Window, With<PrimaryWindow>>,
+    mut commands: Commands,
+    mut next: ResMut<NextState<Screen>>,
 ) {
     for drop in drops.read() {
         let FileDragAndDrop::DroppedFile { path_buf, .. } = drop else {
@@ -872,7 +753,7 @@ fn dropped(
             }
         };
         menu.select(i);
-        launch(&mut menu, &mut running, &mut window);
+        launch(&mut menu, &mut commands, &mut next);
     }
 }
 
@@ -902,6 +783,7 @@ fn draw(mut commands: Commands, mut menu: ResMut<Menu>, roots: Query<Entity, Wit
     commands
         .spawn((
             MenuRoot,
+            DespawnOnExit(Screen::Menu),
             Node {
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),

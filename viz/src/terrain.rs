@@ -66,6 +66,7 @@ use crate::colormap::{LAND, Lut, SEABED};
 use crate::field::{Field, Frame, Nodes, Probe};
 use crate::photo::PhotoPart;
 use crate::scenario::Scenario;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 use crate::solver::H_DRY;
 use crate::surface::{BedScale, SurfaceStyle, WaterOpacity};
 
@@ -73,14 +74,16 @@ pub struct TerrainPlugin;
 
 impl Plugin for TerrainPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn.after(crate::surface::spawn))
+        app.run_resource::<Terrain>()
+            .add_systems(OnEnter(Screen::Viewer), spawn.after(crate::surface::spawn))
             .add_systems(
                 Update,
                 (
                     toggle,
                     sea_style,
                     sea_level.after(crate::field::interpolate),
-                ),
+                )
+                    .in_set(Viewing),
             );
     }
 }
@@ -661,6 +664,7 @@ pub(crate) fn spawn(
             .map(|&z| [(-z).max(0.0), 0.0])
             .collect();
         commands.spawn((
+            RUN,
             Name::new("Terrain"),
             TerrainPart,
             PhotoPart::Bed,
@@ -711,6 +715,7 @@ pub(crate) fn spawn(
             .collect();
         let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
         commands.spawn((
+            RUN,
             Name::new("Sea"),
             TerrainPart,
             PhotoPart::Sea,

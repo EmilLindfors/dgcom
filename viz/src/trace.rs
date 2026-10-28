@@ -28,6 +28,7 @@ use crate::field::Probe;
 use crate::playback::Playback;
 use crate::plot::Canvas;
 use crate::scenario::Scenario;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 
 /// Depth (m) of every node of an element the trace may sample in.
 pub const MIN_DEPTH: f64 = 3.0;
@@ -194,8 +195,10 @@ pub struct TracePlugin;
 
 impl Plugin for TracePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn)
-            .add_systems(Update, (sample, draw, marker, toggle));
+        app.add_systems(OnEnter(Screen::Viewer), spawn)
+            .add_systems(Update, (sample, draw, marker, toggle).in_set(Viewing))
+            .run_resource::<Trace>()
+            .run_resource::<PlotImage>();
     }
 }
 
@@ -225,6 +228,7 @@ fn spawn(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     };
     commands
         .spawn((
+            RUN,
             Panel,
             Node {
                 position_type: PositionType::Absolute,

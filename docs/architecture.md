@@ -124,7 +124,7 @@ src/
 ├── io/               # NetCDF output; parent-ocean and weather-model readers
 │                     # on lon/lat grids (GeoGrid, FieldSeries); VTK, GeoTIFF
 │                     # bathymetry, GSHHS coastline, projections, observations;
-│                     # snapshot files for replay; 3D restart files (restart.rs)
+│                     # snapshot files for replay; 2D and 3D restart files (restart.rs)
 └── analysis/         # Harmonic (tidal) analysis, tidal current ellipses,
                       # skill metrics, tide gauge, ADCP, stability monitoring
 ```

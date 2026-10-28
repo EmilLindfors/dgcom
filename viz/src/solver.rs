@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use std::f64::consts::PI;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::replay::SnapshotSink;
 use dg_rs::boundary::{
@@ -306,17 +307,29 @@ pub struct SolverConfig {
     pub particles: ParticleConfig,
 }
 
-/// Start the run; snapshots arrive on the returned channel, the first at t = 0.
-/// With `save`, every snapshot is also written to that snapshot file
-/// ([`crate::replay::writer`]).
+/// Start the run; snapshots arrive on the returned channel, the first at t = 0, and
+/// setting the returned flag ends the run after the step it is on. With `save`,
+/// every snapshot is also written to that snapshot file ([`crate::replay::writer`]).
 pub fn spawn(
     scenario: &Scenario,
     config: SolverConfig,
     save: Option<SnapshotSink>,
+) -> (Receiver<SolverMessage>, Arc<AtomicBool>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let messages = if scenario.three_d.is_some() {
+        spawn_3d(scenario, config, save, stop.clone())
+    } else {
+        spawn_2d(scenario, config, save, stop.clone())
+    };
+    (messages, stop)
+}
+
+fn spawn_2d(
+    scenario: &Scenario,
+    config: SolverConfig,
+    save: Option<SnapshotSink>,
+    stop: Arc<AtomicBool>,
 ) -> Receiver<SolverMessage> {
-    if scenario.three_d.is_some() {
-        return spawn_3d(scenario, config, save);
-    }
     let (tx, rx) = channel();
     let mesh = scenario.mesh.clone();
     let ops = scenario.ops.clone();
@@ -367,7 +380,7 @@ pub fn spawn(
                 let mut save = Save::new(save);
                 let mut cloud = (config.particles.per_release > 0)
                     .then(|| Cloud::new(&mesh, &ops, &cages, config.particles));
-                // A send fails only once the viewer has closed; the run then ends with the process.
+                // A send fails only once the viewer has left the run, which stops it
                 let mut send = |q: &SWESolution2D, t: f64| {
                     let particles = match cloud.as_mut() {
                         Some(cloud) => {
@@ -385,11 +398,13 @@ pub fn spawn(
                     Simulation::new(physics, MultirateSSPRK3::new(config.levels))
                         .with_cfl(1.0)
                         .with_callback_interval(config.interval)
+                        .with_stop(stop)
                         .run_with_callback(&mut q, 0.0, config.t_end, &mut send)
                 } else {
                     Simulation::new(physics, SSPRK3)
                         .with_cfl(1.0)
                         .with_callback_interval(config.interval)
+                        .with_stop(stop)
                         .run_with_callback(&mut q, 0.0, config.t_end, &mut send)
                 };
                 let _ = tx.send(SolverMessage::Finished {
@@ -410,6 +425,7 @@ fn spawn_3d(
     scenario: &Scenario,
     config: SolverConfig,
     save: Option<SnapshotSink>,
+    stop: Arc<AtomicBool>,
 ) -> Receiver<SolverMessage> {
     let (tx, rx) = channel();
     let three_d = scenario
@@ -590,6 +606,7 @@ fn spawn_3d(
                 let result = Simulation3D::new(physics, ModeSplitIntegrator::new())
                     .with_cfl(0.5)
                     .with_callback_interval(config.interval)
+                    .with_stop(stop)
                     .run_with_callback(&mut state, 0.0, config.t_end, &mut send);
                 // `Simulation3D` calls back at the first step past each interval, so
                 // the end of the run may not have been sent
@@ -640,7 +657,7 @@ mod tests {
             },
         };
         let (mut speed, mut eta) = (0.0_f64, 0.0_f64);
-        for message in spawn(scenario, config, None) {
+        for message in spawn(scenario, config, None).0 {
             match message {
                 SolverMessage::Snapshot(s) => {
                     let layers = s.layers.as_ref().unwrap();

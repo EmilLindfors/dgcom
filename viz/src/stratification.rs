@@ -32,6 +32,7 @@ use crate::field::{Frame, Nodes};
 use crate::layers::Levels;
 use crate::photo::Photo;
 use crate::playback::Playback;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 use crate::solver::Layers;
 
 /// Columns shallower than this (m) carry no sheet, and the readout no steps.
@@ -193,10 +194,18 @@ pub struct StratificationPlugin;
 
 impl Plugin for StratificationPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn).add_systems(
+        app.add_systems(
+            OnEnter(Screen::Viewer),
+            spawn.run_if(resource_exists::<Stratification>),
+        )
+        .add_systems(
             Update,
-            (keys, draw.after(crate::field::interpolate)).chain(),
-        );
+            (keys, draw.after(crate::field::interpolate))
+                .chain()
+                .run_if(resource_exists::<Stratification>)
+                .in_set(Viewing),
+        )
+        .run_resource::<Stratification>();
     }
 }
 
@@ -235,6 +244,7 @@ fn spawn(
         .with_inserted_indices(Indices::U32(indices)),
     );
     commands.spawn((
+        RUN,
         Name::new("Pycnocline"),
         Sheet,
         RenderLayers::layer(crate::minimap::MAIN_ONLY),

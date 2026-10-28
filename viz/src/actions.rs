@@ -25,6 +25,7 @@ use crate::minimap::Minimap;
 use crate::particles::Particles;
 use crate::photo::Photo;
 use crate::playback::Playback;
+use crate::screen::{RunResources, Viewing};
 use crate::stratification::{SheetShows, Stratification};
 use crate::surface::{ColourBy, Colouring, SurfaceStyle, WaterOpacity};
 use crate::terrain::Terrain;
@@ -64,6 +65,8 @@ pub enum Action {
     WindFrom,
     Help,
     Menu,
+    /// Build the run anew from its options
+    Restart,
     Quit,
     /// Close the help and the open menu (Esc while one is shown; not in the table)
     Dismiss,
@@ -266,6 +269,13 @@ impl Actions {
                 Menu::Run,
                 key(&[K::End], "End"),
                 "To the newest frame",
+                false,
+            ),
+            entry(
+                A::Restart,
+                Menu::Run,
+                None,
+                "Restart (build the run anew)",
                 false,
             ),
             entry(A::Quit, Menu::Run, None, "Quit", false),
@@ -585,8 +595,9 @@ pub struct ActionsPlugin;
 impl Plugin for ActionsPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<Act>()
-            .init_resource::<Shown>()
-            .add_systems(PreUpdate, keys.after(InputSystems));
+            .run_resource::<Shown>()
+            .run_resource::<Actions>()
+            .add_systems(PreUpdate, keys.after(InputSystems).in_set(Viewing));
     }
 }
 

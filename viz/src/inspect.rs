@@ -35,6 +35,7 @@ use crate::field::{Frame, Probe};
 use crate::minimap::Minimap;
 use crate::playback::Playback;
 use crate::plot::Canvas;
+use crate::screen::{RUN, RunResources, Screen, Viewing};
 use crate::solver::H_DRY;
 use crate::stratification::{self, SheetShows, column_strongest};
 
@@ -52,7 +53,7 @@ const PYCNOCLINE: [u8; 3] = [255, 225, 80];
 /// Where the inspector looks, and what it holds.
 #[derive(Resource)]
 pub struct Inspector {
-    /// Over a mesh that lives as long as the viewer (see [`Self::new`])
+    /// Holding the run's mesh
     locator: PointLocator2D<'static>,
     ops: Arc<DGOperators2D>,
     projection: Option<LocalProjection>,
@@ -68,9 +69,7 @@ pub struct Inspector {
 }
 
 impl Inspector {
-    /// The inspector of the mesh `mesh`: it keeps a reference to the mesh for the
-    /// rest of the program (the viewer's mesh never goes away), so its locator can
-    /// live in a resource.
+    /// The inspector of the mesh `mesh`, whose locator holds it.
     pub fn new(
         mesh: Arc<Mesh2D>,
         ops: Arc<DGOperators2D>,
@@ -78,9 +77,8 @@ impl Inspector {
         bed: &[f64],
         sigma: Option<Vec<f32>>,
     ) -> Self {
-        let mesh: &'static Mesh2D = Box::leak(Box::new(mesh));
         Self {
-            locator: PointLocator2D::new(mesh),
+            locator: PointLocator2D::shared(mesh),
             ops,
             projection,
             bed: bed.iter().map(|&b| b as f32).collect(),
@@ -357,14 +355,18 @@ pub struct InspectPlugin;
 
 impl Plugin for InspectPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn).add_systems(
-            Update,
-            (
-                pick,
-                (tooltip, pinned, marker).after(crate::field::interpolate),
+        app.add_systems(OnEnter(Screen::Viewer), spawn)
+            .add_systems(
+                Update,
+                (
+                    pick,
+                    (tooltip, pinned, marker).after(crate::field::interpolate),
+                )
+                    .chain()
+                    .in_set(Viewing),
             )
-                .chain(),
-        );
+            .run_resource::<Inspector>()
+            .run_resource::<ProfileImage>();
     }
 }
 
@@ -387,6 +389,7 @@ fn spawn(
     };
     commands
         .spawn((
+            RUN,
             Tooltip,
             Node {
                 position_type: PositionType::Absolute,
@@ -415,6 +418,7 @@ fn spawn(
     commands.insert_resource(ProfileImage(image.clone()));
     commands
         .spawn((
+            RUN,
             PinPanel,
             Node {
                 position_type: PositionType::Absolute,
@@ -445,6 +449,7 @@ fn spawn(
         });
 
     commands.spawn((
+        RUN,
         PinMarker,
         Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
         MeshMaterial3d(materials.add(StandardMaterial {
