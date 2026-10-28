@@ -56,7 +56,7 @@ use super::harmonic_tide::tidal_ramp;
 use crate::io::CoordinateProjection;
 use crate::mesh::{BoundaryTag, Mesh2D};
 use crate::operators::DGOperators2D;
-use crate::tides::{NodalCorrection, canonical_name, constituent_period};
+use crate::tides::{NodalDrift, canonical_name, constituent_period};
 use crate::time::ModelClock;
 use crate::types::ElementIndex;
 
@@ -354,8 +354,8 @@ impl TidalAtlas {
     }
 
     /// Project the atlas onto the boundary nodes of `mesh` whose faces carry
-    /// `tag`, for a run on `clock` of length `duration` (the nodal `f`, `u`
-    /// are taken at its middle).
+    /// `tag`, for a run on `clock` (`V₀` at its epoch, the nodal `f`, `u` at
+    /// each time, [`ModelClock::nodal_drift`]).
     ///
     /// Every such node must lie within `coverage_radius` (m) of an atlas point.
     pub fn boundary_tides<P: CoordinateProjection>(
@@ -365,7 +365,6 @@ impl TidalAtlas {
         projection: &P,
         tag: BoundaryTag,
         clock: &ModelClock,
-        duration: f64,
         coverage_radius: f64,
     ) -> Result<BoundaryTides, TidalAtlasError> {
         let n_nodes = ops.n_nodes;
@@ -388,13 +387,13 @@ impl TidalAtlas {
                 }
             }
         }
-        let mut tides = self.tides_at(&positions, projection, clock, duration, coverage_radius)?;
+        let mut tides = self.tides_at(&positions, projection, clock, coverage_radius)?;
         tides.slot_of_node = slot_of_node;
         Ok(tides)
     }
 
     /// The atlas at the points `positions` (mesh coordinates), in that order
-    /// of slots, for a run on `clock` of length `duration`: as
+    /// of slots, for a run on `clock`: as
     /// [`boundary_tides`](Self::boundary_tides), but anywhere (e.g. the
     /// nodes of a nesting band, [`OceanModelState::with_tidal_correction`](crate::boundary::OceanModelState::with_tidal_correction)).
     /// A [`BoundaryTides`] built here finds its slot by position only.
@@ -403,24 +402,24 @@ impl TidalAtlas {
         positions: &[(f64, f64)],
         projection: &P,
         clock: &ModelClock,
-        duration: f64,
         coverage_radius: f64,
     ) -> Result<BoundaryTides, TidalAtlasError> {
         self.validate()?;
         let names = self.names();
         let velocity = self.has_velocity();
+        let drifts: Vec<NodalDrift> = names
+            .iter()
+            .map(|n| clock.nodal_drift(n).unwrap_or(NodalDrift::IDENTITY))
+            .collect();
+        // The nodal phase's drift u̇ adds to the angular speed
         let omega: Vec<f64> = names
             .iter()
-            .map(|n| 2.0 * PI / constituent_period(n).expect("canonical name"))
-            .collect();
-        let corrections: Vec<NodalCorrection> = names
-            .iter()
-            .map(|n| {
-                clock
-                    .nodal_correction(n, 0.5 * duration)
-                    .unwrap_or(NodalCorrection::IDENTITY)
+            .zip(&drifts)
+            .map(|(n, d)| {
+                2.0 * PI / constituent_period(n).expect("canonical name") + d.u_rate_rad()
             })
             .collect();
+        let f_rate: Vec<f64> = drifts.iter().map(NodalDrift::relative_f_rate).collect();
         let xy: Vec<(f64, f64)> = self
             .points
             .iter()
@@ -483,7 +482,8 @@ impl TidalAtlas {
                     .sum::<f64>(),
             );
 
-            for (j, n) in corrections.iter().enumerate() {
+            for (j, drift) in drifts.iter().enumerate() {
+                let n = drift.at_epoch;
                 // Complex amplitude H e^{−iG}, interpolated
                 let interp = |get: &dyn Fn(&AtlasConstituent) -> Harmonic| {
                     weights.iter().fold((0.0, 0.0), |(re, im), &(w, i)| {
@@ -510,7 +510,7 @@ impl TidalAtlas {
                 } else {
                     ((0.0, 0.0), (0.0, 0.0))
                 };
-                // f Re[A e^{i(ωt + V₀ + u)}] = C cos ωt + S sin ωt
+                // f₀ Re[A e^{i(ω′t + V₀ + u₀)}] = C cos ω′t + S sin ω′t
                 let (sin_p, cos_p) = n.phase_offset_rad().sin_cos();
                 for (re, im) in [eta, u, v] {
                     let (re, im) = (re * cos_p - im * sin_p, re * sin_p + im * cos_p);
@@ -523,6 +523,7 @@ impl TidalAtlas {
         Ok(BoundaryTides {
             names,
             omega,
+            f_rate,
             velocity,
             slot_of_node: Vec::new(),
             positions: positions.to_vec(),
@@ -619,12 +620,17 @@ impl TidalAtlas {
 #[derive(Clone, Debug)]
 pub struct BoundaryTides {
     names: Vec<&'static str>,
+    /// Per constituent `ω′ = ω + u̇` (rad/s): the angular speed with the
+    /// drift of the nodal phase
     omega: Vec<f64>,
+    /// Per constituent `ḟ / f₀` (1/s): the drift of the nodal factor
+    f_rate: Vec<f64>,
     velocity: bool,
     /// Slot per flat mesh node (`u32::MAX`: not a forced boundary node)
     slot_of_node: Vec<u32>,
     positions: Vec<(f64, f64)>,
-    /// Per slot and constituent: `C, S` of η, u, v (`C cos ωt + S sin ωt`)
+    /// Per slot and constituent: `C, S` of η, u, v at the epoch's nodal
+    /// terms (`f(t)/f₀ · (C cos ω′t + S sin ω′t)`)
     coefficients: Vec<f64>,
     mean: Vec<f64>,
     source_depth: Vec<f64>,
@@ -691,7 +697,8 @@ impl BoundaryTides {
         self.velocity
     }
 
-    /// Amplitude (m) and Greenwich-referenced phase (°, `V₀ + u − G` at t = 0)
+    /// Amplitude (m, `f H` at t = 0) and Greenwich-referenced phase (°,
+    /// `V₀ + u − G` at t = 0)
     /// of constituent `j`'s elevation at forced node `slot`.
     pub fn elevation_constants(&self, slot: usize, j: usize) -> (f64, f64) {
         let base = (slot * self.names.len() + j) * 6;
@@ -699,15 +706,17 @@ impl BoundaryTides {
         (c.hypot(s), (-s).atan2(c).to_degrees())
     }
 
-    /// `(η, u, v)` at forced node `slot` and time `t`.
+    /// `(η, u, v)` at forced node `slot` and time `t`, with the nodal terms
+    /// of `t`.
     pub fn evaluate(&self, slot: usize, t: f64) -> (f64, f64, f64) {
         let n_c = self.names.len();
         let coefficients = &self.coefficients[slot * n_c * 6..][..n_c * 6];
         let mut sum = [0.0; 3];
         for (j, c) in coefficients.as_chunks::<6>().0.iter().enumerate() {
             let (sin, cos) = (self.omega[j] * t).sin_cos();
+            let f = 1.0 + self.f_rate[j] * t;
             for (q, s) in sum.iter_mut().enumerate() {
-                *s += c[2 * q] * cos + c[2 * q + 1] * sin;
+                *s += f * (c[2 * q] * cos + c[2 * q + 1] * sin);
             }
         }
         let ramp = tidal_ramp(t, self.ramp_duration);
@@ -913,19 +922,11 @@ mod tests {
         let (mesh, ops, projection) = setup();
         let clock = ModelClock::at_datetime(2025, 6, 1, 0, 0);
         let tides = atlas
-            .boundary_tides(
-                &mesh,
-                &ops,
-                &projection,
-                BoundaryTag::Open,
-                &clock,
-                30.0 * 86_400.0,
-                3000.0,
-            )
+            .boundary_tides(&mesh, &ops, &projection, BoundaryTag::Open, &clock, 3000.0)
             .unwrap();
         // 4 elements × 3 face nodes (DG nodes are not shared between elements)
         assert_eq!(tides.n_nodes(), 12);
-        let m2 = clock.nodal_correction("M2", 15.0 * 86_400.0).unwrap();
+        let m2 = clock.nodal_correction("M2", 0.0).unwrap();
 
         let (x_west, _) = projection.geo_to_xy(63.0, 8.0);
         let west = tides
@@ -958,6 +959,41 @@ mod tests {
         assert!((eta_ramped - (0.05 + 0.5 * eta)).abs() < 1e-12);
     }
 
+    /// The nodal terms are those of the time the tide is evaluated at, not
+    /// of a run's middle (TODO P1.5: a run resumed to another end was forced
+    /// differently): 20 days in, M2 at the atlas point is `f`, `u` at 20 days.
+    #[test]
+    fn boundary_tides_take_the_nodal_terms_of_the_time() {
+        let atlas = TidalAtlas::parse(ATLAS).unwrap();
+        let (mesh, ops, projection) = setup();
+        let clock = ModelClock::at_datetime(2025, 6, 1, 0, 0);
+        let tides = atlas
+            .boundary_tides(&mesh, &ops, &projection, BoundaryTag::Open, &clock, 3000.0)
+            .unwrap();
+        let (x_west, _) = projection.geo_to_xy(63.0, 8.0);
+        let west = tides
+            .positions()
+            .iter()
+            .position(|p| (p.0 - x_west).abs() < 1e-6)
+            .unwrap();
+        let constituent = |name: &str, amp: f64, lag: f64, t: f64| {
+            let n = clock.nodal_correction(name, t).unwrap();
+            let omega = 2.0 * PI / constituent_period(name).unwrap();
+            n.f * amp * (omega * t + n.phase_offset_rad() - lag.to_radians()).cos()
+        };
+        for t in [0.0, 20.0 * 86_400.0 + 4321.0] {
+            let (eta, u, _) = tides.evaluate(west, t);
+            let expected = constituent("M2", 1.0, 350.0, t) + constituent("S2", 0.3, 20.0, t);
+            // The linear drift is at most 6e-6 m off; held at the epoch, 7e-4 m
+            assert!(
+                (eta - expected).abs() < 2e-5,
+                "η at {t}: {eta} vs {expected}"
+            );
+            let expected = constituent("M2", 0.1, 80.0, t);
+            assert!((u - expected).abs() < 2e-6, "u at {t}: {u} vs {expected}");
+        }
+    }
+
     /// With transport scaling the velocity carries the source's transport
     /// over the child's bed, limited by the ratio; without it, or without
     /// source depth, it is the atlas velocity.
@@ -967,15 +1003,7 @@ mod tests {
         let (mesh, ops, projection) = setup();
         let clock = ModelClock::default();
         let tides = atlas
-            .boundary_tides(
-                &mesh,
-                &ops,
-                &projection,
-                BoundaryTag::Open,
-                &clock,
-                0.0,
-                3000.0,
-            )
+            .boundary_tides(&mesh, &ops, &projection, BoundaryTag::Open, &clock, 3000.0)
             .unwrap();
         let (x_west, _) = projection.geo_to_xy(63.0, 8.0);
         let west = tides
@@ -1021,15 +1049,8 @@ mod tests {
         let atlas = TidalAtlas::parse(ATLAS).unwrap();
         let (mesh, ops, projection) = setup();
         let clock = ModelClock::default();
-        let result = atlas.boundary_tides(
-            &mesh,
-            &ops,
-            &projection,
-            BoundaryTag::Open,
-            &clock,
-            0.0,
-            100.0,
-        );
+        let result =
+            atlas.boundary_tides(&mesh, &ops, &projection, BoundaryTag::Open, &clock, 100.0);
         assert!(matches!(result, Err(TidalAtlasError::NotCovered { .. })));
     }
 
@@ -1040,15 +1061,7 @@ mod tests {
         let (mesh, ops, projection) = setup();
         let clock = ModelClock::default();
         let tides = atlas
-            .boundary_tides(
-                &mesh,
-                &ops,
-                &projection,
-                BoundaryTag::Open,
-                &clock,
-                0.0,
-                3000.0,
-            )
+            .boundary_tides(&mesh, &ops, &projection, BoundaryTag::Open, &clock, 3000.0)
             .unwrap();
         let (x_west, _) = projection.geo_to_xy(63.0, 8.0);
         let west = tides

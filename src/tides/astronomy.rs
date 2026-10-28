@@ -215,6 +215,63 @@ impl NodalCorrection {
     }
 }
 
+/// Nodal correction of a constituent through a run: `V₀` at the epoch
+/// (`t = 0`) and the nodal terms linear in the time `t` (s) since it,
+///
+/// ```text
+/// f(t) = f₀ + ḟ t,    u(t) = u₀ + u̇ t,
+/// ```
+///
+/// the first-order expansion of the 18.61-year modulation about the epoch.
+/// Its error is at most ½ max|f̈|, ½ max|ü| times t²: for M2 ≈ 0.001° in `u`
+/// after a month and 0.12° after a year, for K1 0.004° and 0.5° (`f`: 0.2 %
+/// and 0.7 % after a year). Unlike `f`, `u` held at the middle of a run
+/// (off by `u̇ T/2` at its ends, 1.5° for K1 over a year), the correction at
+/// `t` does not depend on where the run ends, so a run resumed or branched to
+/// another end is forced as the run it came from. Built by
+/// [`ModelClock::nodal_drift`](crate::time::ModelClock::nodal_drift).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodalDrift {
+    /// `f₀`, `u₀` and `V₀` at the epoch.
+    pub at_epoch: NodalCorrection,
+    /// `ḟ` (per second).
+    pub f_rate: f64,
+    /// `u̇` (degrees per second).
+    pub u_rate_deg: f64,
+}
+
+impl NodalDrift {
+    /// No correction at any time.
+    pub const IDENTITY: Self = Self {
+        at_epoch: NodalCorrection::IDENTITY,
+        f_rate: 0.0,
+        u_rate_deg: 0.0,
+    };
+
+    /// `f`, `u` at `t` and `V₀` at the epoch.
+    #[inline]
+    pub fn at(&self, t: f64) -> NodalCorrection {
+        NodalCorrection {
+            f: self.at_epoch.f + self.f_rate * t,
+            u_deg: self.at_epoch.u_deg + self.u_rate_deg * t,
+            v0_deg: self.at_epoch.v0_deg,
+        }
+    }
+
+    /// `u̇` in radians per second: the drift of the nodal phase, which adds
+    /// to the constituent's angular speed `ω`.
+    #[inline]
+    pub fn u_rate_rad(&self) -> f64 {
+        self.u_rate_deg * DEG_TO_RAD
+    }
+
+    /// `ḟ / f₀` (per second): the relative drift of the amplitude.
+    #[inline]
+    pub fn relative_f_rate(&self) -> f64 {
+        self.f_rate / self.at_epoch.f
+    }
+}
+
 /// Doodson coefficients of a constituent's equilibrium argument
 /// `V₀ = c_τ τ + c_s s + c_h h + c_p p + c_p₁ p₁ + offset` (degrees).
 ///

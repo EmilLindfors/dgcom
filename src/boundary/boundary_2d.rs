@@ -532,8 +532,8 @@ impl HarmonicTidal2D {
 
     /// Nodal corrections for a run on `clock`; see
     /// [`HarmonicTide::with_nodal_corrections`].
-    pub fn with_nodal_corrections(mut self, clock: &ModelClock, t_mid: f64) -> Self {
-        self.tide = self.tide.with_nodal_corrections(clock, t_mid);
+    pub fn with_nodal_corrections(mut self, clock: &ModelClock) -> Self {
+        self.tide = self.tide.with_nodal_corrections(clock);
         self
     }
 
@@ -824,7 +824,7 @@ mod tests {
         let clock = ModelClock::at_datetime(2024, 6, 1, 0, 0);
         let bc = HarmonicTidal2D::m2_only(0.5, 0.0)
             .with_mean_elevation(0.1)
-            .with_nodal_corrections(&clock, 0.0);
+            .with_nodal_corrections(&clock);
         let n = clock.nodal_correction("M2", 0.0).unwrap();
         let eta = 0.1 + n.f * 0.5 * n.phase_offset_rad().cos();
         let ctx = BCContext2D::new(

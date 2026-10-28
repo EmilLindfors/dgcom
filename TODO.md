@@ -4,10 +4,6 @@ Open items only, one line each. The context (measurements, decisions, what was t
 
 Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon-farm application (currents, waves and particles around cages inside a NorKyst-driven coastal domain) on a 2D model that is correct, cheap and validated, and a 3D model rebuilt on the ROMS recipe. "Faster than ROMS" is to be proven by P3.2, not assumed.
 
-## Next up
-
-1. **P1.5** Nodal factors that do not depend on the run's length (`OceanModelState::with_tidal_correction`, `TidalAtlas::tides_at`, `HarmonicTide::with_nodal_corrections` take them at half of `hours=`), so a branch or resume to another end reproduces the open run byte for byte. See Boundaries and nesting.
-
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
 - [ ] **P3.1** Remove M2's +3 % at Mausund (2.6 cm |ΔZ|, the largest error, NorKyst's own) with `froya_real_data gauge_gains=M2,…` so N2 follows; run it with the overtide work, since M4 scales with M2².
@@ -28,6 +24,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P3.4** A second out-of-sample domain in a fjord (Saltstraumen's tidal jet, or a deep sill fjord) where the shallow-water drag gap (P1.3, 3D/2D 0.79 in 3–50 m on both Frøya and Bodø) and stratification matter more than at Bodø's open skerries.
 - [ ] **P3.2** The Pareto benchmark on the same hardware: M2/S2/K1/O1 gauge error against core-hours, ROMS 2D at 800/400/200 m against DG P1–P4.
 - [ ] **P3.1** Low priority (≤ 4 mm left): whether the interior amplifies the diurnals (shelf waves).
+- [ ] **P3.1** Low priority: harmonic analysis and `ReferenceFit::predict` with the nodal `f`, `u` of each time (as the forcing since 2026-10-28, `ModelClock::nodal_drift`) instead of held at the record's middle, for records of months (K1's `u` moves 1.5° over half a year).
 - [ ] **P3.1** On hold: η-based limiting; revisit only if a real run shows oscillations.
 
 ## Salmon farm and cage drag (F.1) — [notes/farm.md](notes/farm.md)
@@ -217,11 +214,11 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.5 / P4.2** A point-implicit nesting relaxation band, 2D and 3D, so FRS-like τ ≈ Δt works (explicit today: τ 30 min against 0.25–10 s steps).
 - [ ] **P1.5 / P4.2** Read parent snapshots lazily around the current time, 2D (`OceanModelReader`) and 3D (`from_file_with_profiles`, 46 MB per field for 3 days), for months of forcing or OPeNDAP.
 - [ ] **P1.5** Correct NorKyst's own M2/S2 (0.3–1 cm, 10–20 min lag) in the corrected atlas from another reference (gauges along the boundary, TPXO/FES).
-- [ ] **P1.5** `OceanModelState::with_tidal_correction` takes its nodal f/u at half the run's length, so the correction depends on `hours=` (a resume to 71.99 h of a 72 h run differs by 0.01 m/s in the progress lines; F.1's branch runs to t0 + 6 h are 0.05–0.1 % of the RMS velocity off the 18 h open run after 1 h, byte-identical with `hours=18`): nodal factors at each snapshot's time, or a fixed reference time.
 - [ ] **P1.4** Velocity from z-levels stops at 300 m: extend to full depth.
 - [ ] **P1.4** Measure `io::depth_average_z`'s error (z-levels, 300 m cap) against the NorKyst v3 hindcast's `ubar_eastward`/`vbar_northward` (`romshindcast/norkyst_v3/norkyst_v3_sdepth_aggr.ncml`, hourly 2012-01 to 2025-08) at the Frøya boundary cells (`notes/norkyst-issues.md` §7).
 - [ ] **P1.5** `NestingRelaxation2D` relaxes the level at every band node ≥ 5 cm deep, puddles cut off by land included (Mausund element 58: a 5 cm puddle filled at 3e-7 m per step towards NorKyst's level): relax only water connected to the open faces, or momentum only in shore elements.
 - [ ] **P1.5** A depth range in `norkyst-client`'s grid mode (`depth = "0:1:0"` today) as a second source of 3D profiles.
+- [ ] **P1.5** Low priority: a quadratic term in `NodalDrift` for runs of months to a year (the linear drift about the epoch is 0.12° of M2's and 0.5° of K1's phase off after a year, 0.004° after a month); `notes/boundaries-nesting.md` 2026-10-28.
 
 ## Inputs and forcing (P1.6) — [notes/inputs-forcing.md](notes/inputs-forcing.md)
 
@@ -393,6 +390,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P6** `Hydrostatic3D`'s configuration is 20 public fields and 23 consuming `with_*` builders, so it can change between steps while caches assume it fixed (the kept advection of `G` since 2026-10-16, keyed on the state only): make it private once built, or invalidate the caches on change.
 - [ ] **P6** One test-support constructor for a distorted quadrilateral mesh: eight test modules have their own `distorted_mesh` (`operators/geometric.rs`, `bathymetry_2d.rs`, `point_locator.rs`, `particles/walk.rs`, `solver/probe.rs`, `tests/cage_drag_test.rs`, `tests/curvilinear_3d_test.rs`, `tests/particle_tracking_test.rs`), and `transport_3d.rs`'s kernel gate a ninth inline.
 - [ ] **P6** The coastline-day bench as a script (`scripts/`): alternating A/B pairs from the 6 h restart with `DG_PROFILE=1`, and the byte comparison of two runs' restart files for bit-for-bit claims; each perf pass rebuilds it in a scratchpad.
+- [ ] **P6** `TidalConstituent::with_nodal_correction` and `tides::correct_amplitude_phase` bake a correction held constant into a constituent (tests and the `tides` docs only): delete them, or build on `NodalDrift`, so no forcing path freezes `f`, `u` again (P1.5, 2026-10-28).
 
 ## Future (P7) — [notes/operational.md](notes/operational.md)
 
