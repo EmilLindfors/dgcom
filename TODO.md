@@ -372,10 +372,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 - [ ] **P5.1** Delete the superseded `Discharge2D`/`ConstantDischarge2D` (and the `River` tag's boundary dispatch) with P6.
 - [ ] **P5.1** River mouths from NVE's river network: NorKyst's are its 800 m coastline faces, snapped 1.6–1.9 km onto the Frøya coastline mesh.
-- [ ] **P5.3** Refuse a restart resumed with different physics options (compare them, or a configuration hash).
-- [ ] **P5.3** Numbered restart copies (`restart_keep=`) or per-time names, for spin-up branching.
+- [ ] **P5.3** Refuse a restart resumed with different physics options (compare them, or a configuration hash), except those a branch run changes (`site=` cages in 2D).
 - [ ] **P5.2** A ROMS variable-name mapping for `NetCDFWriter` (CF-1.8 today).
-- [ ] **P5.3** 2D restarts (`Simulation`, `SWESolution2D`, the multirate stepper's state).
 - [ ] **P5.3** A NetCDF export of restarts (`ocean_rst.nc`) once P5.2's conventions are settled.
 - [ ] **P5.4** The operational pipeline: run scripts, monitoring/alerting, THREDDS/OPeNDAP serving.
 

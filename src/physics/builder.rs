@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::equations::ShallowWater2D;
 use crate::flux::StandardFlux2D;
+use crate::io::{DriverData, Restart2D, RestartError, domain_fingerprint_2d};
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::disjoint::DisjointChunks;
@@ -183,6 +184,51 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     /// the time step or the flux broke the positivity guarantee.
     pub fn negative_depth_clips(&self) -> usize {
         self.negative_depth_clips.load(Ordering::Relaxed)
+    }
+
+    /// [`domain_fingerprint_2d`] of this module's mesh and bed (a flat bed
+    /// without bathymetry).
+    pub fn domain_fingerprint(&self) -> u64 {
+        let bed = self.bathymetry.as_ref().map_or(&[][..], |b| &b.data[..]);
+        domain_fingerprint_2d(&self.mesh, bed)
+    }
+
+    /// The run's state `state` at time `t` between two steps, to save with
+    /// [`Restart2D::write`]. A 2D run carries nothing else from one step to
+    /// the next: local time stepping assigns its levels from the state every
+    /// step, and this module's caches are recomputed from it.
+    pub fn restart(&self, state: &SWESolution2D, t: f64) -> Restart2D {
+        Restart2D {
+            time: t,
+            domain: self.domain_fingerprint(),
+            state: state.clone(),
+            driver: DriverData::default(),
+        }
+    }
+
+    /// Check that `restart` is of this module's domain (its mesh and bed), so
+    /// that a run can continue from [`Restart2D::time`] with
+    /// [`Restart2D::state`]. The rest of the physics (forcing, boundaries,
+    /// friction, viscosity, cages) is not in the file: the run continues
+    /// under this module's, which is how a branch run adds cages to a spun-up
+    /// open run.
+    pub fn check_restart(&self, restart: &Restart2D) -> Result<(), RestartError> {
+        let s = &restart.state;
+        let expected = (self.mesh.n_elements, self.ops.n_nodes);
+        if (s.n_elements, s.n_nodes) != expected {
+            return Err(RestartError::Domain(format!(
+                "{} elements × {} nodes, this run has {} × {}",
+                s.n_elements, s.n_nodes, expected.0, expected.1
+            )));
+        }
+        let domain = self.domain_fingerprint();
+        if restart.domain != domain {
+            return Err(RestartError::Domain(format!(
+                "its mesh or bed differ (fingerprint {:016x}, this run {domain:016x})",
+                restart.domain
+            )));
+        }
+        Ok(())
     }
 
     /// The wet/dry correction applies the same positivity limiter to every

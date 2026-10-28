@@ -902,6 +902,118 @@ mod tests {
         assert_eq!(coupled.hv_data(), single.hv_data());
     }
 
+    /// A 2D beach (bed −8 → +1.5 m) sloshing up and down its shore under
+    /// `WetDry`, with Coriolis and Smagorinsky's viscosity over a background:
+    /// the step follows the depth, the dry nodes and the strain. `bed_shift`
+    /// moves the bed (m).
+    type Beach = crate::physics::SWEPhysics2D<Reflective2D>;
+    type BeachCallback<'a> = &'a mut dyn FnMut(&Beach, &SWESolution2D, f64);
+
+    fn beach(bed_shift: f64) -> (Beach, SWESolution2D) {
+        use crate::mesh::Bathymetry2D;
+        use crate::solver::SWEFormulation2D;
+        use crate::source::{CoriolisSource2D, HorizontalViscosity2D};
+        let length = 600.0;
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 150.0, 8, 2));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            -8.0 + 9.5 * x / length + 0.4 * y / 150.0 + bed_shift
+        }));
+        let physics = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            ShallowWater2D::new(9.81),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::WetDry)
+        .with_wet_dry_correction(true)
+        .with_source(CoriolisSource2D::f_plane(1.2e-4))
+        .with_viscosity(HorizontalViscosity2D::smagorinsky(0.1).with_background(0.05))
+        .build();
+        let mut state = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for ki in 0..mesh.n_elements {
+            for i in 0..ops.n_nodes {
+                let [x, _] = mesh.reference_to_physical(k(ki), ops.nodes_r[i], ops.nodes_s[i]);
+                let idx = ki * ops.n_nodes + i;
+                let eta = 0.3 * (std::f64::consts::PI * x / length).cos();
+                let h = (eta - bathymetry.data[idx]).max(0.0);
+                state.set_state(k(ki), i, crate::solver::SWEState2D::new(h, 0.0, 0.0));
+            }
+        }
+        (physics, state)
+    }
+
+    /// TODO P5.3 gate: a 2D run restarted halfway, from a file, in a new
+    /// simulation, ends bit for bit where the uninterrupted run does, with
+    /// global steps and with local time stepping. A restart of another bed is
+    /// refused.
+    #[test]
+    fn a_restarted_2d_run_ends_bit_for_bit_where_the_uninterrupted_run_does() {
+        use crate::io::{Restart2D, RestartError};
+        use crate::time::MultirateSSPRK3;
+        let (interval, t_end) = (20.0, 300.0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("beach.restart");
+        fn run<I: TimeIntegrator<SWESolution2D>>(
+            integrator: I,
+            state: &mut SWESolution2D,
+            t_start: f64,
+            t_end: f64,
+            callback: BeachCallback,
+        ) -> SimulationResult {
+            let (physics, _) = beach(0.0);
+            let sim = Simulation::new(physics, integrator)
+                .with_cfl(0.5)
+                .with_callback_interval(20.0);
+            sim.run_with_callback(state, t_start, t_end, |s, t| callback(sim.physics(), s, t))
+        }
+        for local in [false, true] {
+            let integrate = |state: &mut SWESolution2D, t0, callback: BeachCallback| match local {
+                false => run(SSPRK3, state, t0, t_end, callback),
+                true => run(MultirateSSPRK3::new(3), state, t0, t_end, callback),
+            };
+            let (_, mut uninterrupted) = beach(0.0);
+            let mut checkpoint = None;
+            let result = integrate(&mut uninterrupted, 0.0, &mut |physics, s, t| {
+                if (t - 7.0 * interval).abs() < 1e-9 {
+                    checkpoint = Some(physics.restart(s, t));
+                }
+            });
+            assert!(result.success, "{:?}", result.error);
+            if local {
+                let stats = result.local_time_stepping.expect("local time stepping");
+                assert!(stats.finest_level > 0, "every element on one level");
+            }
+            let checkpoint = checkpoint.expect("a callback at 140 s");
+            assert!(
+                checkpoint.state.h_data().contains(&0.0),
+                "the beach has dry nodes"
+            );
+            checkpoint.write(&path).unwrap();
+
+            let restart = Restart2D::read(&path).unwrap();
+            let (physics, _) = beach(0.0);
+            physics.check_restart(&restart).unwrap();
+            let mut resumed = restart.state.clone();
+            let resumed_result = integrate(&mut resumed, restart.time, &mut |_, _, _| {});
+            assert!(resumed_result.success, "{:?}", resumed_result.error);
+            assert_eq!(resumed_result.final_time, t_end);
+            for (j, (a, b)) in uninterrupted.data.iter().zip(&resumed.data).enumerate() {
+                let differ = a.iter().zip(b).filter(|(p, q)| p.to_bits() != q.to_bits());
+                assert_eq!(differ.count(), 0, "local {local}: variable {j} differs");
+            }
+
+            let (shifted, _) = beach(1e-9);
+            assert!(matches!(
+                shifted.check_restart(&restart),
+                Err(RestartError::Domain(_))
+            ));
+        }
+    }
+
     #[test]
     #[should_panic(expected = "must divide the coupling interval")]
     fn a_coupling_interval_is_a_multiple_of_the_callback_interval() {
