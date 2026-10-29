@@ -111,7 +111,7 @@
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [wave_stations=NAME:LON,LAT;…] \
 //!     [levels=0] [tide3d=0] [rk_3d=43|3] [cfl_3d=4|2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] \
-//!     [restart_hours=0] [restart_keep=0] [resume=<file>] [rivers=<file>] [river_snap_km=2] [river_profile=tapered:3] \
+//!     [restart_hours=0] [restart_keep=0] [resume=<file>] [resume_changes=] [rivers=<file>] [river_snap_km=2] [river_profile=tapered:3] \
 //!     [nu=0] [cs=0] [site=<file> …]
 //! ```
 //!
@@ -307,6 +307,16 @@
 //! of each time, not of the run's length). `restart_keep=1` keeps every restart, as
 //! `<output>/<domain>_<hours>h.restart`, for branching from a spun-up state.
 //!
+//! A resume needs the restarted run's options, compared with the command
+//! line the restart records: those that change the physics (mixing, wind,
+//! nesting, viscosity, bed, …) must be given as that run gave them, or the
+//! resume is refused, naming them; `resume_changes=a,b` lets a resume change
+//! those on purpose. The rest may differ: when it stops and what it writes
+//! (`hours=`, `output=`, `*_minutes=`, `restart_*=`), the time stepping
+//! (`rk*=`, `cfl*=`, `lts=`, `bt_levels=`, `dt_3d=`), `debug_3d=`, and the
+//! farm a 2D branch adds (`RESUME_MAY_CHANGE`, `FarmOptions::KEYS`). An option
+//! left out counts as changed even if the run gave it at its default.
+//!
 //! `levels=N` (N > 0) times `steps_3d=` (10) mode-split steps of the 3D model
 //! on the domain instead of the tidal run: N surface-stretched σ-levels, GLS
 //! k-ε, log-layer bottom drag, Smagorinsky viscosity, the Kuzmin limiter, a
@@ -441,11 +451,11 @@
 //! every H model hours (`restart_keep=1`: every one, as
 //! `<output>/<domain>_<hours>h.restart`), with the state, the station
 //! records and the output counters. `resume=<file>` checks the domain's
-//! fingerprint (mesh and bed) and continues from the file's time: the
-//! snapshot file and the stations as in 3D, the VTU frames numbered on, and
-//! the NetCDF output in a new `froya_from_<hours>h.nc` beside the stopped
-//! run's. The waves' spectra are not kept (no `wave_coupling=`). The physics
-//! is the command line's, so a farm run can branch from an open run's state:
+//! fingerprint (mesh and bed) and the options (as in 3D) and continues from
+//! the file's time: the snapshot file and the stations as in 3D, the VTU
+//! frames numbered on, and the NetCDF output in a new
+//! `froya_from_<hours>h.nc` beside the stopped run's. The waves' spectra are not kept (no `wave_coupling=`). The farm's
+//! options may be added, so a farm run can branch from an open run's state:
 //! `resume=<open>/froya_012.00h.restart site=… spinup_hours=12 hours=18`
 //! starts the open, control and caged runs from the same state at 12 h and
 //! compares them over 12–18 h, before the eddying lee lets them diverge (the
@@ -816,6 +826,9 @@ struct Options {
     restart_keep: bool,
     /// Resume the tide from this restart file (`resume=`)
     resume: Option<PathBuf>,
+    /// The options this resume changes on purpose (`resume_changes=a,b`),
+    /// beyond those a resume may change anyway (`RESUME_MAY_CHANGE`)
+    resume_changes: Vec<String>,
     /// Rivers of the 3D tide (`rivers=<file>`, from `norkyst_river_subset`),
     /// snapped onto the mesh from up to `river_snap_km` away, entering over
     /// `river_profile=` (`tapered:3`, `top:D`, `fraction:F`)
@@ -935,6 +948,13 @@ impl Options {
             restart_hours: get("restart_hours", 0.0)?,
             restart_keep: get("restart_keep", 0.0)? != 0.0,
             resume: args.get("resume").map(PathBuf::from),
+            resume_changes: args
+                .get("resume_changes")
+                .map_or("", String::as_str)
+                .split(',')
+                .filter(|k| !k.is_empty())
+                .map(String::from)
+                .collect(),
             rivers: args.get("rivers").map(PathBuf::from),
             river_snap_km: get("river_snap_km", 2.0)?,
             river_profile: {
@@ -1322,6 +1342,76 @@ fn restore_stations(stations: &mut [Station], driver: &DriverData) -> Result<(),
         return Err("the restart has more stations than this run".into());
     }
     Ok(())
+}
+
+/// The options a resumed run may give otherwise than the run that wrote the
+/// restart: what it writes and when it stops, the time stepping (the 3D
+/// benches resume one restart at other schemes and CFL numbers), the debug
+/// flags (`debug_3d=`), and, with [`FarmOptions::KEYS`], the farm a branch
+/// run adds to an open run's state (TODO F.1).
+const RESUME_MAY_CHANGE: &[&str] = &[
+    "hours",
+    "resume",
+    "resume_changes",
+    "restart_hours",
+    "restart_keep",
+    "output",
+    "output_minutes",
+    "snapshot_minutes",
+    "station_minutes",
+    "currents",
+    "spinup_hours",
+    "profile",
+    "rest_hours",
+    "steps_3d",
+    "cfl",
+    "cfl_3d",
+    "cfl_bt",
+    "rk",
+    "rk_3d",
+    "rk_bt",
+    "lts",
+    "bt_levels",
+    "dt_3d",
+    "debug_3d",
+];
+
+/// Refuse a restart written by a run with other options than this one's,
+/// beyond [`RESUME_MAY_CHANGE`], the farm's and `resume_changes=`. The
+/// physics is built from this command line, so another mixing, wind, bed or
+/// nesting would otherwise run on from the restart's state unnoticed. The
+/// options are compared as given: one left out against one given at its
+/// default counts as a change.
+fn check_resumed_options(opts: &Options, driver: &DriverData) -> Result<(), String> {
+    let command = driver
+        .metadata("command")
+        .ok_or("the restart does not record its run's command line")?;
+    let earlier = Arguments::new(command.split_whitespace().map(String::from));
+    let changed: Vec<String> = Arguments::from_env()
+        .changed_from(&earlier)
+        .into_iter()
+        .filter(|(key, ..)| {
+            !RESUME_MAY_CHANGE.contains(key)
+                && !FarmOptions::KEYS.contains(key)
+                && !opts.resume_changes.iter().any(|k| k == key)
+        })
+        .map(|(key, was, now)| {
+            let given = |v: Option<&str>| match v {
+                None => "not given".to_string(),
+                Some("") => key.to_string(),
+                Some(v) => format!("{key}={v}"),
+            };
+            format!("{} → {}", given(was), given(now))
+        })
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the restart's run had other options: {}. Give them as it did, or \
+         name those this run changes on purpose in resume_changes=",
+        changed.join(", ")
+    ))
 }
 
 /// When and where a run writes its restarts (`restart_hours=`,
@@ -2507,6 +2597,7 @@ fn tidal_run<'a>(
                 restart.time / 3600.0,
                 restart.driver.metadata("command").unwrap_or("?")
             );
+            check_resumed_options(opts, &restart.driver)?;
             restore_stations(&mut stations, &restart.driver)?;
             Some(restart)
         }
@@ -4190,6 +4281,7 @@ fn tidal_run_3d(
                 restart.time / 3600.0,
                 restart.driver.metadata("command").unwrap_or("?")
             );
+            check_resumed_options(opts, &restart.driver)?;
             restore_stations(&mut stations, &restart.driver)?;
             Some(restart)
         }

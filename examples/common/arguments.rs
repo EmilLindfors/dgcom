@@ -3,6 +3,9 @@
 //! binary built before it existed does not know (a farm sweep with `site=`
 //! once ran as plain tides that way, `notes/tech-debt.md` P6).
 
+// Shared by several examples, each using a part
+#![allow(dead_code)]
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -60,6 +63,29 @@ impl Arguments {
             unread.join(", ")
         ))
     }
+
+    /// The options given otherwise here than in `earlier`, by key: each
+    /// with its value there and here (`None`: not given).
+    pub fn changed_from<'a>(
+        &'a self,
+        earlier: &'a Arguments,
+    ) -> Vec<(&'a str, Option<&'a str>, Option<&'a str>)> {
+        let mut keys: Vec<&str> = self
+            .values
+            .keys()
+            .chain(earlier.values.keys())
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.into_iter()
+            .map(|k| {
+                let value = |args: &'a Arguments| args.values.get(k).map(String::as_str);
+                (k, value(earlier), value(self))
+            })
+            .filter(|(_, was, now)| was != now)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -85,5 +111,19 @@ mod tests {
         args.get("nx");
         let error = args.refuse_unread().unwrap_err();
         assert!(error.contains("flag, nu, site"), "{error}");
+    }
+
+    #[test]
+    fn changes_are_the_keys_given_otherwise() {
+        let earlier = arguments(&["levels=20", "mixing=k-omega", "wind", "nu=1"]);
+        let now = arguments(&["levels=20", "mixing=k-epsilon", "cs=0.1", "nu=1"]);
+        assert_eq!(
+            now.changed_from(&earlier),
+            [
+                ("cs", None, Some("0.1")),
+                ("mixing", Some("k-omega"), Some("k-epsilon")),
+                ("wind", Some(""), None),
+            ]
+        );
     }
 }
