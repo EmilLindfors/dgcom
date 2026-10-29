@@ -6,7 +6,8 @@
 //! ```
 //!
 //! with reference constants `Aᵢ` and `φᵢ = −Gᵢ` (Greenwich phase lag), the
-//! nodal corrections `fᵢ`, `(V₀ + u)ᵢ` of a [`ModelClock`] (identity until
+//! nodal corrections `fᵢ(t)`, `(V₀ + u(t))ᵢ` of a [`ModelClock`] (`f`, `u`
+//! drifting with `t`, [`NodalDrift`]; identity until
 //! [`HarmonicTide::with_nodal_corrections`] sets them) and a smooth start-up
 //! ramp `R(t)`. The corrections are stored apart from the constants, so setting
 //! them again replaces them instead of applying them twice.
@@ -15,7 +16,7 @@ use super::BCContext2D;
 use super::TidalConstituent;
 use super::characteristic::{ExternalState, ExternalStateProvider};
 use crate::io::ConstituentData;
-use crate::tides::{NodalCorrection, canonical_name};
+use crate::tides::{NodalDrift, canonical_name};
 use crate::time::ModelClock;
 
 /// Smooth ramp `R(t)` from 0 at `t ≤ 0` to 1 at `t ≥ duration`
@@ -38,13 +39,13 @@ pub struct HarmonicTide {
     /// Ramp-up duration (s), `None` for none.
     pub ramp_duration: Option<f64>,
     constituents: Vec<TidalConstituent>,
-    corrections: Vec<NodalCorrection>,
+    corrections: Vec<NodalDrift>,
 }
 
 impl HarmonicTide {
     /// A tide from reference constants (internal phase `φ = −G`).
     pub fn new(constituents: Vec<TidalConstituent>) -> Self {
-        let corrections = vec![NodalCorrection::IDENTITY; constituents.len()];
+        let corrections = vec![NodalDrift::IDENTITY; constituents.len()];
         Self {
             mean_elevation: 0.0,
             ramp_duration: None,
@@ -92,17 +93,14 @@ impl HarmonicTide {
     }
 
     /// Nodal corrections for a run on `clock`: `V₀` at t = 0, `f` and `u` at
-    /// `t_mid` (the middle of the run). Replaces any earlier corrections;
-    /// constituents without tabulated corrections keep the identity.
-    pub fn with_nodal_corrections(mut self, clock: &ModelClock, t_mid: f64) -> Self {
+    /// each time ([`ModelClock::nodal_drift`]). Replaces any earlier
+    /// corrections; constituents without tabulated corrections keep the
+    /// identity.
+    pub fn with_nodal_corrections(mut self, clock: &ModelClock) -> Self {
         self.corrections = self
             .constituents
             .iter()
-            .map(|c| {
-                clock
-                    .nodal_correction(c.name, t_mid)
-                    .unwrap_or(NodalCorrection::IDENTITY)
-            })
+            .map(|c| clock.nodal_drift(c.name).unwrap_or(NodalDrift::IDENTITY))
             .collect();
         self
     }
@@ -113,7 +111,7 @@ impl HarmonicTide {
     }
 
     /// Nodal corrections, one per constituent.
-    pub fn corrections(&self) -> &[NodalCorrection] {
+    pub fn corrections(&self) -> &[NodalDrift] {
         &self.corrections
     }
 
@@ -128,7 +126,8 @@ impl HarmonicTide {
             .constituents
             .iter()
             .zip(&self.corrections)
-            .map(|(c, n)| {
+            .map(|(c, drift)| {
+                let n = drift.at(t);
                 n.f * c.amplitude
                     * (c.angular_frequency() * t + c.phase + n.phase_offset_rad()).cos()
             })
@@ -171,14 +170,35 @@ mod tests {
     #[test]
     fn nodal_corrections_are_not_applied_twice() {
         let clock = ModelClock::at_datetime(2025, 6, 1, 0, 0);
-        let once = HarmonicTide::m2(0.5, 0.3).with_nodal_corrections(&clock, 86_400.0);
-        let twice = once.clone().with_nodal_corrections(&clock, 86_400.0);
+        let once = HarmonicTide::m2(0.5, 0.3).with_nodal_corrections(&clock);
+        let twice = once.clone().with_nodal_corrections(&clock);
         for t in [0.0, 1234.5, 40_000.0] {
             assert_eq!(once.elevation(t), twice.elevation(t));
         }
-        let n = clock.nodal_correction("M2", 86_400.0).unwrap();
+        let n = clock.nodal_correction("M2", 0.0).unwrap();
         let expected = n.f * 0.5 * (0.3 + n.phase_offset_rad()).cos();
         assert!((once.elevation(0.0) - expected).abs() < 1e-12);
+    }
+
+    /// The nodal terms are those of the time the tide is evaluated at, not
+    /// of a run's middle (TODO P1.5: a run resumed to another end was forced
+    /// differently): ten days in, K1 is `f`, `u` at ten days.
+    #[test]
+    fn nodal_corrections_follow_the_time() {
+        let clock = ModelClock::at_datetime(2025, 6, 15, 0, 0);
+        let k1 = TidalConstituent::new(
+            "K1",
+            0.1,
+            crate::tides::constituent_period("K1").unwrap(),
+            0.0,
+        );
+        let tide = HarmonicTide::new(vec![k1.clone()]).with_nodal_corrections(&clock);
+        for t in [0.0, 10.0 * 86_400.0 + 1234.5] {
+            let n = clock.nodal_correction("K1", t).unwrap();
+            let expected = n.f * 0.1 * (k1.angular_frequency() * t + n.phase_offset_rad()).cos();
+            // The linear drift is 6e-7 m off; held at the epoch, 1.4e-4 m
+            assert!((tide.elevation(t) - expected).abs() < 1e-5, "{t}");
+        }
     }
 
     #[test]

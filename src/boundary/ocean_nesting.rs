@@ -546,25 +546,18 @@ impl OceanModelState {
     /// corrected too, so the relaxation does not pull the tide back.
     ///
     /// The correction is interpolated like boundary tides
-    /// ([`TidalAtlas::tides_at`]), with the nodal `f`, `u` at the middle of
-    /// a run of `duration` on this state's clock; every node must lie within
+    /// ([`TidalAtlas::tides_at`]), with the nodal `f`, `u` at each
+    /// snapshot's time on this state's clock; every node must lie within
     /// `coverage_radius` (m) of a point of `correction`.
     pub fn with_tidal_correction<P: CoordinateProjection>(
         self,
         correction: &TidalAtlas,
         projection: &P,
-        duration: f64,
         coverage_radius: f64,
     ) -> Result<Self, TidalAtlasError> {
         let inner = &self.inner;
         let positions: Vec<(f64, f64)> = inner.nodes.iter().map(|n| n.position).collect();
-        let tides = correction.tides_at(
-            &positions,
-            projection,
-            &inner.clock,
-            duration,
-            coverage_radius,
-        )?;
+        let tides = correction.tides_at(&positions, projection, &inner.clock, coverage_radius)?;
         let n_times = inner.reader.n_times();
         let mut series = inner.series.clone();
         for (slot, node_series) in series.chunks_exact_mut(3 * n_times).enumerate() {
@@ -929,15 +922,14 @@ mod tests {
             "{lon} {lat} 50.0 M2 0.25 40.0 0.05 130.0 0.02 300.0\n"
         ))
         .unwrap();
-        let duration = 7200.0;
         let corrected = parent
             .clone()
-            .with_tidal_correction(&correction, &projection, duration, 1e5)
+            .with_tidal_correction(&correction, &projection, 1e5)
             .unwrap();
         let clock = ModelClock::new(T0);
-        let n = clock.nodal_correction("M2", 0.5 * duration).unwrap();
         let omega = 2.0 * PI / crate::tides::constituent_period("M2").unwrap();
         let tide = |amp: f64, lag: f64, t: f64| {
+            let n = clock.nodal_correction("M2", t).unwrap();
             n.f * amp * (omega * t + n.phase_offset_rad() - lag.to_radians()).cos()
         };
         // The mesh is centred on the projection origin: east is x there
@@ -972,7 +964,7 @@ mod tests {
         // Not covered: an error, not a silent zero
         assert!(
             parent
-                .with_tidal_correction(&correction, &projection, duration, 10.0)
+                .with_tidal_correction(&correction, &projection, 10.0)
                 .is_err()
         );
     }

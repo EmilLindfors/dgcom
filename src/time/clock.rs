@@ -4,7 +4,7 @@
 //! time converts through one [`ModelClock`]:
 //!
 //! - boundary forcing: tidal harmonics (equilibrium argument `V₀` at the
-//!   epoch, nodal `f`, `u` at the run midpoint) and parent-model output (CF
+//!   epoch, nodal `f`, `u` drifting with `t`) and parent-model output (CF
 //!   time in Unix seconds);
 //! - output (CF `units = "seconds since <epoch>"`);
 //! - validation against observations (Unix-time series).
@@ -19,14 +19,19 @@
 //!
 //! `V₀` must be the equilibrium argument at `t = 0` (it carries the phase of
 //! the astronomical forcing, and `ω t` advances it exactly). The nodal terms
-//! `f` and `u` change over the 18.61-year lunar node cycle and are held
-//! constant over a run, so they are best taken at the middle of the run
-//! (or of an analysed record) rather than at its start: over a year `u` for M2
-//! drifts by up to ≈ 0.7° and `f` by ≈ 1 %. [`ModelClock::nodal_correction`]
-//! does exactly that.
+//! `f` and `u` change over the 18.61-year lunar node cycle: over a year `u`
+//! for M2 drifts by up to ≈ 0.7° (K1 ≈ 3°) and `f` by ≈ 1 %.
+//!
+//! - Forcing takes them at the time it is evaluated, `f(t)`, `u(t)` linear
+//!   about the epoch ([`ModelClock::nodal_drift`], [`NodalDrift`]), so the
+//!   forcing at `t` is a function of the clock and `t` alone: a run resumed or
+//!   branched to another end is forced as the run it came from.
+//! - Harmonic analysis holds them constant over the analysed record and takes
+//!   them at its middle ([`ModelClock::nodal_correction`]), the
+//!   least-squares convention.
 
 use crate::io::datetime::{format_utc, parse_datetime_seconds};
-use crate::tides::{AstronomicalArguments, NodalCorrection, nodal_correction};
+use crate::tides::{AstronomicalArguments, NodalCorrection, NodalDrift, nodal_correction};
 
 /// Julian Date of the Unix epoch (1970-01-01 00:00:00 UTC).
 const UNIX_EPOCH_JD: f64 = 2_440_587.5;
@@ -79,10 +84,12 @@ impl ModelClock {
         AstronomicalArguments::at_julian_date(self.julian_date(t))
     }
 
-    /// Nodal correction of constituent `name` for a run starting at `t = 0`:
-    /// the equilibrium argument `V₀` at `t = 0` and the nodal factor `f` and
-    /// phase `u` at `t_mid` (the middle of the run or record). `None` for a
-    /// constituent without tabulated corrections.
+    /// Nodal correction of constituent `name` held constant over a record
+    /// starting at `t = 0`: the equilibrium argument `V₀` at `t = 0` and the
+    /// nodal factor `f` and phase `u` at `t_mid` (the middle of the record),
+    /// as harmonic analysis takes them. Forcing takes
+    /// [`nodal_drift`](Self::nodal_drift) instead. `None` for a constituent
+    /// without tabulated corrections.
     pub fn nodal_correction(&self, name: &str, t_mid: f64) -> Option<NodalCorrection> {
         let at_epoch = nodal_correction(name, &self.astronomical_arguments(0.0))?;
         let at_mid = nodal_correction(name, &self.astronomical_arguments(t_mid))?;
@@ -90,6 +97,22 @@ impl ModelClock {
             f: at_mid.f,
             u_deg: at_mid.u_deg,
             v0_deg: at_epoch.v0_deg,
+        })
+    }
+
+    /// Nodal correction of constituent `name` through a run starting at
+    /// `t = 0`: `V₀`, `f` and `u` at `t = 0`, and `f`, `u` drifting with `t`
+    /// at their rates there (central differences over ±1 day, whose error is
+    /// a relative 1e-7 of the rate). `None` for a constituent without
+    /// tabulated corrections.
+    pub fn nodal_drift(&self, name: &str) -> Option<NodalDrift> {
+        const DAY: f64 = 86_400.0;
+        let at = |t| nodal_correction(name, &self.astronomical_arguments(t));
+        let (before, at_epoch, after) = (at(-DAY)?, at(0.0)?, at(DAY)?);
+        Some(NodalDrift {
+            at_epoch,
+            f_rate: (after.f - before.f) / (2.0 * DAY),
+            u_rate_deg: (after.u_deg - before.u_deg) / (2.0 * DAY),
         })
     }
 
@@ -158,5 +181,41 @@ mod tests {
         // Half a year of the nodal cycle moves u (M2) measurably
         assert!((mid_year.u_deg - at_start.u_deg).abs() > 0.1);
         assert!(clock.nodal_correction("XX9", 0.0).is_none());
+    }
+
+    /// The drift follows `f`, `u` at `t` to second order: within the bounds
+    /// of `NodalDrift`'s docs after a month and a year (M2, K1), and better
+    /// than `f`, `u` held at the middle of the year, while `V₀` stays at
+    /// the epoch.
+    #[test]
+    fn nodal_drift_follows_f_and_u_through_the_run() {
+        let clock = ModelClock::at_datetime(2025, 6, 15, 0, 0);
+        let (month, year) = (30.0 * 86_400.0, 365.25 * 86_400.0);
+        for (name, du_month, du_year, df_year) in
+            [("M2", 1e-3, 0.13, 2.5e-3), ("K1", 4e-3, 0.55, 7.5e-3)]
+        {
+            let drift = clock.nodal_drift(name).unwrap();
+            assert_eq!(drift.at(0.0), clock.nodal_correction(name, 0.0).unwrap());
+            for (t, du, df) in [(month, du_month, df_year), (year, du_year, df_year)] {
+                let exact = clock.nodal_correction(name, t).unwrap();
+                let linear = drift.at(t);
+                assert_eq!(linear.v0_deg, exact.v0_deg);
+                assert!(
+                    (linear.u_deg - exact.u_deg).abs() < du,
+                    "{name} u at {t}: {} vs {}",
+                    linear.u_deg,
+                    exact.u_deg
+                );
+                assert!((linear.f - exact.f).abs() < df, "{name} f at {t}");
+            }
+            let held = clock.nodal_correction(name, 0.5 * year).unwrap();
+            let exact = clock.nodal_correction(name, year).unwrap();
+            assert!(
+                (drift.at(year).u_deg - exact.u_deg).abs() < (held.u_deg - exact.u_deg).abs(),
+                "{name}"
+            );
+        }
+        assert_eq!(clock.nodal_drift("S2").unwrap().u_rate_deg, 0.0);
+        assert!(clock.nodal_drift("XX9").is_none());
     }
 }
