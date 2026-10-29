@@ -31,7 +31,9 @@
 //!     [nu=0] [run=both] [particles=0] [particle_seconds=60] [kh=0.1]
 //! ```
 
-use std::collections::HashMap;
+#[path = "common/arguments.rs"]
+mod arguments;
+
 use std::f64::consts::PI;
 use std::path::Path;
 use std::sync::Arc;
@@ -60,10 +62,7 @@ fn bed(x: f64, y: f64) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: HashMap<String, String> = std::env::args()
-        .skip(1)
-        .filter_map(|a| a.split_once('=').map(|(k, v)| (k.into(), v.into())))
-        .collect();
+    let args = arguments::Arguments::from_env();
     let get = |key: &str, default: f64| args.get(key).map_or(Ok(default), |v| v.parse());
     let hours: f64 = get("hours", 1.0)?;
     let order = get("order", 2.0)? as usize;
@@ -74,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let particles_per_cage = get("particles", 0.0)? as usize;
     let particle_seconds: f64 = get("particle_seconds", 60.0)?;
     let kh: f64 = get("kh", 0.1)?;
+    args.refuse_unread()?;
 
     let mesh = Arc::new(read_gmsh_mesh(Path::new("tests/data/gmsh/fjord_farm.msh"))?);
     let ops = Arc::new(DGOperators2D::new(order));

@@ -101,7 +101,9 @@
 //! beside it (`<file>.dgpart`, `io::ParticleFileWriter`), which the viewer
 //! replays: `cd viz && cargo run --release -- --replay <file.dgsnap>`.
 
-use std::collections::HashMap;
+#[path = "common/arguments.rs"]
+mod arguments;
+
 use std::f64::consts::PI;
 use std::sync::Arc;
 use std::time::Instant;
@@ -200,10 +202,7 @@ impl SourceTerm2D for TidalForce {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: HashMap<String, String> = std::env::args()
-        .skip(1)
-        .filter_map(|a| a.split_once('=').map(|(k, v)| (k.into(), v.into())))
-        .collect();
+    let args = arguments::Arguments::from_env();
     let get = |key: &str, default: f64| args.get(key).map_or(Ok(default), |v| v.parse());
     let hours: f64 = get("hours", 3.0)?;
     let order = get("order", 2.0)? as usize;
@@ -277,6 +276,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `none`: no diffusivity of the tracers (a constant viscosity), so that
     // any change of RPE is the advection's
     let closure_name = args.get("closure").map_or("k-epsilon", String::as_str);
+    args.refuse_unread()?;
     let no_diffusion = closure_name == "none";
     let closure = match closure_name {
         "k-epsilon" | "none" => GlsMixing::k_epsilon(),

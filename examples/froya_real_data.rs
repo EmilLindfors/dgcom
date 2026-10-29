@@ -115,6 +115,10 @@
 //!     [nu=0] [cs=0] [site=<file> …]
 //! ```
 //!
+//! An option the run does not read is refused before setup: a misspelt key,
+//! one this binary predates, or one that needs another (the farm's without
+//! `site=`).
+//!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
 //! instead of the tidal run (`wave_grid=frequencies,directions`, refraction
 //! capped at `turning=` rad/s, or refraction and frequency shifting stepped
@@ -463,16 +467,18 @@
 //! - froya_boundary_tides.txt (tidal atlas, optional)
 //! - tide_gauges/mausund_obs.txt, froya_station_tides.txt (validation, optional)
 
+#[path = "common/arguments.rs"]
+mod arguments;
 #[path = "common/farm_site.rs"]
 mod farm_site;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use arguments::Arguments;
 use dg_rs::analysis::{
     ADCPStation, ADCPValidationResult, AnalysisError, ConstituentComparison, CurrentTimeSeries,
     EllipseFit, HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit,
@@ -856,13 +862,7 @@ impl Options {
     }
 
     fn parse() -> Result<Self, String> {
-        let args: HashMap<String, String> = std::env::args()
-            .skip(1)
-            .map(|a| match a.split_once('=') {
-                Some((k, v)) => (k.to_string(), v.to_string()),
-                None => (a, String::new()),
-            })
-            .collect();
+        let args = Arguments::from_env();
         let get = |key: &str, default: f64| -> Result<f64, String> {
             args.get(key).map_or(Ok(default), |v| {
                 v.parse().map_err(|_| format!("bad {key}={v}"))
@@ -1087,7 +1087,7 @@ impl Options {
             tide_transport: get("tide_transport", 0.0)?,
             mesh: args.get("mesh").cloned(),
             output: args.get("output").map(PathBuf::from),
-            wind: args.contains_key("wind"),
+            wind: args.get("wind").is_some(),
             start: args
                 .get("start")
                 .cloned()
@@ -1169,6 +1169,7 @@ impl Options {
             opts.cfl = linear_cfl_swe_2d(opts.order, scheme)
                 .map_or(1.0, |linear| LINEAR_CFL_SAFETY * linear);
         }
+        args.refuse_unread()?;
         Ok(opts)
     }
 }
