@@ -534,6 +534,8 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **`froya_real_data resume=` refuses a restart written with other physics options (TODO P5.3).** The physics is built from the resuming command line, so a resume with another mixing, wind, nesting or viscosity used to carry on from the restart's state without a warning. The options are now compared with the command line the restart records (its `command` metadata, so existing restarts are checked too). A change is refused, naming each option with its old and new value, unless `resume_changes=a,b` names it. These may differ: when the run stops and what it writes, the time stepping (`rk*`, `cfl*`, `lts`, `bt_levels`, `dt_3d`, as the 3D benches resume one restart at other schemes), `debug_3d=`, and the farm options a 2D branch adds (`FarmOptions::KEYS`). Checked on the Kattholmen branch runs of 2026-10-28: as run they resume, at `nu=1` instead of 0.1 they are refused. `examples/common/arguments.rs` gains `Arguments::changed_from`.
+
 - **The viewer is on Bevy 0.20.0** (from 0.20.0-rc.1; `viz/Cargo.toml`, with the lock's other semver-compatible updates). No code changes needed; tests, screenshots and frame times are as before. The terrain's `UV_0` workaround stays: the final release still reads `uv` with only the second UV set.
 
 - **`froya_real_data`'s waves take WAM's sources by default (TODO F.4):** `wave_sources=wam` (was `swan`), and with it `wave_substeps=4 wave_cfl=1.0` (was 1 and 0.5, which `wave_sources=swan` keeps). WAM's integration won the pre-registered Ålesund buoy test (`notes/waves.md`) and halves the wave step's cost.

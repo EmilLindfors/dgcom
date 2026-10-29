@@ -132,6 +132,29 @@ pub struct FarmOptions {
 }
 
 impl FarmOptions {
+    /// The keys [`FarmOptions::parse`] reads, which a branch run from an
+    /// open run's restart may add or change.
+    pub const KEYS: &[&str] = &[
+        "site",
+        "cage_spacing",
+        "cage_radius",
+        "net_depth",
+        "solidity",
+        "kh",
+        "walks",
+        "farm_runs",
+        "farm_control",
+        "farm_window",
+        "farm_grid",
+        "farm_return",
+        "particles",
+        "release",
+        "release_every",
+        "releases",
+        "particle_seconds",
+        "seeds",
+    ];
+
     /// The farm options of the command line, if it has `site=`; the first
     /// batch of particles is released at `spinup_hours` unless `release=`
     /// says otherwise.
