@@ -64,7 +64,6 @@
 //! matrix of the first walk, and `<output>/connectivity.csv` with every
 //! seed's matrix per batch.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
@@ -83,6 +82,8 @@ use dg_rs::solver::{Probe2D, SWESolution2D, WetDryConfig};
 use dg_rs::source::{CageDrag2D, CageFootprint, NetCage};
 use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
+
+use crate::arguments::Arguments;
 
 const RHO0: f64 = 1025.0;
 /// Below this speed (m/s) at the farm's centre a sample is slack water and
@@ -134,10 +135,7 @@ impl FarmOptions {
     /// The farm options of the command line, if it has `site=`; the first
     /// batch of particles is released at `spinup_hours` unless `release=`
     /// says otherwise.
-    pub fn parse(
-        args: &HashMap<String, String>,
-        spinup_hours: f64,
-    ) -> Result<Option<Self>, String> {
+    pub fn parse(args: &Arguments, spinup_hours: f64) -> Result<Option<Self>, String> {
         let Some(site) = args.get("site") else {
             return Ok(None);
         };

@@ -383,7 +383,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P6** Prune ~200 root re-exports to a `prelude`; export `Simulation3D`.
 - [ ] **P6** Feature-gate `tiff`/`shapefile`/`geo` behind `geodata`.
 - [ ] **P6** Retire the mostly dead `solver/simd/` with the `Standard` kernel (P1.2).
-- [ ] **P6** `froya_real_data` ignores unknown `key=value` options: a binary built before `site=`/`nu=` existed ran a farm sweep as plain tides (2026-10-25). Record the keys `Options::parse` reads (`args.get`, `get`, `constituents`) and reject the rest after it.
+- [ ] **P6** The other examples still ignore options they do not read: `wave_growth` (its `fetch` reads keys during the run), `norkyst_boundary_tides`, `tide_gauge_fit` and `common/dap.rs`'s `arguments()` (whose users also drop bare flags). Move them onto `common/arguments.rs` (`Arguments::refuse_unread` after the last read). Its unit tests run only with `cargo test --example <name>`, not in CI.
 - [ ] **P6** Decide crate vs repo name and a `dg-core`/`roms-rs` split.
 - [ ] **P6** Characteristic-based limiting for 2D SWE (likely subsumed by P1.2).
 - [ ] **P6** Low priority: faer 0.23 → 0.24 (setup-time solves only).
