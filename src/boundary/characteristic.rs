@@ -195,10 +195,16 @@ where
 /// inverse-barometer elevation: a [`BoundaryLevel`] such as
 /// `GriddedAtmosphere2D`, or a closure like
 /// `|x, y, t| pressure.inverse_barometer(x, y, t)`.
+///
+/// A parent that carries part of the response already takes a fraction of
+/// it ([`InverseBarometer::with_factor`]): NorKyst-800's ζ responds to
+/// pressure at ≈ −0.22 cm/hPa, a quarter of the static −0.99
+/// (`notes/norkyst-issues.md` §5).
 #[derive(Clone, Debug)]
 pub struct InverseBarometer<P, F> {
     provider: P,
     level: F,
+    factor: f64,
 }
 
 impl<P, F> InverseBarometer<P, F>
@@ -208,7 +214,17 @@ where
 {
     /// `provider`'s external state, raised by `level`.
     pub fn new(provider: P, level: F) -> Self {
-        Self { provider, level }
+        Self {
+            provider,
+            level,
+            factor: 1.0,
+        }
+    }
+
+    /// Raise by `factor` times `level` instead (1: the full response).
+    pub fn with_factor(mut self, factor: f64) -> Self {
+        self.factor = factor;
+        self
     }
 }
 
@@ -219,7 +235,7 @@ where
 {
     fn external_state(&self, ctx: &BCContext2D) -> ExternalState {
         let mut state = self.provider.external_state(ctx);
-        state.eta += self.level.level(ctx);
+        state.eta += self.factor * self.level.level(ctx);
         state
     }
 }
@@ -395,6 +411,22 @@ mod tests {
         let q = bc.state(&ctx(SWEState2D::new(40.0, 0.0, 0.0), -40.0, n));
         assert!((q.h - 40.0).abs() < 1e-12);
         assert_eq!((q.hu, q.hv), (0.0, 0.0));
+    }
+
+    /// The inverse barometer raises the provider's level by its level,
+    /// scaled by the factor (a parent carrying part of the response).
+    #[test]
+    fn the_inverse_barometer_adds_a_fraction_of_its_level() {
+        let tide = |_: f64, _: f64, _: f64| ExternalState::new(0.5, 0.1, 0.0);
+        let low = |_: f64, _: f64, _: f64| 0.2;
+        let c = ctx(SWEState2D::new(40.0, 0.0, 0.0), -40.0, (1.0, 0.0));
+        let full = InverseBarometer::new(tide, low).external_state(&c);
+        assert!((full.eta - 0.7).abs() < 1e-12);
+        let part = InverseBarometer::new(tide, low)
+            .with_factor(0.6)
+            .external_state(&c);
+        assert!((part.eta - 0.62).abs() < 1e-12);
+        assert_eq!(part.velocity, full.velocity);
     }
 
     /// The boundary state carries the interior's outgoing and the external
