@@ -193,6 +193,28 @@ MET switched NorKyst's operational tide file on 2026-03-03 (`notes/norkyst-issue
 - **M2 at Mausund is right in 2026.** NorKyst's 30-day M2 is 1.008×, −0.1° of the gauge's (1.026× in June 2025), and the model follows NorKyst within 0.5 cm, so the `gauge_gains=M2` item applied to the 2025 parent only. The report's one-day "M2 1.033×, +11.9°" (Bodø 0.989×, +11.6°) is S2 lumped into M2: a day cannot separate them, and on 06-12 S2 is near quadrature with M2 (half-way from neaps to springs), so the lumped phase moves by ≈ 12° (in 2025, at springs, it did not).
 - **What the June fits say along the coast** (`output/norkyst_issues/fits.csv`, `*:june2026`, 17 gauges): S2 1.12–1.17× at 13 gauges, N2 0.84–0.87× at 13, M2 0.99–1.04× (Bergen 0.90, Stavanger 0.78, Tregde off), K1 1.03–1.75×. The half-year fit of 2026-04..10, which separates K2 from S2 and ν2 from N2, has S2 1.00, N2 0.99, K2 0.81 (`notes/norkyst-issues.md`, the 2026-04..10 table). So June's S2 and N2 numbers are K2's missing nodal factor and the missing minor semidiurnals (ν2, μ2, 2N2, L2) folded into a 30-day fit, and their phase against M2 turns over the spring–neap cycle. Both are known (MET's answer items 2 and 6), and both can be corrected from theory, without a gauge: K2 × f(date), and the minor semidiurnals from N2 or M2 at equilibrium ratios (TODO P1.5 / P3.1). The diurnal errors (K1 up to 1.75×, P1 and Q1 1.7×) remain; for them only P1's ratio has a theory fix.
 
+**Outcome at Bodø, 3D (2026-11-05): the model passes, and the gauge fails as in 2D.** Run `output/p34_2026-06-12/bodo_3d_raw` (`levels=20 tide3d=1`, the same build, 16 threads beside other load, 8517 s wall = 355 s per model hour against 2025's 567, 0 clips, no NaN).
+
+| Score | Mark | 3D raw, 2026-06-12 | (2025-06-15) | Verdict |
+|---|---|---|---|---|
+| 1. Bodø gauge, centred RMSE h 3–24 against the observations | ≤ 5 cm | 12.0 cm (bias +6.3, r 0.985) | 11.8 | **fail** |
+| 2. M2 current / NorKyst, beds within 20 % | 0.85–1.15 | not re-run: `scripts/norkyst_current_comparison.py` reads hourly VTUs, and the 3D run writes only its snapshot file | 0.939 | — |
+| 3. 3D / 2D M2 current, node by node (51,265 nodes ≥ 3 m) | 0.9–1.1 | 0.957 (η amplitude 1.001) | 0.963 by the same fit (0.957 as reported in 2025) | pass |
+| 4. Section T RMSE below 10 m | ≤ 0.4 °C | saltfjord 0.11, sound 0.11 | 0.17, 0.16 | pass |
+| 5. NaN; clips | none; 0 | none; 0 | none; 0 | pass |
+
+- **The gauge (score 1):** The 3D series is the 2D series within 0.2 cm centred, so it follows NorKyst as closely as the 2D run does. Its bias is 1.4 cm higher than 2D's (+6.3 against +4.9), as in 2025 (+7.3 against +4.8). The fail is the parent's tide, as in 2D.
+- **3D against 2D by our depth (score 3):** 3–20 m 0.93, 20–50 m 0.88, 50–100 m 0.96, 100–200 m 0.96, 200–600 m 1.00 (2025: 0.80, 0.79, 0.95, 0.96, 1.00). The shallow bands are closer to 2D than in 2025. The build carries the changes since 2026-10-17 and the day is a different one, and the two were not separated. Score 3 here comes from a one-off fit of a mean plus M2, K1 and M4 per node; the 2025 column gives its value on the 2025 pair, so like is compared with like.
+- **Sections (score 4):**
+  - Saltfjord mouth: T below 10 m bias −0.00, RMSE 0.11 °C; S RMSE 0.22.
+  - Skerry gap: T below 10 m bias −0.03, RMSE 0.11 °C; S RMSE 0.03.
+  - Whole-column T RMSE: 0.21 and 0.18 (2025: 0.34 and 0.31).
+  - M2 current normal to the section: 0.055 against NorKyst's 0.054 m/s at the Saltfjord mouth, 0.041 against 0.052 at the skerry gap.
+  - The surface stays cool against NorKyst: the domain-mean surface T is 11.25 against 11.46 °C at 24 h (no heat flux, P4.4).
+  - The 2025 caveat stands: started from NorKyst's T and S, a 24 h run shows that the water masses are kept, not how they evolve.
+  - Plots: `output/p34_2026-06-12/bodo_3d_raw/profiles/section_*.png`.
+- **What the re-score settles:** with raw forcing on a June 2026 day, every score that tests the model passes. The gauge fails because it scores NorKyst's tide, which the 2D run passes through within 0.7 cm and the 3D run within 0.2 cm of the 2D. The 15-day score (TODO P3.4) is the test that can separate the two.
+
 ### P3.2 Cost-vs-accuracy benchmark against ROMS
 - [ ] Pareto benchmark on the same hardware: M2/S2/K1/O1 error at tide gauges vs core-hours, ROMS 2D at 800/400/200 m vs DG P1–P4. This is what settles "faster than ROMS" (`review-2026-09-25.md` §5.5).
 
