@@ -411,13 +411,16 @@
 //!
 //! `nu=V` and `cs=C` give the 2D tide a horizontal viscosity: a constant
 //! background of V m²/s plus Smagorinsky's with coefficient C
-//! (`HorizontalViscosity2D`); none by default. A farm's wake needs one: without
+//! (`HorizontalViscosity2D`); none by default. In the 3D tide they set both
+//! the depth mean's (none by default there too) and the shear's
+//! (`Hydrostatic3D::with_horizontal_viscosity`, `with_smagorinsky_viscosity`;
+//! Smagorinsky's with C = 0.1 by default). A farm's wake needs one: without
 //! it nothing but the bed friction removes a 50–100 m eddy. At Kattholmen
 //! `cs=0.1 nu=0.1` (TODO F.1, `notes/farm.md`): ν ≥ 1 halves the farm's
 //! current, while at 0.1 the lee eddies, so the cage and open runs
 //! decorrelate and the wake needs the control run's noise floor.
 //!
-//! `site=<file>` puts a fish farm into the 2D tide (TODO F.1,
+//! `site=<file>` puts a fish farm into the 2D or the 3D tide (TODO F.1,
 //! `examples/common/farm_site.rs`): the cages of a Fiskeridirektoratet site
 //! file (`scripts/fiskeridir_site.sh`, e.g. `data/sites/14042.txt`,
 //! Kattholmen) as `CageDrag2D`, after the same tide without them (in
@@ -445,6 +448,14 @@
 //!     rest_hours=0 cs=0.1 nu=0.1 site=data/sites/14042.txt farm_control=0.1 \
 //!     particles=200 seeds=4 kh=0.1,1 particle_seconds=10 output=output/kattholmen_farm
 //! ```
+//!
+//! With `levels=N tide3d=1` the farm is in the 3D tide: the cages drag on
+//! the layers their nets reach (`Hydrostatic3D::with_cage_drag`), the wake
+//! and the residual are those of the depth mean, the drag on the farm is the
+//! layers' (`F = ρ₀ ∫ Σ_l H_l λ_l |u_l| u_l dA`), and the report adds each
+//! layer's mean speed at the cage centres with and without the cages, inside
+//! and below the nets. The particles are the 2D tide's only (`particles=`
+//! is refused). A branch run (`resume=`, below) works in 3D as in 2D.
 //!
 //! The 2D tide stops and resumes too (`Restart2D`): `restart_hours=H`
 //! writes `<output>/<domain>.restart` at the first callback at or after
@@ -571,6 +582,9 @@ const CLIFF_DEEP: f64 = 20.0;
 /// on the coastline mesh (10–18 s steps), and it bounds how far past the end
 /// the last step reads its forcing (`ModeSplitIntegrator::FORCING_REACH`)
 const MAX_DT_3D: f64 = 60.0;
+/// Smagorinsky's coefficient of the 3D shear's horizontal viscosity unless
+/// `nu=`/`cs=` set the viscosity
+const SHEAR_SMAGORINSKY: f64 = 0.1;
 /// Default level of `ponds3d=` (m above MSL): the lowest astronomical tide at
 /// Mausund (chart datum), the lowest water any run sees
 const POND_LOW_WATER: f64 = -1.43;
@@ -839,11 +853,13 @@ struct Options {
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     river_profile: dg_rs::source::RiverProfile,
     output: Option<PathBuf>,
-    /// The 2D tide's horizontal viscosity: a constant background (`nu=`,
-    /// m²/s) plus Smagorinsky's (`cs=`); none by default
+    /// The tide's horizontal viscosity: a constant background (`nu=`,
+    /// m²/s) plus Smagorinsky's (`cs=`); none by default (in 3D, of the
+    /// depth mean and the shear)
     nu: f64,
     cs: f64,
-    /// A fish farm in the 2D tide (`site=`, see `common/farm_site.rs`)
+    /// A fish farm in the 2D or the 3D tide (`site=`, see
+    /// `common/farm_site.rs`)
     farm: Option<FarmOptions>,
 }
 
@@ -2258,11 +2274,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wave_cost(wave_domain.as_ref().unwrap_or(&domain), &domain, &opts);
         return Ok(());
     }
-    if opts.farm.is_some() && opts.levels > 0 {
-        return Err("site= is for the 2D tide".into());
+    if let Some(farm) = opts.farm.as_ref().filter(|_| opts.levels > 0) {
+        if !opts.tide_3d {
+            return Err("site= in 3D is for the 3D tide (tide3d=1)".into());
+        }
+        if farm.particles() > 0 {
+            return Err("particles= is for the 2D tide's farm".into());
+        }
     }
+    // A fish farm: its cages, and the same tide without them first
+    let farm = match &opts.farm {
+        Some(farm) => {
+            let projection = domain
+                .projection
+                .ok_or("site= needs the Frøya data files")?;
+            let case = FarmCase::new(
+                farm.clone(),
+                &projection,
+                &domain.mesh,
+                &domain.ops,
+                &domain.bathymetry,
+            )?;
+            case.describe(&projection);
+            Some(case)
+        }
+        None => None,
+    };
     if opts.levels > 0 && opts.tide_3d {
-        return tidal_run_3d(&domain, &opts, parent, parent_reader);
+        let Some(case) = &farm else {
+            tidal_run_3d(&domain, &opts, parent, parent_reader, None)?;
+            return Ok(());
+        };
+        return farm_runs(case, &opts, &output_dir(&domain, &opts), |opts, run| {
+            tidal_run_3d(
+                &domain,
+                opts,
+                parent.clone(),
+                parent_reader.clone(),
+                Some((case, run)),
+            )
+        });
     }
     if (opts.restart_hours > 0.0 || opts.resume.is_some()) && opts.levels > 0 {
         return Err(
@@ -2283,37 +2334,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // A fish farm: its cages, and the same tide without them first
-    let farm = match &opts.farm {
-        Some(farm) => {
-            let projection = domain
-                .projection
-                .ok_or("site= needs the Frøya data files")?;
-            let case = FarmCase::new(
-                farm.clone(),
-                &projection,
-                &domain.mesh,
-                &domain.ops,
-                &domain.bathymetry,
-            )?;
-            case.describe(&projection);
-            Some(case)
-        }
-        None => None,
-    };
-
     lake_at_rest(&domain, opts.rest_hours);
     let waves = (opts.wave_coupling > 0.0).then(|| wave_domain.as_ref().unwrap_or(&domain));
     let Some(case) = &farm else {
         tidal_run(&domain, &opts, parent, waves, None)?;
         return Ok(());
     };
-    let output = output_dir(&domain, &opts);
-    let run_into = |dir: &str, label: &str, run: FarmRun| {
+    farm_runs(case, &opts, &output_dir(&domain, &opts), |opts, run| {
+        tidal_run(&domain, opts, parent.clone(), waves, Some((case, run)))
+    })
+}
+
+/// A farm case's runs with `run` (the 2D or the 3D tide): without the
+/// cages into `<output>/no_cages` and the control into `<output>/control`,
+/// if asked, then with the cages into `<output>`; and the farm's report.
+fn farm_runs<'a>(
+    case: &'a FarmCase,
+    opts: &Options,
+    output: &Path,
+    run: impl Fn(&Options, FarmRun) -> Result<Option<FarmRecord<'a>>, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let run_into = |dir: &str, label: &str, farm_run: FarmRun| {
         let mut sub = opts.clone();
         sub.output = Some(output.join(dir));
         println!("\nThe tide {label}...");
-        tidal_run(&domain, &sub, parent.clone(), waves, Some((case, run)))
+        run(&sub, farm_run)
     };
     let reference = if case.options().reference() {
         run_into("no_cages", "without the farm's cages", FarmRun::Open)?
@@ -2330,12 +2375,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     println!("\nThe tide with the farm's cages...");
-    let caged = tidal_run(&domain, &opts, parent, waves, Some((case, FarmRun::Cages)))?
-        .expect("a farm run records the farm");
+    let caged = run(opts, FarmRun::Cages)?.expect("a farm run records the farm");
     // The last whole M2 periods after the spin-up (and after the restart of
     // a branch run, `resume=`)
     let t_end = opts.hours * 3600.0;
     let t_start = match &opts.resume {
+        Some(path) if opts.levels > 0 => dg_rs::io::Restart3D::read(path)?.time,
         Some(path) => Restart2D::read(path)?.time,
         None => 0.0,
     };
@@ -2352,16 +2397,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &caged,
         window,
         &ModelClock::parse(&opts.start)?,
-        &output,
+        output,
     )?;
     Ok(())
 }
 
-/// Where a run writes its output (`output=`, or `output/<domain>`).
+/// Where a run writes its output (`output=`, or `output/<domain>`, in 3D
+/// `output/<domain>_3d`).
 fn output_dir(domain: &Domain, opts: &Options) -> PathBuf {
-    opts.output
-        .clone()
-        .unwrap_or_else(|| Path::new("output").join(domain.name))
+    opts.output.clone().unwrap_or_else(|| match opts.levels {
+        0 => Path::new("output").join(domain.name),
+        _ => Path::new("output").join(format!("{}_3d", domain.name)),
+    })
 }
 
 /// Walls everywhere and no forcing: the largest spurious current and surface
@@ -3880,12 +3927,16 @@ fn rivers_3d(
     }
 }
 
-fn tidal_run_3d(
-    domain: &Domain,
+/// The 3D tide; with `farm`, that run of the farm case (its cages' drag on
+/// the layers their nets reach, if any), and what the run recorded at the
+/// farm.
+fn tidal_run_3d<'a>(
+    domain: &'a Domain,
     opts: &Options,
     parent: Option<OceanModelState>,
     parent_reader: Option<Arc<OceanModelReader>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    farm: Option<(&'a FarmCase, FarmRun)>,
+) -> Result<Option<FarmRecord<'a>>, Box<dyn std::error::Error>> {
     use dg_rs::boundary::{
         ColumnContext3D, DeepReference, Nesting3D, NestingBand3D, OceanColumnsOptions,
         OceanModelColumns, ParentColumn, ParentColumns3D, ReferenceColumns,
@@ -3929,6 +3980,11 @@ fn tidal_run_3d(
     let mut builder = domain.builder_without_friction(bc);
     if let Some(band) = band.filter(|_| !rest) {
         builder = builder.with_source(band);
+    }
+    // `nu=`, `cs=`: the depth mean's viscosity (the 3D shear's below)
+    if opts.nu > 0.0 || opts.cs > 0.0 {
+        builder = builder
+            .with_viscosity(HorizontalViscosity2D::smagorinsky(opts.cs).with_background(opts.nu));
     }
     // The pressure gradient, a depth-uniform force, on the 2D module; the
     // wind stress on the columns (below)
@@ -4214,12 +4270,25 @@ fn tidal_run_3d(
     )
     .with_bottom_drag(BottomDrag3D::log_layer(0.003))
     .with_min_column_depth(opts.thin_depth())
-    .with_smagorinsky_viscosity(0.1)
+    // The shear's: Smagorinsky's with C_s = 0.1 unless `nu=`/`cs=` say
+    // otherwise (as the depth mean's)
+    .with_horizontal_viscosity(opts.nu)
+    .with_smagorinsky_viscosity(if opts.nu > 0.0 || opts.cs > 0.0 {
+        opts.cs
+    } else {
+        SHEAR_SMAGORINSKY
+    })
     .with_tracer_limiter(if dbg("nolimiter") {
         TracerLimiter3DConfig::none()
     } else {
         limiter
     });
+    if let Some(drag) = farm.and_then(|(case, run)| case.cage_drag(&domain.mesh, &domain.ops, run))
+    {
+        physics = physics.with_cage_drag(drag);
+    }
+    let mut record =
+        farm.map(|(case, run)| case.record(&domain.mesh, &domain.ops, &domain.geom, run));
     if let Some(nesting) = nesting.filter(|_| !rest) {
         physics = physics.with_nesting(nesting);
     }
@@ -4250,10 +4319,7 @@ fn tidal_run_3d(
         eos.compute_density(t, s, z)
     });
 
-    let output_dir = opts
-        .output
-        .clone()
-        .unwrap_or_else(|| Path::new("output").join(format!("{}_3d", domain.name)));
+    let output_dir = output_dir(domain, opts);
     fs::create_dir_all(&output_dir)?;
     write_clock(&output_dir, &clock)?;
     println!(
@@ -4287,9 +4353,27 @@ fn tidal_run_3d(
         }
         None => None,
     };
+    if opts.nu > 0.0 || opts.cs > 0.0 {
+        println!(
+            "  Horizontal viscosity of the depth mean and the shear: {} m²/s plus Smagorinsky's \
+             with C_s = {}",
+            opts.nu, opts.cs
+        );
+    }
+    if let Some((_, run)) = farm {
+        println!(
+            "  Farm: {}, sampled every {} min",
+            match run {
+                FarmRun::Open => "no cages",
+                FarmRun::Control => "control",
+                FarmRun::Cages => "cages",
+            },
+            opts.station_minutes
+        );
+    }
     let t_start = restart.as_ref().map_or(0.0, |r| r.time);
     let snapshot_minutes = (opts.snapshot_minutes > 0.0).then_some(opts.snapshot_minutes);
-    let base_minutes = if stations.is_empty() {
+    let base_minutes = if stations.is_empty() && record.is_none() {
         opts.output_minutes
             .min(snapshot_minutes.unwrap_or(f64::INFINITY))
     } else {
@@ -4362,6 +4446,7 @@ fn tidal_run_3d(
     };
     let mut n_callbacks = n_callbacks_done;
     let mut write_error = None;
+    let mut at_restart = t_start > 0.0;
     let start = Instant::now();
     // Called every step: the steps between the samples, and their range
     let (mut last_t, mut next_sample) = (f64::NAN, next_sample_at);
@@ -4372,6 +4457,7 @@ fn tidal_run_3d(
     // each multiple (`resume=` continues from it)
     let mut restarts = RestartSchedule::new(&output_dir, domain, opts, t_start);
     let command = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let land_on_samples = record.is_some();
     let callback =
         |s: &Solution3D,
          t: f64,
@@ -4398,6 +4484,15 @@ fn tidal_run_3d(
                 }
             }
             last_t = t;
+            // A resumed run's first callback is at the restart's time, which
+            // the stopped run sampled; only the farm (not in the restart)
+            // records from it
+            if std::mem::take(&mut at_restart)
+                && let Some(record) = record.as_mut()
+            {
+                barotropic(s, &mut q);
+                record.sample_3d(&q, s, &sigma, bed, t);
+            }
             if t < next_sample - 1e-6 {
                 return;
             }
@@ -4405,6 +4500,9 @@ fn tidal_run_3d(
                 next_sample += interval;
             }
             barotropic(s, &mut q);
+            if let Some(record) = record.as_mut() {
+                record.sample_3d(&q, s, &sigma, bed, t);
+            }
             for station in &mut stations {
                 station.sample(&q, &domain.bathymetry, clock.unix(t));
             }
@@ -4594,8 +4692,12 @@ fn tidal_run_3d(
         .with_cfl(opts.cfl_3d)
         .with_dt_max(opts.dt_3d.unwrap_or(MAX_DT_3D));
     // The snapshots at their times exactly, so that runs with different
-    // steps compare frame by frame (`snapshot_compare_3d`)
-    if let Some(every) = snapshot_every {
+    // steps compare frame by frame (`snapshot_compare_3d`), and a farm's
+    // samples (its runs compare sample by sample, and their steps differ
+    // once the cages slow the flow)
+    if land_on_samples {
+        sim = sim.with_landing_interval(interval);
+    } else if let Some(every) = snapshot_every {
         sim = sim.with_landing_interval(every as f64 * interval);
     }
     if let Some(restart) = restart {
@@ -4643,7 +4745,7 @@ Phase profile:
     if let Some(e) = result.error {
         return Err(e.into());
     }
-    Ok(())
+    Ok(record)
 }
 
 /// Wall time of each phase of an SSP-RK3 step (`profile=N`): after 15 min of
