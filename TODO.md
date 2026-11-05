@@ -231,7 +231,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.6** Pass the last step's `RiverInflow` to `Hydrostatic3D::update_vertical_velocity` (output Ω spreads river volume over the column).
 - [ ] **P1.6** UTM33/Lambert projections for coast-scale domains (the local projection's error grows with the domain).
 - [ ] **P1.6** A spatial index for point-in-polygon and GSHHS inner rings in `coastline.rs:81-95` (the land mask costs ≈ 20 s of setup at Frøya).
-- [ ] **P1.6** Fix or delete the unused `LandMask2D::from_coastline_and_bathymetry`.
 - [ ] **P1.6** Count wet as h > 1 cm in the example's η statistics, so mm films don't set "η max".
 - [ ] **P1.6** Cut the atmosphere forcing's memory (≈ 210 MB at 10⁶ nodes): share stencils per element, or drop them after regridding.
 - [ ] **P1.6** River details: river momentum `Q/(width·depth)` for jets at narrow mouths; spreading over elements within a radius if one-element plumes show.
@@ -381,6 +380,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Tech debt (P6) — [notes/tech-debt.md](notes/tech-debt.md)
 
+- [ ] **P6** `LandMask2D` has no users left (only `lib.rs`/`mesh` re-export it; the coastline meshes are water only): delete the type, or give it a caller (`notes/inputs-forcing.md` 2026-11-05).
 - [ ] **P6** Move `profile_cpu`, `quick_profile` and `high_res_benchmark` off `ssp_rk3_swe_2d`/`SWE2DTimeConfig` onto `Simulation` + `SWEPhysics2D` (precondition for the next item).
 - [ ] **P6** Delete the legacy integrators (`ssp_rk3*.rs`, `burn_ssp_rk3.rs`; the `coupled_swe_tracer` ones went with the 2D tracers, 2026-10-15); one time loop with `Simulation3D::run_with_callback` folded in, landing callbacks exactly (they drift today: 300 s asked, 316 s apart; `Simulation3D::with_landing_interval` lands steps on an interval since 2026-10-19, `froya_real_data` on its snapshot times).
 - [ ] **P6** Build the `netcdf` feature in CI with `--features netcdf/static` (~5.5 min cold); consider it the documented alternative to conda.
