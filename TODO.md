@@ -4,8 +4,11 @@ Open items only, one line each. The context (measurements, decisions, what was t
 
 Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon-farm application (currents, waves and particles around cages inside a NorKyst-driven coastal domain) on a 2D model that is correct, cheap and validated, and a 3D model rebuilt on the ROMS recipe. "Faster than ROMS" is to be proven by P3.2, not assumed.
 
+**Up next** (2026-11-05, after MET's answers in `notes/norkyst-issues.md`): (1) **P3.4** re-score Bodø on a 2026-06 day with `nest_tides=raw`, the first test with no gauge in the forcing; (2) **P3.1** the same raw run at Frøya on 2026-06 (`data/froya_norkyst_3d_2026-06.nc`), which decides the M2 `gauge_gains` item; (3) **P1.5** the parent-ζ datum as the library default. The items' lines are below in their areas.
+
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
+- [ ] **P3.1** Score Mausund on a 2026-06 day with `nest_tides=raw` (atlases from 2026-06, `data/froya_norkyst_3d_2026-06.nc`): no gauge in the forcing, NorKyst's N2 right since 2026-03-03. This tells how much of the open runs' 4.5 cm and M2 1.11× is the parent's; NorKyst's 2026 M2 at Mausund is 0.99× the gauge, so the +3 % below may be gone.
 - [ ] **P3.1** Remove M2's +3 % at Mausund (2.6 cm |ΔZ|, the largest error, NorKyst's own) with `froya_real_data gauge_gains=M2,…` so N2 follows; run it with the overtide work, since M4 scales with M2².
 - [ ] **P3.1** Find why the overtides are too weak: on the 3D bed (`slopes3d=on debug_3d=thin=1`) the model's M4 is a uniform 0.36 cm within 10 km of Mausund, 0.12× the gauge (0.7 cm, 0.34×, on the unsmoothed 2D bed, whose shoals and pinnacles make more; NorKyst 0.17 cm). Compare M4 at other gauges (Kristiansund, Heimsjø, Trondheim) with NorKyst's to tell a local harbour effect from a regional one; `notes/validation.md` 2026-10-16.
 - [ ] **P3.1** Measured currents at a Frøya farm (NS 9415 site surveys, IMR/NIVA moorings): the only way to settle the island lee and which current to trust at farm sites; NorKyst cannot (its bed is 50 m at Kattholmen, the real 25 m).
@@ -15,12 +18,11 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P3.1** Re-run P3 at 1 km against P2 at 500 m with the relaxed positivity CFL (dt ratio now ≈ 1.3–1.4) and stations interpolated at the gauge.
 - [ ] **P3.1** The 500 m, 15-day harmonic run (≈ 2.5 h) for the constituents at resolution.
 - [ ] **P3.1** Fix the approximate `norwegian_stations` positions from Kartverket's station list (`scripts/norkyst_tide_gauges.csv` has 17 permanent gauges; Heimsjø is at 63.425, 9.102).
-- [ ] **P3.1** Send the NorKyst-800 report to MET (the draft message in `notes/norkyst-issues.md`) and record the answer there: N2 was 0.19× at all 17 gauges until 2026-02 and is right since 2026-03 (the new tide file); open are K2 0.8× (no nodal factor), P1 and Q1 1.7×, the missing minor semidiurnals, the datum (−0.28 m), the missing inverse barometer, ubar/vbar.
-- [ ] **P3.1** Boundary atlases from NorKyst after 2026-03 (its N2 right) with K2 and P1 at the equilibrium ratios instead of `gauge_ratios`, so no gauge enters the forcing for N2, K2, P1 (Q1, 1.7×, still needs one); `notes/norkyst-issues.md` "What this means for us".
+- [ ] **P3.1** Boundary atlases from NorKyst windows starting on or after 2026-03-06 (MET switched to the corrected tide file on 2026-03-03, so N2 is right) with K2 and P1 at the equilibrium ratios instead of `gauge_ratios`, so no gauge enters the forcing for N2, K2 or P1 (Q1, 1.7×, still needs one). MET says nodal corrections are probably not applied, which supports the K2 fix; a blanket f(date) on every constituent is not supported, since it would worsen M2 in 2026. Re-check with `scripts/norkyst_tide_check.sh` once MET adds nodal factors (`notes/norkyst-issues.md` "MET's answer").
 - [ ] **P3.1** 2N2, μ2, ν2, L2 in the constituent catalogue (`tides::astronomy`, M2's nodal factors): NorKyst lacks them (2–7 cm of |ΔZ| at the gauges), so atlases could add them from N2/M2 at gauge or equilibrium ratios; and a 30-day fit could infer ν2 from N2, which removes the ±20 % beat of monthly N2 (`notes/norkyst-issues.md` §1).
 - [ ] **P3.1** Run the model against NorKyst-800 barotropic tides for a test period.
 - [ ] **P3.1** Document skill scores (RMSE, bias, correlation) per station.
-- [ ] **P3.4** Score Bodø's gauge again on a day after 2026-03, when NorKyst's N2 is right (same frozen config, `nest_tides=raw`): on 2025-06-15 the raw score failed (11.4 cm centred against ≤ 5) and the gauge-corrected boundary tide alone brought it to 3.4 cm, so the failure is the parent's N2; a post-fix day tests the model with no gauge in the forcing.
+- [ ] **P3.4** Score Bodø's gauge again on a day after 2026-03-06 (MET switched tide files on 2026-03-03), when NorKyst's N2 is right (same frozen config, `nest_tides=raw`): on 2025-06-15 the raw score failed (11.4 cm centred against ≤ 5) and the gauge-corrected boundary tide alone brought it to 3.4 cm, so the failure is the parent's N2; a post-fix day tests the model with no gauge in the forcing.
 - [ ] **P3.4** A second out-of-sample domain in a fjord (Saltstraumen's tidal jet, or a deep sill fjord) where the shallow-water drag gap (P1.3, 3D/2D 0.79 in 3–50 m on both Frøya and Bodø) and stratification matter more than at Bodø's open skerries.
 - [ ] **P3.2** The Pareto benchmark on the same hardware: M2/S2/K1/O1 gauge error against core-hours, ROMS 2D at 800/400/200 m against DG P1–P4.
 - [ ] **P3.1** Low priority (≤ 4 mm left): whether the interior amplifies the diurnals (shelf waves).
@@ -131,6 +133,9 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Viewer (F.3) — [notes/viz.md](notes/viz.md)
 
+- [ ] **F.3** Build `viz/` in CI (a `cargo check` in its workspace, or a job on PRs touching `src/` public API): it is its own workspace, so dg-rs's tests never compile it, and it stayed broken for a week after `4d3a160` (`notes/viz.md` 2026-11-05).
+- [ ] **F.3** Close-range land at a farm is coarse (large flat facets beside the cages in the `--record` farm shot): take the 2 m Kattholmen terrain patch for sites by default, or a finer terrain LOD under the camera.
+- [ ] **F.3** clippy `large_enum_variant` on `viz/src/scenario.rs` `Tide` (box the atlas variant).
 - [ ] **F.3** Separate physics from σ-truncation in the fjord3d rest-state flow under GLS (3.6e-5 m/s at 1 h, growing): halve level spacing and κ in turn, compare with Phillips's boundary-layer velocity.
 - [ ] **F.3** Compare the fjord3d cage wake at P1 on 40 m quads with the 2D 20 m run, a 3D P2 run and the integrated `CageDrag2D` drag (3D LTS would allow P2, see P1.3).
 - [ ] **F.3** Run → Save a snapshot file mid-run: hand a `SnapshotSink` to the running solver (it writes from the next frame) after writing the frames the playback holds; Run → Open a file by a dialog (`rfd`?) besides dropping one on the window.
@@ -210,7 +215,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Boundaries and nesting (P1.4, P1.5) — [notes/boundaries-nesting.md](notes/boundaries-nesting.md)
 
 - [ ] **P1.5** Parent files longer than 3 days for the nested 3D runs (the per-depth comparison is `norkyst_profiles_3d`, P4.6).
-- [ ] **P1.5** A datum for the parent ζ in the library default: NorKyst sits 0.20–0.40 m below the gauges' mean along the coast (median 0.28, deeper northward, 4–10 cm between seasons), neither MSL nor NN2000; its ζ carries about a quarter of the inverse barometer, so `ib=1` does not count it twice (`notes/norkyst-issues.md` §5–6).
+- [ ] **P1.5** The parent-ζ datum as a library default: subtract the parent's own long-term mean ζ at the boundary (a month or more around the run, as `froya_real_data` takes the atlas `Z0` now), never the run window's mean, MSL or NN2000. MET confirmed on 2026-11-05 that ζ is relative to the model's own rest level and drifts on long and short time scales (NorKyst sits 0.20–0.40 m below the gauges; `notes/norkyst-issues.md` §5 and "MET's answer").
+- [ ] **P1.5** A fractional inverse barometer for nesting (`ib=<factor>`, today on/off): gauge − NorKyst regresses on pressure at −0.58 cm/hPa, but `ib=1` adds the static −0.99 on top of NorKyst's −0.22, so it may overshoot by up to ≈ 0.4 cm/hPa (≈ 8 cm in a 20 hPa low). Score `ib=0`, `0.6` and `1` on a stormy week at Mausund's gauge. MET says the IB is applied at NorKyst's open boundary, which does not explain the −0.22 (`notes/norkyst-issues.md` "MET's answer" item 4).
 - [ ] **P1.4** `BoundaryTides::with_transport_scaling` (`tide_transport=3`) as the default for atlas tides (Mausund sub-domain 8.1 → 4.2 cm); check the full mesh with it.
 - [ ] **P1.4** Blend the bed towards the atlas depths near the open boundary for `BoundaryTides`, as `OceanModelState::blend_bathymetry` does.
 - [ ] **P1.5 / P4.2** A point-implicit nesting relaxation band, 2D and 3D, so FRS-like τ ≈ Δt works (explicit today: τ 30 min against 0.25–10 s steps).
