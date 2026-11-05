@@ -53,7 +53,7 @@ use thiserror::Error;
 use crate::mesh::PointLocator2D;
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::GeometricFactors2D;
-use crate::solver::SWEState2D;
+use crate::solver::{Blocks, SWEState2D};
 use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -643,19 +643,23 @@ impl RiverInflow<'_> {
     }
 
     /// Add the inventory sources `s_l·C_river` of a tracer to `rhs`
-    /// (`[element][node][level]`, `n_nodes` per element), with the river
-    /// water's concentration `concentration(river)`.
+    /// (`[element][node][level]`, `n_nodes` per element) in `elements`, with
+    /// the river water's concentration `concentration(river, element)`.
     pub fn add_tracer_sources(
         &self,
         rhs: &mut [f64],
         n_nodes: usize,
-        concentration: impl Fn(&River) -> f64,
+        elements: Blocks,
+        concentration: impl Fn(&River, usize) -> f64,
     ) {
         let nl = self.rivers.n_levels();
         for i in 0..self.rivers.len() {
             let k = self.rivers.element(i).as_usize();
+            if !elements.contains(k) {
+                continue;
+            }
             let rate = self.discharge[i] * self.rivers.inv_area[i];
-            let c = concentration(self.rivers.river(i));
+            let c = concentration(self.rivers.river(i), k);
             let columns = rhs[k * n_nodes * nl..(k + 1) * n_nodes * nl].chunks_exact_mut(nl);
             for (node, column) in columns.enumerate() {
                 for (r, &w) in column.iter_mut().zip(self.rivers.level_weights(i, node)) {
@@ -670,11 +674,20 @@ impl RiverInflow<'_> {
     /// water brings at the column's own value, so that its volume dilutes
     /// nothing: `s_w φ`, with `s_w` the layer sources averaged to the
     /// w-cells (half of the end layers', the mean of the two layers'
-    /// between; [`crate::solver::rhs::w_cell_thicknesses`]).
-    pub fn add_w_point_sources_at_own_value(&self, rhs: &mut [f64], field: &[f64], n_nodes: usize) {
+    /// between; [`crate::solver::rhs::w_cell_thicknesses`]), in `elements`.
+    pub fn add_w_point_sources_at_own_value(
+        &self,
+        rhs: &mut [f64],
+        field: &[f64],
+        n_nodes: usize,
+        elements: Blocks,
+    ) {
         let nw = self.rivers.n_levels() + 1;
         for i in 0..self.rivers.len() {
             let k = self.rivers.element(i).as_usize();
+            if !elements.contains(k) {
+                continue;
+            }
             let rate = self.discharge[i] * self.rivers.inv_area[i];
             let columns = k * n_nodes * nw..(k + 1) * n_nodes * nw;
             for (node, (r, phi)) in rhs[columns.clone()]

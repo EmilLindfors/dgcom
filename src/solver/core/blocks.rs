@@ -77,12 +77,156 @@ impl<T: 'static> Drop for Pooled<T> {
     }
 }
 
-/// Run `f(scratch, block, chunks)` for every `block` in `0..n_blocks`, with
-/// `chunks[i]` the `block`-th of `n_blocks` equal chunks of `outputs[i]`
-/// (in parallel with the `parallel` feature). `init` makes a worker's
-/// scratch, once per loop or rayon job.
-pub(crate) fn for_each_block<T, S, const N: usize>(
-    n_blocks: usize,
+/// The blocks a loop visits: all `n` of them (`0..n`), or an increasing list
+/// of distinct ones among `n` (an element subset of local time stepping).
+/// A `usize` converts to all.
+#[derive(Clone, Copy, Debug)]
+pub enum Blocks<'a> {
+    All(usize),
+    List { n: usize, list: &'a [u32] },
+}
+
+impl<'a> Blocks<'a> {
+    /// `list` among `n` blocks (increasing; checked in debug builds).
+    pub fn list(n: usize, list: &'a [u32]) -> Self {
+        debug_assert!(
+            list.windows(2).all(|w| w[0] < w[1]),
+            "blocks not increasing"
+        );
+        debug_assert!(
+            list.last().is_none_or(|&k| (k as usize) < n),
+            "block out of range"
+        );
+        Self::List { n, list }
+    }
+
+    /// Whether block `k` is visited.
+    pub fn contains(&self, k: usize) -> bool {
+        match *self {
+            Self::All(n) => k < n,
+            Self::List { list, .. } => list.binary_search(&(k as u32)).is_ok(),
+        }
+    }
+
+    /// The number of blocks the outputs are split into.
+    pub fn n(&self) -> usize {
+        match *self {
+            Self::All(n) | Self::List { n, .. } => n,
+        }
+    }
+
+    /// The number of blocks visited.
+    pub fn len(&self) -> usize {
+        match *self {
+            Self::All(n) => n,
+            Self::List { list, .. } => list.len(),
+        }
+    }
+
+    /// Whether no block is visited.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The `i`-th block visited.
+    #[inline]
+    pub fn get(&self, i: usize) -> usize {
+        match *self {
+            Self::All(_) => i,
+            Self::List { list, .. } => list[i] as usize,
+        }
+    }
+
+    /// Whether every block is visited.
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All(_))
+    }
+
+    /// The visited blocks, in order.
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).map(|i| self.get(i))
+    }
+}
+
+impl From<usize> for Blocks<'_> {
+    fn from(n: usize) -> Self {
+        Self::All(n)
+    }
+}
+
+/// An element list grown by the elements around it, for the first pass of
+/// a kernel whose second pass on the list reads the first's results there.
+/// Every element, if the list is.
+#[derive(Debug, Default)]
+pub(crate) struct Neighbourhood {
+    list: Vec<u32>,
+    mark: Vec<bool>,
+}
+
+impl Neighbourhood {
+    /// `blocks` (elements of `mesh`) and their face neighbours, in order.
+    pub(crate) fn faces<'a>(
+        &'a mut self,
+        mesh: &crate::mesh::Mesh2D,
+        blocks: Blocks,
+    ) -> Blocks<'a> {
+        self.grow(mesh.n_elements, blocks, |k, add| {
+            for face in 0..4 {
+                if let Some(nb) = mesh.neighbor(crate::types::ElementIndex::new(k), face) {
+                    add(nb.element);
+                }
+            }
+        })
+    }
+
+    /// `blocks` and every element sharing a vertex with one, in order.
+    pub(crate) fn vertex_patches<'a>(
+        &'a mut self,
+        mesh: &crate::mesh::Mesh2D,
+        blocks: Blocks,
+    ) -> Blocks<'a> {
+        self.grow(mesh.n_elements, blocks, |k, add| {
+            for vertex in mesh.element_vertex_indices(crate::types::ElementIndex::new(k)) {
+                mesh.elements_at_vertex(vertex).iter().for_each(|&e| add(e));
+            }
+        })
+    }
+
+    fn grow<'a>(
+        &'a mut self,
+        n: usize,
+        blocks: Blocks,
+        around: impl Fn(usize, &mut dyn FnMut(usize)),
+    ) -> Blocks<'a> {
+        let Blocks::List { list, .. } = blocks else {
+            return Blocks::All(n);
+        };
+        self.mark.resize(n, false);
+        self.list.clear();
+        let (out, mark) = (&mut self.list, &mut self.mark);
+        let mut add = |e: usize| {
+            if !std::mem::replace(&mut mark[e], true) {
+                out.push(e as u32);
+            }
+        };
+        for &k in list {
+            add(k as usize);
+            around(k as usize, &mut add);
+        }
+        for &e in out.iter() {
+            mark[e as usize] = false;
+        }
+        out.sort_unstable();
+        Blocks::List { n, list: out }
+    }
+}
+
+/// Run `f(scratch, block, chunks)` for every `block` of `blocks` (all of
+/// `0..n_blocks` for a `usize`), with `chunks[i]` the `block`-th of the `n`
+/// equal chunks of `outputs[i]` (in parallel with the `parallel` feature).
+/// `init` makes a worker's scratch, once per loop or rayon job.
+pub(crate) fn for_each_block<'b, T, S, const N: usize>(
+    n_blocks: impl Into<Blocks<'b>>,
     outputs: [&mut [T]; N],
     init: impl Fn() -> S + Sync + Send,
     f: impl Fn(&mut S, usize, [&mut [T]; N]) + Sync + Send,
@@ -98,8 +242,8 @@ pub(crate) fn for_each_block<T, S, const N: usize>(
 /// [`for_each_block`] for a kernel that returns a value per block: their
 /// largest (`−∞` for none; `max` is exact, so this too is independent of the
 /// thread count).
-pub(crate) fn max_over_blocks<T, S, const N: usize>(
-    n_blocks: usize,
+pub(crate) fn max_over_blocks<'b, T, S, const N: usize>(
+    n_blocks: impl Into<Blocks<'b>>,
     outputs: [&mut [T]; N],
     init: impl Fn() -> S + Sync + Send,
     f: impl Fn(&mut S, usize, [&mut [T]; N]) -> f64 + Sync + Send,
@@ -114,8 +258,8 @@ where
 /// with `combine` from `identity()`. The grouping of the combinations
 /// depends on the thread count: `combine` must be exact (and associative and
 /// commutative) for the result not to, e.g. a maximum or an integer count.
-pub(crate) fn reduce_blocks<T, S, R, const N: usize>(
-    n_blocks: usize,
+pub(crate) fn reduce_blocks<'b, T, S, R, const N: usize>(
+    blocks: impl Into<Blocks<'b>>,
     outputs: [&mut [T]; N],
     init: impl Fn() -> S + Sync + Send,
     f: impl Fn(&mut S, usize, [&mut [T]; N]) -> R + Sync + Send,
@@ -126,6 +270,8 @@ where
     T: Send,
     R: Send,
 {
+    let blocks = blocks.into();
+    let n_blocks = blocks.n();
     let chunks = outputs.map(|out| {
         assert!(
             out.len().is_multiple_of(n_blocks.max(1)),
@@ -135,28 +281,31 @@ where
         let chunk = out.len() / n_blocks.max(1);
         (chunk > 0).then(|| DisjointChunks::new(out, chunk))
     });
-    // SAFETY: every block index is visited exactly once (a range), so no
-    // chunk is handed out twice. An empty output has no chunks: an empty slice
+    // SAFETY: every block index is visited at most once (a range, or a list
+    // of distinct blocks), so no chunk is handed out twice. An empty output
+    // has no chunks: an empty slice
     let block_of = |block: usize| {
         std::array::from_fn(|i| match &chunks[i] {
             Some(c) => unsafe { c.chunk(block) },
             None => &mut [][..],
         })
     };
+    let visit = |scratch: &mut S, i: usize| {
+        let block = blocks.get(i);
+        f(scratch, block, block_of(block))
+    };
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        (0..n_blocks)
+        (0..blocks.len())
             .into_par_iter()
-            .map_init(init, |scratch, block| f(scratch, block, block_of(block)))
+            .map_init(init, visit)
             .reduce(identity, combine)
     }
     #[cfg(not(feature = "parallel"))]
     {
         let mut scratch = init();
-        (0..n_blocks).fold(identity(), |r, block| {
-            combine(r, f(&mut scratch, block, block_of(block)))
-        })
+        (0..blocks.len()).fold(identity(), |r, i| combine(r, visit(&mut scratch, i)))
     }
 }
 

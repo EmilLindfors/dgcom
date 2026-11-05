@@ -22,7 +22,7 @@ use crate::physics::traits::PhysicsModule; // For 2D trait bounds
 use crate::physics::vertical_mixing::VerticalMixing;
 use crate::simulation::{SimulationConfig, SimulationResult};
 use crate::solver::state::Solution3D;
-use crate::time::mode_split::ModeSplitIntegrator;
+use crate::time::mode_split::{ModeSplitIntegrator, ModeSplitPhysics};
 
 /// High-level simulation runner for 3D models.
 pub struct Simulation3D<EOS, MIX, BC>
@@ -36,6 +36,8 @@ where
     config: SimulationConfig,
     /// The steps land on every multiple of this time (s), if set.
     landing_interval: Option<f64>,
+    /// Every element's own 3D step, for local time stepping.
+    element_dt: Vec<f64>,
 }
 
 impl<EOS, MIX, BC> Simulation3D<EOS, MIX, BC>
@@ -52,6 +54,7 @@ where
             integrator,
             config: SimulationConfig::default(),
             landing_interval: None,
+            element_dt: Vec::new(),
         }
     }
 
@@ -246,12 +249,23 @@ where
                 return stopped;
             }
 
-            // Compute time step (3D CFL)
+            // Compute time step (3D CFL): the coarse step of the levels
+            // with local time stepping
+            let ssp = self.integrator.baroclinic_scheme().ssp_coefficient();
             let mut dt = crate::profiling::scope("step: compute_dt", || {
-                self.physics.compute_dt_ssp(
+                if self.integrator.baroclinic_levels() == 0 {
+                    return self.physics.compute_dt_ssp(state, self.config.cfl, ssp);
+                }
+                self.element_dt.resize(state.n_elements, 0.0);
+                self.physics
+                    .element_steps_into(state, self.config.cfl, ssp, &mut self.element_dt);
+                let stencils = self.physics.stage_stencils();
+                self.integrator.assign_baroclinic_levels(
                     state,
-                    self.config.cfl,
-                    self.integrator.baroclinic_scheme().ssp_coefficient(),
+                    &self.element_dt,
+                    &self.physics.mesh,
+                    &stencils,
+                    self.config.dt_max,
                 )
             });
             if dt.is_nan() || dt <= 0.0 {
@@ -2545,6 +2559,156 @@ mod tests {
         }
     }
 
+    /// [`run_beach_with`] on local time steps: SSP-RK(4,3) 3D stages, the
+    /// levels from the element steps `element_dt` (fixed, so the levels
+    /// are), every coarse step as long as they allow. The work counts.
+    fn run_beach_local(
+        physics: &Physics,
+        state: &mut Solution3D,
+        element_dt: &[f64],
+        steps: usize,
+        mut check: impl FnMut(&Solution3D),
+    ) -> crate::time::MultirateStats {
+        let mut integrator = ModeSplitIntegrator::new()
+            .with_baroclinic_scheme(SspScheme::Rk43)
+            .with_baroclinic_levels(3);
+        let stencils = physics.stage_stencils();
+        let mut t = 0.0;
+        for n in 0..steps {
+            physics.update_density(state);
+            let dt = integrator.assign_baroclinic_levels(
+                state,
+                element_dt,
+                &physics.mesh,
+                &stencils,
+                None,
+            );
+            integrator.step(state, physics, dt, t);
+            physics.post_process(state);
+            t += dt;
+            assert!(
+                max_or_nan(state.u.iter().chain(&state.temp).map(|x| x.abs())).is_finite(),
+                "step {n}: the run blew up"
+            );
+            check(state);
+        }
+        integrator
+            .baroclinic_multirate_stats()
+            .expect("local time steps were taken")
+    }
+
+    /// The beach's element steps for [`run_beach_local`]: 20 s offshore,
+    /// 10 s over the middle of the slope, 5 s at the shore (three levels,
+    /// coarse steps of 20 s, as
+    /// [`beach_tracers_are_constant_and_conserved_with_ssp_rk43_stages`]
+    /// takes globally).
+    fn beach_levels(physics: &Physics) -> Vec<f64> {
+        (0..physics.mesh.n_elements)
+            .map(|k| {
+                let x = physics.mesh.element_vertices(ElementIndex::new(k))[0][0];
+                if x < 500.0 {
+                    20.0
+                } else if x < 800.0 {
+                    10.0
+                } else {
+                    5.0
+                }
+            })
+            .collect()
+    }
+
+    /// TODO P4.5 gate: local time stepping of the 3D stages on the beach
+    /// (three levels, wetting and drying, wind, stratification). Uniform T
+    /// and S stay uniform, stratified tracers keep their inventories, as
+    /// with global steps, and no depth is clipped: every element's layers
+    /// carry the water its free surface moves at its own stage times, and a
+    /// face's flux is the same from both sides.
+    #[test]
+    fn beach_tracers_are_constant_and_conserved_with_local_time_steps() {
+        let (physics, mut state, _) = beach_3d(0.3);
+        let element_dt = beach_levels(&physics);
+        state.temp.fill(12.3);
+        state.salt.fill(33.1);
+        let mut drift = 0.0_f64;
+        let stats = run_beach_local(&physics, &mut state, &element_dt, 100, |s| {
+            drift = max_or_nan(
+                s.temp
+                    .iter()
+                    .map(|t| (t - 12.3).abs())
+                    .chain(s.salt.iter().map(|x| (x - 33.1).abs()))
+                    .chain([drift]),
+            );
+        });
+        assert_eq!(stats.finest_level, 2, "test regime: three levels");
+        assert!(stats.speedup() > 1.0, "no work saved: {stats:?}");
+        assert!(drift < 5e-8, "uniform tracers drifted by {drift:.3e}");
+        assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
+
+        let (physics, mut state, _) = beach_3d(0.3);
+        let (t0, s0) = (
+            beach_inventory(&physics, &state, &state.temp),
+            beach_inventory(&physics, &state, &state.salt),
+        );
+        let mut max_err = 0.0_f64;
+        run_beach_local(&physics, &mut state, &element_dt, 100, |s| {
+            max_err = max_or_nan([
+                max_err,
+                (beach_inventory(&physics, s, &s.temp) - t0).abs() / t0,
+                (beach_inventory(&physics, s, &s.salt) - s0).abs() / s0,
+            ]);
+        });
+        assert!(max_err < 5e-11, "inventories drifted by {max_err:.3e}");
+    }
+
+    /// TODO P4.5 gate: local time steps of the 3D stages agree with global
+    /// steps at the finest one (5 s) on the beach after 2000 s, and one
+    /// level is the global step bit for bit.
+    #[test]
+    fn local_time_steps_of_the_3d_stages_match_global_steps() {
+        let (physics, mut local, _) = beach_3d(0.3);
+        let element_dt = beach_levels(&physics);
+        run_beach_local(&physics, &mut local, &element_dt, 100, |_| {});
+        let (physics, mut global, _) = beach_3d(0.3);
+        run_beach_with(SspScheme::Rk43, 5.0, &physics, &mut global, 400, |_| {});
+        let difference = |a: &[f64], b: &[f64]| {
+            let scale = max_or_nan(b.iter().map(|x| x.abs()));
+            max_or_nan(a.iter().zip(b).map(|(x, y)| (x - y).abs())) / scale
+        };
+        let (d_eta, d_u, d_t) = (
+            difference(&local.eta.data, &global.eta.data),
+            difference(&local.u, &global.u),
+            difference(&local.temp, &global.temp),
+        );
+        println!("local against global: η {d_eta:.3e}, u {d_u:.3e}, T {d_t:.3e} (relative)");
+        let (physics, mut coarse, _) = beach_3d(0.3);
+        run_beach_with(SspScheme::Rk43, 20.0, &physics, &mut coarse, 100, |_| {});
+        let (c_eta, c_u, c_t) = (
+            difference(&coarse.eta.data, &global.eta.data),
+            difference(&coarse.u, &global.u),
+            difference(&coarse.temp, &global.temp),
+        );
+        println!("global 20 s against 5 s: η {c_eta:.3e}, u {c_u:.3e}, T {c_t:.3e} (relative)");
+        assert!(
+            d_eta < 1e-2 && d_u < 1e-1 && d_t < 1e-1,
+            "η {d_eta:.3e}, u {d_u:.3e}, T {d_t:.3e}"
+        );
+
+        // One level (every element at the coarse step): the global step
+        let (physics, mut one, _) = beach_3d(0.3);
+        let coarse = vec![20.0; physics.mesh.n_elements];
+        run_beach_local(&physics, &mut one, &coarse, 50, |_| {});
+        let (physics, mut global, _) = beach_3d(0.3);
+        run_beach_with(SspScheme::Rk43, 20.0, &physics, &mut global, 50, |_| {});
+        for (a, b) in [
+            (&one.u, &global.u),
+            (&one.temp, &global.temp),
+            (&one.eta.data, &global.eta.data),
+        ] {
+            let same = a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+            assert!(same, "one level differs from the global step");
+        }
+    }
+
     /// `∫ Σ_l H_z C dA` of a tracer on the beach (dry columns hold none).
     fn beach_inventory(physics: &Physics, state: &Solution3D, tracer: &[f64]) -> f64 {
         let nl = state.n_levels;
@@ -3985,6 +4149,7 @@ mod tests {
                 &boundaries,
                 thin,
                 &mut scratch,
+                mesh.n_elements.into(),
             );
             for (i, &(ci, idx_i, li)) in unknowns.iter().enumerate() {
                 let r = if ci == 0 { &rhs_u } else { &rhs_v };
@@ -4151,6 +4316,240 @@ mod tests {
         (physics, state)
     }
 
+    /// TODO P4.5 gate: the 3D stage operations on an element list give the
+    /// listed elements, bit for bit, what the whole-mesh ones give them, and
+    /// leave the others alone: the stage RHS (PGF, Coriolis, BR1 viscosity
+    /// with Smagorinsky, the layer transports and the advection) and the
+    /// stage hook (the Kuzmin limiter over the vertex patches, the
+    /// density), over a seamount in a flow that varies everywhere. Local
+    /// time stepping evaluates them on such lists.
+    #[test]
+    fn stage_operations_on_an_element_list_match_the_whole_mesh() {
+        use crate::solver::Blocks;
+        use crate::solver::rhs::{BarotropicFlux, PressureGradientForm};
+        use crate::time::{StageElements, StageTime};
+        let (physics, mut state) = seamount(PressureGradientForm::SigmaPairs, |z| {
+            RHO0 - 3.0 * (1.0 + z / 400.0)
+        });
+        let physics = physics
+            .with_horizontal_viscosity(0.5)
+            .with_smagorinsky_viscosity(0.1)
+            .with_tracer_limiter(TracerLimiter3DConfig {
+                limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+                ..TracerLimiter3DConfig::default()
+            });
+        let (ne, nn, nl) = (state.n_elements, state.n_nodes, state.n_levels);
+        // A flow and a free surface that vary at every node, and noisy T
+        let wave = |i: usize, a: f64| (0.37 * i as f64 + a).sin();
+        for (i, (u, v)) in state.u.iter_mut().zip(&mut state.v).enumerate() {
+            (*u, *v) = (0.2 * wave(i, 0.0), 0.15 * wave(i, 1.3));
+        }
+        for (i, t) in state.temp.iter_mut().enumerate() {
+            *t += 0.3 * wave(i, 2.1);
+        }
+        for (i, eta) in state.eta.data.iter_mut().enumerate() {
+            *eta = 0.1 * wave(i, 0.7);
+        }
+        for idx in 0..ne * nn {
+            let column = &state.u[idx * nl..(idx + 1) * nl];
+            state.ubar.data[idx] = physics.sigma.depth_average(column);
+            let column = &state.v[idx * nl..(idx + 1) * nl];
+            state.vbar.data[idx] = physics.sigma.depth_average(column);
+        }
+        physics.update_density(&mut state);
+        // A barotropic side of arbitrary values (the property needs none)
+        let nfn = physics.ops.n_face_nodes;
+        let hu: Vec<f64> = (0..ne * nn).map(|i| 3.0 * wave(i, 0.2)).collect();
+        let hv: Vec<f64> = (0..ne * nn).map(|i| 2.0 * wave(i, 0.4)).collect();
+        let face: Vec<f64> = (0..ne * 4 * nfn).map(|i| wave(i, 0.9)).collect();
+        let n_sub = crate::solver::rhs::subcells::subcell_interfaces(physics.ops.n_1d);
+        let subcell = vec![f64::NAN; ne * n_sub];
+        let eta_rate = vec![1e-5; ne * nn];
+        let euler_dt = vec![150.0; ne];
+        let means = vec![false; ne];
+        let barotropic = BarotropicFlux {
+            dt: 300.0,
+            euler_dt: &euler_dt,
+            hu: &hu,
+            hv: &hv,
+            face: &face,
+            subcell: &subcell,
+            eta_rate: &eta_rate,
+            rivers: None,
+            element_means: &means,
+        };
+        let rhs = |elements: Blocks| {
+            let mut out = Solution3D::new(ne, nn, nl);
+            out.u.fill(f64::NAN);
+            out.v.fill(f64::NAN);
+            out.temp.fill(f64::NAN);
+            out.salt.fill(f64::NAN);
+            let on = StageElements {
+                elements,
+                time: StageTime::Uniform(0.0),
+            };
+            physics.stage_momentum_rhs_into(&state, on, &mut out);
+            physics.transport_rhs_into(&state, on, barotropic, &mut out);
+            out
+        };
+        let whole = rhs(Blocks::All(ne));
+        // Every third element and a block of neighbours: lists with and
+        // without listed neighbours
+        let list: Vec<u32> = (0..ne as u32)
+            .filter(|k| k % 3 == 0 || (14..20).contains(k))
+            .collect();
+        let listed = |k: usize| list.binary_search(&(k as u32)).is_ok();
+        let part = rhs(Blocks::list(ne, &list));
+        let block = nn * nl;
+        for (name, a, b) in [
+            ("u", &whole.u, &part.u),
+            ("v", &whole.v, &part.v),
+            ("T", &whole.temp, &part.temp),
+            ("S", &whole.salt, &part.salt),
+        ] {
+            for k in 0..ne {
+                let rows = k * block..(k + 1) * block;
+                let (a, b) = (&a[rows.clone()], &b[rows]);
+                if listed(k) {
+                    let same = a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+                    assert!(same, "{name} of listed element {k} differs");
+                } else {
+                    assert!(
+                        b.iter().all(|x| x.is_nan()),
+                        "{name} of element {k} written"
+                    );
+                }
+            }
+        }
+
+        // The stage hook: limited and given their density
+        let (mut all, mut some) = (state.clone(), state.clone());
+        physics.post_stage(&mut all, Blocks::All(ne));
+        physics.post_stage(&mut some, Blocks::list(ne, &list));
+        let changed = state
+            .temp
+            .iter()
+            .zip(&all.temp)
+            .filter(|(x, y)| x != y)
+            .count();
+        assert!(changed > 0, "test regime: the limiter changed nothing");
+        for (name, a, b, before) in [
+            ("T", &all.temp, &some.temp, &state.temp),
+            ("ρ", &all.rho, &some.rho, &state.rho),
+        ] {
+            for k in 0..ne {
+                let rows = k * block..(k + 1) * block;
+                let expected = if listed(k) {
+                    &a[rows.clone()]
+                } else {
+                    &before[rows.clone()]
+                };
+                let same = expected
+                    .iter()
+                    .zip(&b[rows])
+                    .all(|(x, y)| x.to_bits() == y.to_bits());
+                assert!(same, "{name} of element {k} (listed: {})", listed(k));
+            }
+        }
+    }
+
+    /// The stratified seamount with a free-surface bump, viscosity and the
+    /// Kuzmin limiter, `steps` steps: on local time steps with `element_dt`
+    /// (fixed), or global steps of `dt`.
+    fn seamount_bump(element_dt: Option<&[f64]>, dt: f64, steps: usize) -> Solution3D {
+        use crate::solver::rhs::PressureGradientForm;
+        let (physics, mut state) = seamount(PressureGradientForm::SigmaPairs, |z| {
+            RHO0 - 3.0 * (1.0 + z / 400.0)
+        });
+        let physics = physics
+            .with_horizontal_viscosity(0.5)
+            .with_smagorinsky_viscosity(0.1)
+            .with_tracer_limiter(TracerLimiter3DConfig {
+                limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+                ..TracerLimiter3DConfig::default()
+            });
+        let nn = state.n_nodes;
+        for k in 0..state.n_elements {
+            for i in 0..nn {
+                let [x, y] = physics.mesh.reference_to_physical(
+                    ElementIndex::new(k),
+                    physics.ops.nodes_r[i],
+                    physics.ops.nodes_s[i],
+                );
+                state.eta.data[k * nn + i] =
+                    0.2 * (-((x - 3e3).powi(2) + y * y) / 3e3_f64.powi(2)).exp();
+            }
+        }
+        let mut integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(SspScheme::Rk43);
+        if element_dt.is_some() {
+            integrator = integrator.with_baroclinic_levels(3);
+        }
+        let stencils = physics.stage_stencils();
+        let mut t = 0.0;
+        for n in 0..steps {
+            physics.update_density(&mut state);
+            let dt = match element_dt {
+                Some(element_dt) => integrator.assign_baroclinic_levels(
+                    &state,
+                    element_dt,
+                    &physics.mesh,
+                    &stencils,
+                    None,
+                ),
+                None => dt,
+            };
+            integrator.step(&mut state, &physics, dt, t);
+            physics.post_process(&mut state);
+            t += dt;
+            let speed = max_or_nan(state.u.iter().map(|x| x.abs()));
+            assert!(speed.is_finite() && speed < 10.0, "step {n}: {speed:e} m/s");
+        }
+        state
+    }
+
+    /// TODO P4.5 gate: local time steps of the 3D stages on a 2D mesh with
+    /// every stage kernel's neighbourhood (BR1 viscosity, the Kuzmin
+    /// limiter's vertex patches, the σ-pairs PGF): a free-surface bump on
+    /// the stratified seamount, three levels around it, against global
+    /// steps at the finest step and at the coarse one.
+    #[test]
+    fn local_time_steps_of_the_3d_stages_on_a_seamount() {
+        let (physics, _) = seamount(crate::solver::rhs::PressureGradientForm::SigmaPairs, |z| {
+            RHO0 - 3.0 * (1.0 + z / 400.0)
+        });
+        let element_dt: Vec<f64> = (0..physics.mesh.n_elements)
+            .map(|k| {
+                let vertices = physics.mesh.element_vertices(ElementIndex::new(k));
+                let x = vertices.iter().map(|v| v[0]).sum::<f64>() / 4.0;
+                let y = vertices.iter().map(|v| v[1]).sum::<f64>() / 4.0;
+                match x.hypot(y) {
+                    r if r < 5e3 => 25.0,
+                    r if r < 9e3 => 50.0,
+                    _ => 100.0,
+                }
+            })
+            .collect();
+        let local = seamount_bump(Some(&element_dt), 0.0, 36);
+        let fine = seamount_bump(None, 25.0, 144);
+        let coarse = seamount_bump(None, 100.0, 36);
+        let difference = |a: &[f64], b: &[f64]| {
+            let scale = max_or_nan(b.iter().map(|x| x.abs()));
+            max_or_nan(a.iter().zip(b).map(|(x, y)| (x - y).abs())) / scale
+        };
+        let (d_eta, d_u) = (
+            difference(&local.eta.data, &fine.eta.data),
+            difference(&local.u, &fine.u),
+        );
+        let (c_eta, c_u) = (
+            difference(&coarse.eta.data, &fine.eta.data),
+            difference(&coarse.u, &fine.u),
+        );
+        println!(
+            "local against fine: η {d_eta:.3e}, u {d_u:.3e}; coarse against fine: η {c_eta:.3e}, u {c_u:.3e}"
+        );
+        assert!(d_eta < 2.0 * c_eta.max(1e-6) && d_u < 2.0 * c_u.max(1e-6));
+    }
+
     /// Largest layer speed of `seamount(form, linear N²)` after 36 h, with
     /// `limiter` on the tracers.
     fn seamount_spin_up(
@@ -4241,9 +4640,10 @@ mod tests {
         let largest_change = |limiter: TracerLimiter3DConfig| {
             let (physics, mut state) = seamount(PressureGradientForm::SigmaPairs, pycnocline);
             let before = state.temp.clone();
+            let all = crate::solver::Blocks::All(state.n_elements);
             physics
                 .with_tracer_limiter(limiter)
-                .apply_tracer_limiters(&mut state);
+                .apply_tracer_limiters(&mut state, all);
             max_or_nan(before.iter().zip(&state.temp).map(|(a, b)| (a - b).abs()))
         };
         // Every 5 cm: the profile's interpolation error is ≈ 2e-5 °C

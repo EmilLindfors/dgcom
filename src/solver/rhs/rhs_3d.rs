@@ -18,6 +18,7 @@
 use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::Blocks;
 use crate::solver::rhs::advection_3d::TracerBoundaryCondition3D;
 use crate::solver::rhs::baroclinic::{
     BalancedReference, PressureGradientForm, compute_pressure_gradient,
@@ -72,6 +73,9 @@ pub struct Rhs3DConfig<'a> {
     /// vertical advection keeps the water leaving an end layer within
     /// ([`UNBOUNDED`](super::transport_3d::UNBOUNDED) for none).
     pub tracer_range: [(f64, f64); 2],
+    /// The elements whose tendencies are wanted (the others' are left as
+    /// they are).
+    pub elements: Blocks<'a>,
 }
 
 /// Overwrite `rhs.u` and `rhs.v` with the velocity tendency of the pointwise
@@ -103,11 +107,19 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         config.metric,
         &mut rhs.u,
         &mut rhs.v,
+        config.elements,
     );
     if let Some(reference) = config.balanced_reference {
-        reference.add_to(&mut rhs.u, &mut rhs.v);
+        reference.add_to(&mut rhs.u, &mut rhs.v, config.elements);
     }
-    apply_coriolis_3d(rhs, state, config.mesh, config.ops, config.coriolis);
+    apply_coriolis_3d(
+        rhs,
+        state,
+        config.mesh,
+        config.ops,
+        config.coriolis,
+        config.elements,
+    );
     // The horizontal viscosity needs scratch: see `Hydrostatic3D`
 }
 
@@ -135,6 +147,7 @@ pub fn compute_transport_rhs_3d(
         config.exterior.velocity,
         config.momentum_advection_form,
         config.momentum_vertical_advection,
+        config.elements,
     );
     let tracers = [
         AdvectedTracer {
@@ -162,5 +175,6 @@ pub fn compute_transport_rhs_3d(
         config.geom,
         config.boundaries,
         config.vertical_advection,
+        config.elements,
     );
 }

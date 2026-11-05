@@ -14,8 +14,8 @@
 //! For this implementation, we use a linearized or simplified nonlinear EOS suitable
 //! for coastal applications.
 
+use crate::solver::core::blocks::{Blocks, for_each_block};
 use crate::solver::state::Solution3D;
-use crate::types::ElementIndex;
 
 /// Equation of State trait.
 pub trait EquationOfState: Send + Sync {
@@ -30,7 +30,31 @@ pub trait EquationOfState: Send + Sync {
     fn compute_density(&self, t: f64, s: f64, z: f64) -> f64;
 
     /// Update the density field in the 3D solution.
-    fn update_density(&self, state: &mut Solution3D);
+    fn update_density(&self, state: &mut Solution3D) {
+        let all = Blocks::All(state.n_elements);
+        self.update_density_on(state, all);
+    }
+
+    /// Update the density field on `elements`, from
+    /// [`Self::compute_density`] at the surface (no pressure dependence).
+    fn update_density_on(&self, state: &mut Solution3D, elements: Blocks) {
+        let Solution3D {
+            temp, salt, rho, ..
+        } = state;
+        let (temp, salt): (&[f64], &[f64]) = (temp, salt);
+        let len = rho.len() / elements.n().max(1);
+        for_each_block(
+            elements,
+            [&mut rho[..]],
+            || (),
+            |_, k, [rho]| {
+                let block = k * len..(k + 1) * len;
+                for ((r, &t), &s) in rho.iter_mut().zip(&temp[block.clone()]).zip(&salt[block]) {
+                    *r = self.compute_density(t, s, 0.0);
+                }
+            },
+        );
+    }
 }
 
 /// Linear Equation of State.
@@ -61,42 +85,6 @@ impl EquationOfState for LinearEOS {
     fn compute_density(&self, t: f64, s: f64, _z: f64) -> f64 {
         self.rho0 * (1.0 - self.alpha * (t - self.t0) + self.beta * (s - self.s0))
     }
-
-    fn update_density(&self, state: &mut Solution3D) {
-        let n_elements = state.n_elements;
-        let n_nodes = state.n_nodes;
-        let n_levels = state.n_levels;
-
-        for k in ElementIndex::iter(n_elements) {
-            let _ki = k.as_usize();
-            for i in 0..n_nodes {
-                // Get T, S columns (read-only)
-                // We extract them first to avoid borrow conflicts, or access element-wise?
-                // Slice splitting is hard with `state`.
-                // However, we can just iterate by index since everything is contiguous.
-                // But `update_density` takes &mut Solution3D.
-                // We can't get &temp and &mut rho simultaneously if they are fields of same struct
-                // unless we split the borrow.
-                // Since `Solution3D` fields are public, we can borrow fields individually.
-
-                // This is the borrow checker friendly way:
-                // We cannot access `state.temp_column` and `state.rho_column_mut` simultaneously
-                // if those methods take `&self` and `&mut self`.
-                // But we CAN access `state.temp` and `state.rho` vectors directly.
-
-                let start_idx = (k.as_usize() * n_nodes + i) * n_levels;
-                let end_idx = start_idx + n_levels;
-
-                let t_col = &state.temp[start_idx..end_idx];
-                let s_col = &state.salt[start_idx..end_idx];
-                let rho_col = &mut state.rho[start_idx..end_idx];
-
-                for l in 0..n_levels {
-                    rho_col[l] = self.compute_density(t_col[l], s_col[l], 0.0);
-                }
-            }
-        }
-    }
 }
 
 /// UNESCO 1980 Equation of State (simplified).
@@ -121,26 +109,6 @@ impl EquationOfState for UnescoEOS {
             + (0.824493 - 4.0899e-3 * t + 7.6438e-5 * t2) * s
             - 5.72466e-3 * s32
             + 4.8314e-4 * s * s
-    }
-
-    fn update_density(&self, state: &mut Solution3D) {
-        let n_elements = state.n_elements;
-        let n_nodes = state.n_nodes;
-        let n_levels = state.n_levels;
-
-        // Parallel iteration could be done here if we had par_iter
-        // For now, sequential loop with split borrows.
-
-        // We can iterate over the full flat vectors directly!
-        // No need to do element/node loops since it's pointwise.
-
-        let total_size = n_elements * n_nodes * n_levels;
-        for idx in 0..total_size {
-            let t = state.temp[idx];
-            let s = state.salt[idx];
-            // z dependence ignored in this simplified version
-            state.rho[idx] = self.compute_density(t, s, 0.0);
-        }
     }
 }
 

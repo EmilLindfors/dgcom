@@ -125,6 +125,10 @@ pub enum RhsStencil {
     /// the diagonal GLL LIFT, that gradient reads beyond j only at the corner
     /// nodes. On a structured mesh: the 3 × 3 block around k.
     FacesAndCorners,
+    /// The elements sharing a vertex with k (a vertex-patch limiter, e.g.
+    /// the 3D tracers' Kuzmin limiter): `FacesAndCorners`, and at an
+    /// irregular vertex every element around it.
+    VertexPatches,
 }
 
 /// The element-subset operations that local time stepping needs from a
@@ -411,6 +415,23 @@ fn spread_over_stencil(mesh: &Mesh2D, from: &[u8], to: &mut [u8], stencil: RhsSt
             #[cfg(not(feature = "parallel"))]
             to.iter_mut().enumerate().for_each(element);
         }
+        RhsStencil::VertexPatches => {
+            let element = |(k, out): (usize, &mut u8)| {
+                *out = mesh
+                    .element_vertex_indices(ElementIndex::new(k))
+                    .iter()
+                    .flat_map(|&vertex| mesh.elements_at_vertex(vertex))
+                    .map(|&e| from[e])
+                    .fold(from[k], u8::max);
+            };
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                to.par_iter_mut().enumerate().for_each(element);
+            }
+            #[cfg(not(feature = "parallel"))]
+            to.iter_mut().enumerate().for_each(element);
+        }
     }
 }
 
@@ -486,6 +507,8 @@ pub struct MultirateStepper<S> {
     finest: usize,
     element_dt: Vec<f64>,
     level: Vec<u8>,
+    /// A rate's spreading buffer
+    scratch: Vec<u8>,
     /// `rate[s][k]`: the level whose substeps element k's stage-(s + 1) RHS
     /// follows, the finest level within s + 1 steps of the RHS stencil (one
     /// per stage)
@@ -518,6 +541,7 @@ impl<S: Integrable> MultirateStepper<S> {
             finest: 0,
             element_dt: Vec::new(),
             level: Vec::new(),
+            scratch: Vec::new(),
             rate: vec![Vec::new(); n_stages],
             active: vec![Vec::new(); n_stages],
             ending: Vec::new(),
@@ -541,25 +565,60 @@ impl<S: Integrable> MultirateStepper<S> {
         cfl: f64,
         dt_cap: Option<f64>,
     ) -> f64 {
+        let mut element_dt = std::mem::take(&mut self.element_dt);
+        element_dt.resize(mesh.n_elements, 0.0);
+        local.element_dt(state, cfl, self.scheme, &mut element_dt);
+        let dt = self.assign_levels_from(&element_dt, mesh, &[local.stencil()], dt_cap);
+        self.element_dt = element_dt;
+        dt
+    }
+
+    /// [`Self::assign_levels`] from given element time steps, for a stage
+    /// value of an element that reads the elements of `stencils` applied in
+    /// turn (e.g. an RHS's, then a limiter's on the combination).
+    pub fn assign_levels_from(
+        &mut self,
+        element_dt: &[f64],
+        mesh: &Mesh2D,
+        stencils: &[RhsStencil],
+        dt_cap: Option<f64>,
+    ) -> f64 {
         let n = mesh.n_elements;
-        self.element_dt.resize(n, 0.0);
-        local.element_dt(state, cfl, self.scheme, &mut self.element_dt);
-        let (dt, finest) =
-            assign_levels(&self.element_dt, self.max_levels, dt_cap, &mut self.level);
+        assert_eq!(element_dt.len(), n, "one time step per element");
+        assert!(
+            !stencils.is_empty(),
+            "a stage reads at least its RHS stencil"
+        );
+        let (dt, finest) = assign_levels(element_dt, self.max_levels, dt_cap, &mut self.level);
         self.finest = finest;
 
-        let stencil = local.stencil();
         for rate in &mut self.rate {
             rate.resize(n, 0);
         }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.resize(n, 0);
         limit_level_jumps(mesh, &mut self.level, &mut self.rate[0]);
-        spread_over_stencil(mesh, &self.level, &mut self.rate[0], stencil);
-        for s in 1..self.rate.len() {
+        for s in 0..self.rate.len() {
             let (done, rest) = self.rate.split_at_mut(s);
-            spread_over_stencil(mesh, &done[s - 1], &mut rest[0], stencil);
+            let from = if s == 0 { &self.level } else { &done[s - 1] };
+            let to = &mut rest[0];
+            to.copy_from_slice(from);
+            for &stencil in stencils {
+                spread_over_stencil(mesh, to, &mut scratch, stencil);
+                std::mem::swap(to, &mut scratch);
+            }
         }
+        self.scratch = scratch;
         self.sort_by_rates();
         dt
+    }
+
+    /// Element RHS evaluations of a global step of the scheme at the finest
+    /// level over those of a coarse step with the current levels and rates:
+    /// the speedup the last [`Self::assign_levels`] plans.
+    pub fn planned_speedup(&self) -> f64 {
+        let global = (self.rate.len() * self.level.len()) as u64 * (1u64 << self.finest);
+        global as f64 / self.evaluations_per_step.max(1) as f64
     }
 
     /// Put all `n_elements` elements on one level, for global steps of the
@@ -850,6 +909,35 @@ mod tests {
                 assert_eq!(rate[at(i, j)], in_cross as u8, "element ({i}, {j})");
             }
         }
+        // On a structured mesh the vertex patches are the same 3 × 3 block
+        spread_over_stencil(&mesh, &level, &mut rate, RhsStencil::VertexPatches);
+        for j in 0..5_usize {
+            for i in 0..5_usize {
+                let in_block = i.abs_diff(2) <= 1 && j.abs_diff(2) <= 1;
+                assert_eq!(rate[at(i, j)], in_block as u8, "element ({i}, {j})");
+            }
+        }
+    }
+
+    /// A stage that reads two stencils in turn (an RHS's, then a limiter's)
+    /// spreads its rate over both: one stencil step each, every stage.
+    #[test]
+    fn rates_spread_over_every_stencil_of_a_stage() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 8.0, 0.0, 1.0, 8, 1);
+        let element_dt = [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 2.0];
+        let mut one = MultirateStepper::<crate::solver::DGSolution2D>::new(2, SspScheme::Rk3);
+        one.assign_levels_from(&element_dt, &mesh, &[RhsStencil::Faces], None);
+        assert_eq!(one.levels(), [0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(one.rates(0), [0, 0, 0, 0, 0, 0, 1, 1]);
+        assert_eq!(one.rates(2), [0, 0, 0, 0, 1, 1, 1, 1]);
+        let mut two = MultirateStepper::<crate::solver::DGSolution2D>::new(2, SspScheme::Rk3);
+        let stencils = [RhsStencil::Faces, RhsStencil::Faces];
+        two.assign_levels_from(&element_dt, &mesh, &stencils, None);
+        assert_eq!(two.rates(0), [0, 0, 0, 0, 0, 1, 1, 1]);
+        assert_eq!(two.rates(2), [0, 1, 1, 1, 1, 1, 1, 1]);
+        // 3 stages × 8 elements × 2 finest substeps against the evaluations
+        assert_eq!(one.planned_speedup(), 48.0 / (3.0 * 8.0 + 2.0 + 3.0 + 4.0));
+        assert_eq!(two.planned_speedup(), 48.0 / (3.0 * 8.0 + 3.0 + 5.0 + 7.0));
     }
 
     #[test]

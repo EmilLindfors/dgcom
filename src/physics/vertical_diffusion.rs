@@ -14,7 +14,7 @@ use crate::physics::air_sea::{FRESH_WATER_DENSITY, JerlovWater, SEAWATER_HEAT_CA
 use crate::physics::vertical_mixing::{Column, Forcing, Turbulence, VerticalMixing};
 #[cfg(test)]
 use crate::solver::algorithms::tridiagonal::solve_tridiagonal;
-use crate::solver::core::blocks::{Pooled, for_each_block};
+use crate::solver::core::blocks::{Blocks, Pooled, for_each_block};
 use crate::solver::state::Solution3D;
 use crate::time::StepDrag;
 use crate::types::ElementIndex;
@@ -99,6 +99,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     rho0: f64,
     min_column_depth: f64,
     drag: StepDrag<'_>,
+    elements: Blocks,
 ) {
     let (nn, nl) = (state.n_nodes, state.n_levels);
     let n_w = state.n_elements * nn * (nl + 1);
@@ -125,7 +126,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     let n = state.n_elements * nn * nl;
     let [tau_bx, tau_by] = forcing.bottom_stress;
     for_each_block(
-        state.n_elements,
+        elements,
         [
             &mut u[..n],
             &mut v[..n],
@@ -670,6 +671,7 @@ mod tests {
                 1025.0,
                 0.0,
                 StepDrag::NONE,
+                bathymetry.n_elements.into(),
             );
             state.u_column(ElementIndex::new(0), 0).to_vec()
         };
@@ -732,6 +734,7 @@ mod tests {
             rho0,
             0.0,
             StepDrag::NONE,
+            bathymetry.n_elements.into(),
         );
 
         let el = ElementIndex::new(0);
@@ -798,6 +801,7 @@ mod tests {
                 1025.0,
                 0.0,
                 StepDrag::bottom(&[rate]),
+                bathymetry.n_elements.into(),
             );
             let (u, v) = (state.u_column(el, 0), state.v_column(el, 0));
             for (after, before, bottom) in [
@@ -892,6 +896,7 @@ mod gls_gates {
                         rho0,
                         0.0,
                         StepDrag::NONE,
+                        bathymetry.n_elements.into(),
                     );
                     eos.update_density(&mut state);
                     t += dt;
@@ -974,6 +979,7 @@ mod gls_gates {
                     rho0,
                     0.0,
                     StepDrag::bottom(&[rate]),
+                    bathymetry.n_elements.into(),
                 );
                 if spin_up.is_none() && state.tke[top] > 0.9 * k_log {
                     spin_up = Some(step);
@@ -1091,6 +1097,7 @@ mod gls_gates {
                     rho0,
                     0.0,
                     StepDrag::bottom(&[rate]),
+                    bathymetry.n_elements.into(),
                 );
             }
 
@@ -1171,6 +1178,7 @@ mod gls_gates {
                     rho0,
                     0.0,
                     StepDrag::bottom(&[rate]),
+                    bathymetry.n_elements.into(),
                 );
             }
             let name = format!("{:?}", gls.parameters());
@@ -1245,6 +1253,7 @@ mod gls_gates {
                     eos.rho0,
                     0.0,
                     StepDrag::NONE,
+                    bathymetry.n_elements.into(),
                 );
                 eos.update_density(&mut state);
             }
@@ -1312,6 +1321,7 @@ mod gls_gates {
                     eos.rho0,
                     0.0,
                     StepDrag::NONE,
+                    bathymetry.n_elements.into(),
                 );
                 eos.update_density(state);
             }
@@ -1405,6 +1415,7 @@ mod gls_gates {
                 eos.rho0,
                 0.0,
                 StepDrag::NONE,
+                bathymetry.n_elements.into(),
             );
             eos.update_density(&mut state);
             for col in 0..3 {
@@ -1491,6 +1502,7 @@ mod gls_gates {
                     eos.rho0,
                     0.0,
                     StepDrag::NONE,
+                    bathymetry.n_elements.into(),
                 );
                 eos.update_density(state);
             }

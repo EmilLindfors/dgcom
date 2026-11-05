@@ -184,7 +184,7 @@
 use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
-use crate::solver::core::blocks::{Pooled, for_each_block};
+use crate::solver::core::blocks::{Blocks, Pooled, for_each_block};
 use crate::solver::rhs::transport_3d::MetricForm;
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
@@ -259,6 +259,7 @@ impl BalancedReference {
                 metric,
                 &mut fx,
                 &mut fy,
+                Blocks::All(state.n_elements),
             );
             [fx, fy]
         };
@@ -322,6 +323,7 @@ impl BalancedReference {
             metric,
             &mut fx,
             &mut fy,
+            Blocks::All(reference.n_elements),
         );
         for f in fx.iter_mut().chain(fy.iter_mut()) {
             *f = -*f;
@@ -332,10 +334,17 @@ impl BalancedReference {
     }
 
     /// Add the correction to the forces `fx`, `fy`.
-    pub fn add_to(&self, fx: &mut [f64], fy: &mut [f64]) {
+    pub fn add_to(&self, fx: &mut [f64], fy: &mut [f64], elements: Blocks) {
         let [cx, cy] = &self.correction;
-        for (f, c) in fx.iter_mut().zip(cx).chain(fy.iter_mut().zip(cy)) {
-            *f += c;
+        let len = cx.len() / elements.n().max(1);
+        for k in elements.iter() {
+            let block = k * len..(k + 1) * len;
+            for (f, c) in fx[block.clone()].iter_mut().zip(&cx[block.clone()]) {
+                *f += c;
+            }
+            for (f, c) in fy[block.clone()].iter_mut().zip(&cy[block]) {
+                *f += c;
+            }
         }
     }
 }
@@ -632,6 +641,7 @@ pub fn compute_pressure_gradient(
     metric: MetricForm,
     grad_px: &mut [f64],
     grad_py: &mut [f64],
+    elements: Blocks,
 ) {
     let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
     let nl = sigma.n_levels();
@@ -639,7 +649,7 @@ pub fn compute_pressure_gradient(
 
     let n = state.n_elements * nn * nl;
     for_each_block(
-        state.n_elements,
+        elements,
         [&mut grad_px[..n], &mut grad_py[..n]],
         || {
             let mut scratch = Pooled::take(
@@ -895,6 +905,7 @@ mod tests {
                 MetricForm::Conservative,
                 &mut fx,
                 &mut fy,
+                Blocks::All(self.state.n_elements),
             );
             (fx, fy)
         }
@@ -921,7 +932,7 @@ mod tests {
                 MetricForm::Conservative,
             );
             let (mut fx, mut fy) = self.pgf(RHO0, PressureGradientForm::SigmaPairs);
-            reference.add_to(&mut fx, &mut fy);
+            reference.add_to(&mut fx, &mut fy, Blocks::All(self.state.n_elements));
             largest(&fx, &fy)
         }
     }
@@ -1080,7 +1091,7 @@ mod tests {
                     pycnocline,
                 );
                 let (mut fx, mut fy) = stratified.pgf(RHO0, PressureGradientForm::SigmaPairs);
-                reference.add_to(&mut fx, &mut fy);
+                reference.add_to(&mut fx, &mut fy, Blocks::All(stratified.state.n_elements));
                 let departure = case(&|x, _| RHO0 + anomaly * (x - 1500.0));
                 let (dx, dy) = departure.pgf(RHO0, PressureGradientForm::SigmaPairs);
                 let error = largest(

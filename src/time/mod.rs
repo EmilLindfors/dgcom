@@ -31,8 +31,8 @@ mod burn_ssp_rk3;
 pub use clock::ModelClock;
 pub use mode_split::{
     BarotropicFilter, BarotropicPhysics, BarotropicTransport, MIN_BAROTROPIC_SUBSTEPS,
-    ModeSplitIntegrator, ModeSplitPhysics, SlowForcingRecord, SplitMethod, StageStash, StepDrag,
-    step_average_weights,
+    ModeSplitIntegrator, ModeSplitPhysics, SlowForcingRecord, SplitMethod, StageElements,
+    StageStash, StageTime, StepDrag, step_average_weights,
 };
 pub use multirate::{
     ElementStage, LocalTimeStepping, Multirate, MultiratePass, MultirateSSPRK3, MultirateSSPRK43,
