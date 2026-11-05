@@ -230,6 +230,7 @@ impl Case {
             metric,
             &mut fx,
             &mut fy,
+            self.mesh.n_elements.into(),
         );
         [fx, fy]
     }

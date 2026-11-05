@@ -50,9 +50,11 @@ use crate::boundary::NestingError;
 use crate::boundary::band::boundary_distances;
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use crate::operators::DGOperators2D;
+use crate::solver::Blocks;
 use crate::solver::rhs::{Exterior3D, ExteriorField};
 use crate::solver::state::Solution3D;
 use crate::source::SpongeProfile;
+use crate::time::mode_split::StageTime;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
@@ -196,9 +198,13 @@ pub struct Nesting3D {
 
 /// The parent's columns at every slot for one child state.
 struct Columns {
-    /// Time and child `η` they were evaluated for.
-    time: f64,
+    /// Per band slot, the time and child `η` its column was evaluated for.
+    time: Vec<f64>,
     eta: Vec<f64>,
+    /// Per element, whether the last [`Nesting3D::columns`] was for it.
+    listed: Vec<bool>,
+    /// Nodes per element.
+    n_nodes: usize,
     u: Vec<f64>,
     v: Vec<f64>,
     temp: Vec<f64>,
@@ -251,8 +257,10 @@ impl Nesting3D {
         }
         let n_values = nodes.len() * n_levels;
         let columns = Columns {
-            time: f64::NAN,
+            time: vec![f64::NAN; nodes.len()],
             eta: vec![f64::NAN; nodes.len()],
+            listed: Vec::new(),
+            n_nodes: 1,
             u: vec![0.0; n_values],
             v: vec![0.0; n_values],
             temp: vec![0.0; n_values],
@@ -282,10 +290,12 @@ impl Nesting3D {
         self.nodes.len()
     }
 
-    /// The parent's columns for `state` at time `t`, evaluated unless the
-    /// last evaluation was for the same time and free surface. A node the
-    /// parent does not cover keeps the child's own column, its velocity at
-    /// rest where the column is thinner than `min_column_depth` (as every 3D
+    /// The parent's columns for `state` at the band nodes of `elements`,
+    /// each at its element's stage time in `time`; a column is evaluated
+    /// unless its last evaluation was for the same time and free surface.
+    /// The relaxations then act on those elements only. A node the parent
+    /// does not cover keeps the child's own column, its velocity at rest
+    /// where the column is thinner than `min_column_depth` (as every 3D
     /// kernel sees a thin column; then it does not matter whether `state`
     /// holds the thin columns' velocities or has them masked).
     pub fn columns(
@@ -293,31 +303,43 @@ impl Nesting3D {
         state: &Solution3D,
         bathymetry: &Bathymetry2D,
         sigma: &SigmaGrid,
-        t: f64,
+        time: StageTime,
+        elements: Blocks,
         min_column_depth: f64,
     ) -> NestingColumns<'_> {
         let mut columns = self.columns.lock().expect("Failed to lock nesting columns");
-        let current = columns.time == t
-            && self
-                .nodes
-                .iter()
-                .zip(&columns.eta)
-                .all(|(&flat, &eta)| state.eta.data[flat] == eta);
-        if !current {
+        {
             let nl = self.n_levels;
+            let nn = state.n_nodes;
             let Columns {
-                time,
+                time: times,
                 eta,
                 u,
                 v,
                 temp,
                 salt,
+                listed,
+                n_nodes,
             } = &mut *columns;
-            *time = t;
+            *n_nodes = nn;
+            listed.clear();
+            listed.resize(state.n_elements, elements.is_all());
+            if !elements.is_all() {
+                elements.iter().for_each(|k| listed[k] = true);
+            }
+            let listed: &[bool] = listed;
             // Each band node's column on its own (a parent evaluation is a
             // few µs, ≈ 10⁴ band nodes on a coastline mesh)
-            let column_of = |(slot, (eta, (u, (v, (temp, salt))))): BandColumn<'_>| {
+            let column_of = |(slot, ((t_slot, eta), (u, (v, (temp, salt))))): BandColumn<'_>| {
                 let flat = self.nodes[slot];
+                if !listed[flat / nn] {
+                    return;
+                }
+                let t = time.at(flat / nn);
+                if *t_slot == t && *eta == state.eta.data[flat] {
+                    return;
+                }
+                *t_slot = t;
                 *eta = state.eta.data[flat];
                 let covered = self.parent.column(
                     &ColumnContext3D {
@@ -351,7 +373,9 @@ impl Nesting3D {
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
-                eta.par_iter_mut()
+                times
+                    .par_iter_mut()
+                    .zip(eta.par_iter_mut())
                     .zip(
                         u.par_chunks_exact_mut(nl).zip(
                             v.par_chunks_exact_mut(nl).zip(
@@ -364,7 +388,9 @@ impl Nesting3D {
                     .for_each(column_of);
             }
             #[cfg(not(feature = "parallel"))]
-            eta.iter_mut()
+            times
+                .iter_mut()
+                .zip(eta.iter_mut())
                 .zip(
                     u.chunks_exact_mut(nl).zip(
                         v.chunks_exact_mut(nl)
@@ -386,7 +412,7 @@ impl Nesting3D {
 type BandColumn<'a> = (
     usize,
     (
-        &'a mut f64,
+        (&'a mut f64, &'a mut f64),
         (
             &'a mut [f64],
             (&'a mut [f64], (&'a mut [f64], &'a mut [f64])),
@@ -401,6 +427,11 @@ pub struct NestingColumns<'a> {
 }
 
 impl NestingColumns<'_> {
+    /// Whether node `flat`'s element was listed in [`Nesting3D::columns`].
+    fn listed(&self, flat: usize) -> bool {
+        self.columns.listed[flat / self.columns.n_nodes]
+    }
+
     fn field<'b>(&'b self, values: &'b [f64]) -> ExteriorField<'b> {
         ExteriorField {
             tags: &self.nesting.tags,
@@ -444,7 +475,7 @@ impl NestingColumns<'_> {
             .zip(&self.nesting.velocity_rate)
             .enumerate()
         {
-            if rate == 0.0 || skip(flat) {
+            if rate == 0.0 || !self.listed(flat) || skip(flat) {
                 continue;
             }
             let parent = slot * nl..(slot + 1) * nl;
@@ -491,7 +522,7 @@ impl NestingColumns<'_> {
             .zip(&self.nesting.tracer_rate)
             .enumerate()
         {
-            if rate == 0.0 || skip(flat) {
+            if rate == 0.0 || !self.listed(flat) || skip(flat) {
                 continue;
             }
             let depth = state.eta.data[flat] - bathymetry.data[flat];
@@ -596,7 +627,14 @@ mod tests {
         state.temp.fill(12.0);
         state.salt.fill(33.0);
         state.eta.fill(0.5);
-        let columns = nesting.columns(&state, &bathymetry, &sigma, 100.0, 0.0);
+        let columns = nesting.columns(
+            &state,
+            &bathymetry,
+            &sigma,
+            StageTime::Uniform(100.0),
+            Blocks::All(state.n_elements),
+            0.0,
+        );
         let mut rhs = Solution3D::new(mesh.n_elements, ops.n_nodes, 4);
         columns.relax_shear(&state, &sigma, &mut rhs, |_| false);
         columns.relax_tracers(&state, &bathymetry, &sigma, &mut rhs, |_| false);
@@ -650,7 +688,14 @@ mod tests {
         let bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -20.0);
         let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, 4);
         let at = |state: &Solution3D, t: f64| {
-            let columns = nesting.columns(state, &bathymetry, &sigma, t, 0.0);
+            let columns = nesting.columns(
+                state,
+                &bathymetry,
+                &sigma,
+                StageTime::Uniform(t),
+                Blocks::All(state.n_elements),
+                0.0,
+            );
             let [u, v] = columns.exterior().velocity.unwrap();
             (
                 u.at(BoundaryTag::Open, 0, 0).unwrap(),

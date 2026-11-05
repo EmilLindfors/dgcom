@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::DGSolution2D;
-use crate::solver::core::blocks::{Pooled, for_each_block, reduce_blocks};
+use crate::solver::core::blocks::{Blocks, Neighbourhood, Pooled, for_each_block, reduce_blocks};
 use crate::solver::rhs::UNBOUNDED;
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
@@ -495,6 +495,7 @@ pub fn apply_tracer_limiters_3d(
     bathymetry: &Bathymetry2D,
     sigma: &SigmaGrid,
     config: &TracerLimiter3DConfig,
+    elements: Blocks,
 ) -> TracerLimiter3DStats {
     let mut stats = TracerLimiter3DStats::default();
 
@@ -506,6 +507,9 @@ pub fn apply_tracer_limiters_3d(
                 |a: &Vec<f64>| a.len() == state.n_elements * state.n_nodes * state.n_levels,
                 || vec![f64::NAN; state.n_elements * state.n_nodes * state.n_levels],
             );
+            // The limiter reads the vertex patches' columns
+            let mut near = Pooled::take(|_: &Neighbourhood| true, Neighbourhood::default);
+            let patches = near.vertex_patches(mesh, elements);
             fill_centre_heights(
                 &mut centres,
                 &state.eta,
@@ -513,6 +517,7 @@ pub fn apply_tracer_limiters_3d(
                 state.n_levels,
                 bathymetry,
                 sigma,
+                patches,
             );
             let columns = LayerColumns {
                 centres: &centres,
@@ -529,7 +534,7 @@ pub fn apply_tracer_limiters_3d(
                 |a: &Vec<f64>| a.len() == state.n_elements * state.n_levels,
                 || vec![f64::NAN; state.n_elements * state.n_levels],
             );
-            columns.layer_mean_heights(&mut mean_heights);
+            columns.layer_mean_heights(&mut mean_heights, patches);
             apply_horizontal_kuzmin_fields(
                 [&mut state.temp, &mut state.salt],
                 config.reference.as_deref(),
@@ -538,6 +543,8 @@ pub fn apply_tracer_limiters_3d(
                 mesh,
                 relaxation,
                 &mut stats,
+                elements,
+                patches,
             );
         }
     }
@@ -545,7 +552,7 @@ pub fn apply_tracer_limiters_3d(
     apply_horizontal_bounds_field(
         &mut state.temp,
         &state.eta,
-        state.n_elements,
+        elements,
         state.n_nodes,
         state.n_levels,
         geom,
@@ -560,7 +567,7 @@ pub fn apply_tracer_limiters_3d(
     apply_horizontal_bounds_field(
         &mut state.salt,
         &state.eta,
-        state.n_elements,
+        elements,
         state.n_nodes,
         state.n_levels,
         geom,
@@ -577,7 +584,7 @@ pub fn apply_tracer_limiters_3d(
         apply_vertical_column_bounds_field(
             &mut state.temp,
             &state.eta,
-            state.n_elements,
+            elements,
             state.n_nodes,
             state.n_levels,
             geom,
@@ -592,7 +599,7 @@ pub fn apply_tracer_limiters_3d(
         apply_vertical_column_bounds_field(
             &mut state.salt,
             &state.eta,
-            state.n_elements,
+            elements,
             state.n_nodes,
             state.n_levels,
             geom,
@@ -612,7 +619,7 @@ pub fn apply_tracer_limiters_3d(
 fn apply_horizontal_bounds_field(
     field: &mut [f64],
     eta: &DGSolution2D,
-    n_elements: usize,
+    elements: Blocks,
     n_nodes: usize,
     n_levels: usize,
     geom: &GeometricFactors2D,
@@ -627,8 +634,9 @@ fn apply_horizontal_bounds_field(
     let d_sigma = sigma.d_sigma();
     let index = |i: usize, level: usize| i * n_levels + level;
 
+    let n_elements = elements.n();
     let block_stats = reduce_blocks(
-        n_elements,
+        elements,
         [&mut field[..n_elements * n_nodes * n_levels]],
         || (),
         |_, k, [field]| {
@@ -698,7 +706,7 @@ fn apply_horizontal_bounds_field(
 fn apply_vertical_column_bounds_field(
     field: &mut [f64],
     eta: &DGSolution2D,
-    n_elements: usize,
+    elements: Blocks,
     n_nodes: usize,
     n_levels: usize,
     geom: &GeometricFactors2D,
@@ -713,8 +721,9 @@ fn apply_vertical_column_bounds_field(
     let d_sigma = sigma.d_sigma();
     let index = |i: usize, level: usize| i * n_levels + level;
 
+    let n_elements = elements.n();
     let block_stats = reduce_blocks(
-        n_elements,
+        elements,
         [&mut field[..n_elements * n_nodes * n_levels]],
         || (),
         |_, k, [field]| {
@@ -807,11 +816,11 @@ fn fill_centre_heights(
     n_levels: usize,
     bathymetry: &Bathymetry2D,
     sigma: &SigmaGrid,
+    elements: Blocks,
 ) {
-    let n_elements = centres.len() / (n_nodes * n_levels);
     let sigma_rho = sigma.sigma_rho();
     for_each_block(
-        n_elements,
+        elements,
         [centres],
         || (),
         |_, k, [centres]| {
@@ -834,12 +843,17 @@ impl LayerColumns<'_> {
     }
 
     /// The inventory-weighted mean of `value(k, node, level)` over every
-    /// element's layers into `means` (`[element][level]`; NaN for a layer
-    /// without water).
-    fn layer_means(&self, means: &mut [f64], value: impl Fn(usize, usize, usize) -> f64 + Sync) {
+    /// element's layers of `elements` into `means` (`[element][level]`; NaN
+    /// for a layer without water).
+    fn layer_means(
+        &self,
+        means: &mut [f64],
+        value: impl Fn(usize, usize, usize) -> f64 + Sync,
+        elements: Blocks,
+    ) {
         let d_sigma = self.sigma.d_sigma();
         for_each_block(
-            self.n_elements,
+            elements,
             [means],
             || (),
             |_, k, [means]| {
@@ -865,10 +879,12 @@ impl LayerColumns<'_> {
 
     /// The inventory-weighted mean height of every element layer's centres:
     /// for a tracer linear in `z`, its layer mean is its value there.
-    fn layer_mean_heights(&self, heights: &mut [f64]) {
-        self.layer_means(heights, |k, i, level| {
-            self.centre_height(ElementIndex::new(k), i, level)
-        });
+    fn layer_mean_heights(&self, heights: &mut [f64], elements: Blocks) {
+        self.layer_means(
+            heights,
+            |k, i, level| self.centre_height(ElementIndex::new(k), i, level),
+            elements,
+        );
     }
 }
 
@@ -912,8 +928,13 @@ struct KuzminTracer {
 
 impl KuzminTracer {
     /// The tracer `field`'s pass data, with `references`, the reference at
-    /// every node's layer centre (zero without one).
-    fn new(field: &[f64], references: Pooled<Vec<f64>>, columns: &LayerColumns) -> Self {
+    /// every node's layer centre (zero without one), on `elements`.
+    fn new(
+        field: &[f64],
+        references: Pooled<Vec<f64>>,
+        columns: &LayerColumns,
+        elements: Blocks,
+    ) -> Self {
         let (n_elements, n_nodes, n_levels) =
             (columns.n_elements, columns.n_nodes, columns.n_levels);
         let mut averages = Pooled::take(
@@ -930,9 +951,9 @@ impl KuzminTracer {
                 let j = index(k, i, level, n_nodes, n_levels);
                 field[j] - references[j]
             };
-            columns.layer_means(&mut averages, departure);
+            columns.layer_means(&mut averages, departure, elements);
             for_each_block(
-                n_elements,
+                elements,
                 [&mut end_ranges[..]],
                 || (),
                 |_, k, [range]| {
@@ -1027,6 +1048,8 @@ fn apply_horizontal_kuzmin_fields(
     mesh: &Mesh2D,
     relaxation: f64,
     stats: &mut TracerLimiter3DStats,
+    elements: Blocks,
+    patches: Blocks,
 ) {
     const COMPONENTS: [TracerComponent; 2] =
         [TracerComponent::Temperature, TracerComponent::Salinity];
@@ -1042,7 +1065,7 @@ fn apply_horizontal_kuzmin_fields(
             profile.samples(TracerComponent::Salinity),
         ];
         for_each_block(
-            n_elements,
+            patches,
             [&mut temp_references[..], &mut salt_references[..]],
             || (),
             |_, k, [temp, salt]| {
@@ -1055,12 +1078,19 @@ fn apply_horizontal_kuzmin_fields(
             },
         );
     } else {
-        temp_references.fill(0.0);
-        salt_references.fill(0.0);
+        for_each_block(
+            patches,
+            [&mut temp_references[..], &mut salt_references[..]],
+            || (),
+            |_, _, [temp, salt]| {
+                temp.fill(0.0);
+                salt.fill(0.0);
+            },
+        );
     }
     let tracers = [
-        KuzminTracer::new(temp, temp_references, columns),
-        KuzminTracer::new(salt, salt_references, columns),
+        KuzminTracer::new(temp, temp_references, columns, patches),
+        KuzminTracer::new(salt, salt_references, columns, patches),
     ];
     let local = |i: usize, level: usize| i * n_levels + level;
     // Element `e`'s column at height `z` (near `level`): where its layer
@@ -1071,7 +1101,7 @@ fn apply_horizontal_kuzmin_fields(
     };
 
     let block_stats = reduce_blocks(
-        n_elements,
+        elements,
         [&mut temp[..n_values], &mut salt[..n_values]],
         || Pooled::take(|_: &KuzminScratch| true, KuzminScratch::default),
         |scratch, k, fields| {
@@ -1519,8 +1549,16 @@ mod tests {
         let before = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         let config = TracerLimiter3DConfig::bounds(TracerBounds::new(0.0, 10.0, 0.0, 40.0));
 
-        let stats =
-            apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
+        let stats = apply_tracer_limiters_3d(
+            &mut state,
+            &mesh,
+            &ops,
+            &geom,
+            &bathymetry,
+            &sigma,
+            &config,
+            Blocks::All(mesh.n_elements),
+        );
 
         let after = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         assert!(stats.limited_temperature_cells > 0);
@@ -1543,8 +1581,16 @@ mod tests {
         let before = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         let config = TracerLimiter3DConfig::bounds(TracerBounds::new(0.0, 10.0, 0.0, 40.0));
 
-        let stats =
-            apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
+        let stats = apply_tracer_limiters_3d(
+            &mut state,
+            &mesh,
+            &ops,
+            &geom,
+            &bathymetry,
+            &sigma,
+            &config,
+            Blocks::All(mesh.n_elements),
+        );
 
         let after = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         assert_eq!(stats.temperature_average_violations, 1);
@@ -1559,8 +1605,16 @@ mod tests {
         let config = TracerLimiter3DConfig::bounds(TracerBounds::new(0.0, 10.0, 0.0, 40.0))
             .with_average_policy(TracerAveragePolicy3D::EnforceBounds);
 
-        let stats =
-            apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
+        let stats = apply_tracer_limiters_3d(
+            &mut state,
+            &mesh,
+            &ops,
+            &geom,
+            &bathymetry,
+            &sigma,
+            &config,
+            Blocks::All(mesh.n_elements),
+        );
 
         assert_eq!(stats.temperature_average_violations, 1);
         assert!(stats.temperature_inventory_correction > 0.0);
@@ -1591,8 +1645,16 @@ mod tests {
             TracerBounds::new(-100.0, 100.0, 0.0, 40.0),
             1.0,
         );
-        let stats =
-            apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
+        let stats = apply_tracer_limiters_3d(
+            &mut state,
+            &mesh,
+            &ops,
+            &geom,
+            &bathymetry,
+            &sigma,
+            &config,
+            Blocks::All(mesh.n_elements),
+        );
         let after = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         assert!(stats.limited_temperature_cells > 0);
         for &value in &state.temp[..n_nodes] {
@@ -1637,8 +1699,16 @@ mod tests {
             TracerBounds::new(-100.0, 100.0, 0.0, 40.0),
             1.0,
         );
-        let stats =
-            apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
+        let stats = apply_tracer_limiters_3d(
+            &mut state,
+            &mesh,
+            &ops,
+            &geom,
+            &bathymetry,
+            &sigma,
+            &config,
+            Blocks::All(mesh.n_elements),
+        );
         let change = before
             .iter()
             .zip(&state.temp)
@@ -1671,8 +1741,16 @@ mod tests {
             1.0,
         );
 
-        let stats =
-            apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
+        let stats = apply_tracer_limiters_3d(
+            &mut state,
+            &mesh,
+            &ops,
+            &geom,
+            &bathymetry,
+            &sigma,
+            &config,
+            Blocks::All(mesh.n_elements),
+        );
 
         let after = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         assert!(stats.limited_temperature_cells > 0);

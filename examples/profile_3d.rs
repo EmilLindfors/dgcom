@@ -31,9 +31,11 @@ use dg_rs::physics::{
 };
 use dg_rs::solver::rhs::{BarotropicFlux, MomentumAdvectionForm, VerticalAdvection};
 use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{SWEFormulation2D, SWESolution2D, TracerLimiter3DConfig, TracerLimiterType3D};
+use dg_rs::solver::{
+    Blocks, SWEFormulation2D, SWESolution2D, TracerLimiter3DConfig, TracerLimiterType3D,
+};
 use dg_rs::source::CoriolisSource2D;
-use dg_rs::time::{ModeSplitIntegrator, ModeSplitPhysics, StepDrag};
+use dg_rs::time::{ModeSplitIntegrator, ModeSplitPhysics, StageElements, StepDrag};
 use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
 
 const G: f64 = 9.81;
@@ -90,15 +92,26 @@ impl<P: ModeSplitPhysics> ModeSplitPhysics for Timed<'_, P> {
         })
     }
 
+    fn stage_momentum_rhs_into(
+        &self,
+        state: &Solution3D,
+        stage: StageElements,
+        out: &mut Solution3D,
+    ) {
+        self.time("momentum_rhs", || {
+            self.inner.stage_momentum_rhs_into(state, stage, out)
+        })
+    }
+
     fn transport_rhs_into(
         &self,
         state: &Solution3D,
-        t: f64,
+        stage: StageElements,
         barotropic: BarotropicFlux,
         out: &mut Solution3D,
     ) {
         self.time("transport_rhs", || {
-            self.inner.transport_rhs_into(state, t, barotropic, out)
+            self.inner.transport_rhs_into(state, stage, barotropic, out)
         })
     }
 
@@ -124,26 +137,38 @@ impl<P: ModeSplitPhysics> ModeSplitPhysics for Timed<'_, P> {
         self.time("layer_drag", || self.inner.layer_drag_into(state, t, rate))
     }
 
-    fn vertical_implicit(&self, state: &mut Solution3D, t: f64, dt: f64, drag: StepDrag<'_>) {
+    fn vertical_implicit(
+        &self,
+        state: &mut Solution3D,
+        elements: Blocks,
+        t: f64,
+        dt: f64,
+        drag: StepDrag<'_>,
+    ) {
         self.time("vertical_implicit", || {
-            self.inner.vertical_implicit(state, t, dt, drag)
+            self.inner.vertical_implicit(state, elements, t, dt, drag)
         })
     }
 
-    fn post_stage(&self, state: &mut Solution3D) {
-        self.time("post_stage", || self.inner.post_stage(state))
+    fn post_stage(&self, state: &mut Solution3D, elements: Blocks) {
+        self.time("post_stage", || self.inner.post_stage(state, elements))
     }
 
-    fn end_density(&self, state: &mut Solution3D) {
-        self.time("end_density", || self.inner.end_density(state))
+    fn end_density(&self, state: &mut Solution3D, elements: Blocks) {
+        self.time("end_density", || self.inner.end_density(state, elements))
     }
 
-    fn mask_stage(&self, state: &mut Solution3D, stash: &mut dg_rs::time::StageStash) {
-        self.inner.mask_stage(state, stash)
+    fn stage_stencils(&self) -> Vec<dg_rs::time::RhsStencil> {
+        self.inner.stage_stencils()
     }
 
-    fn unmask_stage(&self, state: &mut Solution3D, stash: &dg_rs::time::StageStash) {
-        self.inner.unmask_stage(state, stash)
+    fn mask_stage(
+        &self,
+        state: &mut Solution3D,
+        elements: Blocks,
+        stash: &mut dg_rs::time::StageStash,
+    ) {
+        self.inner.mask_stage(state, elements, stash)
     }
 }
 

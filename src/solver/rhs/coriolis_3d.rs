@@ -9,7 +9,7 @@
 
 use crate::mesh::Mesh2D;
 use crate::operators::DGOperators2D;
-use crate::solver::core::blocks::for_each_block;
+use crate::solver::core::blocks::{Blocks, for_each_block};
 use crate::solver::state::Solution3D;
 use crate::source::CoriolisSource2D;
 use crate::types::ElementIndex;
@@ -30,11 +30,12 @@ pub fn apply_coriolis_3d(
     mesh: &Mesh2D,
     ops: &DGOperators2D,
     coriolis: &CoriolisSource2D,
+    elements: Blocks,
 ) {
     let (n_nodes, n_levels) = (ops.n_nodes, state.n_levels);
     let n = mesh.n_elements * n_nodes * n_levels;
     for_each_block(
-        mesh.n_elements,
+        elements,
         [&mut rhs.u[..n], &mut rhs.v[..n]],
         || (),
         |_, k, [rhs_u, rhs_v]| {
@@ -85,7 +86,14 @@ mod tests {
         let f0 = 1.0e-4;
         let coriolis = CoriolisSource2D::f_plane(f0);
 
-        apply_coriolis_3d(&mut rhs, &state, &mesh, &ops, &coriolis);
+        apply_coriolis_3d(
+            &mut rhs,
+            &state,
+            &mesh,
+            &ops,
+            &coriolis,
+            mesh.n_elements.into(),
+        );
 
         // du/dt = f*v = 0
         // dv/dt = -f*u = -1e-4 * 10 = -1e-3

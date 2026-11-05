@@ -34,7 +34,7 @@ pub mod simd;
 pub mod state;
 
 // Re-export core solution types
-pub use core::{DGSolution1D, DGSolution2D, SystemSolution, SystemSolution2D};
+pub use core::{Blocks, DGSolution1D, DGSolution2D, SystemSolution, SystemSolution2D};
 
 pub use probe::{Probe2D, SWEPointSample};
 

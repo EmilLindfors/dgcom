@@ -72,7 +72,7 @@
 
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::GeometricFactors2D;
-use crate::solver::core::blocks::{Pooled, for_each_block};
+use crate::solver::core::blocks::{Blocks, Pooled, for_each_block};
 use crate::solver::rhs::transport_3d::{layer_thickness_of, layer_volume_of};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
@@ -160,9 +160,10 @@ impl ImplicitVerticalAdvection {
 /// Relax the inventory fields of the stage value `stage` (`H_z u`, `H_z v`,
 /// `H_z T`, `H_z S` and the turbulence's `H_w k`, `H_w ψ`) with the implicit
 /// vertical fluxes `omega_implicit` (`Ω_i` at the σ-surfaces,
-/// `[element][node][n_levels + 1]`) over `dt` (see the module docs), on the
-/// stage's thicknesses (its `η`): the layers' σ-thicknesses `d_sigma`, the
-/// w-cells' `d_sigma_w` ([`crate::solver::rhs::w_cell_thicknesses`]).
+/// `[element][node][n_levels + 1]`) over `dt[k]` in each element k of
+/// `elements` (see the module docs), on the stage's thicknesses (its `η`):
+/// the layers' σ-thicknesses `d_sigma`, the w-cells' `d_sigma_w`
+/// ([`crate::solver::rhs::w_cell_thicknesses`]).
 ///
 /// - Elements not marked in `element_means`: every column on its own.
 /// - Marked elements, whose fields the mode splitter carries as element
@@ -182,7 +183,8 @@ pub(crate) fn apply_implicit_vertical_advection(
     bathymetry: &Bathymetry2D,
     geom: &GeometricFactors2D,
     element_means: &[bool],
-    dt: f64,
+    elements: Blocks,
+    dt: &[f64],
 ) {
     let (ne, nn, nl) = (stage.n_elements, stage.n_nodes, stage.n_levels);
     let n = ne * nn * nl;
@@ -199,7 +201,7 @@ pub(crate) fn apply_implicit_vertical_advection(
     let eta: &[f64] = &eta.data;
     let has_turbulence = !tke.is_empty();
     for_each_block(
-        ne,
+        elements,
         [
             &mut u[..n],
             &mut v[..n],
@@ -228,6 +230,7 @@ pub(crate) fn apply_implicit_vertical_advection(
                 geom,
                 means: element_means[k],
             };
+            let dt = dt[k];
             for field in [u, v, temp, salt] {
                 columns.relax(field, d_sigma, false, dt, scratch);
             }

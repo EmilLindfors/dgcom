@@ -105,7 +105,7 @@ use crate::mesh::data::Bathymetry2D;
 use crate::mesh::data::BoundaryTag;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::SWEFormulation2D;
-use crate::solver::core::blocks::{Pooled, for_each_block, max_over_blocks};
+use crate::solver::core::blocks::{Blocks, Neighbourhood, Pooled, for_each_block, max_over_blocks};
 use crate::solver::rhs::advection_3d::{TracerBCContext3D, TracerBoundaryCondition3D};
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D, ExteriorField, FaceExterior};
 use crate::solver::rhs::subcells::{
@@ -661,10 +661,12 @@ fn subtract_face_lift_levels(
 pub struct BarotropicFlux<'a> {
     /// Length of the baroclinic step (s).
     pub dt: f64,
-    /// The longest forward-Euler step in the 3D stages' scheme (s): `dt`
-    /// over its SSP coefficient (`dt` for SSP-RK3, `dt/2` for SSP-RK(4,3)).
-    /// A stage's explicit Courant number is taken for it.
-    pub euler_dt: f64,
+    /// The longest forward-Euler step of every element in the 3D stages'
+    /// scheme (s), `[element]`: its step over the scheme's SSP coefficient
+    /// (`dt` for SSP-RK3, `dt/2` for SSP-RK(4,3) at global steps; an
+    /// element's own step with local time stepping). A stage's explicit
+    /// Courant number is taken for it.
+    pub euler_dt: &'a [f64],
     /// Nodal barotropic transport `DU_avg2` (m²/s), `[element][node]`.
     pub hu: &'a [f64],
     pub hv: &'a [f64],
@@ -735,6 +737,8 @@ pub struct LayerTransport {
     /// The volume form of every horizontal divergence of these transports:
     /// the 2D module's ([`MetricForm::of`]; see [`Self::with_metric`]).
     pub metric: MetricForm,
+    /// The elements of a [`Self::compute`] on a list and their neighbours.
+    neighbourhood: Neighbourhood,
 }
 
 impl LayerTransport {
@@ -754,6 +758,7 @@ impl LayerTransport {
             d_sigma: vec![1.0 / n_levels as f64; n_levels],
             surface_residual: 0.0,
             metric: MetricForm::default(),
+            neighbourhood: Neighbourhood::default(),
         }
     }
 
@@ -813,10 +818,10 @@ impl LayerTransport {
         boundaries: &Boundaries3D,
         exterior: &Exterior3D,
         min_column_depth: f64,
+        elements: Blocks,
     ) {
         let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, self.n_levels);
         assert_eq!(state.n_levels, nl, "layer count of the state");
-        let n_elements = state.n_elements;
         let n1 = ops.n_1d;
         let n_sub = subcell_interfaces(n1);
         let d_sigma = sigma.d_sigma();
@@ -831,6 +836,7 @@ impl LayerTransport {
             volume_source,
             dt_over_depth,
             metric,
+            neighbourhood,
             ..
         } = self;
         let metric = *metric;
@@ -838,8 +844,8 @@ impl LayerTransport {
         // The subcell elements: those the pass moved on the subcells
         // throughout (so the layers sum to its update node by node), or
         // without a pass those with a thin column
-        for (k, sub) in subcell_elements.iter_mut().enumerate() {
-            *sub = match barotropic {
+        for k in elements.iter() {
+            subcell_elements[k] = match barotropic {
                 Some(b) => b.subcell[k * n_sub..(k + 1) * n_sub]
                     .iter()
                     .all(|f| f.is_finite()),
@@ -848,9 +854,10 @@ impl LayerTransport {
         }
         let subcell_elements: &[bool] = subcell_elements;
 
-        // 1. Nodal layer transports, corrected to DU_avg2
+        // 1. Nodal layer transports, corrected to DU_avg2, on the elements
+        // and their face neighbours (whose transports the faces read)
         for_each_block(
-            n_elements,
+            neighbourhood.faces(mesh, elements),
             [&mut layer_hu[..], &mut layer_hv[..], &mut dt_over_depth[..]],
             || (),
             |_, k, [hu_k, hv_k, dt_k]| {
@@ -859,7 +866,7 @@ impl LayerTransport {
                     let idx = k * nn + i;
                     let depth = state.eta.data[idx] - b;
                     dt_k[i] = match barotropic {
-                        Some(flux) if depth > 0.0 => flux.euler_dt / depth,
+                        Some(flux) if depth > 0.0 => flux.euler_dt[k] / depth,
                         _ => 0.0,
                     };
                     let column = idx * nl..(idx + 1) * nl;
@@ -896,7 +903,7 @@ impl LayerTransport {
         // 2. Face fluxes: central average of the nodal transports, corrected
         // to the barotropic face flux
         for_each_block(
-            n_elements,
+            elements,
             [&mut layer_face[..]],
             || (),
             |_, k, [face_k]| {
@@ -963,7 +970,7 @@ impl LayerTransport {
         // 2b. Subcell interface fluxes of the subcell elements: each layer's
         // share of the barotropic flux, none between a column and a thin one
         for_each_block(
-            n_elements,
+            elements,
             [&mut layer_subcell[..]],
             || (),
             |_, k, [sub_k]| {
@@ -1017,7 +1024,7 @@ impl LayerTransport {
         // 3. Ω from the bed up
         let sigma_w = sigma.sigma_w();
         let residual = max_over_blocks(
-            n_elements,
+            elements,
             [&mut layer_omega[..], &mut volume_source[..]],
             || {
                 Pooled::take(
@@ -1121,7 +1128,7 @@ impl LayerTransport {
     /// continuity of the two layers gives the w-cell's, so a field advected
     /// with these fluxes keeps the constancy and conservation of
     /// [`apply_tracer_transport_3d`].
-    pub fn stagger_from(&mut self, layers: &LayerTransport) {
+    pub fn stagger_from(&mut self, layers: &LayerTransport, elements: Blocks) {
         let nl = layers.n_levels;
         assert_eq!(self.n_levels, nl + 1, "w-cells of {nl} layers");
         let nw = nl + 1;
@@ -1136,7 +1143,7 @@ impl LayerTransport {
             &values[k * len..(k + 1) * len]
         }
         for_each_block(
-            n_elements,
+            elements,
             [
                 &mut self.hu[..],
                 &mut self.hv[..],
@@ -1206,11 +1213,12 @@ impl LayerTransport {
         bathymetry: &Bathymetry2D,
         geom: &GeometricFactors2D,
         element_means: &[bool],
+        elements: Blocks,
     ) {
         let (nn, nc) = (bathymetry.n_nodes, cells.len());
         let n_elements = bathymetry.n_elements;
         for_each_block(
-            n_elements,
+            elements,
             [&mut rhs[..n_elements * nn * nc]],
             || (),
             |_, k, [rhs_k]| {
@@ -1344,12 +1352,18 @@ const DRY_DEPTH: f64 = 1e-6;
 /// `C` → inventory `H_z C`, with `H_z = D·Δσ` for the σ-thicknesses
 /// `d_sigma` of the cells in a column (the layers' [`SigmaGrid::d_sigma`],
 /// or the w-cells' of [`w_cell_thicknesses`] for a field at the w-points),
-/// zero without water ([`layer_volume_of`]).
-pub fn to_inventory(tracer: &mut [f64], eta: &[f64], d_sigma: &[f64], bathymetry: &Bathymetry2D) {
+/// zero without water ([`layer_volume_of`]), on `elements`.
+pub fn to_inventory(
+    tracer: &mut [f64],
+    eta: &[f64],
+    d_sigma: &[f64],
+    bathymetry: &Bathymetry2D,
+    elements: Blocks,
+) {
     let (nn, nl) = (bathymetry.n_nodes, d_sigma.len());
     let n_elements = bathymetry.n_elements;
     for_each_block(
-        n_elements,
+        elements,
         [&mut tracer[..n_elements * nn * nl]],
         || (),
         |_, k, [block]| {
@@ -1369,17 +1383,19 @@ pub fn to_inventory(tracer: &mut [f64], eta: &[f64], d_sigma: &[f64], bathymetry
 
 /// [`to_inventory`] of `values` into `q` at the nodes with (almost) no water
 /// only, shallower than `DRY_DEPTH`, where [`from_inventory`] keeps the last
-/// value: their inventories become that value's, the rest are left alone.
+/// value: their inventories become that value's, the rest are left alone
+/// (on `elements`).
 pub(crate) fn dry_inventories(
     q: &mut [f64],
     values: &[f64],
     eta: &[f64],
     d_sigma: &[f64],
     bathymetry: &Bathymetry2D,
+    elements: Blocks,
 ) {
-    let nl = d_sigma.len();
-    for (idx, (&e, &b)) in eta.iter().zip(&bathymetry.data).enumerate() {
-        let depth = e - b;
+    let (nl, nn) = (d_sigma.len(), bathymetry.n_nodes);
+    for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
+        let depth = eta[idx] - bathymetry.data[idx];
         if depth < DRY_DEPTH {
             let column = idx * nl..(idx + 1) * nl;
             for ((q, &c), &ds) in q[column.clone()]
@@ -1394,7 +1410,7 @@ pub(crate) fn dry_inventories(
 }
 
 /// Inventory `q = H_z C` → concentration, written to `out`, for cells of
-/// σ-thickness `d_sigma` in a column (as [`to_inventory`]).
+/// σ-thickness `d_sigma` in a column (as [`to_inventory`]), on `elements`.
 ///
 /// - Elements not marked in `element_means`: `C = q / H_z` at every node.
 /// - Marked elements: per level, the element's inventory over its volume,
@@ -1429,12 +1445,13 @@ pub fn from_inventory(
     geom: &GeometricFactors2D,
     element_means: &[bool],
     out: &mut [f64],
+    elements: Blocks,
 ) {
     let nl = d_sigma.len();
     let nn = bathymetry.n_nodes;
     let n_elements = bathymetry.n_elements;
     for_each_block(
-        n_elements,
+        elements,
         [&mut out[..n_elements * nn * nl]],
         || (),
         |_, k, [out_k]| {
@@ -1604,6 +1621,7 @@ pub fn apply_tracer_transport_3d<const N: usize>(
     geom: &GeometricFactors2D,
     boundaries: &Boundaries3D,
     vertical: VerticalAdvection,
+    elements: Blocks,
 ) {
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
     let context = LayerContext {
@@ -1618,7 +1636,7 @@ pub fn apply_tracer_transport_3d<const N: usize>(
         .map(|t| (t.tracer, t.reference, t.bc, t.exterior, t.range));
     let n = mesh.n_elements * nn * nl;
     for_each_block(
-        mesh.n_elements,
+        elements,
         tracers.map(|t| &mut t.rhs[..n]),
         || TransportScratch::take(ops, nl),
         |scratch, k, mut rhs_k| {
@@ -2153,6 +2171,7 @@ pub fn apply_momentum_transport_3d(
     exterior: Option<[ExteriorField; 2]>,
     form: MomentumAdvectionForm,
     vertical: VerticalAdvection,
+    elements: Blocks,
 ) {
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
     let split = form == MomentumAdvectionForm::Split;
@@ -2166,7 +2185,7 @@ pub fn apply_momentum_transport_3d(
     let [exterior_u, exterior_v] = exterior.map_or([None, None], |[u, v]| [Some(u), Some(v)]);
     let n = mesh.n_elements * nn * nl;
     for_each_block(
-        mesh.n_elements,
+        elements,
         [&mut rhs_u[..n], &mut rhs_v[..n]],
         || TransportScratch::take(ops, nl),
         |scratch, k, [rhs_u, rhs_v]| {
@@ -2613,7 +2632,7 @@ mod tests {
                 LayerTransport::new(self.mesh.n_elements, &self.ops, self.sigma.n_levels());
             let barotropic = BarotropicFlux {
                 dt: 1.0,
-                euler_dt: 1.0,
+                euler_dt: &vec![1.0; self.mesh.n_elements],
                 hu: &self.du_hu,
                 hv: &self.du_hv,
                 face: &self.du_face,
@@ -2633,6 +2652,7 @@ mod tests {
                 &self.boundaries,
                 exterior,
                 0.0,
+                self.mesh.n_elements.into(),
             );
             transport
         }
@@ -2659,6 +2679,7 @@ mod tests {
                 &self.geom,
                 &self.boundaries,
                 VerticalAdvection::default(),
+                self.mesh.n_elements.into(),
             );
             rhs
         }
@@ -2754,6 +2775,7 @@ mod tests {
             &case.boundaries,
             &Exterior3D::default(),
             0.0,
+            case.mesh.n_elements.into(),
         );
         assert!(alone.dt_over_depth.iter().all(|&s| s == 0.0));
     }
@@ -2980,6 +3002,7 @@ mod tests {
                 &geom,
                 &Boundaries3D::default(),
                 VerticalAdvection::Upwind,
+                mesh.n_elements.into(),
             );
             for column in rhs.chunks_exact(nl) {
                 for (got, want) in column.iter().zip(expected) {
@@ -3031,6 +3054,7 @@ mod tests {
             &geom,
             &Boundaries3D::default(),
             scheme,
+            mesh.n_elements.into(),
         );
         rhs
     }
@@ -3753,6 +3777,7 @@ mod tests {
                 None,
                 form,
                 VerticalAdvection::Centred,
+                self.mesh.n_elements.into(),
             );
             (rhs_u, rhs_v)
         }
@@ -3993,6 +4018,7 @@ mod tests {
             None,
             MomentumAdvectionForm::default(),
             VerticalAdvection::Centred,
+            mesh.n_elements.into(),
         );
         let sw = sigma.sigma_w();
         // Ω vanishes at the bed and the surface
@@ -4028,6 +4054,7 @@ mod tests {
             &case.boundaries,
             &Exterior3D::default(),
             0.0,
+            case.mesh.n_elements.into(),
         );
         let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
         for idx in 0..case.mesh.n_elements * nn {
@@ -4083,6 +4110,7 @@ mod tests {
             &Boundaries3D::default(),
             &Exterior3D::default(),
             0.0,
+            mesh.n_elements.into(),
         );
         let scale = max_abs(transport.omega.iter().copied());
         assert!(scale > 1e-3, "test flow should drive a non-trivial Ω");
@@ -4236,6 +4264,7 @@ mod tests {
             &case.geom,
             &case.boundaries,
             VerticalAdvection::default(),
+            case.mesh.n_elements.into(),
         );
         let (mut rhs_u, mut rhs_v) = (vec![0.0; rhs_t.len()], vec![0.0; rhs_t.len()]);
         apply_momentum_transport_3d(
@@ -4251,6 +4280,7 @@ mod tests {
             exterior.velocity,
             MomentumAdvectionForm::default(),
             VerticalAdvection::Centred,
+            case.mesh.n_elements.into(),
         );
         let fields = [
             (&rhs_t, &case.state.temp, 2),
@@ -4324,6 +4354,7 @@ mod tests {
             &case.geom,
             &case.boundaries,
             VerticalAdvection::default(),
+            case.mesh.n_elements.into(),
         );
         let scale = c * max_abs(case.eta_rate.iter().copied());
         for (idx, column) in rhs.chunks_exact(nl).enumerate() {
@@ -4359,7 +4390,13 @@ mod tests {
         marked[3] = true;
         let concentration = case.state.temp.clone();
         let mut inventory = concentration.clone();
-        to_inventory(&mut inventory, &eta, case.sigma.d_sigma(), &case.bathymetry);
+        to_inventory(
+            &mut inventory,
+            &eta,
+            case.sigma.d_sigma(),
+            &case.bathymetry,
+            case.bathymetry.n_elements.into(),
+        );
         let last = vec![-1.0; concentration.len()];
         let mut out = last.clone();
         from_inventory(
@@ -4370,6 +4407,7 @@ mod tests {
             &case.geom,
             &marked,
             &mut out,
+            case.bathymetry.n_elements.into(),
         );
         for k in 0..n_el {
             for i in 0..nn {
@@ -4393,7 +4431,13 @@ mod tests {
         }
         // Element 2: one value per level, and its inventory per level kept
         let mut back = out.clone();
-        to_inventory(&mut back, &eta, case.sigma.d_sigma(), &case.bathymetry);
+        to_inventory(
+            &mut back,
+            &eta,
+            case.sigma.d_sigma(),
+            &case.bathymetry,
+            case.bathymetry.n_elements.into(),
+        );
         for l in 0..nl {
             let level = |field: &[f64]| -> f64 {
                 (0..nn)
@@ -4438,6 +4482,7 @@ mod tests {
             &case.geom,
             &marked,
             &mut kept,
+            case.bathymetry.n_elements.into(),
         );
         let spread = concentration[element_2.clone()]
             .iter()
@@ -4492,7 +4537,7 @@ mod tests {
             );
             let nw = nl + 1;
             let mut w_cells = LayerTransport::new(ne, &case.ops, nw);
-            w_cells.stagger_from(&layers);
+            w_cells.stagger_from(&layers, layers.subcell_elements.len().into());
             for (cells, layer) in [
                 (&w_cells.hu, &layers.hu),
                 (&w_cells.hv, &layers.hv),
