@@ -81,7 +81,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 #### Depth limit
 - [ ] **F.4** Re-run the storm with `wave_depth_limit=0` on current code, for like-for-like and the limit's uncontended cost.
 - [ ] **F.4** Read the coupled storm's limiter counts by depth band (`depth_limit_bands`); if it binds in metres of water, count the removed variance as breaking in `dissipation()`.
-- [ ] **F.4** `the_depth_limit_leaves_a_resolved_surf_zone_to_breaking` takes 10.8 s: trim it or move it to the slow tier (`.config/nextest.toml`).
 - [ ] **F.4** Check the depth limit's γ against SWAN's very-shallow limiter before trusting the surf zone or a coarse grid's coastal nodes.
 
 #### Validation
@@ -263,6 +262,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P2.1** Measure linear stability limits for curved elements and N ≥ 5 (`PositivityBound` does not relax without a table entry).
 - [ ] **P2.6** A wave-step bench before the F.4 SIMD port.
 - [ ] **P2.6** Full-RHS and full-step throughput at realistic size (≥ 100k elements, bathymetry, limiter, open BCs); DOFs/s, scaling over 1–16 cores, bandwidth; allocation counting in CI.
+- [ ] **P2.6** Ten tests in the PR tier take over the slow tier's 15 s bar in CI (PR #183's run, 2026-11-05; `notes/performance.md` P2.6): make each cheaper, or move it to `.config/nextest.toml`'s slow gates.
 - [ ] **P2.6** Audit the slow test tier (`.config/nextest.toml`, 25 gates, 28 test-minutes): spread-sea ladders, 3D rest gates' model hours, particle counts.
 - [ ] **P2.4** Limit only troubled cells.
 - [ ] **P2.7 / P0.11** Decide GPU: fix Burn (`src/solver/burn/rhs.rs` computes the HLL flux and discards it, so no surface term; fusion disabled, ~13× the bytes per node-stage) with a burn-vs-CPU test, or replace it with fused f64 CubeCL/cudarc kernels over CSR faces. Pays only from ≈ 10⁵ elements; fewer steps come first.
