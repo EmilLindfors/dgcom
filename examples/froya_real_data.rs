@@ -110,7 +110,7 @@
 //!     [wave_mesh=NX,NY[,ORDER]|FILE.msh[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] \
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [wave_stations=NAME:LON,LAT;…] \
-//!     [levels=0] [tide3d=0] [rk_3d=43|3] [cfl_3d=4|2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] \
+//!     [levels=0] [tide3d=0] [rk_3d=43|3] [cfl_3d=4|2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] [levels_3d=0] \
 //!     [restart_hours=0] [restart_keep=0] [resume=<file>] [resume_changes=] [rivers=<file>] [river_snap_km=2] [river_profile=tapered:3] \
 //!     [nu=0] [cs=0] [site=<file> …]
 //! ```
@@ -265,7 +265,10 @@
 //! substeps for 4/3 of the work each. Together 773 → 388 s per model hour
 //! on hours 6–8 (24 threads), 0 negative-depth clips. The barotropic pass
 //! takes local time steps of up to `bt_levels=` (2) levels
-//! (`ModeSplitIntegrator::with_barotropic_levels`; 0 for global substeps):
+//! (`ModeSplitIntegrator::with_barotropic_levels`; 0 for global substeps),
+//! and the 3D stages of up to `levels_3d=` (0, global steps;
+//! `ModeSplitIntegrator::with_baroclinic_levels`), so that a farm's small
+//! elements no longer set every element's 3D step:
 //! the cliff-shore elements that set the substep take it alone, the rest 2
 //! or 4 times longer ones, and the run reports the RHS work saved. On hours
 //! 6–8 against global substeps (2026-10-16): η 0.07 mm, ū 0.16 mm/s, T
@@ -313,7 +316,7 @@
 //! resume is refused, naming them; `resume_changes=a,b` lets a resume change
 //! those on purpose. The rest may differ: when it stops and what it writes
 //! (`hours=`, `output=`, `*_minutes=`, `restart_*=`), the time stepping
-//! (`rk*=`, `cfl*=`, `lts=`, `bt_levels=`, `dt_3d=`), `debug_3d=`, and the
+//! (`rk*=`, `cfl*=`, `lts=`, `bt_levels=`, `levels_3d=`, `dt_3d=`), `debug_3d=`, and the
 //! farm a 2D branch adds (`RESUME_MAY_CHANGE`, `FarmOptions::KEYS`). An option
 //! left out counts as changed even if the run gave it at its default.
 //!
@@ -830,6 +833,8 @@ struct Options {
     /// Most levels of local time stepping in the barotropic pass
     /// (`bt_levels=`, 2; 0: global substeps)
     bt_levels: usize,
+    /// ... and in the 3D stages (`levels_3d=`, 0: global steps)
+    levels_3d: usize,
     debug_3d: String,
     /// Write a restart of the tide every this many model hours
     /// (`restart_hours=`; 0: none), at the first callback (in 3D, progress
@@ -950,6 +955,7 @@ impl Options {
             cfl_3d: f64::NAN,
             cfl_bt: get("cfl_bt", 2.0)?,
             bt_levels: get("bt_levels", 2.0)? as usize,
+            levels_3d: get("levels_3d", 0.0)? as usize,
             rk_bt: match args.get("rk_bt").map_or("43", String::as_str) {
                 "3" => dg_rs::time::SspScheme::Rk3,
                 "43" => dg_rs::time::SspScheme::Rk43,
@@ -1388,6 +1394,7 @@ const RESUME_MAY_CHANGE: &[&str] = &[
     "rk_bt",
     "lts",
     "bt_levels",
+    "levels_3d",
     "dt_3d",
     "debug_3d",
 ];
@@ -4597,6 +4604,46 @@ fn tidal_run_3d<'a>(
                         without(2.0),
                         without(5.0),
                     );
+                    // What the multirate schedule would save, with its level
+                    // jumps of one and each stage's rate spread over what a
+                    // stage value reads: the transport's faces, the
+                    // viscosity's corners, then the Kuzmin limiter's vertex
+                    // patches
+                    let mut element_dt = vec![0.0; s.n_elements];
+                    let ssp = opts.rk_3d.ssp_coefficient();
+                    physics.element_steps_into(s, opts.cfl_3d, ssp, &mut element_dt);
+                    use dg_rs::time::multirate::{MultirateStepper, RhsStencil};
+                    let reads: [(&str, &[RhsStencil]); 3] = [
+                        ("faces", &[RhsStencil::Faces]),
+                        ("corners", &[RhsStencil::FacesAndCorners]),
+                        (
+                            "corners + vertex patches",
+                            &[RhsStencil::FacesAndCorners, RhsStencil::VertexPatches],
+                        ),
+                    ];
+                    let planned: Vec<String> = reads
+                        .iter()
+                        .map(|(name, stencils)| {
+                            let speedups: Vec<String> = (1..=4)
+                                .map(|levels| {
+                                    let mut stepper =
+                                        MultirateStepper::<Solution3D>::new(levels, opts.rk_3d);
+                                    stepper.assign_levels_from(
+                                        &element_dt,
+                                        &domain.mesh,
+                                        stencils,
+                                        None,
+                                    );
+                                    format!("{:.2}", stepper.planned_speedup())
+                                })
+                                .collect();
+                            format!("{name} {}", speedups.join("/"))
+                        })
+                        .collect();
+                    println!(
+                        "           scheduled gain at L = 1/2/3/4, stage values reading {}",
+                        planned.join("; ")
+                    );
                     let limits = physics.time_step_limits(s, opts.cfl_3d);
                     println!(
                         "           limits now: advection {:.2} (element {}), viscosity {:.2} (element {}), coriolis {:.0}, vertical {:.2}; last compute_dt's advection {:.2}",
@@ -4687,7 +4734,8 @@ fn tidal_run_3d<'a>(
         .with_barotropic_cfl(opts.cfl_bt)
         .with_barotropic_scheme(opts.rk_bt)
         .with_baroclinic_scheme(opts.rk_3d)
-        .with_barotropic_levels(opts.bt_levels);
+        .with_barotropic_levels(opts.bt_levels)
+        .with_baroclinic_levels(opts.levels_3d);
     let mut sim = Simulation3D::new(physics, integrator)
         .with_cfl(opts.cfl_3d)
         .with_dt_max(opts.dt_3d.unwrap_or(MAX_DT_3D));
@@ -4733,6 +4781,13 @@ Phase profile:
         sim.integrator().last_substeps(),
         sim.physics().swe_physics.negative_depth_clips()
     );
+    if let Some(stats) = sim.integrator().baroclinic_multirate_stats() {
+        println!(
+            "3D local time steps: up to {} levels, {:.2}× less stage RHS work than global steps at the finest step",
+            stats.finest_level,
+            stats.speedup(),
+        );
+    }
     if let Some(stats) = sim.integrator().barotropic_multirate_stats() {
         println!(
             "Barotropic local time steps: up to {} levels, {:.2}× less RHS work than global substeps at the finest step ({} coarse substeps)",

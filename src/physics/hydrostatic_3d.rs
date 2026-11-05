@@ -83,7 +83,9 @@ use crate::physics::vertical_diffusion::{
 };
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
-use crate::solver::core::blocks::{Pooled, for_each_block, reduce_blocks, update_with};
+use crate::solver::core::blocks::{
+    Blocks, Neighbourhood, Pooled, for_each_block, reduce_blocks, update_with,
+};
 use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::rhs::{
     AdvectedTracer, BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D,
@@ -96,9 +98,12 @@ use crate::solver::rhs::{
 };
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
-use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
+use crate::solver::{
+    TracerLimiter3DConfig, TracerLimiter3DStats, TracerLimiterType3D, apply_tracer_limiters_3d,
+};
 use crate::source::{CageDrag2D, CageNode, CoriolisSource2D, RiverSources};
-use crate::time::{ModeSplitPhysics, StageStash, StepDrag};
+use crate::time::multirate::RhsStencil;
+use crate::time::{ModeSplitPhysics, StageElements, StageStash, StepDrag};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
@@ -847,9 +852,10 @@ where
         split: &ImplicitVerticalAdvection,
         state: &Solution3D,
         transport: &mut LayerTransport,
-        dt: f64,
+        euler_dt: &[f64],
+        elements: Blocks,
     ) {
-        let (ne, nn, nl) = (state.n_elements, state.n_nodes, state.n_levels);
+        let (nn, nl) = (state.n_nodes, state.n_levels);
         let mut guard = self
             .implicit_split
             .lock()
@@ -867,7 +873,7 @@ where
             w_cell_thicknesses(d_sigma, d_sigma_w);
         }
         let (count, courant) = reduce_blocks(
-            ne,
+            elements,
             [&mut transport.omega[..], &mut implicit[..]],
             || Pooled::take(|t: &Vec<f64>| t.len() == nl, || vec![0.0; nl]),
             |thickness, k, [omega_k, implicit_k]| {
@@ -885,6 +891,7 @@ where
                         *h = layer_thickness_of(depth, ds);
                     }
                     let omega = &mut omega_k[column];
+                    let dt = euler_dt[k];
                     largest = largest.max(split.split_column(omega, thickness, dt, implicit));
                     if implicit.iter().any(|&w| w != 0.0) {
                         count += 1;
@@ -1247,9 +1254,9 @@ where
 
     /// Zero the momentum tendency of thin columns: they carry no shear, and
     /// the splitter adds the depth-mean rate.
-    fn zero_thin_momentum(&self, state: &Solution3D, rhs: &mut Solution3D) {
-        let nl = state.n_levels;
-        for idx in 0..state.eta.data.len() {
+    fn zero_thin_momentum(&self, state: &Solution3D, rhs: &mut Solution3D, elements: Blocks) {
+        let (nn, nl) = (state.n_nodes, state.n_levels);
+        for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
             if self.is_thin(state, idx) {
                 rhs.u[idx * nl..(idx + 1) * nl].fill(0.0);
                 rhs.v[idx * nl..(idx + 1) * nl].fill(0.0);
@@ -1308,7 +1315,11 @@ where
     }
 
     /// Apply configured 3D tracer limiters and refresh density if tracers changed.
-    pub fn apply_tracer_limiters(&self, state: &mut Solution3D) -> TracerLimiter3DStats {
+    pub fn apply_tracer_limiters(
+        &self,
+        state: &mut Solution3D,
+        elements: Blocks,
+    ) -> TracerLimiter3DStats {
         let limiter = crate::profiling::start();
         let stats = apply_tracer_limiters_3d(
             state,
@@ -1318,11 +1329,14 @@ where
             &self.bathymetry,
             &self.sigma,
             &self.tracer_limiter,
+            elements,
         );
         crate::profiling::stop("3d: tracer limiter", limiter);
 
         if stats.changed() {
-            crate::profiling::scope("3d: density", || self.eos.update_density(state));
+            crate::profiling::scope("3d: density", || {
+                self.eos.update_density_on(state, elements)
+            });
         }
 
         stats
@@ -1355,6 +1369,7 @@ where
             // The vertical reference is locked where the transport needs it
             tracer_reference: [None, None],
             tracer_range: self.tracer_limiter.advection_ranges(),
+            elements: Blocks::All(self.mesh.n_elements),
         }
     }
 
@@ -1365,18 +1380,34 @@ where
     /// the shear, which has no depth mean), zero in thin columns.
     /// `state.rho` must be current.
     pub fn compute_momentum_rhs_into(&self, state: &Solution3D, t: f64, rhs: &mut Solution3D) {
-        self.momentum_rhs(state, t, rhs, false);
+        self.momentum_rhs(state, StageElements::all(state.n_elements, t), rhs, false);
     }
 
-    /// [`Self::compute_momentum_rhs_into`]; at a later stage of a step
-    /// (`stage`) with [`Self::with_viscosity_once_per_step`], the viscosity's
-    /// tendency of the step's start instead of the state's.
-    fn momentum_rhs(&self, state: &Solution3D, t: f64, rhs: &mut Solution3D, stage: bool) {
+    /// [`Self::compute_momentum_rhs_into`] on the elements of `on`, each
+    /// at its stage time; at a later stage of a step (`stage`) with
+    /// [`Self::with_viscosity_once_per_step`], the viscosity's tendency of
+    /// the step's start instead of the state's (global steps only).
+    fn momentum_rhs(
+        &self,
+        state: &Solution3D,
+        on: StageElements,
+        rhs: &mut Solution3D,
+        stage: bool,
+    ) {
+        let elements = on.elements;
+        let config = Rhs3DConfig {
+            elements,
+            ..self.rhs_config()
+        };
         crate::profiling::scope("3d: pgf, coriolis", || {
-            compute_momentum_rhs_3d(rhs, state, &self.rhs_config())
+            compute_momentum_rhs_3d(rhs, state, &config)
         });
         let viscosity = crate::profiling::start();
         if !self.horizontal_viscosity.is_zero() && self.viscosity_once_per_step {
+            assert!(
+                elements.is_all(),
+                "the viscosity once per step needs global steps (no common step start otherwise)"
+            );
             let mut kept = self
                 .step_viscosity
                 .lock()
@@ -1407,6 +1438,7 @@ where
                     &self.boundaries,
                     self.min_column_depth,
                     scratch,
+                    elements,
                 );
             }
             let [u, v] = &*kept;
@@ -1432,6 +1464,7 @@ where
                 &self.boundaries,
                 self.min_column_depth,
                 scratch,
+                elements,
             );
         }
         crate::profiling::stop("3d: viscosity", viscosity);
@@ -1441,12 +1474,13 @@ where
                     state,
                     &self.bathymetry,
                     &self.sigma,
-                    t,
+                    on.time,
+                    elements,
                     self.min_column_depth,
                 )
                 .relax_shear(state, &self.sigma, rhs, |idx| self.is_thin(state, idx));
         }
-        self.zero_thin_momentum(state, rhs);
+        self.zero_thin_momentum(state, rhs, elements);
     }
 
     /// The layer transports of `state` corrected to `barotropic`, then the
@@ -1458,10 +1492,11 @@ where
     pub fn compute_transport_rhs_into(
         &self,
         state: &Solution3D,
-        t: f64,
+        on: StageElements,
         barotropic: BarotropicFlux,
         rhs: &mut Solution3D,
     ) {
+        let elements = on.elements;
         let mut guard = self
             .transport_scratch
             .lock()
@@ -1474,7 +1509,8 @@ where
                 state,
                 &self.bathymetry,
                 &self.sigma,
-                t,
+                on.time,
+                elements,
                 self.min_column_depth,
             )
         });
@@ -1497,11 +1533,18 @@ where
                 &self.boundaries,
                 &exterior,
                 self.min_column_depth,
+                elements,
             );
             // The stages advect with the explicit part of Ω; the rest is
             // the implicit relaxation's
             if let Some(split) = &self.implicit_vertical_advection {
-                self.split_vertical_velocity(split, state, transport, barotropic.euler_dt);
+                self.split_vertical_velocity(
+                    split,
+                    state,
+                    transport,
+                    barotropic.euler_dt,
+                    elements,
+                );
             }
             crate::profiling::stop("3d: layer transports", layer);
             let reference = self.vertical_reference.as_ref().map(|reference| {
@@ -1516,6 +1559,7 @@ where
                     Some(fields) => [Some(fields[0].as_slice()), Some(fields[1].as_slice())],
                     None => [None, None],
                 },
+                elements,
                 ..self.rhs_config()
             };
             crate::profiling::scope("3d: advection kernels", || {
@@ -1538,24 +1582,30 @@ where
                     &self.bathymetry,
                     &self.geom,
                     means,
+                    elements,
                 );
             }
             crate::profiling::scope("3d: turbulence advection", || {
-                self.turbulence_transport_rhs(state, transport, barotropic, rhs)
+                self.turbulence_transport_rhs(state, transport, barotropic, rhs, elements)
             });
         });
         // The river water's tracers, with the volume the layer transports
         // gave the layers
         if let Some(rivers) = barotropic.rivers {
             let nn = state.n_nodes;
-            rivers.add_tracer_sources(&mut rhs.temp, nn, |r| r.temperature.at(t));
-            rivers.add_tracer_sources(&mut rhs.salt, nn, |r| r.salinity.at(t));
+            let time = on.time;
+            rivers.add_tracer_sources(&mut rhs.temp, nn, elements, |r, k| {
+                r.temperature.at(time.at(k))
+            });
+            rivers.add_tracer_sources(&mut rhs.salt, nn, elements, |r, k| {
+                r.salinity.at(time.at(k))
+            });
         }
         if let Some(columns) = &columns {
             let thin = |idx| self.is_thin(state, idx);
             columns.relax_tracers(state, &self.bathymetry, &self.sigma, rhs, thin);
         }
-        self.zero_thin_momentum(state, rhs);
+        self.zero_thin_momentum(state, rhs, elements);
     }
 
     /// Overwrite `rhs.tke` and `rhs.gls` with the inventory tendencies of the
@@ -1579,33 +1629,48 @@ where
         transport: &LayerTransport,
         barotropic: BarotropicFlux,
         rhs: &mut Solution3D,
+        elements: Blocks,
     ) {
         if state.tke.is_empty() {
             return;
         }
         let Some(scheme) = self.turbulence_advection else {
-            rhs.tke.fill(0.0);
-            rhs.gls.fill(0.0);
+            for_each_block(
+                elements,
+                [&mut rhs.tke[..], &mut rhs.gls[..]],
+                || (),
+                |_, _, [tke, gls]| {
+                    tke.fill(0.0);
+                    gls.fill(0.0);
+                },
+            );
             return;
         };
         let mut guard = self
             .w_transport_scratch
             .lock()
             .expect("Failed to lock w_transport_scratch");
-        let TurbulenceScratch { w_cells, advected } =
-            guard.get_or_insert_with(|| TurbulenceScratch {
-                w_cells: LayerTransport::new(self.mesh.n_elements, &self.ops, state.n_levels + 1)
-                    .with_metric(self.metric_form()),
-                advected: [vec![0.0; state.tke.len()], vec![0.0; state.tke.len()]],
-            });
-        crate::profiling::scope("turb: stagger", || w_cells.stagger_from(transport));
+        let TurbulenceScratch {
+            w_cells,
+            advected,
+            near,
+        } = guard.get_or_insert_with(|| TurbulenceScratch {
+            w_cells: LayerTransport::new(self.mesh.n_elements, &self.ops, state.n_levels + 1)
+                .with_metric(self.metric_form()),
+            advected: [vec![0.0; state.tke.len()], vec![0.0; state.tke.len()]],
+            near: Neighbourhood::default(),
+        });
+        crate::profiling::scope("turb: stagger", || {
+            w_cells.stagger_from(transport, elements)
+        });
         let nl = state.n_levels;
         let n_elements = self.mesh.n_elements;
         let len = state.tke.len() / n_elements;
         let [tke, gls] = advected;
         let copy = crate::profiling::start();
+        // The advection reads the face neighbours' values
         for_each_block(
-            n_elements,
+            near.faces(&self.mesh, elements),
             [&mut tke[..], &mut gls[..]],
             || (),
             |_, k, advected| {
@@ -1633,6 +1698,7 @@ where
                 &self.geom,
                 &self.boundaries,
                 scheme,
+                elements,
             )
         });
         let sources = crate::profiling::start();
@@ -1640,7 +1706,7 @@ where
             // River water brings the column's own turbulence: its volume
             // source must not dilute it; nor the 2D module's
             if let Some(rivers) = barotropic.rivers {
-                rivers.add_w_point_sources_at_own_value(out, advected, state.n_nodes);
+                rivers.add_w_point_sources_at_own_value(out, advected, state.n_nodes, elements);
             }
             w_cells.add_volume_sources(
                 out,
@@ -1650,6 +1716,7 @@ where
                 &self.bathymetry,
                 &self.geom,
                 barotropic.element_means,
+                elements,
             );
         }
         crate::profiling::stop("turb: volume sources", sources);
@@ -1820,6 +1887,122 @@ where
         rates
     }
 
+    /// The vertical Courant number (on the forward-Euler step) up to which an
+    /// element's local time step lets the implicit vertical advection take
+    /// the excess ([`Self::element_steps_into`]). Global steps reach 7 at
+    /// most on the Kattholmen tide; on its local steps, uncapped, a 2.4 m
+    /// deep sound at 3 m/s on a 13–26 s substep (vertical Courant numbers
+    /// of 30–60) blew up within one to four coarse steps, explicit vertical
+    /// advection or a cap of 4 or 8 held (9 → 9.5 h, 2026-11-03).
+    pub const LOCAL_STEP_IMPLICIT_COURANT: f64 = 4.0;
+
+    /// Every element's own step under the bounds of [`Self::compute_dt_ssp`]
+    /// for an SSP scheme of coefficient `ssp` at Courant number `cfl`, into
+    /// `out` (`[element]`; their least is [`Self::compute_dt_ssp`]'s step):
+    /// horizontal advection and internal waves, Coriolis, the horizontal
+    /// viscosity (with its face neighbours' `ν`, which BR1 couples in), and
+    /// the vertical advection (where its excess is implicit, at
+    /// [`Self::LOCAL_STEP_IMPLICIT_COURANT`] times its explicit bound, which
+    /// [`Self::compute_dt_ssp`] does not apply). The advective bound is
+    /// the least over the element and its face neighbours, as the 2D
+    /// module's local steps take theirs: the upwind fluxes bring the
+    /// neighbours' waves in (on the Kattholmen mesh a slow element beside a
+    /// 3 m/s sound, on its own bound, blew the tide up within four coarse
+    /// steps). Infinite for an element of thin columns only with no wet
+    /// neighbour, which no 3D bound limits.
+    pub fn element_steps_into(&self, state: &Solution3D, cfl: f64, ssp: f64, out: &mut [f64]) {
+        let ne = self.mesh.n_elements;
+        assert_eq!(out.len(), ne, "one step per element");
+        let order_factor = (self.ops.order as f64 + 1.0).powi(2);
+        let explicit_vertical = self.implicit_vertical_advection.is_none();
+        for_each_block(
+            ne,
+            [&mut out[..]],
+            || (),
+            |_, k, [dt]| {
+                let rates = self.element_rates(state, k);
+                dt[0] = cfl / rates.wave / order_factor;
+            },
+        );
+        // The advective bound over the face neighbours too, then the
+        // element's own others
+        let own = out.to_vec();
+        for_each_block(
+            ne,
+            [&mut out[..]],
+            || (),
+            |_, k, [dt]| {
+                let el = ElementIndex::new(k);
+                let mut bound = (0..4)
+                    .filter_map(|face| self.mesh.neighbor(el, face))
+                    .map(|nb| own[nb.element])
+                    .fold(own[k], f64::min);
+                let f = self
+                    .mesh
+                    .element_vertices(el)
+                    .iter()
+                    .map(|&[_, y]| self.coriolis.f_at(y).abs())
+                    .fold(0.0, f64::max);
+                bound = bound.min(1.0 / f);
+                // The vertical advection's Courant number: one where it is
+                // explicit, a few where its excess is implicit
+                let courant = if explicit_vertical {
+                    1.0
+                } else {
+                    Self::LOCAL_STEP_IMPLICIT_COURANT
+                };
+                let rates = self.element_rates(state, k);
+                dt[0] = bound.min(courant * ssp * (1.0 / rates.vertical));
+            },
+        );
+        if !self.horizontal_viscosity.is_zero() {
+            self.viscous_element_steps_into(state, cfl, out);
+        }
+    }
+
+    /// Every element's step `out` bounded by its explicit horizontal
+    /// viscosity at Courant number `cfl` (with its face neighbours' `ν`,
+    /// which BR1 couples in).
+    fn viscous_element_steps_into(&self, state: &Solution3D, cfl: f64, out: &mut [f64]) {
+        let ne = self.mesh.n_elements;
+        let mut guard = self
+            .viscosity_scratch
+            .lock()
+            .expect("Failed to lock viscosity_scratch");
+        let scratch =
+            guard.get_or_insert_with(|| ViscosityScratch3D::new(self.mesh.n_elements, &self.ops));
+        let mut largest = vec![0.0; ne];
+        largest_horizontal_viscosity_3d(
+            &mut largest,
+            state,
+            self.horizontal_viscosity,
+            &self.mesh,
+            &self.ops,
+            &self.geom,
+            &self.bathymetry,
+            &self.sigma,
+            &self.boundaries,
+            self.min_column_depth,
+            scratch,
+        );
+        for (k, dt) in out.iter_mut().enumerate() {
+            let nu = (0..4)
+                .filter_map(|face| self.mesh.neighbor(ElementIndex::new(k), face))
+                .map(|nb| largest[nb.element])
+                .fold(largest[k], f64::max);
+            let viscous = element_dt_viscous_swe_2d(
+                &self.mesh,
+                &self.ops,
+                &self.geom,
+                nu,
+                self.ops.order,
+                cfl,
+                k,
+            );
+            *dt = dt.min(viscous);
+        }
+    }
+
     /// Every element's own step from horizontal advection and internal
     /// waves at Courant number `cfl` (the bound of [`Self::compute_dt`] that
     /// usually sets it; infinite for an element of thin columns only), with
@@ -1928,7 +2111,8 @@ where
     /// last stage leaves them to this, after the vertical terms), their
     /// density, and `Ω` for output ([`Self::update_vertical_velocity`]).
     pub fn post_process(&self, state: &mut Solution3D) {
-        if !self.apply_tracer_limiters(state).changed() {
+        let all = Blocks::All(state.n_elements);
+        if !self.apply_tracer_limiters(state, all).changed() {
             self.update_density(state);
         }
 
@@ -2002,6 +2186,7 @@ where
                 &self.boundaries,
                 &Exterior3D::default(),
                 self.min_column_depth,
+                Blocks::All(state.n_elements),
             );
             advection_u.fill(0.0);
             advection_v.fill(0.0);
@@ -2018,6 +2203,7 @@ where
                 None,
                 self.momentum_advection_form,
                 self.momentum_vertical_advection,
+                Blocks::All(state.n_elements),
             );
         });
         *advection_of = Some(flow_fingerprint(state));
@@ -2053,18 +2239,23 @@ where
         self.compute_momentum_rhs_into(state, t, out);
     }
 
-    fn stage_momentum_rhs_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D) {
-        self.momentum_rhs(state, t, out, true);
+    fn stage_momentum_rhs_into(
+        &self,
+        state: &Solution3D,
+        stage: StageElements,
+        out: &mut Solution3D,
+    ) {
+        self.momentum_rhs(state, stage, out, true);
     }
 
     fn transport_rhs_into(
         &self,
         state: &Solution3D,
-        t: f64,
+        stage: StageElements,
         barotropic: BarotropicFlux,
         out: &mut Solution3D,
     ) {
-        self.compute_transport_rhs_into(state, t, barotropic, out);
+        self.compute_transport_rhs_into(state, stage, barotropic, out);
     }
 
     /// `G = D·⟨R_PGF+Cor(u)⟩ + Σ_l A_l(u) − A(ū) − D·R_Cor(ū) + (τ_s − τ_b)/ρ₀
@@ -2124,10 +2315,18 @@ where
             &self.boundaries,
             &Exterior3D::default(),
             self.min_column_depth,
+            Blocks::All(ne),
         );
         bar_rhs.u.fill(0.0);
         bar_rhs.v.fill(0.0);
-        apply_coriolis_3d(bar_rhs, bar, &self.mesh, &self.ops, &self.coriolis);
+        apply_coriolis_3d(
+            bar_rhs,
+            bar,
+            &self.mesh,
+            &self.ops,
+            &self.coriolis,
+            Blocks::All(ne),
+        );
         for ((u, v), (&eta, &b)) in bar_rhs
             .u
             .iter_mut()
@@ -2150,6 +2349,7 @@ where
             None,
             self.momentum_advection_form,
             self.momentum_vertical_advection,
+            Blocks::All(ne),
         );
 
         let [tau_sx, tau_sy] = self.forcing.surface_stress;
@@ -2255,7 +2455,13 @@ where
 
     /// The implicit part of `Ω` of the last [`Self::transport_rhs_into`],
     /// if any ([`Self::with_implicit_vertical_advection`]).
-    fn implicit_vertical_advection(&self, stage: &mut Solution3D, dt: f64, element_means: &[bool]) {
+    fn implicit_vertical_advection(
+        &self,
+        stage: &mut Solution3D,
+        elements: Blocks,
+        dt: &[f64],
+        element_means: &[bool],
+    ) {
         if self.implicit_vertical_advection.is_none() {
             return;
         }
@@ -2274,6 +2480,7 @@ where
             &self.bathymetry,
             &self.geom,
             element_means,
+            elements,
             dt,
         );
     }
@@ -2281,7 +2488,14 @@ where
     /// The vertical diffusion with the surface stress and fluxes at the
     /// middle of the step, `t + dt/2` (the fluxes over the surface layer at
     /// `t`).
-    fn vertical_implicit(&self, state: &mut Solution3D, t: f64, dt: f64, drag: StepDrag<'_>) {
+    fn vertical_implicit(
+        &self,
+        state: &mut Solution3D,
+        elements: Blocks,
+        t: f64,
+        dt: f64,
+        drag: StepDrag<'_>,
+    ) {
         let fluxes = self.surface_fluxes_at(state, t + 0.5 * dt);
         let tracers =
             fluxes.as_deref().map(
@@ -2309,11 +2523,12 @@ where
                 self.rho0,
                 self.min_column_depth,
                 drag,
+                elements,
             )
         });
         // Thin columns carry the depth mean only
-        let nl = state.n_levels;
-        for idx in 0..state.eta.data.len() {
+        let (nn, nl) = (state.n_nodes, state.n_levels);
+        for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
             if self.is_thin(state, idx) {
                 state.u[idx * nl..(idx + 1) * nl].fill(state.ubar.data[idx]);
                 state.v[idx * nl..(idx + 1) * nl].fill(state.vbar.data[idx]);
@@ -2321,32 +2536,40 @@ where
         }
     }
 
-    fn end_density(&self, state: &mut Solution3D) {
-        self.update_density(state);
+    fn end_density(&self, state: &mut Solution3D, elements: Blocks) {
+        self.eos.update_density_on(state, elements);
     }
 
     /// Tracer limiters, then the density of the limited tracers.
-    fn post_stage(&self, state: &mut Solution3D) {
-        if !self.apply_tracer_limiters(state).changed() {
-            self.update_density(state);
+    fn post_stage(&self, state: &mut Solution3D, elements: Blocks) {
+        if !self.apply_tracer_limiters(state, elements).changed() {
+            self.eos.update_density_on(state, elements);
+        }
+    }
+
+    /// The transport's face neighbours (with BR1 viscosity, their corners
+    /// too), then the Kuzmin limiter's vertex patches.
+    fn stage_stencils(&self) -> Vec<RhsStencil> {
+        let rhs = if self.horizontal_viscosity.is_zero() {
+            RhsStencil::Faces
+        } else {
+            RhsStencil::FacesAndCorners
+        };
+        match self.tracer_limiter.limiter_type {
+            TracerLimiterType3D::HorizontalKuzmin { .. } => vec![rhs, RhsStencil::VertexPatches],
+            TracerLimiterType3D::None | TracerLimiterType3D::Bounds => vec![rhs],
         }
     }
 
     /// The thin columns at rest, as every 3D kernel sees them (so the
     /// stage's RHS need not copy the state to mask them,
     /// [`Self::with_thin_columns_at_rest`]); their values into `stash`.
-    fn mask_stage(&self, state: &mut Solution3D, stash: &mut StageStash) {
-        let nl = state.n_levels;
-        stash.columns.clear();
-        stash.values.clear();
-        for idx in 0..state.eta.data.len() {
+    fn mask_stage(&self, state: &mut Solution3D, elements: Blocks, stash: &mut StageStash) {
+        let (nn, nl) = (state.n_nodes, state.n_levels);
+        for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
             if self.is_thin(state, idx) {
+                stash.keep(state, idx);
                 let column = idx * nl..(idx + 1) * nl;
-                stash.columns.push(idx);
-                stash.values.extend_from_slice(&state.u[column.clone()]);
-                stash.values.extend_from_slice(&state.v[column.clone()]);
-                stash.values.push(state.ubar.data[idx]);
-                stash.values.push(state.vbar.data[idx]);
                 state.u[column.clone()].fill(0.0);
                 state.v[column].fill(0.0);
                 state.ubar.data[idx] = 0.0;
@@ -2362,6 +2585,8 @@ struct TurbulenceScratch {
     w_cells: LayerTransport,
     /// `k` and `ψ` as advected: the end w-points at their neighbours' values.
     advected: [Vec<f64>; 2],
+    /// The elements of a call on a list and their face neighbours.
+    near: Neighbourhood,
 }
 
 /// Buffers of [`Hydrostatic3D`]'s slow forcing.

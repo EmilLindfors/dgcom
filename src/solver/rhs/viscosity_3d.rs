@@ -46,7 +46,7 @@
 use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
-use crate::solver::core::blocks::{Pooled, for_each_block};
+use crate::solver::core::blocks::{Blocks, Neighbourhood, Pooled, for_each_block};
 use crate::solver::state::Solution3D;
 use crate::source::swe_2d::viscosity::strain_rate_magnitude;
 use crate::types::ElementIndex;
@@ -103,6 +103,9 @@ pub struct ViscosityScratch3D {
     /// A block of layers' shear gradients and `ν_l D`,
     /// `[element][node][level in the block]`.
     layer: Vec<LayerNode>,
+    /// The elements of a call on a list and their face neighbours, and
+    /// theirs: where the gradients, and the means they read, are needed.
+    near: [Neighbourhood; 2],
 }
 
 /// Levels per pass of [`apply_horizontal_viscosity_3d`]: each pass reads the
@@ -136,6 +139,7 @@ impl ViscosityScratch3D {
             mean: vec![[0.0; 2]; n_total],
             mean_gradient: vec![[ScalarGradient2D::default(); 2]; n_total],
             layer: vec![LayerNode::default(); n_total * LEVEL_BLOCK],
+            near: Default::default(),
         }
     }
 }
@@ -208,17 +212,19 @@ impl Columns<'_> {
         );
     }
 
-    /// Depths, depth means, the Smagorinsky areas and (with Smagorinsky)
-    /// the means' gradients.
+    /// Depths and depth means on `means`, the Smagorinsky areas and (with
+    /// Smagorinsky) the means' gradients on `gradients` (whose face
+    /// neighbours must be in `means`).
     fn prepare(
         &self,
         bathymetry: &Bathymetry2D,
         sigma: &SigmaGrid,
         min_column_depth: f64,
         scratch: &mut ViscosityScratch3D,
+        means: Blocks,
+        gradients: Blocks,
     ) {
         let (state, nl) = (self.state, self.state.n_levels);
-        let ne = self.mesh.n_elements;
         let ViscosityScratch3D {
             depth,
             smagorinsky_area,
@@ -227,7 +233,7 @@ impl Columns<'_> {
             ..
         } = scratch;
         for_each_block(
-            ne,
+            means,
             [&mut depth[..]],
             || (),
             |_, k, [depth_k]| {
@@ -244,7 +250,7 @@ impl Columns<'_> {
         );
         let depth: &[f64] = depth;
         for_each_block(
-            ne,
+            means,
             [&mut mean[..]],
             || (),
             |_, k, [mean_k]| {
@@ -271,7 +277,7 @@ impl Columns<'_> {
             }
             let (mean, nn): (&[[f64; 2]], _) = (mean, self.ops.n_nodes);
             for_each_block(
-                ne,
+                gradients,
                 [&mut mean_gradient[..]],
                 || ElementScratch::<2>::take(nn),
                 |scratch, k, [gradient_k]| {
@@ -285,8 +291,14 @@ impl Columns<'_> {
     }
 
     /// The shear gradients and `ν_l D` of the layers `levels` into
-    /// `scratch.layer`.
-    fn layers(&self, levels: std::ops::Range<usize>, scratch: &mut ViscosityScratch3D) {
+    /// `scratch.layer`, on `elements` (whose face neighbours must have had
+    /// [`Self::prepare`]'s means).
+    fn layers(
+        &self,
+        levels: std::ops::Range<usize>,
+        scratch: &mut ViscosityScratch3D,
+        elements: Blocks,
+    ) {
         let (state, nn, nl) = (self.state, self.ops.n_nodes, self.state.n_levels);
         let ViscosityScratch3D {
             depth,
@@ -294,6 +306,7 @@ impl Columns<'_> {
             mean,
             mean_gradient,
             layer,
+            ..
         } = scratch;
         let block = levels.len();
         let shear = |idx: usize, level: usize| {
@@ -311,7 +324,7 @@ impl Columns<'_> {
         let smagorinsky = self.viscosity.smagorinsky > 0.0;
         let n = self.mesh.n_elements * nn * block;
         for_each_block(
-            self.mesh.n_elements,
+            elements,
             [&mut layer[..n]],
             || ElementScratch::<LANES>::take(nn),
             |scratch, k, [layer_k]| {
@@ -352,8 +365,8 @@ impl Columns<'_> {
 
 /// Add the velocity tendency `∇·(ν_l D∇u′_l)/D` of the horizontal
 /// `viscosity` on the vertical shear of `state` to `rhs_u`, `rhs_v`
-/// (`[element][node][level]`; see the [module documentation](self)).
-/// Columns shallower than `min_column_depth` get nothing.
+/// (`[element][node][level]`; see the [module documentation](self)) on
+/// `elements`. Columns shallower than `min_column_depth` get nothing.
 pub fn apply_horizontal_viscosity_3d(
     rhs_u: &mut [f64],
     rhs_v: &mut [f64],
@@ -367,6 +380,7 @@ pub fn apply_horizontal_viscosity_3d(
     boundaries: &Boundaries3D,
     min_column_depth: f64,
     scratch: &mut ViscosityScratch3D,
+    elements: Blocks,
 ) {
     if viscosity.is_zero() {
         return;
@@ -381,15 +395,28 @@ pub fn apply_horizontal_viscosity_3d(
     };
     let (nn, nl) = (ops.n_nodes, state.n_levels);
     let n = mesh.n_elements * nn * nl;
-    columns.prepare(bathymetry, sigma, min_column_depth, scratch);
+    // The diffusion on the elements reads their neighbours' gradients, and
+    // a gradient its element's neighbours' means
+    let mut near = std::mem::take(&mut scratch.near);
+    let [first_ring, second_ring] = &mut near;
+    let gradients = first_ring.faces(mesh, elements);
+    let means = second_ring.faces(mesh, gradients);
+    columns.prepare(
+        bathymetry,
+        sigma,
+        min_column_depth,
+        scratch,
+        means,
+        gradients,
+    );
 
     for first in (0..nl).step_by(LEVEL_BLOCK) {
         let levels = first..(first + LEVEL_BLOCK).min(nl);
         let block = levels.len();
-        columns.layers(levels.clone(), scratch);
+        columns.layers(levels.clone(), scratch, gradients);
         let (depth, layer) = (&scratch.depth, &scratch.layer);
         for_each_block(
-            mesh.n_elements,
+            elements,
             [&mut rhs_u[..n], &mut rhs_v[..n]],
             || ElementScratch::<LANES>::take(nn),
             |scratch, k, [rhs_u, rhs_v]| {
@@ -448,6 +475,7 @@ pub fn apply_horizontal_viscosity_3d(
             },
         );
     }
+    scratch.near = near;
 }
 
 /// The largest viscosity `ν_l` (m²/s) of every element's nodes and layers
@@ -480,12 +508,13 @@ pub fn largest_horizontal_viscosity_3d(
         boundaries,
     };
     let nn = ops.n_nodes;
-    columns.prepare(bathymetry, sigma, min_column_depth, scratch);
+    let all = Blocks::All(mesh.n_elements);
+    columns.prepare(bathymetry, sigma, min_column_depth, scratch, all, all);
     let nl = state.n_levels;
     for first in (0..nl).step_by(LEVEL_BLOCK) {
         let levels = first..(first + LEVEL_BLOCK).min(nl);
         let block = levels.len();
-        columns.layers(levels, scratch);
+        columns.layers(levels, scratch, all);
         for (idx, &d) in scratch.depth.iter().enumerate() {
             if d > 0.0 {
                 let nu = &mut largest[idx / nn];
@@ -574,6 +603,7 @@ mod tests {
             &Boundaries3D::default(),
             0.1,
             &mut scratch,
+            mesh.n_elements.into(),
         );
         (rhs_u, rhs_v)
     }
@@ -862,6 +892,7 @@ mod tests {
                 boundaries,
                 0.1,
                 &mut scratch,
+                mesh.n_elements.into(),
             );
             for (i, &(ci, row)) in unknowns.iter().enumerate() {
                 matrix[(i, j)] = if ci == 0 { rhs_u[row] } else { rhs_v[row] };
