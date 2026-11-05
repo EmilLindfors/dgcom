@@ -4,7 +4,7 @@ Open items only, one line each. The context (measurements, decisions, what was t
 
 Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon-farm application (currents, waves and particles around cages inside a NorKyst-driven coastal domain) on a 2D model that is correct, cheap and validated, and a 3D model rebuilt on the ROMS recipe. "Faster than ROMS" is to be proven by P3.2, not assumed.
 
-**Up next** (2026-11-05, after MET's answers in `notes/norkyst-issues.md`): (1) **P3.4** re-score Bodø on a 2026-06 day with `nest_tides=raw`, the first test with no gauge in the forcing; (2) **P3.1** the same raw run at Frøya on 2026-06 (`data/froya_norkyst_3d_2026-06.nc`), which decides the M2 `gauge_gains` item; (3) **P1.5** the parent-ζ datum as the library default. The items' lines are below in their areas.
+**Up next** (2026-11-05, after MET's answers in `notes/norkyst-issues.md`): (1) **P3.4** re-score Bodø on a 2026-06 day with `nest_tides=raw`, the first test with no gauge in the forcing; (2) **P3.1** the same raw run at Frøya on 2026-06 (`data/froya_norkyst_3d_2026-06.nc`), which decides the M2 `gauge_gains` item. The items' lines are below in their areas.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -215,7 +215,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Boundaries and nesting (P1.4, P1.5) — [notes/boundaries-nesting.md](notes/boundaries-nesting.md)
 
 - [ ] **P1.5** Parent files longer than 3 days for the nested 3D runs (the per-depth comparison is `norkyst_profiles_3d`, P4.6).
-- [ ] **P1.5** The parent-ζ datum as a library default: subtract the parent's own long-term mean ζ at the boundary (a month or more around the run, as `froya_real_data` takes the atlas `Z0` now), never the run window's mean, MSL or NN2000. MET confirmed on 2026-11-05 that ζ is relative to the model's own rest level and drifts on long and short time scales (NorKyst sits 0.20–0.40 m below the gauges; `notes/norkyst-issues.md` §5 and "MET's answer").
 - [ ] **P1.5** A fractional inverse barometer for nesting (`ib=<factor>`, today on/off): gauge − NorKyst regresses on pressure at −0.58 cm/hPa, but `ib=1` adds the static −0.99 on top of NorKyst's −0.22, so it may overshoot by up to ≈ 0.4 cm/hPa (≈ 8 cm in a 20 hPa low). Score `ib=0`, `0.6` and `1` on a stormy week at Mausund's gauge. MET says the IB is applied at NorKyst's open boundary, which does not explain the −0.22 (`notes/norkyst-issues.md` "MET's answer" item 4).
 - [ ] **P1.4** `BoundaryTides::with_transport_scaling` (`tide_transport=3`) as the default for atlas tides (Mausund sub-domain 8.1 → 4.2 cm); check the full mesh with it.
 - [ ] **P1.4** Blend the bed towards the atlas depths near the open boundary for `BoundaryTides`, as `OceanModelState::blend_bathymetry` does.

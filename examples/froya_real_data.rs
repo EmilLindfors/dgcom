@@ -41,7 +41,9 @@
 //!    coastline day in `mausund_norkyst_3d.nc`, cut for Mausund, closed 120
 //!    faces and halved the M2 current, TODO P1.3). NorKyst's ζ is shifted
 //!    by minus the mean level `Z0` of the boundary atlas (its datum sits
-//!    0.28 m below mean sea level here), or by `nest_level=`. NorKyst's
+//!    0.28 m below mean sea level here), or by `nest_level=`; without an
+//!    atlas `Z0`, by minus the parent file's own mean at the open boundary,
+//!    if the file is a month long (`ParentDatum`). NorKyst's
 //!    `gauge_gains` and `gauge_ratios` constituents are replaced by the
 //!    gauge-corrected ones (below) by adding the difference between the
 //!    corrected and the raw atlas, which is NorKyst's own harmonic fit, so
@@ -508,13 +510,13 @@ use dg_rs::analysis::{
     EllipseFit, HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit,
     StationValidationResult, TidalEllipse, TideGaugeStation, TimeSeries,
 };
-#[cfg(feature = "netcdf")]
-use dg_rs::boundary::NestingOptions;
 use dg_rs::boundary::{
     AtlasPoint, BCContext2D, BoundaryCoverage, BoundaryLevel, BoundaryTides, CharacteristicOBC,
     ExternalStateProvider, HarmonicTide, InverseBarometer, MultiBoundaryCondition2D,
     NestingRelaxation2D, OceanModelState, Reflective2D, SWEBoundaryCondition2D, TidalAtlas,
 };
+#[cfg(feature = "netcdf")]
+use dg_rs::boundary::{NestingOptions, ParentDatum};
 use dg_rs::equations::ShallowWater2D;
 #[cfg(feature = "netcdf")]
 use dg_rs::io::WaveSpectraFile;
@@ -1872,34 +1874,29 @@ impl Domain {
             OceanModelReader::from_file(Path::new(path))?
         });
         println!("  NorKyst: {}", reader.summary());
-        // NorKyst's ζ is not referenced to mean sea level: its 30-day mean
-        // along the Frøya boundary is −0.28 m (−0.26 m at Mausund, where the
-        // gauge's is 0). Shift it by the atlas's mean level.
-        let level = match opts.nesting_level {
-            Some(level) => level,
-            None => {
-                let atlas = Path::new(&opts.tides);
-                let means: Vec<f64> = if atlas.exists() {
-                    TidalAtlas::read(atlas)?
-                        .points
-                        .iter()
-                        .filter_map(|p| p.mean)
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                if means.is_empty() {
-                    0.0
-                } else {
-                    -means.iter().sum::<f64>() / means.len() as f64
-                }
-            }
+        // NorKyst's ζ has no geodetic datum: its 30-day mean along the
+        // Frøya boundary is −0.28 m (−0.26 m at Mausund, where the gauge's
+        // is 0). Shift it by minus the boundary atlas's mean level, the
+        // parent's own month-long mean; without an atlas the library's
+        // default takes the parent file's mean, if it is a month long.
+        let atlas = Path::new(&opts.tides);
+        let datum = match opts.nesting_level {
+            Some(level) => ParentDatum::Shift(level),
+            None => match atlas
+                .exists()
+                .then(|| TidalAtlas::read(atlas))
+                .transpose()?
+            {
+                Some(atlas) => atlas
+                    .mean_level()
+                    .map_or(ParentDatum::RecordMean, |mean| ParentDatum::Shift(-mean)),
+                None => ParentDatum::RecordMean,
+            },
         };
-        println!("  NorKyst ζ shifted by {level:+.3} m to mean sea level");
         let options = NestingOptions::default()
             .with_band(1000.0 * opts.band_km)
             .with_ramp_up(3600.0 * opts.ramp_hours)
-            .with_reference_level(level);
+            .with_datum(datum);
         let closed = self.close_open_faces(path, opts.max_closed, |mesh, ops, projection| {
             BoundaryCoverage::of_parent(mesh, ops, projection, BoundaryTag::Open, &reader, &options)
         })?;
@@ -1916,6 +1913,15 @@ impl Domain {
             clock,
             &options,
         )?;
+        println!(
+            "  NorKyst ζ shifted by {:+.3} m to mean sea level ({})",
+            parent.reference_level(),
+            match datum {
+                ParentDatum::Shift(_) if opts.nesting_level.is_some() => "nest_level=",
+                ParentDatum::Shift(_) => "minus the boundary atlas's mean level",
+                ParentDatum::RecordMean => "minus the parent file's mean at the open boundary",
+            }
+        );
         println!(
             "  Nesting: {} open-boundary nodes ({} snapped to a wet NorKyst point), {} nodes in a {} km band",
             parent.n_boundary_nodes(),

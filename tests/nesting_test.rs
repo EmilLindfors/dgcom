@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use dg_rs::boundary::{
     CharacteristicOBC, InverseBarometer, MultiBoundaryCondition2D, NestingOptions, OceanModelState,
-    Reflective2D, SWEBoundaryCondition2D, StillWater,
+    ParentDatum, Reflective2D, SWEBoundaryCondition2D, StillWater,
 };
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::io::{
@@ -264,6 +264,12 @@ impl Domain {
 
 /// Largest surface error, relative to the amplitude, after two periods of a
 /// progressive wave nested at both ends, with parent output every T/8.
+/// The parent's ζ as it is: the test parents are hours long, too short for
+/// the default record-mean datum.
+fn as_is() -> NestingOptions {
+    NestingOptions::default().with_datum(ParentDatum::Shift(0.0))
+}
+
 fn progressive_wave_error(interpolation: TimeInterpolation) -> f64 {
     let (length, depth, amplitude, period) = (20_000.0, 20.0, 0.05, 7200.0);
     let domain = Domain::channel(length, 2000.0, 20, 2, 2);
@@ -276,10 +282,7 @@ fn progressive_wave_error(interpolation: TimeInterpolation) -> f64 {
         let eta = wave(x, t);
         (eta, ((G / depth).sqrt() * eta, 0.0))
     });
-    let nesting = domain.nested(
-        reader,
-        &NestingOptions::default().with_time_interpolation(interpolation),
-    );
+    let nesting = domain.nested(reader, &as_is().with_time_interpolation(interpolation));
     nesting.check_time_coverage(0.0, t_end).unwrap();
 
     let open = CharacteristicOBC::new(nesting);
@@ -327,7 +330,7 @@ fn channel_velocity(transport_scaling: bool) -> f64 {
         parent_depth,
         |_, _, _| (0.0, (u_parent, 0.0)),
     );
-    let options = NestingOptions::default().with_transport_scaling(transport_scaling);
+    let options = as_is().with_transport_scaling(transport_scaling);
     let nesting = domain.nested(reader, &options);
     let open = CharacteristicOBC::new(nesting);
     let wall = Reflective2D::new();
@@ -380,7 +383,7 @@ fn parent_at_rest_keeps_a_lake_at_rest_with_band_and_blended_bed() {
         depth,
         |_, _, _| (0.0, (0.0, 0.0)),
     );
-    let nesting = domain.nested(reader, &NestingOptions::default().with_band(2500.0));
+    let nesting = domain.nested(reader, &as_is().with_band(2500.0));
     assert!(nesting.n_band_nodes() > 0 && nesting.n_boundary_nodes() > 0);
 
     let mut bed = Bathymetry2D::from_function(&domain.mesh, &domain.ops, &domain.geom, |x, y| {

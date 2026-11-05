@@ -93,7 +93,9 @@ pub use nesting_3d::{
     ReferenceColumns, Supplied,
 };
 pub use ocean_columns::{DeepReference, OceanColumnsOptions, OceanModelColumns};
-pub use ocean_nesting::{NestingError, NestingOptions, NestingRelaxation2D, OceanModelState};
+pub use ocean_nesting::{
+    NestingError, NestingOptions, NestingRelaxation2D, OceanModelState, ParentDatum,
+};
 pub use tidal_atlas::{AtlasConstituent, AtlasPoint, BoundaryTides, TidalAtlas, TidalAtlasError};
 pub use tidal_config::{SpongeConfig, TidalBCType, TidalSimulationBuilder};
 

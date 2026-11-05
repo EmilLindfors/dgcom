@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use dg_rs::boundary::{
         BCContext2D, CharacteristicOBC, ExternalStateProvider, NestingOptions, OceanModelState,
-        SWEBoundaryCondition2D,
+        ParentDatum, SWEBoundaryCondition2D,
     };
     use dg_rs::io::{LocalProjection, OceanModelReader};
     use dg_rs::mesh::{BoundaryTag, Mesh2D};
@@ -71,7 +71,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &projection,
         BoundaryTag::Open,
         clock,
-        &NestingOptions::default().with_band(2000.0),
+        // ζ as it is: a check of the coupling, and a subset of a few days
+        // is too short for the default record-mean datum
+        &NestingOptions::default()
+            .with_band(2000.0)
+            .with_datum(ParentDatum::Shift(0.0)),
     )?;
     let (s0, s1) = parent.simulation_time_range();
     println!(
