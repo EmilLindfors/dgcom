@@ -94,7 +94,7 @@ fn open_boundary(forcing: &Forcing) -> Box<dyn SWEBoundaryCondition2D + Send + S
             }))
         }
         Tide::Atlas(tides) => {
-            let tides = tides.clone();
+            let tides = (**tides).clone();
             Box::new(CharacteristicOBC::new(match ramp {
                 Some(r) => tides.with_ramp_up(r),
                 None => tides,

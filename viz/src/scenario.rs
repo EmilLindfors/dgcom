@@ -49,7 +49,7 @@ pub enum Tide {
     /// M2 of this amplitude (m), in one phase along the whole boundary
     UniformM2(f64),
     /// Tides of a boundary atlas, varying along the boundary
-    Atlas(BoundaryTides),
+    Atlas(Box<BoundaryTides>),
     /// A depth-uniform M2 body force along mesh x that drives a current of this
     /// amplitude (m/s) without friction: the tidal surface slope of a periodic channel
     BodyForceM2(f64),
@@ -403,7 +403,7 @@ impl Scenario {
                 arrow_radius: 5_000.0,
             },
             forcing: Forcing {
-                tide: Tide::Atlas(tides),
+                tide: Tide::Atlas(Box::new(tides)),
                 manning: 0.025,
                 coriolis: 1.31e-4,
                 // A spring tide squeezed into one hour overshoots (TODO P1.4)

@@ -135,7 +135,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 - [ ] **F.3** Build `viz/` in CI (a `cargo check` in its workspace, or a job on PRs touching `src/` public API): it is its own workspace, so dg-rs's tests never compile it, and it stayed broken for a week after `4d3a160` (`notes/viz.md` 2026-11-05).
 - [ ] **F.3** Close-range land at a farm is coarse (large flat facets beside the cages in the `--record` farm shot): take the 2 m Kattholmen terrain patch for sites by default, or a finer terrain LOD under the camera.
-- [ ] **F.3** clippy `large_enum_variant` on `viz/src/scenario.rs` `Tide` (box the atlas variant).
 - [ ] **F.3** Separate physics from σ-truncation in the fjord3d rest-state flow under GLS (3.6e-5 m/s at 1 h, growing): halve level spacing and κ in turn, compare with Phillips's boundary-layer velocity.
 - [ ] **F.3** Compare the fjord3d cage wake at P1 on 40 m quads with the 2D 20 m run, a 3D P2 run and the integrated `CageDrag2D` drag (3D LTS would allow P2, see P1.3).
 - [ ] **F.3** Run → Save a snapshot file mid-run: hand a `SnapshotSink` to the running solver (it writes from the next frame) after writing the frames the playback holds; Run → Open a file by a dialog (`rfd`?) besides dropping one on the window.
