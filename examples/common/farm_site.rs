@@ -1,12 +1,15 @@
-//! A real fish farm in `froya_real_data`'s 2D tide (TODO F.1): the cages of
-//! a Fiskeridirektoratet site file (`site=`, `io::farm_site`), their wake
-//! and their effect on the residual current, the drag on the farm, and the
-//! pen-to-pen connectivity of particles released in the cages, with and
-//! without the random walk's depth drift (TODO F.2).
+//! A real fish farm in `froya_real_data`'s 2D or 3D tide (TODO F.1): the
+//! cages of a Fiskeridirektoratet site file (`site=`, `io::farm_site`), their
+//! wake and their effect on the residual current, the drag on the farm, and
+//! in 2D the pen-to-pen connectivity of particles released in the cages,
+//! with and without the random walk's depth drift (TODO F.2).
 //!
 //! The site's cages ([`FarmSite::cage_layout`], [`CageGrid::RING_160M`]
 //! unless `cage_spacing= cage_radius= net_depth= solidity=` say otherwise)
-//! drag on the depth mean (`CageDrag2D`). Unless `farm_runs=cages`, the
+//! drag on the depth mean (`CageDrag2D`), in 3D on the layers their nets
+//! reach ([`FarmRecord::sample_3d`]: the wake is the depth mean's, the drag
+//! the layers', and each layer's speed at the cage centres is reported with
+//! and without the cages). Unless `farm_runs=cages`, the
 //! same tide runs first without them (into `<output>/no_cages`), and every
 //! callback samples the depth-mean current of both runs on a grid of
 //! `farm_grid` m (default 20) over `farm_window` m (default 1500) around the
@@ -77,11 +80,13 @@ use dg_rs::particles::{
     ConnectivityMatrix, ConnectivityRecorder, ContactZone, Particle2D, ParticleStatus,
     ParticleTracker2D, SWEVelocity2D, WalkTracer,
 };
-use dg_rs::physics::cage_drag::for_each_caged_node;
+use dg_rs::physics::cage_drag::{for_each_caged_node, layer_coefficient};
+use dg_rs::solver::state::Solution3D;
 use dg_rs::solver::{Probe2D, SWESolution2D, WetDryConfig};
 use dg_rs::source::{CageDrag2D, CageFootprint, NetCage};
 use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
+use dg_rs::vertical::SigmaGrid;
 
 use crate::arguments::Arguments;
 
@@ -228,6 +233,11 @@ impl FarmOptions {
             return Err("farm_control= needs the run without the cages (farm_runs=both)".into());
         }
         Ok(Some(options))
+    }
+
+    /// Particles released in each cage per batch.
+    pub fn particles(&self) -> usize {
+        self.particles
     }
 
     /// Whether the tide runs without the cages first.
@@ -441,6 +451,7 @@ impl FarmCase {
             centre: Vec::new(),
             cage_speed: Vec::new(),
             force: Vec::new(),
+            layers: None,
             particles,
         }
     }
@@ -496,12 +507,117 @@ pub struct FarmRecord<'a> {
     cage_speed: Vec<f64>,
     /// The drag on the farm (N), with cages
     force: Vec<[f64; 2]>,
+    /// A 3D run's layers at the cages
+    layers: Option<Layers>,
     particles: Option<FarmParticles<'a>>,
+}
+
+/// What a 3D run records of its layers at the farm's centre and each cage
+/// centre (the probes, in that order).
+struct Layers {
+    /// σ at the layer centres, bed first
+    sigma: Vec<f64>,
+    /// Each layer's speed, `[time × probe × level]` (NaN where dry)
+    speed: Vec<f32>,
+    /// The column's depth, `[time × probe]`
+    depth: Vec<f32>,
 }
 
 impl FarmRecord<'_> {
     /// Sample the state `q` at `t` (and move the particles to it).
     pub fn sample(&mut self, q: &SWESolution2D, t: f64) {
+        self.sample_depth_mean(q, t);
+        if let Some((drag, geom)) = &self.drag {
+            let nn = self.n_nodes;
+            let mut force = [0.0; 2];
+            for k in 0..q.n_elements {
+                for_each_caged_node(drag, k, nn, |i, entries| {
+                    let idx = k * nn + i;
+                    let s = q.get_state(ElementIndex::new(k), i);
+                    let (h, hu, hv) = (s.h, s.hu, s.hv);
+                    if h <= WetDryConfig::DEFAULT_H_DRY {
+                        return;
+                    }
+                    let rate = CageDrag2D::damping_rate(entries, h, hu.hypot(hv) / h);
+                    force[0] += RHO0 * geom.mass[idx] * rate * hu;
+                    force[1] += RHO0 * geom.mass[idx] * rate * hv;
+                });
+            }
+            self.force.push(force);
+        }
+        if let Some(particles) = self.particles.as_mut() {
+            particles.advance(q, t);
+        }
+    }
+
+    /// [`Self::sample`] of a 3D run at `t`: `q` is the depth mean of its
+    /// state `s` on σ-levels `sigma` over the bed `bed`. The drag on the
+    /// farm is the layers', `F = ρ₀ ∫ Σ_l H_l λ_l |u_l| u_l dA` over the
+    /// layers each net reaches, and every layer's speed at the cages is
+    /// recorded (the particles are the 2D run's only).
+    pub fn sample_3d(
+        &mut self,
+        q: &SWESolution2D,
+        s: &Solution3D,
+        sigma: &SigmaGrid,
+        bed: &[f64],
+        t: f64,
+    ) {
+        assert!(
+            self.particles.is_none(),
+            "the farm's particles are tracked in 2D only"
+        );
+        self.sample_depth_mean(q, t);
+        let (nn, nl) = (self.n_nodes, sigma.n_levels());
+        let h_dry = WetDryConfig::DEFAULT_H_DRY;
+        if let Some((drag, geom)) = &self.drag {
+            let mut force = [0.0; 2];
+            for k in 0..q.n_elements {
+                for_each_caged_node(drag, k, nn, |i, entries| {
+                    let idx = k * nn + i;
+                    let depth = s.eta.data[idx] - bed[idx];
+                    if depth <= h_dry {
+                        return;
+                    }
+                    for (l, &ds) in sigma.d_sigma().iter().enumerate() {
+                        let (u, v) = (s.u[idx * nl + l], s.v[idx * nl + l]);
+                        let rate = layer_coefficient(entries, sigma, l, depth) * u.hypot(v);
+                        let weight = RHO0 * geom.mass[idx] * ds * depth * rate;
+                        force[0] += weight * u;
+                        force[1] += weight * v;
+                    }
+                });
+            }
+            self.force.push(force);
+        }
+        let layers = self.layers.get_or_insert_with(|| Layers {
+            sigma: sigma.sigma_rho().to_vec(),
+            speed: Vec::new(),
+            depth: Vec::new(),
+        });
+        let (mut u, mut v) = (vec![0.0; nn], vec![0.0; nn]);
+        for probe in std::iter::once(&self.case.centre_probe).chain(&self.case.cage_probes) {
+            let depth = probe.sample_swe(q, None, h_dry).h;
+            layers.depth.push(depth as f32);
+            let k = probe.element().as_usize();
+            for l in 0..nl {
+                if depth <= h_dry {
+                    layers.speed.push(f32::NAN);
+                    continue;
+                }
+                for i in 0..nn {
+                    let j = (k * nn + i) * nl + l;
+                    (u[i], v[i]) = (s.u[j], s.v[j]);
+                }
+                layers
+                    .speed
+                    .push(probe.evaluate(&u).hypot(probe.evaluate(&v)) as f32);
+            }
+        }
+    }
+
+    /// The depth-mean samples of [`Self::sample`] and [`Self::sample_3d`].
+    fn sample_depth_mean(&mut self, q: &SWESolution2D, t: f64) {
         let h_dry = WetDryConfig::DEFAULT_H_DRY;
         let velocity = |probe: &Probe2D| {
             let s = probe.sample_swe(q, None, h_dry);
@@ -522,27 +638,6 @@ impl FarmRecord<'_> {
                 .iter()
                 .map(|p| velocity(p).map_or(0.0, |[u, v]| u.hypot(v))),
         );
-        if let Some((drag, geom)) = &self.drag {
-            let nn = self.n_nodes;
-            let mut force = [0.0; 2];
-            for k in 0..q.n_elements {
-                for_each_caged_node(drag, k, nn, |i, entries| {
-                    let idx = k * nn + i;
-                    let s = q.get_state(ElementIndex::new(k), i);
-                    let (h, hu, hv) = (s.h, s.hu, s.hv);
-                    if h <= h_dry {
-                        return;
-                    }
-                    let rate = CageDrag2D::damping_rate(entries, h, hu.hypot(hv) / h);
-                    force[0] += RHO0 * geom.mass[idx] * rate * hu;
-                    force[1] += RHO0 * geom.mass[idx] * rate * hv;
-                });
-            }
-            self.force.push(force);
-        }
-        if let Some(particles) = self.particles.as_mut() {
-            particles.advance(q, t);
-        }
     }
 
     /// The samples in `[t0, t1]` (indices).
@@ -726,6 +821,10 @@ impl FarmCase {
             }
         }
 
+        if caged.layers.is_some() {
+            self.report_layers(reference, control, caged, window);
+        }
+
         // Drag on the farm
         let forces: Vec<(f64, usize)> = range.clone().map(|k| (speed(caged.force[k]), k)).collect();
         let mean_force = forces.iter().map(|f| f.0).sum::<f64>() / forces.len() as f64;
@@ -781,6 +880,103 @@ impl FarmCase {
             particles.report(self, caged, clock, output)?;
         }
         Ok(())
+    }
+
+    /// A 3D run's layers at the cage centres over `window`: each layer's
+    /// mean depth and speed, and with a run without the cages each run's
+    /// speed over that run's, layer by layer and inside and below the nets.
+    fn report_layers(
+        &self,
+        reference: Option<&FarmRecord>,
+        control: Option<&FarmRecord>,
+        caged: &FarmRecord,
+        window: [f64; 2],
+    ) {
+        let n_probes = 1 + self.cages.len();
+        let Some(n_levels) = caged.layers.as_ref().map(|l| l.sigma.len()) else {
+            return;
+        };
+        // Per layer, over the window's wet samples at every cage centre:
+        // the mean speed and the mean depth of the layer's centre
+        let profile = |record: &FarmRecord| -> Option<Vec<[f64; 2]>> {
+            let layers = record.layers.as_ref()?;
+            let mut sums = vec![[0.0; 3]; n_levels];
+            for k in record.window(window) {
+                for probe in 1..n_probes {
+                    let depth = layers.depth[k * n_probes + probe] as f64;
+                    let row = (k * n_probes + probe) * n_levels;
+                    for (l, sum) in sums.iter_mut().enumerate() {
+                        let speed = layers.speed[row + l] as f64;
+                        if speed.is_nan() {
+                            continue;
+                        }
+                        sum[0] += speed;
+                        sum[1] += -layers.sigma[l] * depth;
+                        sum[2] += 1.0;
+                    }
+                }
+            }
+            Some(sums.iter().map(|s| [s[0] / s[2], s[1] / s[2]]).collect())
+        };
+        let Some(cages) = profile(caged) else { return };
+        let open = reference.and_then(profile);
+        let floor = control.and_then(profile);
+        let net_depth = self.cages[0].net_depth;
+        println!(
+            "  Layers at the cage centres (nets {net_depth:.0} m deep): mean speed (m/s) by the \
+             depth of the layer's centre{}",
+            if open.is_some() {
+                ", and over the run without the cages"
+            } else {
+                ""
+            }
+        );
+        let ratio = |a: f64, b: f64| format!("{:6.3}", a / b);
+        // Speed-weighted ratios inside and below the nets: Σ speed / Σ open
+        let mut inside = [0.0; 3];
+        let mut below = [0.0; 3];
+        for l in (0..n_levels).rev() {
+            let [speed, depth] = cages[l];
+            let mut line = format!("    {depth:7.1} m | cages {speed:.3}");
+            if let Some(open) = &open {
+                let open_speed = open[l][0];
+                line += &format!(
+                    " | no cages {open_speed:.3} | ratio {}",
+                    ratio(speed, open_speed)
+                );
+                let control_speed = floor.as_ref().map_or(f64::NAN, |f| f[l][0]);
+                if floor.is_some() {
+                    line += &format!(" | control {}", ratio(control_speed, open_speed));
+                }
+                let sums = if depth <= net_depth {
+                    &mut inside
+                } else {
+                    &mut below
+                };
+                for (sum, value) in sums.iter_mut().zip([open_speed, speed, control_speed]) {
+                    *sum += value;
+                }
+            }
+            println!("{line}");
+        }
+        if open.is_some() {
+            let describe = |[open, with, control]: [f64; 3]| {
+                format!(
+                    "{}{}",
+                    ratio(with, open),
+                    if floor.is_some() {
+                        format!(" (control {})", ratio(control, open))
+                    } else {
+                        String::new()
+                    }
+                )
+            };
+            println!(
+                "    speed over no cages: inside the nets {}, below them {}",
+                describe(inside),
+                describe(below)
+            );
+        }
     }
 
     /// The wake and the residual, cages (and the control) against no cages.
