@@ -8,7 +8,7 @@ use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseSc
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-#[derive(Component, Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct OrbitCamera {
     pub focus: Vec3,
     /// Angle about +Y from +Z (rad)

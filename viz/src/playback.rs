@@ -229,6 +229,30 @@ impl Playback {
         Some((a, b, w as f32))
     }
 
+    /// Whether [`Self::bracket`] holds the run's own neighbouring frames about the
+    /// shown time, so that the field interpolated from them is the run's (an
+    /// on-demand replay may still be reading them).
+    pub fn exact(&self) -> bool {
+        let Some((a, b, _)) = self.bracket() else {
+            return false;
+        };
+        if !(a.t <= self.t && self.t <= b.t) {
+            return false;
+        }
+        match &self.on_demand {
+            None => true,
+            Some(file) => !file.times.iter().any(|&ti| ti > a.t && ti < b.t),
+        }
+    }
+
+    /// The span of model time the run has, held or not: (first, last) frame time.
+    pub fn span(&self) -> Option<(f64, f64)> {
+        match &self.on_demand {
+            Some(file) => Some((*file.times.first()?, *file.times.last()?)),
+            None => Some((self.oldest()?, self.newest()?)),
+        }
+    }
+
     fn clamp(&mut self) {
         if let (Some(lo), Some(hi)) = (self.oldest(), self.newest()) {
             self.t = self.t.clamp(lo, hi);

@@ -101,8 +101,9 @@
 //! - `--memory MB` snapshots kept, oldest dropped first (a live run, or VTU frames)
 //!   [2048]
 //! - `--rate R` model seconds shown per second [60; 3600 in a replay]
-//! - `--vz Z` vertical exaggeration [3]; `--speed-max V` fix the speed scale (m/s)
-//!   instead of letting it follow the flow in round steps
+//! - `--vz Z` vertical exaggeration [3]; `--scale-max V` fix the top of the starting
+//!   colouring's scale (m/s for the speed, m for η's half-width and H_s, s for T_p)
+//!   instead of letting it follow the field in round steps
 //! - `--colour speed|elevation|hs|tp|dissipation` what the water's colour shows at the
 //!   start (C cycles it; the last three are a run's waves: a snapshot file of a
 //!   coupled wave run, `froya_real_data wave_coupling=`) [speed]
@@ -133,6 +134,12 @@
 //!   machine's GPU
 //! - `--screenshot PATH` save a frame once the shown time reaches `--at S` (model
 //!   seconds; default the end of the run) and quit: for checking a change headlessly.
+//! - `--record DIR` render a video's frames to `DIR/frame_NNNNN.png` on a fixed clock
+//!   and quit ([`record`]): `--camera FILE` the camera path (keys of video time,
+//!   model time and view; without it the view stays and the model time runs from
+//!   `--at` at `--rate`), `--fps N` [30], `--ui off|legend|on` [legend], `--size WxH`
+//!   the frames' pixels [1920x1080]. `ffmpeg -framerate 30 -i DIR/frame_%05d.png …`
+//!   makes the video.
 //!
 //! The menu bar along the top ([`menubar`]) does by mouse what the keys do, F1 (or H,
 //! or ?) lists the keys with what each shows now; both read one table of actions
@@ -157,6 +164,7 @@ mod particles;
 mod photo;
 mod playback;
 mod plot;
+mod record;
 mod replay;
 mod scenario;
 mod screen;
@@ -225,7 +233,7 @@ struct Args {
     memory_mb: usize,
     rate: Option<f64>,
     vz: f32,
-    speed_max: Option<f32>,
+    scale_max: Option<f32>,
     colour: ColourBy,
     water_alpha: f32,
     drag: bool,
@@ -246,6 +254,13 @@ struct Args {
     show: actions::Shown,
     /// `--eye`: mesh point (m), height (m), bearing and tilt (degrees)
     eye: Option<([f64; 2], f32, f32, f32)>,
+    /// `--record DIR`: a video's frames ([`record`])
+    record: Option<PathBuf>,
+    camera: Option<PathBuf>,
+    fps: f64,
+    ui: record::Ui,
+    /// `--size WxH`: the recorded frames' pixels
+    size: (u32, u32),
 }
 
 impl Args {
@@ -272,7 +287,7 @@ impl Args {
             memory_mb: 2048,
             rate: None,
             vz: 3.0,
-            speed_max: None,
+            scale_max: None,
             colour: ColourBy::Speed,
             water_alpha: WaterOpacity::default().0,
             drag: true,
@@ -287,6 +302,11 @@ impl Args {
             screenshot: None,
             at: None,
             frame_times: None,
+            record: None,
+            camera: None,
+            fps: 30.0,
+            ui: record::Ui::Legend,
+            size: (1920, 1080),
             sigma: None,
             start: "2025-06-15T00:00:00Z".into(),
             sheet: SheetShows::Density,
@@ -336,7 +356,7 @@ impl Args {
                         )
                     })?;
                 }
-                "--speed-max" => args.speed_max = Some(num(&flag, &value)?),
+                "--scale-max" => args.scale_max = Some(num(&flag, &value)?),
                 "--water-alpha" => {
                     args.water_alpha = num(&flag, &value)?;
                     if !(0.0..=1.0).contains(&args.water_alpha) {
@@ -419,6 +439,23 @@ impl Args {
                 "--screenshot" => args.screenshot = Some(value),
                 "--at" => args.at = Some(num(&flag, &value)?),
                 "--frame-times" => args.frame_times = Some(num(&flag, &value)?),
+                "--record" => args.record = Some(value.into()),
+                "--camera" => args.camera = Some(value.into()),
+                "--fps" => {
+                    args.fps = num(&flag, &value)?;
+                    if args.fps.is_nan() || args.fps <= 0.0 {
+                        return Err(format!("--fps takes a positive number, not {value}"));
+                    }
+                }
+                "--ui" => args.ui = value.parse()?,
+                "--size" => {
+                    let bad = || format!("--size takes WxH in pixels, not {value}");
+                    let (w, h) = value.split_once('x').ok_or_else(bad)?;
+                    args.size = (
+                        w.parse().map_err(|_| bad())?,
+                        h.parse().map_err(|_| bad())?,
+                    );
+                }
                 _ => {
                     return Err(format!(
                         "unknown option {flag} (see the docs at the top of viz/src/main.rs)"
@@ -587,7 +624,6 @@ impl Run {
                         &data.join("froya_topobathy.tif"),
                         &data.join("froya_boundary_tides.txt"),
                         order,
-                        args.hours * 3600.0,
                     )
                 }
                 "channel" => Ok(Scenario::farm_channel(order, sigma, clock()?)),
@@ -1108,7 +1144,7 @@ impl Run {
         world.insert_resource(Field::default());
         world.insert_resource(shown);
         world.insert_resource(periodic);
-        world.insert_resource(Colouring::new(args.speed_max, args.colour));
+        world.insert_resource(Colouring::new(args.scale_max, args.colour));
         // The waves' maps read on opaque water, not mixed with the bed's colours
         world.insert_resource(if args.colour.is_waves() {
             surface::SurfaceStyle::Opaque
@@ -1141,6 +1177,27 @@ impl Run {
             at: args.at.unwrap_or(t_end),
             frames: None,
         });
+        if let Some(dir) = &args.record {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| fail(1, format!("--record {}: {e}", dir.display())))?;
+            let drive = match &args.camera {
+                Some(file) => {
+                    let text = std::fs::read_to_string(file)
+                        .map_err(|e| fail(1, format!("--camera {}: {e}", file.display())))?;
+                    let keys = record::parse(&text).map_err(|e| fail(2, e))?;
+                    record::Drive::Path(record::CameraPath::new(&keys, &frame))
+                }
+                None => {
+                    let start = args.at.unwrap_or(0.0);
+                    record::Drive::Clock {
+                        start,
+                        rate,
+                        seconds: ((t_end - start) / rate).max(0.0),
+                    }
+                }
+            };
+            world.insert_resource(record::Recording::new(dir.clone(), args.fps, drive, args.ui));
+        }
         world.insert_resource(FrameTimes {
             wanted: args.frame_times.unwrap_or(0),
             at: args.at.unwrap_or(t_end),
@@ -1233,14 +1290,24 @@ fn main() -> AppExit {
         },
     };
     let timed = run.as_ref().is_some_and(|r| r.args.frame_times.is_some());
+    // A recording's window has the frames' pixels, laid out as the usual 1600 × 900
+    let recorded = run
+        .as_ref()
+        .and_then(|r| r.args.record.is_some().then_some(r.args.size));
+    let resolution = match recorded {
+        Some((w, h)) => {
+            bevy::window::WindowResolution::new(w, h).with_scale_factor_override(w as f32 / 1600.0)
+        }
+        None => (1600, 900).into(),
+    };
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "dg-viz".into(),
-            resolution: (1600, 900).into(),
-            // Timed frames are not held to the display's rate
-            present_mode: if timed {
+            resolution,
+            // Timed and recorded frames are not held to the display's rate
+            present_mode: if timed || recorded.is_some() {
                 bevy::window::PresentMode::AutoNoVsync
             } else {
                 bevy::window::PresentMode::default()
@@ -1276,7 +1343,7 @@ fn main() -> AppExit {
         PhotoPlugin,
         LayersPlugin,
     ))
-    .add_plugins(StratificationPlugin)
+    .add_plugins((StratificationPlugin, record::RecordPlugin))
     .run_resource::<RunArgs>()
     .run_resource::<Frame>()
     .run_resource::<Nodes>()

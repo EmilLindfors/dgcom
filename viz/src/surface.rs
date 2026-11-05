@@ -119,22 +119,40 @@ pub struct Colouring {
     pub tp_max: f32,
     /// Top of the dissipation's log scale (W/m², a power of ten)
     pub dissipation_max: f32,
-    /// Whether the speed scale was set by hand (else it follows the flow)
-    fixed_speed: bool,
+    /// The colouring whose scale was set by hand (`--scale-max`): it stays, where
+    /// the others follow the field
+    fixed: Option<ColourBy>,
     luts: [Lut; 5],
 }
 
 impl Colouring {
-    pub fn new(speed_max: Option<f32>, by: ColourBy) -> Self {
-        Self {
+    /// Colouring by `by`, its scale's top fixed at `scale_max` if given (m/s for the
+    /// speed, m for η's half-width and H_s, s for T_p, W/m² for the dissipation).
+    pub fn new(scale_max: Option<f32>, by: ColourBy) -> Self {
+        let mut colouring = Self {
             by,
-            speed_max: speed_max.unwrap_or(0.05),
+            speed_max: 0.05,
             eta_max: 0.1,
             hs_max: 1.0,
             tp_max: 10.0,
             dissipation_max: 100.0,
-            fixed_speed: speed_max.is_some(),
+            fixed: scale_max.map(|_| by),
             luts: [VIRIDIS, DIVERGING, THERMAL, CIVIDIS, ICE].map(Lut::new),
+        };
+        if let Some(top) = scale_max {
+            *colouring.scale_of(by) = top;
+        }
+        colouring
+    }
+
+    /// The top of `by`'s scale.
+    fn scale_of(&mut self, by: ColourBy) -> &mut f32 {
+        match by {
+            ColourBy::Speed => &mut self.speed_max,
+            ColourBy::Elevation => &mut self.eta_max,
+            ColourBy::WaveHeight => &mut self.hs_max,
+            ColourBy::WavePeriod => &mut self.tp_max,
+            ColourBy::WaveDissipation => &mut self.dissipation_max,
         }
     }
 
@@ -184,7 +202,15 @@ impl Colouring {
             let at = (p * (sample.len() - 1) as f32) as usize;
             Some(*sample.select_nth_unstable_by(at, f32::total_cmp).1)
         };
-        if !self.fixed_speed
+        let follows = |by| self.fixed != Some(by);
+        let (speed_follows, eta_follows, hs_follows, tp_follows, dissipation_follows) = (
+            follows(ColourBy::Speed),
+            follows(ColourBy::Elevation),
+            follows(ColourBy::WaveHeight),
+            follows(ColourBy::WavePeriod),
+            follows(ColourBy::WaveDissipation),
+        );
+        if speed_follows
             && let Some(p98) = percentile(speed, 0.98, &|g| speed[g])
         {
             follow(&mut self.speed_max, p98, 1e-3);
@@ -193,16 +219,18 @@ impl Colouring {
             .iter()
             .step_by(stride)
             .fold(0.0_f32, |m, e| m.max(e.abs()));
-        follow(&mut self.eta_max, eta_abs, 1e-2);
+        if eta_follows {
+            follow(&mut self.eta_max, eta_abs, 1e-2);
+        }
         let Some(w) = waves else { return };
-        if let Some(p99) = percentile(&w.hs, 0.99, &|g| w.hs[g]) {
+        if hs_follows && let Some(p99) = percentile(&w.hs, 0.99, &|g| w.hs[g]) {
             follow(&mut self.hs_max, p99, 0.1);
         }
-        if let Some(p99) = percentile(&w.tp, 0.99, &|g| w.tp[g]) {
+        if tp_follows && let Some(p99) = percentile(&w.tp, 0.99, &|g| w.tp[g]) {
             follow(&mut self.tp_max, p99, 1.0);
         }
         let power = |g: usize| w.whitecapping[g] + w.breaking[g];
-        if let Some(top) = percentile(&w.hs, 0.995, &power) {
+        if dissipation_follows && let Some(top) = percentile(&w.hs, 0.995, &power) {
             // A decade up at once, down once the field fits a decade lower with a
             // quarter to spare
             let top = top.max(1e-2);
@@ -306,6 +334,29 @@ mod tests {
         assert_eq!(colouring.dissipation_max, 1.0);
         assert_eq!(colouring.hs_max, 1.0);
         assert_eq!(colouring.tp_max, 10.0);
+    }
+
+    #[test]
+    fn a_scale_set_by_hand_stays_and_the_others_follow() {
+        let mut colouring = Colouring::new(Some(10.0), ColourBy::WaveHeight);
+        assert_eq!(colouring.legend().1, ["0", "5", "10"]);
+        let n = 1000;
+        let waves = Waves {
+            hs: vec![3.0; n],
+            tp: vec![12.0; n],
+            whitecapping: vec![1.0; n],
+            breaking: vec![0.0; n],
+            ..Waves::default()
+        };
+        let speed = vec![0.3; n];
+        colouring.fit(&speed, &vec![0.0; n], Some(&waves));
+        assert_eq!(colouring.hs_max, 10.0);
+        // The others still fit the field
+        assert_eq!(colouring.tp_max, 20.0);
+        assert_eq!(colouring.speed_max, 0.5);
+        let mut speed_fixed = Colouring::new(Some(0.35), ColourBy::Speed);
+        speed_fixed.fit(&vec![2.0; n], &vec![0.0; n], None);
+        assert_eq!(speed_fixed.speed_max, 0.35);
     }
 
     #[test]
