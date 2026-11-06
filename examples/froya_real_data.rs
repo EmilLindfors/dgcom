@@ -41,14 +41,19 @@
 //!    coastline day in `mausund_norkyst_3d.nc`, cut for Mausund, closed 120
 //!    faces and halved the M2 current, TODO P1.3). NorKyst's ζ is shifted
 //!    by minus the mean level `Z0` of the boundary atlas (its datum sits
-//!    0.28 m below mean sea level here), or by `nest_level=`. NorKyst's
+//!    0.28 m below mean sea level here), or by `nest_level=`; without an
+//!    atlas `Z0`, by minus the parent file's own mean at the open boundary,
+//!    if the file is a month long (`ParentDatum`). NorKyst's
 //!    `gauge_gains` and `gauge_ratios` constituents are replaced by the
 //!    gauge-corrected ones (below) by adding the difference between the
 //!    corrected and the raw atlas, which is NorKyst's own harmonic fit, so
 //!    the residual flow is kept (`OceanModelState::with_tidal_correction`;
-//!    `nest_tides=raw` to keep NorKyst's tides). The parent ζ is taken as is; `ib=1` adds the
-//!    inverse-barometer level of `met=` to it (for a parent run without
-//!    pressure forcing).
+//!    `nest_tides=raw` to keep NorKyst's tides). `ib=F` adds F times the
+//!    inverse-barometer level of `met=` to the parent ζ (0, the default:
+//!    none; 1: all of it, for a parent run without pressure forcing).
+//!    NorKyst's ζ carries ≈ 0.22 of the static response and gauge minus
+//!    NorKyst regresses on pressure at 0.58 of it, so a fraction may fit
+//!    best (TODO P1.5).
 //!    Without an atlas: M2 of `M2_AMPLITUDE` in one phase along the boundary.
 //!    NorKyst-800 has too little N2 here (0.027 m at Mausund against 0.156 m
 //!    observed) and about twice the Q1, its diurnals are off (K1 1.14×,
@@ -508,13 +513,13 @@ use dg_rs::analysis::{
     EllipseFit, HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit,
     StationValidationResult, TidalEllipse, TideGaugeStation, TimeSeries,
 };
-#[cfg(feature = "netcdf")]
-use dg_rs::boundary::NestingOptions;
 use dg_rs::boundary::{
     AtlasPoint, BCContext2D, BoundaryCoverage, BoundaryLevel, BoundaryTides, CharacteristicOBC,
     ExternalStateProvider, HarmonicTide, InverseBarometer, MultiBoundaryCondition2D,
     NestingRelaxation2D, OceanModelState, Reflective2D, SWEBoundaryCondition2D, TidalAtlas,
 };
+#[cfg(feature = "netcdf")]
+use dg_rs::boundary::{NestingOptions, ParentDatum};
 use dg_rs::equations::ShallowWater2D;
 #[cfg(feature = "netcdf")]
 use dg_rs::io::WaveSpectraFile;
@@ -669,7 +674,8 @@ struct Options {
     /// The largest share of the open faces the atlas or the parent may
     /// leave uncovered (they become walls)
     max_closed: f64,
-    nesting_ib: bool,
+    /// Fraction of the inverse barometer added to the parent's ζ (`ib=`)
+    nesting_ib: f64,
     /// In 3D, the bulk heat and freshwater fluxes of `met=` when it has the
     /// fields (`heat=0`: none)
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
@@ -1150,7 +1156,14 @@ impl Options {
             band_minutes: get("band_minutes", 30.0)?,
             blend_bed: get("blend", 1.0)? != 0.0,
             max_closed: get("max_closed", 0.05)?,
-            nesting_ib: get("ib", 0.0)? != 0.0,
+            nesting_ib: match get("ib", 0.0)? {
+                f if (0.0..=2.0).contains(&f) => f,
+                f => {
+                    return Err(format!(
+                        "bad ib={f}: a fraction of the inverse barometer, 0–2"
+                    ));
+                }
+            },
             heat: get("heat", 1.0)? != 0.0,
             jerlov: args.get("jerlov").map_or("III", String::as_str).parse()?,
             mixing: match args.get("mixing").map_or("k-epsilon", String::as_str) {
@@ -1872,34 +1885,29 @@ impl Domain {
             OceanModelReader::from_file(Path::new(path))?
         });
         println!("  NorKyst: {}", reader.summary());
-        // NorKyst's ζ is not referenced to mean sea level: its 30-day mean
-        // along the Frøya boundary is −0.28 m (−0.26 m at Mausund, where the
-        // gauge's is 0). Shift it by the atlas's mean level.
-        let level = match opts.nesting_level {
-            Some(level) => level,
-            None => {
-                let atlas = Path::new(&opts.tides);
-                let means: Vec<f64> = if atlas.exists() {
-                    TidalAtlas::read(atlas)?
-                        .points
-                        .iter()
-                        .filter_map(|p| p.mean)
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                if means.is_empty() {
-                    0.0
-                } else {
-                    -means.iter().sum::<f64>() / means.len() as f64
-                }
-            }
+        // NorKyst's ζ has no geodetic datum: its 30-day mean along the
+        // Frøya boundary is −0.28 m (−0.26 m at Mausund, where the gauge's
+        // is 0). Shift it by minus the boundary atlas's mean level, the
+        // parent's own month-long mean; without an atlas the library's
+        // default takes the parent file's mean, if it is a month long.
+        let atlas = Path::new(&opts.tides);
+        let datum = match opts.nesting_level {
+            Some(level) => ParentDatum::Shift(level),
+            None => match atlas
+                .exists()
+                .then(|| TidalAtlas::read(atlas))
+                .transpose()?
+            {
+                Some(atlas) => atlas
+                    .mean_level()
+                    .map_or(ParentDatum::RecordMean, |mean| ParentDatum::Shift(-mean)),
+                None => ParentDatum::RecordMean,
+            },
         };
-        println!("  NorKyst ζ shifted by {level:+.3} m to mean sea level");
         let options = NestingOptions::default()
             .with_band(1000.0 * opts.band_km)
             .with_ramp_up(3600.0 * opts.ramp_hours)
-            .with_reference_level(level);
+            .with_datum(datum);
         let closed = self.close_open_faces(path, opts.max_closed, |mesh, ops, projection| {
             BoundaryCoverage::of_parent(mesh, ops, projection, BoundaryTag::Open, &reader, &options)
         })?;
@@ -1916,6 +1924,15 @@ impl Domain {
             clock,
             &options,
         )?;
+        println!(
+            "  NorKyst ζ shifted by {:+.3} m to mean sea level ({})",
+            parent.reference_level(),
+            match datum {
+                ParentDatum::Shift(_) if opts.nesting_level.is_some() => "nest_level=",
+                ParentDatum::Shift(_) => "minus the boundary atlas's mean level",
+                ParentDatum::RecordMean => "minus the parent file's mean at the open boundary",
+            }
+        );
         println!(
             "  Nesting: {} open-boundary nodes ({} snapped to a wet NorKyst point), {} nodes in a {} km band",
             parent.n_boundary_nodes(),
@@ -6287,16 +6304,18 @@ impl BoundaryLevel for Level {
     }
 }
 
-/// Characteristic OBC with external data from `provider`, raised by the
-/// inverse-barometer level of the pressure forcing, if any.
+/// Characteristic OBC with external data from `provider`, raised by
+/// `factor` times the inverse-barometer level of the pressure forcing, if
+/// any.
 fn characteristic<P: ExternalStateProvider + 'static>(
     provider: P,
     level: Option<Level>,
+    factor: f64,
 ) -> Box<dyn SWEBoundaryCondition2D> {
     match level {
-        Some(level) => Box::new(CharacteristicOBC::new(InverseBarometer::new(
-            provider, level,
-        ))),
+        Some(level) => Box::new(CharacteristicOBC::new(
+            InverseBarometer::new(provider, level).with_factor(factor),
+        )),
         None => Box::new(CharacteristicOBC::new(provider)),
     }
 }
@@ -6477,7 +6496,7 @@ fn correct_parent_tides(
 /// Open-boundary condition and a description of the forcing: NorKyst
 /// nesting (`norkyst=`), else atlas tides (`tides=`), else uniform M2; raised
 /// by the inverse-barometer `level` of the pressure forcing (for nesting only
-/// with `ib=1`).
+/// with `ib=`, times its factor).
 fn open_boundary(
     domain: &Domain,
     opts: &Options,
@@ -6491,8 +6510,8 @@ fn open_boundary(
             "NorKyst nesting ({})",
             parent.reader().velocity_source().unwrap_or("no currents")
         );
-        let level = level.filter(|_| opts.nesting_ib);
-        return Ok((characteristic(parent, level), description));
+        let level = level.filter(|_| opts.nesting_ib > 0.0);
+        return Ok((characteristic(parent, level, opts.nesting_ib), description));
     }
 
     let clock = *clock;
@@ -6521,7 +6540,7 @@ fn open_boundary(
                 opts.tide_transport
             ));
         }
-        return Ok((characteristic(tides, level), description));
+        return Ok((characteristic(tides, level, 1.0), description));
     }
 
     println!("  No tidal atlas at {}: uniform M2", opts.tides);
@@ -6529,7 +6548,7 @@ fn open_boundary(
         .with_ramp_up(3600.0 * opts.ramp_hours)
         .with_nodal_corrections(&clock);
     let description = format!("M2 of {M2_AMPLITUDE} m in one phase at the open boundaries");
-    Ok((characteristic(tide, level), description))
+    Ok((characteristic(tide, level, 1.0), description))
 }
 
 /// Constituents, forced nodes, and the M2 amplitude range and phase spread

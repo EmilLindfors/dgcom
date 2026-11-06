@@ -82,7 +82,7 @@ pub use boundary::{
     Tidal2D, TidalAtlas, TidalBCType, TidalConstituent, TidalSimulationBuilder,
     format_bathymetry_warning, validate_bathymetry_convention,
 };
-pub use boundary::{NestingOptions, NestingRelaxation2D, OceanModelState};
+pub use boundary::{NestingOptions, NestingRelaxation2D, OceanModelState, ParentDatum};
 pub use equations::Advection2D;
 pub use mesh::{BoundaryConfig, BoundaryTag, Mesh2D, Mesh2DBuilder};
 pub use operators::{DGOperators2D, GeometricFactors2D, MeshTransfer2D};

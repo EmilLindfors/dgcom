@@ -50,6 +50,20 @@
 //! step. Relaxing `h` adds or removes mass, as nesting does through the
 //! boundary; nodes that are dry in the child or the parent are left alone.
 //!
+//! # Datum
+//!
+//! An ocean model's ζ is relative to its own rest level over its own bed,
+//! with no geodetic datum, and its time mean drifts: NorKyst-800's sits
+//! 0.20–0.40 m below the gauges' mean sea level along the coast, and moves
+//! by 4–10 cm between seasons (`notes/norkyst-issues.md`; MET confirmed
+//! this on 2026-11-05 and advises taking anomalies from the model's own
+//! time mean). The child's 0 is mean sea level, so the parent's mean comes
+//! off ([`ParentDatum`]): by default its own time mean over the open
+//! boundary and a record of a month or more. The run's own window of a few
+//! days is never used, since its mean also holds whatever surge is in it.
+//! One level for the whole boundary keeps the parent's surface slopes (the
+//! coastal current's geostrophic tilt).
+//!
 //! # Time base
 //!
 //! Simulation time `t` is the parent instant `clock.unix(t)`. A time outside
@@ -97,6 +111,15 @@ pub enum NestingError {
     /// The parent has no sea surface height.
     #[error("the parent model has no sea surface height")]
     NoSurface,
+    /// The parent record is too short for [`ParentDatum::RecordMean`].
+    #[error(
+        "the parent record is {days:.1} days, too short to take its own mean as the datum (at          least {min} days, or a surge in it comes off too): give ParentDatum::Shift, e.g. minus          TidalAtlas::mean_level of an atlas fitted to the parent over a month around the run",
+        min = ParentDatum::MIN_RECORD_DAYS
+    )]
+    ShortDatumRecord {
+        /// Length of the parent record (days)
+        days: f64,
+    },
     /// No mesh face has the boundary tag.
     #[error("no boundary face is tagged {0:?}")]
     NoBoundary(BoundaryTag),
@@ -119,6 +142,27 @@ pub enum NestingError {
     },
 }
 
+/// How the parent's ζ is moved to the child's datum, mean sea level (see
+/// the module docs).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ParentDatum {
+    /// Subtract the parent's time mean of ζ over the open-boundary nodes and
+    /// its whole record, which must be at least
+    /// [`ParentDatum::MIN_RECORD_DAYS`] long (the default)
+    RecordMean,
+    /// Add this level (m) to the parent's ζ: e.g. minus
+    /// [`TidalAtlas::mean_level`] of an atlas fitted to the parent over a
+    /// month around the run, or 0 to take ζ as it is
+    Shift(f64),
+}
+
+impl ParentDatum {
+    /// Shortest record (days) whose mean [`ParentDatum::RecordMean`] takes:
+    /// a spring–neap cycle twice, so the tide averages out and a few days'
+    /// surge weighs little.
+    pub const MIN_RECORD_DAYS: f64 = 29.0;
+}
+
 /// Options of [`OceanModelState::new`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NestingOptions {
@@ -135,8 +179,8 @@ pub struct NestingOptions {
     pub transport_scaling: bool,
     /// Largest factor transport scaling may change the velocity by
     pub max_transport_ratio: f64,
-    /// Added to the parent's ζ (m), e.g. to move it to the child's datum
-    pub reference_level: f64,
+    /// How the parent's ζ is moved to the child's datum
+    pub datum: ParentDatum,
     /// Ramp the parent state up from rest over this many seconds (a run
     /// started at rest would otherwise be hit by the parent's full ζ and ū);
     /// the reference level ramps with it
@@ -152,7 +196,7 @@ impl Default for NestingOptions {
             time_interpolation: TimeInterpolation::Cubic,
             transport_scaling: true,
             max_transport_ratio: 3.0,
-            reference_level: 0.0,
+            datum: ParentDatum::RecordMean,
             ramp: None,
         }
     }
@@ -177,9 +221,9 @@ impl NestingOptions {
         self
     }
 
-    /// Add `level` (m) to the parent's ζ.
-    pub fn with_reference_level(mut self, level: f64) -> Self {
-        self.reference_level = level;
+    /// How the parent's ζ is moved to the child's datum.
+    pub fn with_datum(mut self, datum: ParentDatum) -> Self {
+        self.datum = datum;
         self
     }
 
@@ -189,6 +233,21 @@ impl NestingOptions {
         self.ramp = Some(duration);
         self
     }
+}
+
+/// Mean parent ζ over the open-boundary nodes and every snapshot of
+/// `series` (`[slot][time][ζ, u, v]`).
+fn boundary_mean_zeta(nodes: &[NestedNode], series: &[f32], n_times: usize) -> f64 {
+    let (mut sum, mut count) = (0.0, 0usize);
+    for (node, node_series) in nodes.iter().zip(series.chunks_exact(3 * n_times)) {
+        if node.on_boundary {
+            for zeta in node_series.iter().step_by(3) {
+                sum += *zeta as f64;
+                count += 1;
+            }
+        }
+    }
+    sum / count as f64
 }
 
 /// A mesh node the parent is sampled at.
@@ -223,6 +282,8 @@ struct Inner {
     /// costs only the time stencil at run time
     series: Vec<f32>,
     has_velocity: bool,
+    /// Added to the parent's ζ (m), from [`NestingOptions::datum`]
+    reference_level: f64,
 }
 
 /// Parent ocean model at the open boundary (and relaxation band) of a mesh;
@@ -240,7 +301,8 @@ impl OceanModelState {
     /// simulation time to UTC with `clock`. Every open-boundary node must
     /// lie in a parent cell with a wet corner or within `options.max_snap`
     /// of a wet parent point; band nodes the parent does not cover are not
-    /// relaxed.
+    /// relaxed. With [`ParentDatum::RecordMean`] the parent record must be
+    /// at least [`ParentDatum::MIN_RECORD_DAYS`] long.
     pub fn new<P: CoordinateProjection>(
         reader: Arc<OceanModelReader>,
         mesh: &Mesh2D,
@@ -359,6 +421,18 @@ impl OceanModelState {
             }
         }
 
+        let reference_level = match options.datum {
+            ParentDatum::Shift(level) => level,
+            ParentDatum::RecordMean => {
+                let (t0, t1) = reader.time_range().expect("at least one snapshot");
+                let days = (t1 - t0) / 86_400.0;
+                if days < ParentDatum::MIN_RECORD_DAYS {
+                    return Err(NestingError::ShortDatumRecord { days });
+                }
+                -boundary_mean_zeta(&nodes, &series, n_times)
+            }
+        };
+
         Ok(Self {
             inner: Arc::new(Inner {
                 reader,
@@ -371,8 +445,14 @@ impl OceanModelState {
                 snapped,
                 series,
                 has_velocity,
+                reference_level,
             }),
         })
+    }
+
+    /// The level (m) added to the parent's ζ (see [`NestingOptions::datum`]).
+    pub fn reference_level(&self) -> f64 {
+        self.inner.reference_level
     }
 
     /// A clock whose `t = 0` is the first snapshot of `reader`.
@@ -506,7 +586,7 @@ impl OceanModelState {
         }
         let [zeta, u, v] = sum.map(|x| moment.ramp * x);
         // The datum shift ramps with ζ: the run starts at rest at 0
-        let eta = zeta + moment.ramp * inner.options.reference_level;
+        let eta = zeta + moment.ramp * inner.reference_level;
         if !inner.has_velocity {
             return (eta, None);
         }
@@ -808,6 +888,19 @@ mod tests {
     /// ζ = 0.1, 0.3, 0.7 m, uniform (east, north) = (0.2, −0.1) m/s, depth
     /// `DEPTH`.
     fn reader(projection: &LocalProjection) -> Arc<OceanModelReader> {
+        reader_with(
+            projection,
+            vec![T0, T0 + 3600.0, T0 + 7200.0],
+            &[0.1, 0.3, 0.7],
+        )
+    }
+
+    /// As [`reader`], ζ spatially uniform at `zeta` at `times`.
+    fn reader_with(
+        projection: &LocalProjection,
+        times: Vec<f64>,
+        zeta: &[f32],
+    ) -> Arc<OceanModelReader> {
         let (lat0, lon0) = projection.xy_to_geo(-20_000.0, -20_000.0);
         let (lat1, lon1) = projection.xy_to_geo(20_000.0, 20_000.0);
         let n = 9;
@@ -828,16 +921,34 @@ mod tests {
                     .collect(),
             )
         };
+        let n_times = times.len();
         Arc::new(
-            OceanModelReader::new(grid, vec![T0, T0 + 3600.0, T0 + 7200.0])
+            OceanModelReader::new(grid, times)
                 .unwrap()
-                .with_ssh(series(&[0.1, 0.3, 0.7]))
-                .with_velocity(series(&[0.2; 3]), series(&[-0.1; 3]), "test")
+                .with_ssh(series(zeta))
+                .with_velocity(
+                    series(&vec![0.2; n_times]),
+                    series(&vec![-0.1; n_times]),
+                    "test",
+                )
                 .with_depth(vec![DEPTH; m]),
         )
     }
 
+    /// The parent's ζ as it is (the test parents' records are too short for
+    /// [`ParentDatum::RecordMean`]).
+    fn as_is() -> NestingOptions {
+        NestingOptions::default().with_datum(ParentDatum::Shift(0.0))
+    }
+
     fn setup(options: &NestingOptions) -> (Mesh2D, DGOperators2D, OceanModelState) {
+        setup_with(reader(&LocalProjection::new(63.5, 8.5)), options).unwrap()
+    }
+
+    fn setup_with(
+        reader: Arc<OceanModelReader>,
+        options: &NestingOptions,
+    ) -> Result<(Mesh2D, DGOperators2D, OceanModelState), NestingError> {
         let projection = LocalProjection::new(63.5, 8.5);
         let mesh = Mesh2D::uniform_rectangle_with_bc(
             -5000.0,
@@ -851,16 +962,53 @@ mod tests {
         let ops = DGOperators2D::new(2);
         let clock = ModelClock::new(T0);
         let parent = OceanModelState::new(
-            reader(&projection),
+            reader,
             &mesh,
             &ops,
             &projection,
             BoundaryTag::Open,
             clock,
             options,
-        )
-        .unwrap();
-        (mesh, ops, parent)
+        )?;
+        Ok((mesh, ops, parent))
+    }
+
+    /// P1.5: by default the parent's own record mean comes off ζ, so the
+    /// child sees anomalies about its mean sea level (NorKyst's mean sits
+    /// 0.28 m low at Frøya), and the shift ramps with ζ.
+    #[test]
+    fn the_default_datum_takes_off_the_parents_record_mean() {
+        // Daily snapshots over 30 days, a −0.28 m mean with a 0.1 m swing
+        let times: Vec<f64> = (0..=30).map(|k| T0 + 86_400.0 * k as f64).collect();
+        let zeta: Vec<f32> = (0..=30)
+            .map(|k| (-0.28 + 0.1 * (0.7 * k as f64).sin()) as f32)
+            .collect();
+        let mean = zeta.iter().map(|&z| z as f64).sum::<f64>() / zeta.len() as f64;
+        let projection = LocalProjection::new(63.5, 8.5);
+        let reader = reader_with(&projection, times, &zeta);
+        let (_, _, parent) = setup_with(reader, &NestingOptions::default()).unwrap();
+        assert!((parent.reference_level() + mean).abs() < 1e-6);
+        let day = 86_400.0 * 5.0;
+        let s = parent.external_state(&ctx(day, -DEPTH));
+        assert!((s.eta - (zeta[5] as f64 - mean)).abs() < 1e-6, "{}", s.eta);
+
+        let shifted = NestingOptions::default().with_datum(ParentDatum::Shift(0.25));
+        let (_, _, parent) = setup(&shifted);
+        assert_eq!(parent.reference_level(), 0.25);
+    }
+
+    /// A few days' mean would also take off a surge in them: the default
+    /// refuses a record shorter than a month instead of guessing.
+    #[test]
+    fn the_default_datum_refuses_a_short_record() {
+        let projection = LocalProjection::new(63.5, 8.5);
+        let times: Vec<f64> = (0..=72).map(|k| T0 + 3600.0 * k as f64).collect();
+        let reader = reader_with(&projection, times, &[0.0; 73]);
+        let result = setup_with(reader, &NestingOptions::default());
+        match result {
+            Err(NestingError::ShortDatumRecord { days }) => assert!((days - 3.0).abs() < 1e-9),
+            other => panic!("expected ShortDatumRecord, got {:?}", other.map(|_| ())),
+        }
     }
 
     fn ctx(t: f64, bed: f64) -> BCContext2D {
@@ -872,7 +1020,7 @@ mod tests {
     /// quadratic ζ(τ) = 0.1 + 0.1 τ + 0.1 τ² (τ in hours).
     #[test]
     fn boundary_state_interpolates_the_parent_in_time() {
-        let (_, _, parent) = setup(&NestingOptions::default());
+        let (_, _, parent) = setup(&as_is());
         for (t, zeta) in [(0.0, 0.1), (1800.0, 0.175), (5400.0, 0.475), (7200.0, 0.7)] {
             let s = parent.external_state(&ctx(t, -DEPTH));
             assert!((s.eta - zeta).abs() < 1e-6, "t = {t}: {} vs {zeta}", s.eta);
@@ -882,7 +1030,7 @@ mod tests {
                 "({u}, {v})"
             );
         }
-        let linear = NestingOptions::default().with_time_interpolation(TimeInterpolation::Linear);
+        let linear = as_is().with_time_interpolation(TimeInterpolation::Linear);
         let (_, _, parent) = setup(&linear);
         assert!((parent.external_state(&ctx(1800.0, -DEPTH)).eta - 0.2).abs() < 1e-6);
         assert!(parent.check_time_coverage(0.0, 7200.0).is_ok());
@@ -894,7 +1042,7 @@ mod tests {
     /// transport), limited by `max_transport_ratio`.
     #[test]
     fn transport_is_conserved_across_a_bed_mismatch() {
-        let (_, _, parent) = setup(&NestingOptions::default());
+        let (_, _, parent) = setup(&as_is());
         let (u, _) = parent.external_state(&ctx(0.0, -DEPTH)).velocity.unwrap();
         let (u_half, _) = parent
             .external_state(&ctx(0.0, -0.5 * DEPTH))
@@ -904,7 +1052,7 @@ mod tests {
         assert!((u_half / u - 50.1 / 25.1).abs() < 1e-9, "{}", u_half / u);
         let (u_shallow, _) = parent.external_state(&ctx(0.0, -2.0)).velocity.unwrap();
         assert!((u_shallow / u - 3.0).abs() < 1e-9);
-        let (_, _, plain) = setup(&NestingOptions::default().with_transport_scaling(false));
+        let (_, _, plain) = setup(&as_is().with_transport_scaling(false));
         let (u_plain, _) = plain.external_state(&ctx(0.0, -2.0)).velocity.unwrap();
         assert!((u_plain - u).abs() < 1e-12);
     }
@@ -914,7 +1062,7 @@ mod tests {
     #[test]
     fn tidal_correction_is_added_to_the_parent() {
         use std::f64::consts::PI;
-        let options = NestingOptions::default().with_band(2000.0);
+        let options = as_is().with_band(2000.0);
         let (_, _, parent) = setup(&options);
         let projection = LocalProjection::new(63.5, 8.5);
         let (lat, lon) = projection.xy_to_geo(0.0, 0.0);
@@ -972,7 +1120,7 @@ mod tests {
     /// The ramp starts the parent state from rest.
     #[test]
     fn ramp_starts_from_rest() {
-        let (_, _, parent) = setup(&NestingOptions::default().with_ramp_up(3600.0));
+        let (_, _, parent) = setup(&as_is().with_ramp_up(3600.0));
         let s = parent.external_state(&ctx(0.0, -DEPTH));
         assert_eq!((s.eta, s.velocity), (0.0, Some((0.0, 0.0))));
         let s = parent.external_state(&ctx(1800.0, -DEPTH));
@@ -987,9 +1135,9 @@ mod tests {
     /// 5 cm in three minutes).
     #[test]
     fn the_reference_level_ramps_with_the_parent() {
-        let options = NestingOptions::default()
+        let options = as_is()
             .with_ramp_up(3600.0)
-            .with_reference_level(0.25);
+            .with_datum(ParentDatum::Shift(0.25));
         let (_, _, parent) = setup(&options);
         let s = parent.external_state(&ctx(0.0, -DEPTH));
         assert_eq!(s.eta, 0.0);
@@ -1003,7 +1151,7 @@ mod tests {
     #[should_panic(expected = "outside the parent file")]
     fn forcing_past_the_last_snapshot_panics() {
         // P0.20: this used to return the last snapshot forever.
-        let (_, _, parent) = setup(&NestingOptions::default());
+        let (_, _, parent) = setup(&as_is());
         parent.external_state(&ctx(7260.0, -DEPTH));
     }
 
@@ -1012,7 +1160,7 @@ mod tests {
     /// is not changed.
     #[test]
     fn relaxation_band_weights_and_fixed_point() {
-        let options = NestingOptions::default().with_band(2000.0);
+        let options = as_is().with_band(2000.0);
         let (mesh, ops, parent) = setup(&options);
         assert_eq!(parent.n_snapped(), 0);
         assert!(parent.n_band_nodes() > 0);
@@ -1047,7 +1195,7 @@ mod tests {
     /// leaves the interior alone.
     #[test]
     fn bathymetry_is_blended_to_the_parent_across_the_band() {
-        let (mesh, ops, parent) = setup(&NestingOptions::default().with_band(2000.0));
+        let (mesh, ops, parent) = setup(&as_is().with_band(2000.0));
         let geom = GeometricFactors2D::compute(&mesh, &ops);
         let mut bed = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -20.0);
         assert_eq!(parent.depth_ratios(&bed), Some((2.5, 2.5, 2.5)));
@@ -1063,7 +1211,7 @@ mod tests {
     /// elements touching it keep their nodes; the rest of the band blends.
     #[test]
     fn blending_leaves_the_shores_alone() {
-        let (mesh, ops, parent) = setup(&NestingOptions::default().with_band(2000.0));
+        let (mesh, ops, parent) = setup(&as_is().with_band(2000.0));
         let geom = GeometricFactors2D::compute(&mesh, &ops);
         let shallow = |x: f64, y: f64| x <= -3000.0 + 1e-6 && y <= -3000.0 + 1e-6;
         let bed_at = |x: f64, y: f64| if shallow(x, y) { -1.0 } else { -20.0 };
@@ -1116,7 +1264,7 @@ mod tests {
             &projection,
             BoundaryTag::Open,
             ModelClock::new(T0),
-            &NestingOptions::default(),
+            &as_is(),
         );
         assert!(matches!(result, Err(NestingError::NotCovered { .. })));
     }

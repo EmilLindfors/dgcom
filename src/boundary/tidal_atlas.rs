@@ -313,6 +313,15 @@ impl TidalAtlas {
             .min_by(|a, b| a.1.total_cmp(&b.1))
     }
 
+    /// Mean of the points' mean levels `Z0` (m), `None` if no point has
+    /// one: for a parent fitted over a month around a run, minus this is the
+    /// [`ParentDatum::Shift`](crate::boundary::ParentDatum::Shift) that
+    /// moves the parent's ζ to mean sea level.
+    pub fn mean_level(&self) -> Option<f64> {
+        let means: Vec<f64> = self.points.iter().filter_map(|p| p.mean).collect();
+        (!means.is_empty()).then(|| means.iter().sum::<f64>() / means.len() as f64)
+    }
+
     /// Whether the atlas has velocities.
     pub fn has_velocity(&self) -> bool {
         self.points
@@ -792,6 +801,8 @@ mod tests {
         assert_eq!(atlas.names(), vec!["M2", "S2"]);
         assert!(atlas.has_velocity());
         assert_eq!(atlas.points[1].mean, Some(0.05));
+        assert!((atlas.mean_level().unwrap() - 0.05).abs() < 1e-12);
+        assert_eq!(TidalAtlas::default().mean_level(), None);
         assert_eq!(atlas.header[0], "test atlas");
         let again = TidalAtlas::parse(&atlas.to_text()).unwrap();
         assert_eq!(again.points, atlas.points);
