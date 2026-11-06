@@ -115,10 +115,7 @@ impl AdmittanceInference {
         };
         let (a, b) = (complex(lower), complex(upper));
         let (re, im) = (wa * a.0 + wb * b.0, wa * a.1 + wb * b.1);
-        Some((
-            re.hypot(im),
-            (-im).atan2(re).to_degrees().rem_euclid(360.0),
-        ))
+        Some((re.hypot(im), (-im).atan2(re).to_degrees().rem_euclid(360.0)))
     }
 }
 
@@ -141,8 +138,16 @@ mod tests {
         for (inference, (a, b)) in AdmittanceInference::MINOR_SEMIDIURNALS.iter().zip(expected) {
             let (wa, wb) = inference.weights().unwrap();
             // Ray's coefficients carry two or three digits
-            assert!((wa - a).abs() < 0.006 * a.abs().max(0.1), "{}: {wa} vs {a}", inference.name);
-            assert!((wb - b).abs() < 0.03 * b.abs(), "{}: {wb} vs {b}", inference.name);
+            assert!(
+                (wa - a).abs() < 0.006 * a.abs().max(0.1),
+                "{}: {wa} vs {a}",
+                inference.name
+            );
+            assert!(
+                (wb - b).abs() < 0.03 * b.abs(),
+                "{}: {wb} vs {b}",
+                inference.name
+            );
         }
     }
 
@@ -168,7 +173,11 @@ mod tests {
                 .infer(z(inference.lower), z(inference.upper))
                 .unwrap();
             let (h0, g0) = z(inference.name);
-            assert!((h - h0).abs() < 1e-12 && (g - g0).abs() < 1e-9, "{}", inference.name);
+            assert!(
+                (h - h0).abs() < 1e-12 && (g - g0).abs() < 1e-9,
+                "{}",
+                inference.name
+            );
         }
         let itself = AdmittanceInference::new("N2", "N2", "M2");
         assert_eq!(itself.weights().map(|w| w.1), Some(0.0));
@@ -178,7 +187,15 @@ mod tests {
 
     #[test]
     fn unknown_constituents_infer_nothing() {
-        assert!(AdmittanceInference::new("M4", "N2", "M2").weights().is_none());
-        assert!(AdmittanceInference::new("NU2", "M2", "M2").weights().is_none());
+        assert!(
+            AdmittanceInference::new("M4", "N2", "M2")
+                .weights()
+                .is_none()
+        );
+        assert!(
+            AdmittanceInference::new("NU2", "M2", "M2")
+                .weights()
+                .is_none()
+        );
     }
 }

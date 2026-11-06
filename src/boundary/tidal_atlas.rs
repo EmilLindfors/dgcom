@@ -969,8 +969,16 @@ mod tests {
             let [m2, s2, l2] = [0, 1, 2].map(|k| p.constituents[k]);
             let pairs = [
                 (m2.eta, s2.eta, l2.eta),
-                (m2.velocity.unwrap().0, s2.velocity.unwrap().0, l2.velocity.unwrap().0),
-                (m2.velocity.unwrap().1, s2.velocity.unwrap().1, l2.velocity.unwrap().1),
+                (
+                    m2.velocity.unwrap().0,
+                    s2.velocity.unwrap().0,
+                    l2.velocity.unwrap().0,
+                ),
+                (
+                    m2.velocity.unwrap().1,
+                    s2.velocity.unwrap().1,
+                    l2.velocity.unwrap().1,
+                ),
             ];
             for (a, b, z) in pairs {
                 let (a, b, z) = (complex(a), complex(b), complex(z));
