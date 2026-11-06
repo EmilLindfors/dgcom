@@ -123,9 +123,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let [gauge_path, parent_path] = files.as_slice() else {
-        return Err("usage: parent_tide_check <gauge file> <parent series> [from=] [to=] \
+        return Err(
+            "usage: parent_tide_check <gauge file> <parent series> [from=] [to=] \
                     [ratios_from=] [ratios_to=] [hours=3,24] [pre=] [skip=]"
-            .into());
+                .into(),
+        );
     };
     let time = |key: &str, default: &str| {
         ModelClock::parse(args.get(key).map_or(default, String::as_str)).map(|c| c.epoch_unix)
@@ -221,7 +223,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     println!(
         "\nCentred RMSE (cm) against the gauge, hours {h0}–{h1} of each day:\n  day          parent  corrected{}",
-        if predicted.is_some() { "  prediction" } else { "" }
+        if predicted.is_some() {
+            "  prediction"
+        } else {
+            ""
+        }
     );
     let mut totals = [0.0; 3];
     let mut n_days = 0;
