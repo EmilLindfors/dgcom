@@ -6,6 +6,8 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Recorded videos from the viewer (F.3).** `dg-viz --record DIR --camera FILE` renders a run's replay along a camera path (keys of video time, model time and an orbit or photographer's view, smoothly interpolated) to PNG frames on a fixed clock, independent of the GPU's speed; `--fps`, `--ui off|legend|on`, `--size WxH`. `scripts/froya_video.sh` makes the 45 s Frøya showcase (the nested 3D tide, the Kattholmen farm, the October 2025 storm, the photo view) with captions and crossfades by ffmpeg (`notes/viz.md`).
+
 - **A fish farm in the 3D tide (TODO F.1).** `froya_real_data levels=N tide3d=1 site=<file>` runs the open, control and caged 3D tides (no longer refused): the cages drag on the layers their nets reach (`Hydrostatic3D::with_cage_drag`), the drag on the farm is the layers' `ρ₀ ∫ Σ_l H_l λ_l |u_l| u_l dA`, and the report adds each layer's mean speed at the cage centres with and without the cages, inside and below the nets. Branch runs (`resume=` an open 3D run's restart) work as in 2D; `particles=` stays the 2D tide's. `nu=` and `cs=` now set the 3D tide's horizontal viscosity too (the depth mean's and the shear's, Smagorinsky's C = 0.1 by default). On Kattholmen (2 h branch from 9 h, 745 s per model hour on 24 threads) the cages slow the nets' layers to 0.82 and those below to 0.86, as in 2D, but the farm lies in a current a quarter of 2D's (the 3D island lee, P3.1), so the drag is 10.5 kN mean and the wake stays within 50 m of the frame (`notes/farm.md`).
 - **Local time stepping of the 3D stages (TODO P4.5).** `ModeSplitIntegrator::with_baroclinic_levels(L)` gives every element `2^ℓ` substeps of its own per coarse baroclinic step, `ℓ ≤ L`, on `MultirateStepper::schedule` (as the barotropic pass already was); `Simulation3D` takes the coarse step from `ModeSplitIntegrator::assign_baroclinic_levels` and `Hydrostatic3D::element_steps_into`, and `froya_real_data levels_3d=L` (0, global steps, the default) turns it on. The barotropic pass, `G` and the drag rates stay once per coarse step; within it `η`, `ū`, `v̄` and `DU_avg2` change at constant rates, so every element's layers carry the water its free surface moves at its own stage times. Every substep ends as a step does (the implicit vertical terms at the element's own step, the depth mean back to `ū`, the limiters). Context and the design in `notes/3d-numerics.md` ("3D local time stepping").
   - Kattholmen (the farm mesh, F.1), 9 → 10 h on 24 threads: 640 → 370 s per model hour (1.73×) at `levels_3d=3`, 0 clips; coarse steps of 23 s mean against global steps of 3.2 s, the stage RHS work 2.26× less. After the hour it is twice as far from the global run as a global run with 2.5 % shorter steps (ū 9.5 against 5.1 mm/s RMS at nodes ≥ 10 m, T 28 against 17 m°C), growing the same way in the island lee.
@@ -543,6 +545,8 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **The viewer's `--speed-max` is now `--scale-max`** and fixes the starting colouring's scale, whichever it is (speed, η, H_s, T_p, dissipation); the others still follow the field.
+
 - **`froya_real_data resume=` refuses a restart written with other physics options (TODO P5.3).** The physics is built from the resuming command line, so a resume with another mixing, wind, nesting or viscosity used to carry on from the restart's state without a warning. The options are now compared with the command line the restart records (its `command` metadata, so existing restarts are checked too). A change is refused, naming each option with its old and new value, unless `resume_changes=a,b` names it. These may differ: when the run stops and what it writes, the time stepping (`rk*`, `cfl*`, `lts`, `bt_levels`, `dt_3d`, as the 3D benches resume one restart at other schemes), `debug_3d=`, and the farm options a 2D branch adds (`FarmOptions::KEYS`). Checked on the Kattholmen branch runs of 2026-10-28: as run they resume, at `nu=1` instead of 0.1 they are refused. `examples/common/arguments.rs` gains `Arguments::changed_from`.
 
 - **The viewer is on Bevy 0.20.0** (from 0.20.0-rc.1; `viz/Cargo.toml`, with the lock's other semver-compatible updates). No code changes needed; tests, screenshots and frame times are as before. The terrain's `UV_0` workaround stays: the final release still reads `uv` with only the second UV set.
@@ -711,6 +715,8 @@ All notable changes to this project should be documented in this file.
   - `froya_real_data waves=N` also prints the sources' DIA share and a half-step of each implicit pass alone.
 
 ### Fixed
+
+- **The viewer (`viz/`) builds again**: it still passed the run's duration to `TidalAtlas::boundary_tides`, which lost it on 2026-10-28 (nodal factors of each time); `viz/` is its own workspace, so nothing built it since.
 
 - **Examples ran with options they did not know (TODO P6).** `froya_real_data` ignored any `key=value` it does not read, so a binary built before `site=`/`nu=` existed ran a farm sweep as plain tides (2026-10-25). It now refuses them before setup, naming them, as do `farm_3d` and `local_time_stepping_farm`. This also catches a misspelt key and a farm option without `site=`. The shared parser is `examples/common/arguments.rs`; context in `notes/tech-debt.md`.
 

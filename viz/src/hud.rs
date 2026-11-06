@@ -48,6 +48,14 @@ struct Tick(usize);
 struct ScaleTitle;
 
 /// The bed's depth scale: its title, its bar and its labels (shallow, middle, deep).
+/// The root of the colour scales, which a recording may keep ([`crate::record`]).
+#[derive(Component)]
+pub struct Legend;
+
+/// The bed's part of the scales, which a recording leaves out.
+#[derive(Component)]
+pub struct BedLegend;
+
 #[derive(Component)]
 struct BedTitle;
 
@@ -103,6 +111,7 @@ fn spawn(mut commands: Commands) {
     commands
         .spawn((
             RUN,
+            Legend,
             Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(14.0),
@@ -114,9 +123,10 @@ fn spawn(mut commands: Commands) {
             },
         ))
         .with_children(|scale| {
-            scale.spawn((BedTitle, Text::new("bed depth (m)"), font(13.0), shadow()));
+            scale.spawn((BedTitle, BedLegend, Text::new("bed depth (m)"), font(13.0), shadow()));
             scale.spawn((
                 BedBar,
+                BedLegend,
                 Node {
                     width: Val::Percent(100.0),
                     height: Val::Px(12.0),
@@ -125,11 +135,14 @@ fn spawn(mut commands: Commands) {
                 BackgroundGradient::default(),
             ));
             scale
-                .spawn(Node {
-                    justify_content: JustifyContent::SpaceBetween,
-                    margin: UiRect::bottom(Val::Px(8.0)),
-                    ..default()
-                })
+                .spawn((
+                    BedLegend,
+                    Node {
+                        justify_content: JustifyContent::SpaceBetween,
+                        margin: UiRect::bottom(Val::Px(8.0)),
+                        ..default()
+                    },
+                ))
                 .with_children(|ticks| {
                     for i in 0..3 {
                         ticks.spawn((BedTick(i), Text::new(""), font(12.0), shadow()));

@@ -49,7 +49,7 @@ pub enum Tide {
     /// M2 of this amplitude (m), in one phase along the whole boundary
     UniformM2(f64),
     /// Tides of a boundary atlas, varying along the boundary
-    Atlas(BoundaryTides),
+    Atlas(Box<BoundaryTides>),
     /// A depth-uniform M2 body force along mesh x that drives a current of this
     /// amplitude (m/s) without friction: the tidal surface slope of a periodic channel
     BodyForceM2(f64),
@@ -315,14 +315,12 @@ impl Scenario {
     }
 
     /// Frøya–Smøla–Hitra on the coastline mesh `mesh_path`, with the elevation model
-    /// `dem_path` and the boundary tidal atlas `atlas_path` (see the module docs),
-    /// run for `duration` seconds (for the tides' nodal corrections).
+    /// `dem_path` and the boundary tidal atlas `atlas_path` (see the module docs).
     pub fn froya(
         mesh_path: &Path,
         dem_path: &Path,
         atlas_path: &Path,
         order: usize,
-        duration: f64,
     ) -> Result<Self, Box<dyn Error>> {
         /// Land above this height (m) is never wet: capped, so that shoreline cliffs
         /// do not drive films up the land
@@ -388,7 +386,6 @@ impl Scenario {
             &projection,
             BoundaryTag::Open,
             &clock,
-            duration,
             ATLAS_COVERAGE,
         )?;
         let geom = GeometricFactors2D::compute(&mesh, &ops);
@@ -406,7 +403,7 @@ impl Scenario {
                 arrow_radius: 5_000.0,
             },
             forcing: Forcing {
-                tide: Tide::Atlas(tides),
+                tide: Tide::Atlas(Box::new(tides)),
                 manning: 0.025,
                 coriolis: 1.31e-4,
                 // A spring tide squeezed into one hour overshoots (TODO P1.4)
