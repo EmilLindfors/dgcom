@@ -318,8 +318,12 @@ impl Doodson {
 enum NodalKind {
     /// No node dependence (solar constituents, long-period Ssa): `f = 1`, `u = 0`.
     None,
-    /// M2-type semidiurnal lunar (also N2). Base factor for compounds.
+    /// M2-type semidiurnal lunar (also N2, 2N2, μ2, ν2, λ2). Base factor
+    /// for compounds.
     M2,
+    /// L2: M2's factor times Schureman's `1 − 6 tan²(I/2) e^{2iP}`, which
+    /// also follows the lunar perigee (`P = p − ξ`, 8.85 years).
+    L2,
     K1,
     O1,
     K2,
@@ -368,6 +372,28 @@ fn constituent_def(name: &str) -> Option<ConstituentDef> {
         "K2" => ConstituentDef {
             doodson: d(2.0, 2.0, 0.0, 0.0, 0.0, 0.0),
             nodal: NodalKind::K2,
+        },
+        // Minor semidiurnals: Doodson numbers, and the 180° offsets of λ2
+        // and L2, as in Foreman's tables (used by t_tide and UTide)
+        "2N2" => ConstituentDef {
+            doodson: d(2.0, -2.0, 0.0, 2.0, 0.0, 0.0),
+            nodal: NodalKind::M2,
+        },
+        "MU2" => ConstituentDef {
+            doodson: d(2.0, -2.0, 2.0, 0.0, 0.0, 0.0),
+            nodal: NodalKind::M2,
+        },
+        "NU2" => ConstituentDef {
+            doodson: d(2.0, -1.0, 2.0, -1.0, 0.0, 0.0),
+            nodal: NodalKind::M2,
+        },
+        "LDA2" => ConstituentDef {
+            doodson: d(2.0, 1.0, -2.0, 1.0, 0.0, 180.0),
+            nodal: NodalKind::M2,
+        },
+        "L2" => ConstituentDef {
+            doodson: d(2.0, 1.0, 0.0, -1.0, 0.0, 180.0),
+            nodal: NodalKind::L2,
         },
         // --- Diurnal (±90° offsets are Schureman's convention) ---
         "K1" => ConstituentDef {
@@ -422,8 +448,9 @@ fn constituent_def(name: &str) -> Option<ConstituentDef> {
 }
 
 /// Names of the supported constituents, in their conventional spelling.
-pub const CONSTITUENT_NAMES: [&str; 15] = [
-    "M2", "S2", "N2", "K2", "K1", "O1", "P1", "Q1", "M4", "MS4", "MN4", "M6", "Mf", "Mm", "Ssa",
+pub const CONSTITUENT_NAMES: [&str; 20] = [
+    "M2", "S2", "N2", "K2", "2N2", "MU2", "NU2", "LDA2", "L2", "K1", "O1", "P1", "Q1", "M4", "MS4",
+    "MN4", "M6", "Mf", "Mm", "Ssa",
 ];
 
 /// The conventional (`'static`) spelling of a supported constituent name,
@@ -442,13 +469,57 @@ fn nodal_m2(n_rad: f64) -> (f64, f64) {
     (f, u)
 }
 
-/// Compute the nodal factor `f` and phase `u` (degrees) for a nodal family.
-fn nodal_factors(kind: NodalKind, n_rad: f64) -> (f64, f64) {
+/// Obliquity of the ecliptic `ω` and inclination `i` of the Moon's orbit to
+/// it (Schureman 1958, degrees).
+const OBLIQUITY_DEG: f64 = 23.452;
+const LUNAR_INCLINATION_DEG: f64 = 5.145;
+
+/// Inclination `I` of the Moon's orbit to the equator and the longitude `ξ`
+/// in the Moon's orbit of its intersection with the equator (both radians)
+/// at node longitude `N` (radians), Schureman (1958) eqs. 191–197:
+/// `cos I = cos ω cos i − sin ω sin i cos N` and
+/// `tan ½(N − ξ ± ν) = (cos | sin) ½(ω − i) / (cos | sin) ½(ω + i) · tan ½N`.
+fn lunar_intersection(n_rad: f64) -> (f64, f64) {
+    let (w, i) = (
+        OBLIQUITY_DEG.to_radians(),
+        LUNAR_INCLINATION_DEG.to_radians(),
+    );
+    let incl = (w.cos() * i.cos() - w.sin() * i.sin() * n_rad.cos()).acos();
+    // N in (−π, π] keeps ½N in (−π/2, π/2], the principal branch of atan
+    let n = PI - (PI - n_rad).rem_euclid(2.0 * PI);
+    let t = (0.5 * n).tan();
+    let a = ((0.5 * (w - i)).cos() / (0.5 * (w + i)).cos() * t).atan();
+    let b = ((0.5 * (w - i)).sin() / (0.5 * (w + i)).sin() * t).atan();
+    // a + b = N − ξ
+    (incl, n - (a + b))
+}
+
+/// L2's factor relative to M2's, Schureman (1958) eqs. 213–214 as one
+/// complex number, `1 − 6 tan²(I/2) e^{2iP}` with `P = p − ξ`: its modulus
+/// is `1/R_a` and its argument `−R` (`f = f(M2)/R_a`, `u = u(M2) − R`).
+/// The lunar perigee swings `f(L2)/f(M2)` over 1 ± 6 tan²(I/2), ≈ 0.61–1.39 at
+/// the largest `I` and 0.84–1.16 at the smallest, in 8.85 years.
+fn nodal_l2_relative(n_rad: f64, p_rad: f64) -> (f64, f64) {
+    let (incl, xi) = lunar_intersection(n_rad);
+    let k = 6.0 * (0.5 * incl).tan().powi(2);
+    let two_p = 2.0 * (p_rad - xi);
+    let (re, im) = (1.0 - k * two_p.cos(), -k * two_p.sin());
+    (re.hypot(im), im.atan2(re).to_degrees())
+}
+
+/// Compute the nodal factor `f` and phase `u` (degrees) for a nodal family
+/// at node longitude `N` and lunar perigee `p` (radians; only L2 uses `p`).
+fn nodal_factors(kind: NodalKind, n_rad: f64, p_rad: f64) -> (f64, f64) {
     let (c, c2, c3) = (n_rad.cos(), (2.0 * n_rad).cos(), (3.0 * n_rad).cos());
     let (s, s2, s3) = (n_rad.sin(), (2.0 * n_rad).sin(), (3.0 * n_rad).sin());
     match kind {
         NodalKind::None => (1.0, 0.0),
         NodalKind::M2 => nodal_m2(n_rad),
+        NodalKind::L2 => {
+            let (fm, um) = nodal_m2(n_rad);
+            let (fr, ur) = nodal_l2_relative(n_rad, p_rad);
+            (fm * fr, um + ur)
+        }
         NodalKind::K1 => {
             let f = 1.0060 + 0.1150 * c - 0.0088 * c2 + 0.0006 * c3;
             let u = -8.86 * s + 0.68 * s2 - 0.07 * s3;
@@ -484,7 +555,8 @@ fn nodal_factors(kind: NodalKind, n_rad: f64) -> (f64, f64) {
 /// given astronomical arguments.
 ///
 /// Names are case-insensitive. Supported constituents:
-/// M2, S2, N2, K2, K1, O1, P1, Q1, M4, MS4, MN4, M6, Mf, Mm, Ssa.
+/// M2, S2, N2, K2, 2N2, MU2 (μ2), NU2 (ν2), LDA2 (λ2), L2, K1, O1, P1, Q1,
+/// M4, MS4, MN4, M6, Mf, Mm, Ssa.
 /// Returns `None` for any other name.
 ///
 /// # Example
@@ -499,7 +571,7 @@ fn nodal_factors(kind: NodalKind, n_rad: f64) -> (f64, f64) {
 /// ```
 pub fn nodal_correction(name: &str, astro: &AstronomicalArguments) -> Option<NodalCorrection> {
     let def = constituent_def(name)?;
-    let (f, u_deg) = nodal_factors(def.nodal, astro.n * DEG_TO_RAD);
+    let (f, u_deg) = nodal_factors(def.nodal, astro.n * DEG_TO_RAD, astro.p * DEG_TO_RAD);
     Some(NodalCorrection {
         f,
         u_deg,
@@ -636,6 +708,11 @@ mod tests {
             ("Mf", 1.098_033_1),
             ("Mm", 0.544_374_7),
             ("Ssa", 0.082_137_3),
+            ("2N2", 27.895_354_8),
+            ("MU2", 27.968_208_4),
+            ("NU2", 28.512_583_1),
+            ("LDA2", 29.455_625_3),
+            ("L2", 29.528_478_9),
         ];
         for (name, tabulated) in cases {
             let speed = angular_speed(name).unwrap();
@@ -694,16 +771,16 @@ mod tests {
     #[test]
     fn diurnal_nodal_factor_ranges() {
         // K1: ≈0.882 at N=180°, ≈1.113 at N=0°.
-        let (f_k1_max, _) = nodal_factors(NodalKind::K1, 0.0);
-        let (f_k1_min, _) = nodal_factors(NodalKind::K1, PI);
+        let (f_k1_max, _) = nodal_factors(NodalKind::K1, 0.0, 0.0);
+        let (f_k1_min, _) = nodal_factors(NodalKind::K1, PI, 0.0);
         assert!((f_k1_max - 1.1128).abs() < 1e-3, "f(K1) max = {f_k1_max}");
         assert!((f_k1_min - 0.8816).abs() < 1e-3, "f(K1) min = {f_k1_min}");
         // The peak-to-peak modulation exceeds 11 %.
         assert!(f_k1_max - f_k1_min > 0.11);
 
         // O1: ≈0.806 at N=180°, ≈1.183 at N=0°.
-        let (f_o1_max, _) = nodal_factors(NodalKind::O1, 0.0);
-        let (f_o1_min, _) = nodal_factors(NodalKind::O1, PI);
+        let (f_o1_max, _) = nodal_factors(NodalKind::O1, 0.0, 0.0);
+        let (f_o1_min, _) = nodal_factors(NodalKind::O1, PI, 0.0);
         assert!((f_o1_max - 1.1827).abs() < 1e-3, "f(O1) max = {f_o1_max}");
         assert!((f_o1_min - 0.8057).abs() < 1e-3, "f(O1) min = {f_o1_min}");
         assert!(f_o1_max - f_o1_min > 0.18);
@@ -780,5 +857,65 @@ mod tests {
             "K1 not periodic: {eta0} vs {eta_t}"
         );
         assert!(c.f > 0.8 && c.f < 1.2);
+    }
+
+    /// The minor semidiurnals of M2's family share its nodal factors.
+    #[test]
+    fn minor_semidiurnals_follow_m2() {
+        let a = AstronomicalArguments::at_datetime(2026, 6, 15, 0, 0, 0.0);
+        let m2 = nodal_correction("M2", &a).unwrap();
+        for name in ["N2", "2N2", "MU2", "NU2", "LDA2"] {
+            let c = nodal_correction(name, &a).unwrap();
+            assert_eq!((c.f, c.u_deg), (m2.f, m2.u_deg), "{name}");
+        }
+    }
+
+    /// Schureman's `I` and `ξ`: `I = ω + i` at N = 0 and `ω − i` at
+    /// N = 180°, with `ξ = 0` at both; `|ξ|` peaks near 12° (his Table 6).
+    #[test]
+    fn lunar_intersection_extremes() {
+        let (w, i) = (OBLIQUITY_DEG, LUNAR_INCLINATION_DEG);
+        let (incl, xi) = lunar_intersection(0.0);
+        assert!((incl.to_degrees() - (w + i)).abs() < 1e-9 && xi.abs() < 1e-12);
+        let (incl, xi) = lunar_intersection(PI);
+        assert!((incl.to_degrees() - (w - i)).abs() < 1e-9 && xi.abs() < 1e-9);
+        let largest = (0..3600)
+            .map(|k| {
+                lunar_intersection(k as f64 / 3600.0 * 2.0 * PI)
+                    .1
+                    .to_degrees()
+                    .abs()
+            })
+            .fold(0.0, f64::max);
+        assert!((largest - 12.0).abs() < 0.2, "max |ξ| = {largest}°");
+    }
+
+    /// L2's factor against Schureman's closed forms (eqs. 213–214), and its
+    /// extremes `1 ∓ 6 tan²(I/2)` at 2P = 0 and π.
+    #[test]
+    fn l2_nodal_factor_matches_schureman() {
+        for k in 0..72 {
+            let n = (k as f64 * 5.0).to_radians();
+            let p = (k as f64 * 37.0).to_radians();
+            let (incl, xi) = lunar_intersection(n);
+            let t2 = (0.5 * incl).tan().powi(2);
+            let two_p = 2.0 * (p - xi);
+            let inv_ra = (1.0 - 12.0 * t2 * two_p.cos() + 36.0 * t2 * t2).sqrt();
+            let r = two_p
+                .sin()
+                .atan2(1.0 / (6.0 * t2) - two_p.cos())
+                .to_degrees();
+            let (fr, ur) = nodal_l2_relative(n, p);
+            assert!((fr - inv_ra).abs() < 1e-12, "1/Ra {fr} vs {inv_ra}");
+            assert!((ur + r).abs() < 1e-9, "−R {ur} vs {}", -r);
+            let (f, u) = nodal_factors(NodalKind::L2, n, p);
+            let (fm, um) = nodal_m2(n);
+            assert!((f - fm * inv_ra).abs() < 1e-12 && (u - (um - r)).abs() < 1e-9);
+        }
+        // At N = 0, I = ω + i = 28.597° and 6 tan²(I/2) = 0.3896
+        let (low, _) = nodal_l2_relative(0.0, 0.0);
+        let (high, _) = nodal_l2_relative(0.0, 0.5 * PI);
+        assert!((low - 0.6104).abs() < 1e-3, "{low}");
+        assert!((high - 1.3896).abs() < 1e-3, "{high}");
     }
 }

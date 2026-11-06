@@ -104,7 +104,8 @@ src/
 │                     # bulk formulae and Jerlov absorption in air_sea), EOS
 │
 │  # ---- Application layer ----
-├── tides/            # Tidal astronomy: Doodson/Schureman V₀, nodal f and u
+├── tides/            # Tidal astronomy: Doodson/Schureman V₀, nodal f and u;
+│                     # admittance inference of minor constituents
 ├── simulation/       # Simulation runner (2D), Simulation3D
 ├── waves/            # Spectral wind waves (F.4): action balance per (σ, θ)
 │                     # component on the DG mesh (WaveModel2D: DG propagation,

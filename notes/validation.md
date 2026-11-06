@@ -215,6 +215,36 @@ MET switched NorKyst's operational tide file on 2026-03-03 (`notes/norkyst-issue
   - Plots: `output/p34_2026-06-12/bodo_3d_raw/profiles/section_*.png`.
 - **What the re-score settles:** with raw forcing on a June 2026 day, every score that tests the model passes. The gauge fails because it scores NorKyst's tide, which the 2D run passes through within 0.7 cm and the 3D run within 0.2 cm of the 2D. The 15-day score (TODO P3.4) is the test that can separate the two.
 
+#### The parent's tide corrected from theory, 2026-06-12 (P1.5 `nest_tides=theory`; written 2026-11-06, before the model runs)
+
+Not a pre-registered score. The correction was designed from the 2026-06-12 diagnosis above, and its effect on NorKyst's own series at the two gauges was measured before these runs (`parent_tide_check`, below). The pre-registered gauge score stays a fail. The runs test one thing: whether the nested model carries the corrected parent tide to the gauge as it carries the raw one (within 0.5–0.7 cm).
+
+- **The correction, no gauge in it** (`notes/boundaries-nesting.md` 2026-11-06): K2 and P1 at the equilibrium ratios to S2 and K1, and the minor semidiurnals 2N2, μ2, ν2, λ2, L2 by linear admittance from N2, M2, S2 (`TidalAtlas::infer_from_theory`). It is added to the parent as the difference of two atlases. The raw atlas infers K2 and P1 at NorKyst's own half-year ratios at the gauge's cell (`norkyst_boundary_tides ratios=`), so the difference removes what NorKyst carries. The NorKyst ratios are Bodø K2/S2 0.227, +7.7°, P1/K1 0.365, +2.4°; Mausund 0.221, +10.3° and 0.471, +6.3°. The gauges have K2/S2 0.278, and P1/K1 0.23 (Bodø) and 0.27 (Mausund).
+- **On the parent alone** (`parent_tide_check`, NorKyst ζ at the gauge's cell, June 2026; centred RMSE over hours 3–24, cm):
+
+| | NorKyst | + theory | Kartverket's prediction |
+|---|---|---|---|
+| Bodø 2026-06-12 | 11.8 | 3.2 | 2.8 |
+| Bodø, RMS of the 30 days | 7.0 | 5.1 | 3.4 |
+| Mausund 2026-06-12 | 9.6 | 4.3 | 2.4 |
+| Mausund, RMS of the 30 days | 6.0 | 3.9 | 2.6 |
+
+  Each part helps over the month. Without the minor semidiurnals the 30-day RMS is 6.8 and 5.5 cm; without K2 it is 5.5 and 4.4; without L2 and λ2, 5.8 and 4.6; without μ2 and 2N2, 6.0 and 4.8. P1 is neutral at Bodø (5.1) and helps at Mausund (4.2 without it). Some days get worse, by up to 1.6 cm at Bodø (06-03..05, 06-16/17).
+- **Runs:** `output/p34_2026-06-12/run.sh` with `nest_tides=theory` and the `_nkratios` atlases in place of the 2026-06 ones, nothing else changed: 2D at Bodø, then at Mausund.
+- **Expected:** the model within ≈ 1 cm of the corrected parent at the gauge, so ≈ 3–4 cm at Bodø and ≈ 4–5 cm at Mausund. If it is much worse, the correction does not survive the boundary (the band, the interpolation of the atlas, the atlas's offshore K2/P1 ratios taken from one cell).
+
+**Outcome (2026-11-06): the model carries the corrected tide as it carries the raw one.** Runs `output/p34_2026-06-12/{bodo,froya}_2d_theory` (built from `b239339`, `BUILD_COMMIT_theory`; 1385 and 951 s wall, 0 clips, lake at rest 2e-11 and 1e-11). The correction's largest term at the boundary is μ2 (0.034 m) at Bodø and ν2 (0.030 m) at Mausund.
+
+| Gauge, 2026-06-12, hours 3–24 | raw | theory | parent + theory, predicted |
+|---|---|---|---|
+| Bodø, centred RMSE against the observations | 11.8 cm (r 0.985) | **3.0 cm** (r 0.9990) | 3.2 |
+| Mausund | 9.5 cm (r 0.988) | **4.2 cm** (r 0.9984) | 4.3 |
+| Bodø, RSS of the harmonic \|ΔZ\| against the gauge | 0.198 m | 0.103 m | |
+| Mausund | 0.172 m | 0.079 m | |
+
+- The bias is unchanged (+5.9 and +7.3 cm): the datum, not the tide.
+- Bodø's 3.0 cm is inside score 1's 5 cm mark. It does not count: the correction was designed after this day's diagnosis and checked on the parent before the run. What it shows is that a gauge-free correction of the parent's tide carries through the nesting to the gauge within 0.2 cm of the parent-only prediction. That makes `parent_tide_check` a cheap stand-in for gauge scores of the nested 2D tide. The 15-day score (TODO P3.4) remains the test, now with `nest_tides=theory` as a candidate default (TODO P1.5).
+
 ### P3.2 Cost-vs-accuracy benchmark against ROMS
 - [ ] Pareto benchmark on the same hardware: M2/S2/K1/O1 error at tide gauges vs core-hours, ROMS 2D at 800/400/200 m vs DG P1–P4. This is what settles "faster than ROMS" (`review-2026-09-25.md` §5.5).
 

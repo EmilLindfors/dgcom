@@ -3,7 +3,8 @@
 //! This module supplies the astronomical corrections a real tidal prediction
 //! needs on top of catalogued amplitude/phase pairs: the equilibrium argument
 //! `V₀` (astronomical phase at the prediction epoch) and the 18.61-year nodal
-//! modulation `f`, `u`. See [`astronomy`] for the mathematical formulation.
+//! modulation `f`, `u`. See [`astronomy`] for the mathematical formulation,
+//! and [`admittance`] for minor constituents inferred from major ones.
 //!
 //! # Applying corrections
 //!
@@ -28,8 +29,10 @@
 //! assert!((h_corr - corr.f * h).abs() < 1e-12);
 //! ```
 
+pub mod admittance;
 pub mod astronomy;
 
+pub use admittance::{AdmittanceInference, equilibrium_amplitude};
 pub use astronomy::{
     AstronomicalArguments, CONSTITUENT_NAMES, NodalCorrection, NodalDrift, angular_speed,
     canonical_name, constituent_period, julian_date, nodal_correction,
