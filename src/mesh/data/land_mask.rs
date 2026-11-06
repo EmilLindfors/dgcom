@@ -15,13 +15,13 @@
 //! let bathy = GeoTiffBathymetry::load("data/bathymetry.tif")?;
 //! let proj = LocalProjection::new(63.75, 8.75);
 //!
-//! // Create land mask
-//! let mask = LandMask2D::from_coastline_and_bathymetry(
-//!     &mesh, &ops, &coastline, &bathy, &proj, 1.0
-//! );
+//! // Land masks: from the coastline, or from the bathymetry (wet where at
+//! // least 1 m deep)
+//! let by_coast = LandMask2D::from_coastline(&mesh, &ops, &coastline, &proj);
+//! let by_depth = LandMask2D::from_bathymetry(&mesh, &ops, &bathy, &proj, 1.0);
 //!
 //! // Check if element is wet
-//! if mask.is_wet(5) {
+//! if by_coast.is_wet(5) && by_depth.is_wet(5) {
 //!     // Process water element
 //! }
 //! ```
@@ -133,58 +133,6 @@ impl LandMask2D {
                     if -depth >= min_depth {
                         wet_nodes += 1;
                     }
-                }
-            }
-
-            let frac = wet_nodes as f64 / ops.n_nodes as f64;
-            wet_fraction.push(frac);
-            wet.push(frac > 0.5);
-        }
-
-        Self {
-            wet,
-            wet_fraction,
-            n_elements: mesh.n_elements,
-        }
-    }
-
-    /// Create land mask from both coastline and bathymetry data.
-    ///
-    /// An element is wet if:
-    /// 1. Its centroid is in water (according to coastline)
-    /// 2. AND its depth is greater than min_depth (according to bathymetry)
-    ///
-    /// This is the most robust approach, combining coastline geometry with depth data.
-    pub fn from_coastline_and_bathymetry<P: CoordinateProjection>(
-        mesh: &Mesh2D,
-        ops: &DGOperators2D,
-        coastline: &CoastlineData,
-        bathymetry: &GeoTiffBathymetry,
-        projection: &P,
-        min_depth: f64,
-    ) -> Self {
-        let mut wet = Vec::with_capacity(mesh.n_elements);
-        let mut wet_fraction = Vec::with_capacity(mesh.n_elements);
-
-        for k in ElementIndex::iter(mesh.n_elements) {
-            let mut wet_nodes = 0;
-
-            for i in 0..ops.n_nodes {
-                let r = ops.nodes_r[i];
-                let s = ops.nodes_s[i];
-                let [x, y] = mesh.reference_to_physical(k, r, s);
-                let (lat, lon) = projection.xy_to_geo(x, y);
-
-                // Must satisfy both conditions
-                let in_water = coastline.is_water(lat, lon);
-                let has_depth = if let Some(depth) = bathymetry.get_depth(lat, lon) {
-                    -depth >= min_depth
-                } else {
-                    false
-                };
-
-                if in_water && has_depth {
-                    wet_nodes += 1;
                 }
             }
 

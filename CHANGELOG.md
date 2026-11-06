@@ -642,6 +642,8 @@ All notable changes to this project should be documented in this file.
 
 ### Removed
 
+- **`LandMask2D::from_coastline_and_bathymetry`** (TODO P1.6): unused, and it counted water shallower than `min_depth` as land, dropping tidal flats. `from_coastline` and `from_bathymetry` remain.
+
 - **The viewer's vertical section** (`viz/src/layers.rs`'s `Section`, the V key, `--section`, `ThreeD::section` and the snapshot metadata `section=`, which `examples/farm_3d.rs` no longer writes; TODO F.3). On a real coast it was a thin band through the view that told little. The profiles over the depth at a point are the pinned point's (click, or `--pin X,Y`). `colormap::THERMAL` went with it.
 
 - **The 2D depth-averaged tracer path (T and S in 2D, ≈ 5.6k lines).** `TracerSolution2D`, `TracerState`, `ConservativeTracerState`, the 2D tracer RHS, limiters and fluxes, the `source::tracer` module (2D baroclinic source, surface heat flux, `RiverTracerSource`, relaxation sources), the `coupled_swe_tracer` steppers and `CoupledState2D`, `write_vtk_coupled` (and `write_vtk_series`'s tracer argument), the equations of state's `density_from_tracers`, the whole-mesh `compute_br1_diffusion_rhs_2d`, `examples/norwegian_fjord.rs` and `tests/tracer_2d_test.rs`. Only the legacy coupled stepper ran it (no `Simulation` route), and T/S belong to the 3D model. `TracerBounds` now lives with the 3D tracer limiter, `KuzminParameter2D` with the SWE limiters; `TVBParameter2D` is gone. A passive 2D tracer, if needed, is to be built on `Simulation`.
