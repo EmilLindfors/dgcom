@@ -15,3 +15,6 @@ perf.data.old
 
 # Local credentials (Copernicus Marine, BarentsWatch)
 .env
+
+# Private notes (correspondence); never committed
+notes/private/
