@@ -34,11 +34,14 @@ use std::path::Path;
 use dg_rs::analysis::{ConstituentComparison, HarmonicAnalysis, Inference, ReferenceFit};
 use dg_rs::boundary::TidalAtlas;
 use dg_rs::io::{TideGaugeFile, read_tide_gauge_file};
+use dg_rs::tides::AdmittanceInference;
 use dg_rs::time::ModelClock;
 
-/// Candidates in priority order: a short record keeps the first ones.
-const CANDIDATES: [&str; 15] = [
-    "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6", "Mf", "Mm", "Ssa",
+/// Candidates in priority order: a short record keeps the first ones (the
+/// minor semidiurnals need half a year to a year).
+const CANDIDATES: [&str; 20] = [
+    "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6", "NU2", "MU2", "2N2",
+    "L2", "LDA2", "Mf", "Mm", "Ssa",
 ];
 
 /// Long-period constituents (mostly weather), left out of the comparison's
@@ -90,6 +93,45 @@ fn print_fit(name: &str, times: &[f64], fit: &ReferenceFit) {
     }
 }
 
+/// The fitted minor semidiurnals against their linear-admittance inference
+/// from the fitted references (`tides::AdmittanceInference`).
+fn print_admittance_check(fit: &ReferenceFit) {
+    let rows: Vec<String> = AdmittanceInference::MINOR_SEMIDIURNALS
+        .iter()
+        .filter_map(|i| {
+            let (c, a, b) = (fit.get(i.name)?, fit.get(i.lower)?, fit.get(i.upper)?);
+            if c.inferred || a.inferred || b.inferred {
+                return None;
+            }
+            let (h, g) = i.infer((a.amplitude, a.lag_deg), (b.amplitude, b.lag_deg))?;
+            let cmp = ConstituentComparison::new(
+                i.name,
+                h,
+                g.to_radians(),
+                c.amplitude,
+                c.lag_deg.to_radians(),
+            );
+            Some(format!(
+                "  {:4}  {:7.4}  {:7.4}  {:5.3}  {:+7.2}   {:.4}   ({}, {})",
+                i.name,
+                h,
+                c.amplitude,
+                cmp.amplitude_ratio,
+                cmp.phase_error_degrees(),
+                cmp.complex_difference(),
+                i.lower,
+                i.upper
+            ))
+        })
+        .collect();
+    if !rows.is_empty() {
+        println!("  admittance inference against the fit:");
+        println!("  name  H infer  H fit    ratio   ΔG (°)   |ΔZ| (m)  from");
+        rows.iter().for_each(|r| println!("{r}"));
+        println!();
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: HashMap<String, String> = HashMap::new();
     let mut file = None;
@@ -137,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         HarmonicAnalysis::resolvable(&CANDIDATES, t1 - t0, rayleigh, &Inference::EQUILIBRIUM);
     let fit = analysis.fit(&times, &values)?;
     print_fit(&name, &times, &fit);
+    print_admittance_check(&fit);
 
     if let Some(path) = args.get("atlas") {
         let station = gauge

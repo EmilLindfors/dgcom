@@ -12,7 +12,12 @@
 //!    ([`depth_average_z`](dg_rs::io::depth_average_z)).
 //! 4. Fit reference constants `(H, G)` of η, ū and v̄ with
 //!    [`HarmonicAnalysis::fit`](dg_rs::analysis::HarmonicAnalysis::fit) (V₀ at the first sample, f and u at the
-//!    record midpoint), inferring P1 from K1 and K2 from S2.
+//!    record midpoint), inferring P1 from K1 and K2 from S2: at the
+//!    equilibrium ratios, or with `ratios=<series>` at the ratios NorKyst
+//!    itself carries, fitted from its ζ at one cell over half a year or more
+//!    (`scripts/norkyst_gauge_series.py`), so that the atlas holds NorKyst's
+//!    own K2 and P1 (0.8× and 1.1–1.4× the equilibrium ones in 2026), as
+//!    `froya_real_data nest_tides=theory` needs.
 //! 5. Write the atlas (text format of `dg_rs::boundary::TidalAtlas`).
 //!
 //! `points=lon,lat;lon,lat…` also fits those points (e.g. tide gauges inside
@@ -30,7 +35,7 @@
 //! cargo run --release --example norkyst_boundary_tides -- \
 //!     [bbox=8.0,63.6,9.2,64.0] [start=2025-06-01] [days=30] [spacing_km=1.0] \
 //!     [out=data/froya_boundary_tides.txt] [url=<OPeNDAP URL>] \
-//!     [points=8.665231,63.869331] [points_out=data/froya_station_tides.txt]
+//!     [points=8.665231,63.869331] [points_out=data/froya_station_tides.txt] //!     [ratios=data/norkyst_gauges/2026-04_2026-10/MSU.txt]
 //! ```
 //!
 //! Requires the `netcdf` feature (default) with a DAP-enabled netCDF-C.
@@ -58,7 +63,7 @@ mod app {
 
     use dg_rs::analysis::{AnalysisError, HarmonicAnalysis, Inference, ReferenceFit};
     use dg_rs::boundary::{AtlasConstituent, AtlasPoint, TidalAtlas};
-    use dg_rs::io::depth_average_z;
+    use dg_rs::io::{depth_average_z, read_tide_gauge_file};
     use dg_rs::time::ModelClock;
     use netcdf::Variable;
 
@@ -68,6 +73,10 @@ mod app {
     /// Constituents resolvable from a month of hourly data
     const NAMES: [&str; 10] = ["M2", "S2", "N2", "K1", "O1", "Q1", "M4", "MS4", "MN4", "M6"];
     const INFERRED: [Inference; 2] = [Inference::P1_FROM_K1, Inference::K2_FROM_S2];
+    /// What half a year separates, for `ratios=`
+    const HALF_YEAR: [&str; 12] = [
+        "M2", "S2", "N2", "K1", "O1", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6",
+    ];
     /// Coarse stride for locating the domain in the NorKyst grid
     const STRIDE: usize = 8;
     /// Farthest a perimeter sample may snap to a wet cell (m)
@@ -84,6 +93,7 @@ mod app {
         url: String,
         points: Vec<(f64, f64)>,
         points_out: PathBuf,
+        ratios: Option<PathBuf>,
     }
 
     impl Options {
@@ -128,6 +138,7 @@ mod app {
                 points_out: args
                     .get("points_out")
                     .map_or("data/froya_station_tides.txt".into(), PathBuf::from),
+                ratios: args.get("ratios").map(PathBuf::from),
             })
         }
     }
@@ -154,8 +165,58 @@ mod app {
         v: Vec<f64>,
     }
 
+    /// P1/K1 and K2/S2 as a series of the source carries them (`ratios=`),
+    /// else the equilibrium ones, and how they were found.
+    fn inferences(ratios: Option<&PathBuf>) -> Result<([Inference; 2], String), Box<dyn Error>> {
+        let Some(path) = ratios else {
+            return Ok((INFERRED, "at the equilibrium ratios".into()));
+        };
+        let series = read_tide_gauge_file(path)?.time_series;
+        let (t, v): (Vec<f64>, Vec<f64>) = series
+            .times()
+            .iter()
+            .zip(series.values())
+            .filter(|(_, v)| v.is_finite())
+            .map(|(&t, &v)| (t, v))
+            .unzip();
+        let analysis = HarmonicAnalysis::new(&HALF_YEAR);
+        let (Some(&first), Some(&last)) = (t.first(), t.last()) else {
+            return Err(format!("ratios={}: no samples", path.display()).into());
+        };
+        if last - first < analysis.minimum_record_length() {
+            return Err(format!(
+                "ratios={}: {:.0} days cannot separate K2 from S2 ({:.0} needed)",
+                path.display(),
+                (last - first) / 86_400.0,
+                analysis.minimum_record_length() / 86_400.0
+            )
+            .into());
+        }
+        let fit = analysis.fit(&t, &v)?;
+        let inferences = INFERRED.map(|i| {
+            Inference::from_reference(i.name, i.from, &fit).expect("fitted K2, S2, P1, K1")
+        });
+        let how = format!(
+            "at the ratios of {} ({} to {}): {}",
+            path.display(),
+            &ModelClock::new(first).format(0.0)[..10],
+            &ModelClock::new(last).format(0.0)[..10],
+            inferences
+                .iter()
+                .map(|i| format!(
+                    "{}/{} {:.3}, {:+.1}°",
+                    i.name, i.from, i.amplitude_ratio, i.lag_offset_deg
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        Ok((inferences, how))
+    }
+
     pub fn run() -> Result<(), Box<dyn Error>> {
         let opts = Options::parse()?;
+        let (inferred, how) = inferences(opts.ratios.as_ref())?;
+        println!("  P1 and K2 inferred {how}");
         let [min_lon, min_lat, max_lon, max_lat] = opts.bbox;
         let start = ModelClock::parse(&opts.start)?.epoch_unix;
         let hours = opts.days * 24;
@@ -339,11 +400,11 @@ mod app {
             "dg-rs tidal atlas: reference constants (H, Greenwich lag G)".to_string(),
             format!("source: NorKyst-800 {}", opts.url),
             format!(
-                "record: {} + {} days hourly; fit {} with {} inferred",
+                "record: {} + {} days hourly; fit {} with {} inferred {how}",
                 ModelClock::new(times[0]).format(0.0),
                 opts.days,
                 NAMES.join(" "),
-                INFERRED.map(|i| format!("{} from {}", i.name, i.from)).join(", ")
+                inferred.map(|i| format!("{} from {}", i.name, i.from)).join(", ")
             ),
             "velocity: z-level u_eastward/v_northward averaged over the column (levels end at 300 m)".into(),
         ];
@@ -356,7 +417,7 @@ mod app {
             header,
         };
         let (mut r2, mut r2_stations) = (Vec::new(), Vec::new());
-        let analysis = HarmonicAnalysis::new(&NAMES).with_inferences(&INFERRED);
+        let analysis = HarmonicAnalysis::new(&NAMES).with_inferences(&inferred);
         for cell in &cells {
             let fit = |values: &[f64]| -> Result<ReferenceFit, AnalysisError> {
                 let (t, x): (Vec<f64>, Vec<f64>) = times

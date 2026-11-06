@@ -56,7 +56,9 @@ use super::harmonic_tide::tidal_ramp;
 use crate::io::CoordinateProjection;
 use crate::mesh::{BoundaryTag, Mesh2D};
 use crate::operators::DGOperators2D;
-use crate::tides::{NodalDrift, canonical_name, constituent_period};
+use crate::tides::{
+    AdmittanceInference, NodalDrift, canonical_name, constituent_period, equilibrium_amplitude,
+};
 use crate::time::ModelClock;
 use crate::types::ElementIndex;
 
@@ -293,6 +295,80 @@ impl TidalAtlas {
                 Some(c) => *c = inferred,
                 None => p.constituents.push(inferred),
             }
+        }
+        Ok(())
+    }
+
+    /// Replace (or add) `inference.name` at every point by linear admittance
+    /// between its two references ([`AdmittanceInference`]), for elevation
+    /// and velocity alike: the minor constituents a source lacks (NorKyst
+    /// has none of 2N2, μ2, ν2, λ2, L2) from the major ones it has.
+    pub fn infer_by_admittance(
+        &mut self,
+        inference: &AdmittanceInference,
+    ) -> Result<(), TidalAtlasError> {
+        let name = canonical_name(inference.name).ok_or_else(|| {
+            TidalAtlasError::Inconsistent(format!("unknown constituent {}", inference.name))
+        })?;
+        let unknown = || {
+            TidalAtlasError::Inconsistent(format!(
+                "no admittance inference of {name} from {} and {}",
+                inference.lower, inference.upper
+            ))
+        };
+        inference.weights().ok_or_else(unknown)?;
+        for p in &mut self.points {
+            let find = |source: &str| {
+                p.constituents
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(source))
+                    .copied()
+                    .ok_or_else(|| {
+                        TidalAtlasError::Inconsistent(format!(
+                            "{name} is inferred from {source}, which is missing"
+                        ))
+                    })
+            };
+            let (a, b) = (find(inference.lower)?, find(inference.upper)?);
+            let infer = |x, y| inference.infer(x, y).ok_or_else(unknown);
+            let inferred = AtlasConstituent {
+                name,
+                eta: infer(a.eta, b.eta)?,
+                velocity: match (a.velocity, b.velocity) {
+                    (Some((ua, va)), Some((ub, vb))) => Some((infer(ua, ub)?, infer(va, vb)?)),
+                    _ => None,
+                },
+            };
+            match p.constituents.iter_mut().find(|c| c.name == name) {
+                Some(c) => *c = inferred,
+                None => p.constituents.push(inferred),
+            }
+        }
+        Ok(())
+    }
+
+    /// What tidal theory supplies without a gauge, on top of the
+    /// constituents a month's record separates: K2 and P1 at their
+    /// equilibrium ratios to S2 and K1 with equal lags (0.272 and 0.331,
+    /// [`equilibrium_amplitude`]; separating them takes half a year), and
+    /// the minor semidiurnals 2N2, μ2, ν2, λ2 and L2 by linear admittance
+    /// ([`AdmittanceInference::MINOR_SEMIDIURNALS`]). Needs M2, S2, N2 and
+    /// K1.
+    ///
+    /// For a source that carries K2 or P1 wrongly or lacks the minor
+    /// constituents (NorKyst-800: K2 0.8× from a missing nodal factor, P1
+    /// 1.7×, no minor semidiurnals), `atlas.infer_from_theory()` minus
+    /// `atlas` ([`difference`](Self::difference)) is the correction, once
+    /// `atlas` holds the source's own K2 and P1 (inferred at the source's
+    /// ratios, as a month's fit cannot separate them).
+    pub fn infer_from_theory(&mut self) -> Result<(), TidalAtlasError> {
+        for (name, from) in [("K2", "S2"), ("P1", "K1")] {
+            let ratio = equilibrium_amplitude(name).zip(equilibrium_amplitude(from));
+            let (a, b) = ratio.expect("equilibrium amplitudes of K2, S2, P1, K1");
+            self.infer(name, from, a / b, 0.0)?;
+        }
+        for inference in &AdmittanceInference::MINOR_SEMIDIURNALS {
+            self.infer_by_admittance(inference)?;
         }
         Ok(())
     }
@@ -877,6 +953,73 @@ mod tests {
         let mut moved = raw.clone();
         moved.points[1].lon += 0.01;
         assert!(corrected.difference(&moved).is_err());
+    }
+
+    /// L2 from M2 and S2 at every point, η and velocity, by the inference's
+    /// weights on the complex amplitudes; a missing reference is an error.
+    #[test]
+    fn minor_constituents_by_admittance() {
+        let mut atlas = TidalAtlas::parse(ATLAS).unwrap();
+        let l2 = AdmittanceInference::new("L2", "M2", "S2");
+        atlas.infer_by_admittance(&l2).unwrap();
+        assert_eq!(atlas.names(), vec!["M2", "S2", "L2"]);
+        let (wa, wb) = l2.weights().unwrap();
+        let complex = |(a, g): Harmonic| (a * g.to_radians().cos(), -a * g.to_radians().sin());
+        for p in &atlas.points {
+            let [m2, s2, l2] = [0, 1, 2].map(|k| p.constituents[k]);
+            let pairs = [
+                (m2.eta, s2.eta, l2.eta),
+                (m2.velocity.unwrap().0, s2.velocity.unwrap().0, l2.velocity.unwrap().0),
+                (m2.velocity.unwrap().1, s2.velocity.unwrap().1, l2.velocity.unwrap().1),
+            ];
+            for (a, b, z) in pairs {
+                let (a, b, z) = (complex(a), complex(b), complex(z));
+                assert!((z.0 - (wa * a.0 + wb * b.0)).abs() < 1e-12);
+                assert!((z.1 - (wa * a.1 + wb * b.1)).abs() < 1e-12);
+            }
+        }
+        // Inferred again, it replaces itself
+        atlas.infer_by_admittance(&l2).unwrap();
+        assert_eq!(atlas.names().len(), 3);
+        let nu2 = AdmittanceInference::new("NU2", "N2", "M2");
+        assert!(atlas.infer_by_admittance(&nu2).is_err());
+    }
+
+    /// Theory replaces a source's K2 and P1 by the equilibrium ratios to S2
+    /// and K1 and adds the minor semidiurnals, so the difference from the
+    /// source is those constituents only.
+    #[test]
+    fn theory_replaces_k2_p1_and_adds_the_minor_semidiurnals() {
+        let source = TidalAtlas::parse(
+            "8.0 63.0 100.0 M2 0.9 330.0\n8.0 63.0 100.0 S2 0.3 10.0\n\
+             8.0 63.0 100.0 N2 0.18 305.0\n8.0 63.0 100.0 K1 0.1 180.0\n\
+             8.0 63.0 100.0 O1 0.05 20.0\n8.0 63.0 100.0 K2 0.068 18.0\n\
+             8.0 63.0 100.0 P1 0.036 183.0\n",
+        )
+        .unwrap();
+        let mut theory = source.clone();
+        theory.infer_from_theory().unwrap();
+        let get = |a: &TidalAtlas, name| {
+            a.points[0]
+                .constituents
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap()
+                .eta
+        };
+        let (k2, p1) = (get(&theory, "K2"), get(&theory, "P1"));
+        assert!((k2.0 - 0.3 * 0.030_704 / 0.112_841).abs() < 1e-12 && k2.1 == 10.0);
+        assert!((p1.0 - 0.1 * 0.046_843 / 0.141_565).abs() < 1e-12 && p1.1 == 180.0);
+        for name in ["2N2", "MU2", "NU2", "LDA2", "L2"] {
+            assert!(get(&theory, name).0 > 0.0, "{name}");
+        }
+        let d = theory.difference(&source).unwrap();
+        for c in &d.points[0].constituents {
+            let changed = !["M2", "S2", "N2", "K1", "O1"].contains(&c.name);
+            assert_eq!(c.eta.0 > 1e-12, changed, "{}", c.name);
+        }
+        let mut short = TidalAtlas::parse("8.0 63.0 100.0 M2 0.9 330.0\n").unwrap();
+        assert!(short.infer_from_theory().is_err());
     }
 
     /// 0.1° of longitude at 63° N is ≈ 5.05 km.

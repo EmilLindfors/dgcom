@@ -48,7 +48,16 @@
 //!    gauge-corrected ones (below) by adding the difference between the
 //!    corrected and the raw atlas, which is NorKyst's own harmonic fit, so
 //!    the residual flow is kept (`OceanModelState::with_tidal_correction`;
-//!    `nest_tides=raw` to keep NorKyst's tides). `ib=F` adds F times the
+//!    `nest_tides=raw` to keep NorKyst's tides). `nest_tides=theory`
+//!    corrects them without a gauge instead (`TidalAtlas::infer_from_theory`):
+//!    K2 and P1 at the equilibrium ratios to S2 and K1 (NorKyst's K2 lacks
+//!    its nodal factor, 0.8×; its P1 is 1.1–1.4× the equilibrium ratio) and
+//!    the minor semidiurnals 2N2, μ2, ν2, λ2, L2 it lacks, by admittance.
+//!    The raw atlas must hold NorKyst's own K2 and P1 for that
+//!    (`norkyst_boundary_tides ratios=`); one inferred at the equilibrium
+//!    ratios gets the minor semidiurnals only. On June 2026 at the Bodø and
+//!    Mausund gauges this takes NorKyst's daily centred RMSE from 7.0 and
+//!    6.0 cm to 5.1 and 3.9 cm (`parent_tide_check`). `ib=F` adds F times the
 //!    inverse-barometer level of `met=` to the parent ζ (0, the default:
 //!    none; 1: all of it, for a parent run without pressure forcing).
 //!    NorKyst's ζ carries ≈ 0.22 of the static response and gauge minus
@@ -108,7 +117,7 @@
 //!     [wall_land=keep|lower] \
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [heat=1] [jerlov=III] [mixing=k-epsilon] [band_km=3] [band_minutes=30] [blend=1] [max_closed=0.05] [ib=0] [nest_level=] \
-//!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
+//!     [nest_tides=corrected|theory|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
 //!     [wave_sources=wam|swan] [wave_integration=] [wave_limiter=] [wave_substeps=4|1] [wave_cfl=1.0|0.5] [wave_hours=0] \
 //!     [wave_land=absorbing|floored] [wave_force=dissipation|stress] [wave_depth_limit=1] \
 //!     [wave_reference=<file>] \
@@ -642,6 +651,19 @@ const GAUGE_CONSTITUENTS: [&str; 15] = [
     "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6", "Mf", "Mm", "Ssa",
 ];
 
+/// How a nested run treats its parent's tides (`nest_tides=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NestTides {
+    /// The `gauge_gains` and `gauge_ratios` constituents replaced by the
+    /// gauge-corrected ones (the default)
+    Corrected,
+    /// K2 and P1 at the equilibrium ratios and the minor semidiurnals added
+    /// (`TidalAtlas::infer_from_theory`): no gauge
+    Theory,
+    /// As they are
+    Raw,
+}
+
 /// Command-line options (`key=value`, or a bare flag)
 #[derive(Clone)]
 struct Options {
@@ -685,10 +707,8 @@ struct Options {
     /// The GLS closure of the 3D columns (`mixing=k-epsilon`): its name and
     /// constructor
     mixing: (&'static str, fn() -> GlsMixing),
-    /// Nesting: replace NorKyst's `gauge_gains` and `gauge_ratios`
-    /// constituents by the gauge-corrected ones (`nest_tides=corrected`, the
-    /// default) or keep its tides (`nest_tides=raw`)
-    correct_nested_tides: bool,
+    /// Nesting: NorKyst's tides as they are or corrected (`nest_tides=`)
+    nest_tides: NestTides,
     /// Added to NorKyst's ζ (m); default: minus the mean level `Z0` of the
     /// boundary atlas
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
@@ -1174,10 +1194,11 @@ impl Options {
                     return Err(format!("bad mixing={other}: k-epsilon, k-omega or generic"));
                 }
             },
-            correct_nested_tides: match args.get("nest_tides").map_or("corrected", String::as_str) {
-                "corrected" => true,
-                "raw" => false,
-                other => return Err(format!("bad nest_tides={other}: corrected or raw")),
+            nest_tides: match args.get("nest_tides").map_or("corrected", String::as_str) {
+                "corrected" => NestTides::Corrected,
+                "theory" => NestTides::Theory,
+                "raw" => NestTides::Raw,
+                other => return Err(format!("bad nest_tides={other}: corrected, theory or raw")),
             },
             nesting_level: args
                 .get("nest_level")
@@ -2548,7 +2569,7 @@ fn tide_setup(
     };
     let reference = AtlasReference::new(&stations, station_atlas.as_ref());
     let parent = match parent {
-        Some(parent) if opts.correct_nested_tides => Some(correct_parent_tides(
+        Some(parent) if opts.nest_tides != NestTides::Raw => Some(correct_parent_tides(
             domain,
             opts,
             reference.as_ref(),
@@ -6452,12 +6473,13 @@ fn corrected_atlas(
     Ok(atlas)
 }
 
-/// NorKyst with its tides corrected (`nest_tides=corrected`): the boundary
-/// atlas is NorKyst's own harmonic fit, so adding (corrected atlas − atlas)
-/// keeps NorKyst's residual (coastal current, surge) and replaces its
-/// `gauge_gains` and `gauge_ratios` constituents by the gauge-corrected
-/// ones, at the boundary
-/// and across the relaxation band.
+/// NorKyst with its tides corrected (`nest_tides=corrected` or `theory`):
+/// the boundary atlas is NorKyst's own harmonic fit, so adding (corrected
+/// atlas − atlas) keeps NorKyst's residual (coastal current, surge) and
+/// replaces its `gauge_gains` and `gauge_ratios` constituents by the
+/// gauge-corrected ones (`corrected`), or its K2 and P1 by the equilibrium
+/// ratios and adds the minor semidiurnals (`theory`), at the boundary and
+/// across the relaxation band.
 fn correct_parent_tides(
     domain: &Domain,
     opts: &Options,
@@ -6473,7 +6495,25 @@ fn correct_parent_tides(
         return Ok(parent);
     };
     let raw = TidalAtlas::read(atlas_path)?;
-    let correction = corrected_atlas(&raw, opts, reference)?.difference(&raw)?;
+    let corrected = match opts.nest_tides {
+        NestTides::Theory => {
+            let mut theory = raw.clone();
+            theory.infer_from_theory()?;
+            if theory.difference(&raw)?.points.iter().all(|p| {
+                p.constituents
+                    .iter()
+                    .filter(|c| c.name == "K2" || c.name == "P1")
+                    .all(|c| c.eta.0 < 1e-3)
+            }) {
+                println!(
+                    "  The atlas has K2 and P1 at the equilibrium ratios, so theory adds the                      minor semidiurnals only (build it with `norkyst_boundary_tides ratios=`)"
+                );
+            }
+            theory
+        }
+        _ => corrected_atlas(&raw, opts, reference)?,
+    };
+    let correction = corrected.difference(&raw)?;
     let largest = correction
         .points
         .iter()
