@@ -1,7 +1,7 @@
 //! Integration tests for the harmonic analysis: fitting reference constants,
 //! prediction, inference, the Rayleigh guard, and comparison metrics.
 
-use dg_rs::{
+use dgcom::{
     AnalysisError, ComparisonMetrics, HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit,
     TimeSeries, compare_harmonics,
 };

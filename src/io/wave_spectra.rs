@@ -225,7 +225,7 @@ impl WaveSpectraFile {
             "A direction of 0 degrees means a wave propagating towards the North \
              (Oceanographic convention)",
         )?;
-        file.add_attribute("history", "written by dg-rs io::WaveSpectraFile")?;
+        file.add_attribute("history", "written by dgcom io::WaveSpectraFile")?;
         let mut v = file.add_variable::<f64>("time", &["time"])?;
         v.put_attribute("units", "seconds since 1970-01-01 00:00:00")?;
         v.put_attribute("calendar", "gregorian")?;

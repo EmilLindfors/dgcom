@@ -11,7 +11,7 @@
 //! # Example
 //!
 //! ```
-//! use dg_rs::vertical::{SigmaGrid, UniformStretching, SongHaidvogelStretching};
+//! use dgcom::vertical::{SigmaGrid, UniformStretching, SongHaidvogelStretching};
 //!
 //! // Uniform spacing
 //! let uniform = SigmaGrid::new(35, UniformStretching);
@@ -126,7 +126,7 @@ impl Stretching for UniformStretching {
 /// # Example
 ///
 /// ```
-/// use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
+/// use dgcom::vertical::{SigmaGrid, SongHaidvogelStretching};
 ///
 /// // Norwegian coastal configuration
 /// let stretching = SongHaidvogelStretching {

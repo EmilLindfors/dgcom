@@ -56,9 +56,9 @@ use std::path::{Path, PathBuf};
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
-use dg_rs::io::{BedRaster, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry};
-use dg_rs::mesh::PointLocator2D;
-use dg_rs::types::ElementIndex;
+use dgcom::io::{BedRaster, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry};
+use dgcom::mesh::PointLocator2D;
+use dgcom::types::ElementIndex;
 use rayon::prelude::*;
 
 use crate::actions::{Act, Action};

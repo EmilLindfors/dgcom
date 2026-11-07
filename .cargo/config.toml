@@ -1,4 +1,4 @@
-# Cargo build configuration for dg-rs
+# Cargo build configuration for dgcom
 # Based on: https://nnethercote.github.io/perf-book/build-configuration.html
 #
 # This enables native CPU optimizations (AVX2/AVX-512) for maximum performance.

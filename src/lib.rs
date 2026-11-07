@@ -1,8 +1,10 @@
-//! # dg-rs
+//! # DGCOM
 //!
-//! A Discontinuous Galerkin library for solving hyperbolic PDEs.
+//! The Discontinuous Galerkin Coastal Ocean Model: 2D shallow water on
+//! unstructured quadrilaterals, a ROMS-style 3D layer (sigma coordinates, mode
+//! splitting, GLS), open boundaries with tides and nesting, waves and particles.
 //!
-//! This crate provides the core building blocks for DG methods:
+//! It is built on these DG building blocks:
 //! - Polynomial basis functions (Legendre)
 //! - Quadrature rules (Gauss-Lobatto)
 //! - DG operators (mass, differentiation, LIFT)

@@ -196,7 +196,7 @@ impl ParticleFileReader {
             .map_err(|_| SnapshotError::Format("shorter than its magic number".into()))?;
         if &start[..8] != MAGIC {
             return Err(SnapshotError::Format(
-                "wrong magic number (not a dg-rs particle file, or another version)".into(),
+                "wrong magic number (not a dgcom particle file, or another version)".into(),
             ));
         }
         let header_len = u64::from_le_bytes(start[8..].try_into().unwrap()) as usize;
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn particles_read_back_as_written() {
-        let path = std::env::temp_dir().join(format!("dg-rs-particles-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("dgcom-particles-{}", std::process::id()));
         let mut writer = ParticleFileWriter::create(
             &path,
             &["lice larvae", "faeces", "feed"],

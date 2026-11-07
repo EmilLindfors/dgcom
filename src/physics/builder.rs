@@ -757,9 +757,9 @@ where
 ///
 /// # Example
 /// ```ignore
-/// use dg_rs::physics::SWEPhysics2DBuilder;
-/// use dg_rs::flux::StandardFlux2D;
-/// use dg_rs::solver::StandardLimiter2D;
+/// use dgcom::physics::SWEPhysics2DBuilder;
+/// use dgcom::flux::StandardFlux2D;
+/// use dgcom::solver::StandardLimiter2D;
 ///
 /// let physics = SWEPhysics2DBuilder::new(mesh, ops, geom, equation, bc)
 ///     .with_flux(StandardFlux2D::Roe)

@@ -10,7 +10,7 @@
 //! velocity and T, as the RMS and the largest difference (with where the
 //! largest is). Both runs must be on the same mesh and levels.
 
-use dg_rs::io::SnapshotReader;
+use dgcom::io::SnapshotReader;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();

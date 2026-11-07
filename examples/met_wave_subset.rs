@@ -43,8 +43,8 @@ mod app {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use dg_rs::io::WaveSpectraFile;
-    use dg_rs::time::ModelClock;
+    use dgcom::io::WaveSpectraFile;
+    use dgcom::time::ModelClock;
 
     use super::dap::{arguments, parse_bbox};
 

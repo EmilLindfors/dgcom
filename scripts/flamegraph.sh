@@ -1,5 +1,5 @@
 #!/bin/bash
-# Flamegraph profiling script for dg-rs examples
+# Flamegraph profiling script for dgcom examples
 #
 # Prerequisites:
 #   cargo install flamegraph

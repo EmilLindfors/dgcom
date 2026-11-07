@@ -39,19 +39,19 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use dg_rs::boundary::{CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D};
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, read_gmsh_mesh};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::particles::{Particle2D, ParticleStatus, ParticleTracker2D, SWEVelocity2D};
-use dg_rs::physics::PhysicsBuilder;
-use dg_rs::simulation::{Simulation, SimulationResult};
-use dg_rs::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig};
-use dg_rs::source::{
+use dgcom::boundary::{CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D};
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, read_gmsh_mesh};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::particles::{Particle2D, ParticleStatus, ParticleTracker2D, SWEVelocity2D};
+use dgcom::physics::PhysicsBuilder;
+use dgcom::simulation::{Simulation, SimulationResult};
+use dgcom::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig};
+use dgcom::source::{
     CageDrag2D, CageFootprint, CoriolisSource2D, HorizontalViscosity2D, ManningFriction2D, NetCage,
 };
-use dg_rs::time::{MultirateSSPRK3, SSPRK3};
-use dg_rs::types::ElementIndex;
+use dgcom::time::{MultirateSSPRK3, SSPRK3};
+use dgcom::types::ElementIndex;
 
 const G: f64 = 9.81;
 const LX: f64 = 12_000.0;
@@ -246,7 +246,7 @@ impl<'a> FarmParticles<'a> {
     /// `n` particles in each cage footprint (a sunflower pattern), with a
     /// random walk of diffusivity `kh`; they strand in water under 5 cm.
     fn release(
-        mesh: &'a dg_rs::mesh::Mesh2D,
+        mesh: &'a dgcom::mesh::Mesh2D,
         ops: &'a DGOperators2D,
         cages: &[NetCage],
         n: usize,

@@ -5,15 +5,15 @@
 //! Benchmarks the complete RHS computation at various mesh sizes and polynomial orders.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use dg_rs::ElementIndex;
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::Mesh2D;
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_rhs_swe_2d};
+use dgcom::ElementIndex;
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::Mesh2D;
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::solver::{SWE2DRhsConfig, SWESolution2D, compute_rhs_swe_2d};
 
 #[cfg(all(feature = "parallel", feature = "simd"))]
-use dg_rs::solver::compute_rhs_swe_2d_parallel;
+use dgcom::solver::compute_rhs_swe_2d_parallel;
 
 /// Setup a test problem with uniform flow.
 fn setup_problem(
@@ -41,7 +41,7 @@ fn setup_problem(
             q.set_state(
                 ElementIndex::new(k),
                 i,
-                dg_rs::solver::SWEState2D::new(h0, h0 * u0, h0 * v0),
+                dgcom::solver::SWEState2D::new(h0, h0 * u0, h0 * v0),
             );
         }
     }
@@ -140,8 +140,8 @@ fn bench_rhs_polynomial_order(c: &mut Criterion) {
 
 /// Benchmark RHS with source terms enabled.
 fn bench_rhs_with_sources(c: &mut Criterion) {
-    use dg_rs::mesh::Bathymetry2D;
-    use dg_rs::source::{
+    use dgcom::mesh::Bathymetry2D;
+    use dgcom::source::{
         BathymetrySource2D, CombinedSource2D, CoriolisSource2D, ManningFriction2D,
     };
 

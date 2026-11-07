@@ -1,4 +1,4 @@
-use dg_rs::{
+use dgcom::{
     DGOperators2D, Depth, ElementIndex, GeometricFactors2D, Mesh2D, SWESolution2D, SWEState2D,
     WetDryConfig, apply_wet_dry_correction_all, swe_positivity_limiter_2d,
 };

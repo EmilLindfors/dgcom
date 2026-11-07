@@ -33,10 +33,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use dg_rs::analysis::{HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit};
-use dg_rs::boundary::{AtlasConstituent, AtlasPoint, TidalAtlas};
-use dg_rs::io::{TideGaugeFile, read_tide_gauge_file};
-use dg_rs::time::ModelClock;
+use dgcom::analysis::{HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit};
+use dgcom::boundary::{AtlasConstituent, AtlasPoint, TidalAtlas};
+use dgcom::io::{TideGaugeFile, read_tide_gauge_file};
+use dgcom::time::ModelClock;
 
 /// What a month separates (as `norkyst_boundary_tides`)
 const MONTH: [&str; 10] = ["M2", "S2", "N2", "K1", "O1", "Q1", "M4", "MS4", "MN4", "M6"];

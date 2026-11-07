@@ -517,57 +517,57 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arguments::Arguments;
-use dg_rs::analysis::{
+use dgcom::analysis::{
     ADCPStation, ADCPValidationResult, AnalysisError, ConstituentComparison, CurrentTimeSeries,
     EllipseFit, HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit,
     StationValidationResult, TidalEllipse, TideGaugeStation, TimeSeries,
 };
-use dg_rs::boundary::{
+use dgcom::boundary::{
     AtlasPoint, BCContext2D, BoundaryCoverage, BoundaryLevel, BoundaryTides, CharacteristicOBC,
     ExternalStateProvider, HarmonicTide, InverseBarometer, MultiBoundaryCondition2D,
     NestingRelaxation2D, OceanModelState, Reflective2D, SWEBoundaryCondition2D, TidalAtlas,
 };
 #[cfg(feature = "netcdf")]
-use dg_rs::boundary::{NestingOptions, ParentDatum};
-use dg_rs::equations::ShallowWater2D;
+use dgcom::boundary::{NestingOptions, ParentDatum};
+use dgcom::equations::ShallowWater2D;
 #[cfg(feature = "netcdf")]
-use dg_rs::io::WaveSpectraFile;
+use dgcom::io::WaveSpectraFile;
 #[cfg(feature = "netcdf")]
-use dg_rs::io::{AtmosphereReader, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig};
-use dg_rs::io::{
+use dgcom::io::{AtmosphereReader, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig};
+use dgcom::io::{
     BedRaster, CoastlineData, CoordinateProjection, DriverData, GeoBoundingBox, GeoTiffBathymetry,
     LocalProjection, OceanModelReader, Restart2D, RestartError, SnapshotLayout, SnapshotWriter,
     TideGaugeFile, east_axis, read_adcp_file, read_tide_gauge_file, write_adcp_file,
     write_tide_gauge_file, write_vtk_swe,
 };
-use dg_rs::mesh::{
+use dgcom::mesh::{
     Bathymetry2D, BoundaryTag, ElementSlopeBound, Mesh2D, MeshPoint, PointLocator2D,
     inverse_bilinear, read_gmsh_mesh,
 };
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{
     Coare35, GlsMixing, JerlovWater, PhysicsBuilder, PhysicsModule, SWEPhysics2D,
     SWEPhysics2DBuilder,
 };
-use dg_rs::simulation::{Simulation, SimulationResult};
-use dg_rs::solver::{
+use dgcom::simulation::{Simulation, SimulationResult};
+use dgcom::solver::{
     LINEAR_CFL_SAFETY, Probe2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
     linear_cfl_swe_2d, positivity_cfl_swe_2d,
 };
-use dg_rs::source::{
+use dgcom::source::{
     AtmosphericPressure2D, CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D,
     GriddedSurfaceFluxes, GriddedWindStress, HorizontalViscosity2D, ManningFriction2D,
     WindStress2D,
 };
-use dg_rs::tides::canonical_name;
-use dg_rs::time::{
+use dgcom::tides::canonical_name;
+use dgcom::time::{
     IntegratorInfo, ModelClock, Multirate, SSPRK3, SspScheme, StandardIntegrator, TimeIntegrator,
 };
 #[cfg(feature = "netcdf")]
-use dg_rs::types::Depth;
-use dg_rs::types::ElementIndex;
-use dg_rs::waves::{BoundarySpectra, PointSpectra, WindSeries};
-use dg_rs::waves::{
+use dgcom::types::Depth;
+use dgcom::types::ElementIndex;
+use dgcom::waves::{BoundarySpectra, PointSpectra, WindSeries};
+use dgcom::waves::{
     CoupledWaves2D, CoupledWavesStats, DEFAULT_RATE_LIMITER, GrowthLimiter, SeaStateFields,
     SourceIntegration, SourceTerms, SpectralGrid, WaveForceForm, WaveModel2D, Wind,
 };
@@ -853,9 +853,9 @@ struct Options {
     /// `ModeSplitIntegrator::with_barotropic_cfl`)
     cfl_bt: f64,
     /// SSP scheme of the barotropic substeps (`rk_bt=3|43`)
-    rk_bt: dg_rs::time::SspScheme,
+    rk_bt: dgcom::time::SspScheme,
     /// SSP scheme of the 3D stages (`rk_3d=3|43`)
-    rk_3d: dg_rs::time::SspScheme,
+    rk_3d: dgcom::time::SspScheme,
     /// Most levels of local time stepping in the barotropic pass
     /// (`bt_levels=`, 2; 0: global substeps)
     bt_levels: usize,
@@ -882,7 +882,7 @@ struct Options {
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     river_snap_km: f64,
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
-    river_profile: dg_rs::source::RiverProfile,
+    river_profile: dgcom::source::RiverProfile,
     output: Option<PathBuf>,
     /// The tide's horizontal viscosity: a constant background (`nu=`,
     /// m²/s) plus Smagorinsky's (`cs=`); none by default (in 3D, of the
@@ -895,9 +895,9 @@ struct Options {
 }
 
 /// The 3D model of `levels=N`.
-type Physics3D = dg_rs::physics::Hydrostatic3D<
-    dg_rs::physics::LinearEOS,
-    Box<dyn dg_rs::physics::VerticalMixing + Send + Sync>,
+type Physics3D = dgcom::physics::Hydrostatic3D<
+    dgcom::physics::LinearEOS,
+    Box<dyn dgcom::physics::VerticalMixing + Send + Sync>,
     Reflective2D,
 >;
 
@@ -983,13 +983,13 @@ impl Options {
             bt_levels: get("bt_levels", 2.0)? as usize,
             levels_3d: get("levels_3d", 0.0)? as usize,
             rk_bt: match args.get("rk_bt").map_or("43", String::as_str) {
-                "3" => dg_rs::time::SspScheme::Rk3,
-                "43" => dg_rs::time::SspScheme::Rk43,
+                "3" => dgcom::time::SspScheme::Rk3,
+                "43" => dgcom::time::SspScheme::Rk43,
                 other => return Err(format!("rk_bt={other}: expected 3 or 43")),
             },
             rk_3d: match args.get("rk_3d").map_or("43", String::as_str) {
-                "3" => dg_rs::time::SspScheme::Rk3,
-                "43" => dg_rs::time::SspScheme::Rk43,
+                "3" => dgcom::time::SspScheme::Rk3,
+                "43" => dgcom::time::SspScheme::Rk43,
                 other => return Err(format!("rk_3d={other}: expected 3 or 43")),
             },
             debug_3d: args.get("debug_3d").cloned().unwrap_or_default(),
@@ -1006,7 +1006,7 @@ impl Options {
             rivers: args.get("rivers").map(PathBuf::from),
             river_snap_km: get("river_snap_km", 2.0)?,
             river_profile: {
-                use dg_rs::source::RiverProfile;
+                use dgcom::source::RiverProfile;
                 let text = args
                     .get("river_profile")
                     .map_or("tapered:3", String::as_str);
@@ -1236,8 +1236,8 @@ impl Options {
         opts.cfl_3d = get(
             "cfl_3d",
             match opts.rk_3d {
-                dg_rs::time::SspScheme::Rk3 => 2.0,
-                dg_rs::time::SspScheme::Rk43 => 4.0,
+                dgcom::time::SspScheme::Rk3 => 2.0,
+                dgcom::time::SspScheme::Rk43 => 4.0,
             },
         )?;
         if opts.cfl.is_nan() {
@@ -2425,7 +2425,7 @@ fn farm_runs<'a>(
     // a branch run, `resume=`)
     let t_end = opts.hours * 3600.0;
     let t_start = match &opts.resume {
-        Some(path) if opts.levels > 0 => dg_rs::io::Restart3D::read(path)?.time,
+        Some(path) if opts.levels > 0 => dgcom::io::Restart3D::read(path)?.time,
         Some(path) => Restart2D::read(path)?.time,
         None => 0.0,
     };
@@ -2521,7 +2521,7 @@ fn tide_setup(
     // A 3D step's barotropic pass reads its forcing past the step's end, the
     // last one past `t_end`
     let t_forcing = if three_d {
-        let reach = dg_rs::time::ModeSplitIntegrator::FORCING_REACH;
+        let reach = dgcom::time::ModeSplitIntegrator::FORCING_REACH;
         t_end + (reach - 1.0) * opts.dt_3d.unwrap_or(MAX_DT_3D)
     } else {
         t_end
@@ -2715,7 +2715,7 @@ fn tidal_run<'a>(
         Some(projection) => Some(NetCDFWriter::create(
             NetCDFWriterConfig::new(output_dir.join(netcdf_name).to_string_lossy())
                 .with_title("Frøya–Smøla–Hitra tidal run")
-                .with_institution("dg-rs")
+                .with_institution("dgcom")
                 .with_clock(clock),
             &netcdf_mesh_info(domain, projection),
         )?),
@@ -3545,7 +3545,7 @@ const LIMIT_BANDS: [(f64, f64); 5] = [
 /// [`LIMIT_BANDS`], and of all the nodes in each band; none without breaking.
 fn depth_limit_bands(
     model: &WaveModel2D,
-    params: &[dg_rs::waves::WaveParameters],
+    params: &[dgcom::waves::WaveParameters],
 ) -> Option<[(usize, usize); 5]> {
     let (_, gamma) = model.sources.breaking?;
     let mut bands = [(0, 0); 5];
@@ -3565,7 +3565,7 @@ fn depth_limit_bands(
 }
 
 /// A line of [`depth_limit_bands`].
-fn report_depth_limit(model: &WaveModel2D, params: &[dg_rs::waves::WaveParameters]) {
+fn report_depth_limit(model: &WaveModel2D, params: &[dgcom::waves::WaveParameters]) {
     let Some(bands) = depth_limit_bands(model, params) else {
         return;
     };
@@ -3778,9 +3778,9 @@ struct MeanProfile {
 
 impl MeanProfile {
     fn of(
-        state: &dg_rs::solver::state::Solution3D,
+        state: &dgcom::solver::state::Solution3D,
         bed: &[f64],
-        sigma: &dg_rs::vertical::SigmaGrid,
+        sigma: &dgcom::vertical::SigmaGrid,
         use_column: impl Fn(usize) -> bool,
         density: impl Fn(f64, f64) -> f64,
     ) -> Option<Self> {
@@ -3890,9 +3890,9 @@ fn rivers_3d(
     opts: &Options,
     clock: &ModelClock,
     t_end: f64,
-) -> Result<Option<dg_rs::source::RiverSources>, Box<dyn std::error::Error>> {
-    use dg_rs::io::RiverForcing;
-    use dg_rs::source::RiverSources;
+) -> Result<Option<dgcom::source::RiverSources>, Box<dyn std::error::Error>> {
+    use dgcom::io::RiverForcing;
+    use dgcom::source::RiverSources;
 
     let Some(path) = &opts.rivers else {
         return Ok(None);
@@ -3965,7 +3965,7 @@ fn rivers_3d(
     opts: &Options,
     _clock: &ModelClock,
     _t_end: f64,
-) -> Result<Option<dg_rs::source::RiverSources>, Box<dyn std::error::Error>> {
+) -> Result<Option<dgcom::source::RiverSources>, Box<dyn std::error::Error>> {
     match opts.rivers {
         Some(_) => Err("rivers= needs the `netcdf` feature".into()),
         None => Ok(None),
@@ -3982,23 +3982,23 @@ fn tidal_run_3d<'a>(
     parent_reader: Option<Arc<OceanModelReader>>,
     farm: Option<(&'a FarmCase, FarmRun)>,
 ) -> Result<Option<FarmRecord<'a>>, Box<dyn std::error::Error>> {
-    use dg_rs::boundary::{
+    use dgcom::boundary::{
         ColumnContext3D, DeepReference, Nesting3D, NestingBand3D, OceanColumnsOptions,
         OceanModelColumns, ParentColumn, ParentColumns3D, ReferenceColumns,
     };
     // e-folding depth of the parent's bottom anomaly below its bed (m)
     const DEEP_DECAY: f64 = 10.0;
-    use dg_rs::io::Restart3D;
-    use dg_rs::physics::{
+    use dgcom::io::Restart3D;
+    use dgcom::physics::{
         BottomDrag3D, EquationOfState, Forcing, Hydrostatic3D, ImplicitVerticalAdvection,
         LinearEOS, TimeStepLimit, VerticalMixing,
     };
-    use dg_rs::simulation::{RunContext3D, Simulation3D};
-    use dg_rs::solver::state::Solution3D;
-    use dg_rs::solver::{TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile};
-    use dg_rs::source::SpongeProfile;
-    use dg_rs::time::ModeSplitIntegrator;
-    use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
+    use dgcom::simulation::{RunContext3D, Simulation3D};
+    use dgcom::solver::state::Solution3D;
+    use dgcom::solver::{TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile};
+    use dgcom::source::SpongeProfile;
+    use dgcom::time::ModeSplitIntegrator;
+    use dgcom::vertical::{SigmaGrid, SongHaidvogelStretching};
 
     const RHO0: f64 = 1025.0;
     let TideSetup {
@@ -4287,7 +4287,7 @@ fn tidal_run_3d<'a>(
         Arc::new(CoriolisSource2D::f_plane(F_CORIOLIS)),
         eos,
         if dbg("constant") {
-            Box::new(dg_rs::physics::ConstantMixing::new(1e-3, 0.0))
+            Box::new(dgcom::physics::ConstantMixing::new(1e-3, 0.0))
                 as Box<dyn VerticalMixing + Send + Sync>
         } else {
             Box::new((opts.mixing.1)())
@@ -4650,7 +4650,7 @@ fn tidal_run_3d<'a>(
                     let mut element_dt = vec![0.0; s.n_elements];
                     let ssp = opts.rk_3d.ssp_coefficient();
                     physics.element_steps_into(s, opts.cfl_3d, ssp, &mut element_dt);
-                    use dg_rs::time::multirate::{MultirateStepper, RhsStencil};
+                    use dgcom::time::multirate::{MultirateStepper, RhsStencil};
                     let reads: [(&str, &[RhsStencil]); 3] = [
                         ("faces", &[RhsStencil::Faces]),
                         ("corners", &[RhsStencil::FacesAndCorners]),
@@ -4791,12 +4791,12 @@ fn tidal_run_3d<'a>(
         state = restart.state;
     }
     let result = sim.run_with_context_callback(&mut state, t_start, t_end, callback);
-    if dg_rs::profiling::enabled() {
+    if dgcom::profiling::enabled() {
         println!(
             "
 Phase profile:
 {}",
-            dg_rs::profiling::report()
+            dgcom::profiling::report()
         );
     }
     if let Some(e) = write_error {
@@ -4849,12 +4849,12 @@ fn profile_phases<P: PhysicsModule<SWESolution2D>>(domain: &Domain, physics: &P,
     let mut q = domain.at_rest();
     let spin_up = 900.0;
     let mut t = 0.0;
-    let mut stages = dg_rs::time::StageWorkspace::new();
+    let mut stages = dgcom::time::StageWorkspace::new();
     while t < spin_up {
         let dt = physics
             .compute_dt_ssp(&q, 1.0, Some(SspScheme::Rk3))
             .min(spin_up - t);
-        dg_rs::time::TimeIntegrator::step_with_relaxation(
+        dgcom::time::TimeIntegrator::step_with_relaxation(
             &SSPRK3,
             &mut q,
             dt,
@@ -4940,7 +4940,7 @@ fn profile_phases<P: PhysicsModule<SWESolution2D>>(domain: &Domain, physics: &P,
 /// coupling to the run's mesh `circulation` (`WaveCoupling2D`): its build and
 /// each exchange, from a circulation at rest.
 fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
-    use dg_rs::waves::{
+    use dgcom::waves::{
         StokesDriftField, WaveCoupling2D, WaveWorkspace, group_velocity, wavenumber,
     };
     let [nf, nd] = opts.wave_grid;
@@ -5022,7 +5022,7 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
     }
     // The parts of a step that run node by node, each alone (with its own
     // transposes to node-major and back)
-    let timed = |f: &mut dyn FnMut(&mut dg_rs::waves::WaveSolution)| {
+    let timed = |f: &mut dyn FnMut(&mut dgcom::waves::WaveSolution)| {
         let mut times = Vec::with_capacity(opts.waves);
         for _ in 0..opts.waves {
             let mut scratch = n.clone();
@@ -5185,7 +5185,7 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
 /// `wave_reference=`.
 fn write_wave_nodes(
     model: &WaveModel2D,
-    params: &[dg_rs::waves::WaveParameters],
+    params: &[dgcom::waves::WaveParameters],
     t: f64,
     output_dir: &Path,
 ) -> std::io::Result<()> {
@@ -5230,7 +5230,7 @@ fn wave_node_positions(model: &WaveModel2D) -> impl Iterator<Item = [f64; 2]> + 
 /// by depth), T_m01 and the mean direction.
 fn compare_wave_nodes(
     model: &WaveModel2D,
-    params: &[dg_rs::waves::WaveParameters],
+    params: &[dgcom::waves::WaveParameters],
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // x, y, depth, H_s, T_m01, direction (deg)
@@ -5384,13 +5384,13 @@ fn compare_wave_nodes(
 /// at rest and with 1 m/s currents everywhere, each element's own step (what
 /// local time stepping could save), and the barotropic substeps per step.
 fn cost_3d(domain: &Domain, opts: &Options) {
-    use dg_rs::physics::{
+    use dgcom::physics::{
         BottomDrag3D, ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, VerticalMixing,
     };
-    use dg_rs::solver::state::Solution3D;
-    use dg_rs::solver::{TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile};
-    use dg_rs::time::ModeSplitIntegrator;
-    use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
+    use dgcom::solver::state::Solution3D;
+    use dgcom::solver::{TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile};
+    use dgcom::time::ModeSplitIntegrator;
+    use dgcom::vertical::{SigmaGrid, SongHaidvogelStretching};
 
     const RHO0: f64 = 1025.0;
     // `debug_3d=around=K:R`: only the elements within R m of element K
@@ -5514,9 +5514,9 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     // `tadv=none|centred`: the turbulence's advection (LimitedAkima by default)
     .with_turbulence_advection(match dbg_value("tadv").as_deref() {
         Some("none") => None,
-        Some("centred") => Some(dg_rs::solver::rhs::VerticalAdvection::Centred),
+        Some("centred") => Some(dgcom::solver::rhs::VerticalAdvection::Centred),
         Some(other) => panic!("tadv={other}"),
-        None => Some(dg_rs::solver::rhs::VerticalAdvection::LimitedAkima),
+        None => Some(dgcom::solver::rhs::VerticalAdvection::LimitedAkima),
     })
     .with_horizontal_viscosity(
         opts.debug_3d
@@ -5525,7 +5525,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
             .unwrap_or(0.0),
     )
     .with_vertical_advection({
-        use dg_rs::solver::rhs::VerticalAdvection;
+        use dgcom::solver::rhs::VerticalAdvection;
         match dbg_value("vadv").as_deref() {
             _ if dbg("vcentred") => VerticalAdvection::Centred,
             Some("centred") => VerticalAdvection::Centred,
@@ -5656,7 +5656,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     } else if dbg("balanced") {
         physics.with_balanced_reference(&state)
     } else {
-        use dg_rs::physics::EquationOfState;
+        use dgcom::physics::EquationOfState;
         physics.with_reference_profile(&state, |z| {
             let (t, s) = profile(z);
             eos.compute_density(t, s, z)
@@ -5900,7 +5900,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
 
 /// Write `state`'s η, ū, v̄ and per-level u, v, T, S, ρ as little-endian
 /// f64 after a header of (elements, nodes, levels) as u64 (`debug_3d=dump=`).
-fn write_mode_dump(path: &str, state: &dg_rs::solver::state::Solution3D) {
+fn write_mode_dump(path: &str, state: &dgcom::solver::state::Solution3D) {
     let mut bytes = Vec::new();
     for n in [state.n_elements, state.n_nodes, state.n_levels] {
         bytes.extend_from_slice(&(n as u64).to_le_bytes());
@@ -5925,8 +5925,8 @@ fn write_mode_dump(path: &str, state: &dg_rs::solver::state::Solution3D) {
 /// Read a dump of [`write_mode_dump`] into a copy of `like`.
 fn read_mode_dump(
     path: &str,
-    like: &dg_rs::solver::state::Solution3D,
-) -> dg_rs::solver::state::Solution3D {
+    like: &dgcom::solver::state::Solution3D,
+) -> dgcom::solver::state::Solution3D {
     let bytes = fs::read(path).expect("read the mode dump");
     let mut words = bytes
         .as_chunks::<8>()
@@ -5963,8 +5963,8 @@ fn read_mode_dump(
 fn write_mode_geometry(
     prefix: &str,
     domain: &Domain,
-    sigma: &dg_rs::vertical::SigmaGrid,
-    state: &dg_rs::solver::state::Solution3D,
+    sigma: &dgcom::vertical::SigmaGrid,
+    state: &dgcom::solver::state::Solution3D,
 ) {
     let (ne, nn, nl) = (state.n_elements, state.n_nodes, state.n_levels);
     let mut bytes = Vec::new();
@@ -5996,7 +5996,7 @@ fn write_mode_geometry(
 /// walls). Read by the 3D tests (`tests/data/`).
 fn write_patch_fixture(
     path: &str,
-    mesh: &dg_rs::mesh::Mesh2D,
+    mesh: &dgcom::mesh::Mesh2D,
     bathymetry: &Bathymetry2D,
     element: usize,
     radius: f64,
@@ -6004,7 +6004,7 @@ fn write_patch_fixture(
     use std::fmt::Write as _;
     let [x0, y0] = mesh.vertices[0];
     let mut text = format!(
-        "# dg-rs patch fixture: the elements of froya_coast.msh within {radius} m of element \
+        "# dgcom patch fixture: the elements of froya_coast.msh within {radius} m of element \
          {element}, bed smoothed for 3D (slopes3d), walls around\n"
     );
     writeln!(text, "vertices {}", mesh.vertices.len()).unwrap();

@@ -12,7 +12,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use dg_rs::io::write_vtk_swe;
+//! use dgcom::io::write_vtk_swe;
 //!
 //! write_vtk_swe("output.vtu", &mesh, &ops, &swe_solution, Some(&bathymetry), time, h_min)?;
 //! ```

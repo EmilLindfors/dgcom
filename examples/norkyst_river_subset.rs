@@ -45,8 +45,8 @@ mod app {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use dg_rs::io::{GeoBoundingBox, RiverForcing, RomsRhoPoints};
-    use dg_rs::time::ModelClock;
+    use dgcom::io::{GeoBoundingBox, RiverForcing, RomsRhoPoints};
+    use dgcom::time::ModelClock;
 
     use super::dap::{arguments, locate_window, parse_bbox, retry};
 

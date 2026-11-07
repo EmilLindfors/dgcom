@@ -3,17 +3,17 @@
 //! Simulates a standing wave in a closed basin (seiche) using the 3D solver.
 //! Demonstrates the setup of the Simulation3D runner.
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::Mesh2D;
-use dg_rs::mesh::data::Bathymetry2D;
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, PhysicsBuilder};
-use dg_rs::simulation::Simulation3D;
-use dg_rs::solver::state::Solution3D;
-use dg_rs::time::ModeSplitIntegrator;
-use dg_rs::types::ElementIndex;
-use dg_rs::vertical::{SigmaGrid, UniformStretching};
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::Mesh2D;
+use dgcom::mesh::data::Bathymetry2D;
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, PhysicsBuilder};
+use dgcom::simulation::Simulation3D;
+use dgcom::solver::state::Solution3D;
+use dgcom::time::ModeSplitIntegrator;
+use dgcom::types::ElementIndex;
+use dgcom::vertical::{SigmaGrid, UniformStretching};
 use std::sync::Arc;
 
 fn main() -> Result<(), String> {
@@ -38,7 +38,7 @@ fn main() -> Result<(), String> {
     let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |_, _| {
         -10.0
     }));
-    let coriolis = Arc::new(dg_rs::source::CoriolisSource2D::f_plane(0.0)); // No rotation
+    let coriolis = Arc::new(dgcom::source::CoriolisSource2D::f_plane(0.0)); // No rotation
     let eos = LinearEOS::default();
     let mixing = ConstantMixing::new(1e-4, 1e-4);
     let forcing = Forcing {

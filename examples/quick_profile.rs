@@ -17,44 +17,44 @@
 
 use std::time::Instant;
 
-use dg_rs::SWEState2D;
-use dg_rs::mesh::{BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::SWESolution2D;
-use dg_rs::types::ElementIndex;
+use dgcom::SWEState2D;
+use dgcom::mesh::{BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::solver::SWESolution2D;
+use dgcom::types::ElementIndex;
 
 // CPU imports
 #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dg_rs::SWEFluxType2D;
+use dgcom::SWEFluxType2D;
 #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dg_rs::boundary::{MultiBoundaryCondition2D, Reflective2D};
+use dgcom::boundary::{MultiBoundaryCondition2D, Reflective2D};
 #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dg_rs::equations::ShallowWater2D;
+use dgcom::equations::ShallowWater2D;
 #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dg_rs::mesh::Bathymetry2D;
+use dgcom::mesh::Bathymetry2D;
 #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dg_rs::solver::SWE2DRhsConfig;
+use dgcom::solver::SWE2DRhsConfig;
 #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
+use dgcom::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
 
 #[cfg(all(
     not(all(feature = "parallel", feature = "simd")),
     not(any(feature = "burn-cuda", feature = "burn-wgpu"))
 ))]
-use dg_rs::solver::{compute_dt_swe_2d, compute_rhs_swe_2d};
+use dgcom::solver::{compute_dt_swe_2d, compute_rhs_swe_2d};
 #[cfg(all(
     all(feature = "parallel", feature = "simd"),
     not(any(feature = "burn-cuda", feature = "burn-wgpu"))
 ))]
-use dg_rs::solver::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
+use dgcom::solver::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
 
 // GPU imports
 #[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
-use dg_rs::solver::burn::{
+use dgcom::solver::burn::{
     BurnConnectivity, BurnGeometricFactors2D, BurnOperators2D, BurnRhsConfig, BurnSWESolution2D,
 };
 #[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
-use dg_rs::time::{compute_dt_burn, ssp_rk3_step_burn};
+use dgcom::time::{compute_dt_burn, ssp_rk3_step_burn};
 
 #[cfg(feature = "burn-cuda")]
 use burn_cuda::{Cuda, CudaDevice};

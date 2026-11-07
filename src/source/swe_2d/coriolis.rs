@@ -43,8 +43,8 @@ pub fn coriolis_beta(latitude_deg: f64) -> f64 {
 /// # Example
 ///
 /// ```
-/// use dg_rs::source::{CoriolisSource2D, SourceTerm2D, SourceContext2D};
-/// use dg_rs::SWEState2D;
+/// use dgcom::source::{CoriolisSource2D, SourceTerm2D, SourceContext2D};
+/// use dgcom::SWEState2D;
 ///
 /// // Norwegian coast at 60°N
 /// let coriolis = CoriolisSource2D::norwegian_coast();

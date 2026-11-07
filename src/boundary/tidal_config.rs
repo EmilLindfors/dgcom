@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use dg_rs::boundary::{TidalSimulationBuilder, SpongeConfig};
+//! use dgcom::boundary::{TidalSimulationBuilder, SpongeConfig};
 //!
 //! // For closed/semi-closed basins (recommended)
 //! let builder = TidalSimulationBuilder::closed_basin_stable(0.5, 50.0, 5000.0);

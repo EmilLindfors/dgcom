@@ -27,19 +27,19 @@ use std::f64::consts::PI;
 use std::path::Path;
 use std::sync::Arc;
 
-use dg_rs::boundary::{BoundaryTides, TidalAtlas};
-use dg_rs::io::{
+use dgcom::boundary::{BoundaryTides, TidalAtlas};
+use dgcom::io::{
     BedRaster, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry, LocalProjection,
     SnapshotHeader,
 };
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, ElementSlopeBound, Mesh2D, read_gmsh_mesh};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::particles::ClearSkyLight;
-use dg_rs::solver::{SWESolution2D, SWEState2D};
-use dg_rs::source::{CageFootprint, NetCage};
-use dg_rs::time::ModelClock;
-use dg_rs::types::ElementIndex;
-use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching, UniformStretching};
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, ElementSlopeBound, Mesh2D, read_gmsh_mesh};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::particles::ClearSkyLight;
+use dgcom::solver::{SWESolution2D, SWEState2D};
+use dgcom::source::{CageFootprint, NetCage};
+use dgcom::time::ModelClock;
+use dgcom::types::ElementIndex;
+use dgcom::vertical::{SigmaGrid, SongHaidvogelStretching, UniformStretching};
 
 pub const G: f64 = 9.81;
 
@@ -592,7 +592,7 @@ mod tests {
     /// density step.
     #[test]
     fn the_fjord_is_brackish_over_sill_water() {
-        use dg_rs::physics::{EquationOfState, LinearEOS};
+        use dgcom::physics::{EquationOfState, LinearEOS};
         let close = |a: f64, b: f64| (a - b).abs() < 0.02;
         let ((t_top, s_top), (t_sill, s_sill)) = (fjord_profile(0.0), fjord_profile(-40.0));
         assert!(

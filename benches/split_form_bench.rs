@@ -14,14 +14,14 @@
 use std::f64::consts::PI;
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::solver::{
     SWE2DRhsConfig, SWEFormulation2D, SWESolution2D, SWEState2D, compute_rhs_swe_2d_into,
 };
-use dg_rs::types::ElementIndex;
+use dgcom::types::ElementIndex;
 
 const G: f64 = 9.81;
 const L: f64 = 20_000.0;
@@ -113,7 +113,7 @@ fn bench_split_form(c: &mut Criterion) {
         #[cfg(feature = "parallel")]
         group.bench_function(BenchmarkId::new("parallel", name), |b| {
             b.iter(|| {
-                dg_rs::solver::compute_rhs_swe_2d_parallel_into(
+                dgcom::solver::compute_rhs_swe_2d_parallel_into(
                     black_box(&q),
                     &mesh,
                     &ops,

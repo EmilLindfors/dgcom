@@ -23,8 +23,8 @@
 //! # Example
 //!
 //! ```
-//! use dg_rs::source::{SpongeLayer2D, SpongeProfile, SourceTerm2D};
-//! use dg_rs::SWEState2D;
+//! use dgcom::source::{SpongeLayer2D, SpongeProfile, SourceTerm2D};
+//! use dgcom::SWEState2D;
 //!
 //! // Create sponge zones on left and right boundaries
 //! let domain = (0.0, 1000.0, 0.0, 500.0);

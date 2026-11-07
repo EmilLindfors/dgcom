@@ -9,7 +9,7 @@
 //! - `zeta` (sea surface height) and `h` (still-water depth),
 //! - `ubar_eastward`, `vbar_northward`: the z-level `u_eastward` and
 //!   `v_northward` averaged over the water column
-//!   ([`depth_average_z`](dg_rs::io::depth_average_z), trapezoid rule down
+//!   ([`depth_average_z`](dgcom::io::depth_average_z), trapezoid rule down
 //!   to `h`). NorKyst's aggregation has no barotropic velocity, and its
 //!   levels end at 300 m: deeper columns hold the 300 m value to the bed.
 //! - with `wind=1` also `Uwind_eastward`, `Vwind_northward`, the 10 m wind
@@ -56,8 +56,8 @@ mod app {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use dg_rs::io::depth_average_z;
-    use dg_rs::time::ModelClock;
+    use dgcom::io::depth_average_z;
+    use dgcom::time::ModelClock;
     use netcdf::{Extent, Variable};
 
     use super::dap::{

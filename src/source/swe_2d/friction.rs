@@ -353,9 +353,9 @@ impl SourceTerm2D for ChezyFriction2D {
 /// # Example
 ///
 /// ```
-/// use dg_rs::mesh::Mesh2D;
-/// use dg_rs::operators::DGOperators2D;
-/// use dg_rs::source::SpatiallyVaryingManning2D;
+/// use dgcom::mesh::Mesh2D;
+/// use dgcom::operators::DGOperators2D;
+/// use dgcom::source::SpatiallyVaryingManning2D;
 ///
 /// let mesh = Mesh2D::uniform_rectangle(0.0, 20.0, 0.0, 10.0, 4, 2);
 /// let ops = DGOperators2D::new(2);

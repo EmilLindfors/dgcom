@@ -10,17 +10,17 @@
 //!   horizontal (in proportion to the depth along each σ-surface) and in σ;
 //!   without the drift they leave the deep water.
 
-use dg_rs::mesh::{Bathymetry2D, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::particles::{
+use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::particles::{
     DiffusivityInTime, HorizontalDiffusivity, Particle2D, Particle3D, ParticleTracker2D,
     ParticleTracker3D, ParticleVelocity3D, SWEVelocity2D, Solution3DVelocity, WalkTracer,
     WithHorizontalDiffusivity2D,
 };
-use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{SWESolution2D, SWEState2D};
-use dg_rs::types::ElementIndex;
-use dg_rs::vertical::{SigmaGrid, UniformStretching};
+use dgcom::solver::state::Solution3D;
+use dgcom::solver::{SWESolution2D, SWEState2D};
+use dgcom::types::ElementIndex;
+use dgcom::vertical::{SigmaGrid, UniformStretching};
 
 const BINS: usize = 8;
 

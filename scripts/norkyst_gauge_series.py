@@ -12,7 +12,7 @@ NorKyst-800 sea level at tide gauges, in the gauge-file format.
 For each gauge in a CSV (`name,code,lat,lon`), snap to the nearest wet
 NorKyst cell (as `examples/norkyst_boundary_tides.rs` does for `points=`)
 and write NorKyst's hourly `zeta` over `[from, to)` as a text file that
-`dg_rs::io::read_tide_gauge_file` reads, so that the gauge and NorKyst go
+`dgcom::io::read_tide_gauge_file` reads, so that the gauge and NorKyst go
 through the same reader and the same harmonic fit (`examples/tide_gauge_fit.rs
 <gauge> compare=<this file>`).
 

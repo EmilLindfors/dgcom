@@ -1,4 +1,4 @@
-# Claude Guidelines for dg-rs
+# Claude Guidelines for DGCOM
 
 This is a high-performance Discontinuous Galerkin (DG) solver for coastal ocean modeling, targeting simulation of currents along the Norwegian coast. Numerical accuracy and computational efficiency are critical.
 

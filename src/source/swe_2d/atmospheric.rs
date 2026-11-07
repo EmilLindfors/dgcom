@@ -37,7 +37,7 @@
 //! # Example
 //!
 //! ```rust
-//! use dg_rs::source::AtmosphericPressure2D;
+//! use dgcom::source::AtmosphericPressure2D;
 //!
 //! // Uniform pressure gradient (1 hPa per 100 km from west)
 //! let pressure = AtmosphericPressure2D::uniform_gradient(1.0e-3, 0.0);
@@ -128,7 +128,7 @@ impl AtmosphericPressure2D {
     ///
     /// # Example
     /// ```rust
-    /// use dg_rs::source::AtmosphericPressure2D;
+    /// use dgcom::source::AtmosphericPressure2D;
     ///
     /// // 1 hPa per 100 km from west (pressure increasing eastward)
     /// let pressure = AtmosphericPressure2D::uniform_gradient(1.0e-3, 0.0);
@@ -158,7 +158,7 @@ impl AtmosphericPressure2D {
     ///
     /// # Example
     /// ```rust
-    /// use dg_rs::source::AtmosphericPressure2D;
+    /// use dgcom::source::AtmosphericPressure2D;
     ///
     /// // Gradient from southwest (typical Norwegian storm direction)
     /// let pressure = AtmosphericPressure2D::from_direction(1.5e-3, 225.0);
@@ -179,7 +179,7 @@ impl AtmosphericPressure2D {
     ///
     /// # Example
     /// ```rust
-    /// use dg_rs::source::AtmosphericPressure2D;
+    /// use dgcom::source::AtmosphericPressure2D;
     ///
     /// // Rotating gradient (e.g., passing weather system)
     /// let pressure = AtmosphericPressure2D::time_varying_gradient(|t| {
@@ -209,7 +209,7 @@ impl AtmosphericPressure2D {
     ///
     /// # Example
     /// ```rust
-    /// use dg_rs::source::AtmosphericPressure2D;
+    /// use dgcom::source::AtmosphericPressure2D;
     ///
     /// // Gaussian low pressure system moving eastward
     /// let pressure = AtmosphericPressure2D::spatio_temporal(|x, y, t| {
@@ -248,7 +248,7 @@ impl AtmosphericPressure2D {
     ///
     /// # Example
     /// ```rust
-    /// use dg_rs::source::AtmosphericPressure2D;
+    /// use dgcom::source::AtmosphericPressure2D;
     ///
     /// // Storm moving northeast at 15 m/s
     /// let storm = AtmosphericPressure2D::moving_storm(

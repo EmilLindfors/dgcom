@@ -8,7 +8,7 @@
 use bevy::prelude::*;
 use bevy::text::FontSize;
 use bevy::ui::{BackgroundGradient, ColorStop, LinearGradient};
-use dg_rs::time::ModelClock;
+use dgcom::time::ModelClock;
 
 use crate::actions::{Action, Actions};
 use crate::camera::OrbitCamera;

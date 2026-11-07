@@ -19,9 +19,9 @@ use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::text::FontSize;
-use dg_rs::mesh::PointLocator2D;
-use dg_rs::time::ModelClock;
-use dg_rs::types::ElementIndex;
+use dgcom::mesh::PointLocator2D;
+use dgcom::time::ModelClock;
+use dgcom::types::ElementIndex;
 
 use crate::actions::{Act, Action};
 use crate::field::Probe;
@@ -146,7 +146,7 @@ fn submerged_point(scenario: &Scenario, p: [f64; 2]) -> ([f64; 2], f64, f64) {
             .all(|&b| b <= -MIN_DEPTH)
     };
     let locator = PointLocator2D::new(mesh);
-    if let Some(probe) = dg_rs::solver::Probe2D::at(&locator, ops, p)
+    if let Some(probe) = dgcom::solver::Probe2D::at(&locator, ops, p)
         && submerged(probe.element().as_usize())
     {
         let depth: f64 = -probe

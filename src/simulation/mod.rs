@@ -8,9 +8,9 @@
 //!
 //! # Example
 //! ```ignore
-//! use dg_rs::simulation::Simulation;
-//! use dg_rs::physics::PhysicsBuilder;
-//! use dg_rs::time::SSPRK3;
+//! use dgcom::simulation::Simulation;
+//! use dgcom::physics::PhysicsBuilder;
+//! use dgcom::time::SSPRK3;
 //!
 //! let physics = PhysicsBuilder::swe_2d(mesh, ops, geom, equation, bc).build();
 //! let integrator = SSPRK3;

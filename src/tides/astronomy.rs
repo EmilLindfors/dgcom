@@ -562,7 +562,7 @@ fn nodal_factors(kind: NodalKind, n_rad: f64, p_rad: f64) -> (f64, f64) {
 /// # Example
 ///
 /// ```
-/// use dg_rs::tides::{AstronomicalArguments, nodal_correction};
+/// use dgcom::tides::{AstronomicalArguments, nodal_correction};
 ///
 /// let astro = AstronomicalArguments::at_datetime(2024, 1, 1, 0, 0, 0.0);
 /// let m2 = nodal_correction("M2", &astro).unwrap();

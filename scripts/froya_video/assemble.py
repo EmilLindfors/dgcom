@@ -30,7 +30,7 @@ shots = [
 title = ("Simulating the Norwegian coast",
          "Tides, 3D currents and waves around Frøya, mid-Norway",
          "A discontinuous Galerkin ocean model, written in Rust")
-end = ("dg-rs",
+end = ("dgcom",
        "Discontinuous Galerkin coastal ocean model, written in Rust",
        "Nested in NorKyst-800 · checked against Kartverket's tide gauges")
 TITLE_S, END_S = 3.5, 4.0

@@ -2514,7 +2514,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "dg-rs"
+name = "dg-viz"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "dgcom",
+ "rayon",
+]
+
+[[package]]
+name = "dgcom"
 version = "0.1.0"
 dependencies = [
  "faer",
@@ -2524,15 +2533,6 @@ dependencies = [
  "shapefile",
  "thiserror 2.0.21",
  "tiff",
-]
-
-[[package]]
-name = "dg-viz"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "dg-rs",
- "rayon",
 ]
 
 [[package]]

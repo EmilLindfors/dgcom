@@ -10,7 +10,7 @@
 //! ([`crate::photo`]) has none.
 
 use bevy::prelude::*;
-use dg_rs::mesh::PointLocator2D;
+use dgcom::mesh::PointLocator2D;
 
 use crate::actions::{Act, Action};
 use crate::camera::OrbitCamera;

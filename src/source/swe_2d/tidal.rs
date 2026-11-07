@@ -144,8 +144,8 @@ impl TidalPotentialConstituent {
 /// # Example
 ///
 /// ```
-/// use dg_rs::source::{TidalPotential, TidalPotentialConstituent, SourceTerm2D, SourceContext2D};
-/// use dg_rs::SWEState2D;
+/// use dgcom::source::{TidalPotential, TidalPotentialConstituent, SourceTerm2D, SourceContext2D};
+/// use dgcom::SWEState2D;
 ///
 /// // Create M2 tidal potential for Norwegian coast
 /// let m2 = TidalPotentialConstituent::m2(0.5, 0.0);

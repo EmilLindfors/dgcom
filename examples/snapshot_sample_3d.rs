@@ -27,10 +27,10 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 
-use dg_rs::io::{CoordinateProjection, LocalProjection, SnapshotFrame, SnapshotReader};
-use dg_rs::mesh::PointLocator2D;
-use dg_rs::operators::DGOperators2D;
-use dg_rs::solver::Probe2D;
+use dgcom::io::{CoordinateProjection, LocalProjection, SnapshotFrame, SnapshotReader};
+use dgcom::mesh::PointLocator2D;
+use dgcom::operators::DGOperators2D;
+use dgcom::solver::Probe2D;
 
 /// One observation and where it sits in the mesh.
 struct Observation {

@@ -6,8 +6,8 @@
 //!
 //! # Example
 //! ```
-//! use dg_rs::flux::{NumericalFlux2D, FluxContext2D, RoeFlux2D, HLLFlux2D};
-//! use dg_rs::solver::SWEState2D;
+//! use dgcom::flux::{NumericalFlux2D, FluxContext2D, RoeFlux2D, HLLFlux2D};
+//! use dgcom::solver::SWEState2D;
 //!
 //! let q_l = SWEState2D::new(2.0, 1.0, 0.0);
 //! let q_r = SWEState2D::new(1.0, 0.5, 0.0);

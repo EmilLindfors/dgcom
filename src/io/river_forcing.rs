@@ -436,7 +436,7 @@ mod netcdf_file {
         /// `river_transport`, `river_temp`, `river_salt` as `[time][river]`.
         pub fn write(&self, path: impl AsRef<Path>) -> Result<(), NetCDFError> {
             let mut file = netcdf::create(path.as_ref())?;
-            file.add_attribute("title", "River forcing (dg-rs RiverForcing)")?;
+            file.add_attribute("title", "River forcing (dgcom RiverForcing)")?;
             file.add_dimension("river", self.len())?;
             file.add_dimension("river_time", self.time.len())?;
             let ids: Vec<f64> = self.mouths.iter().map(|m| m.id as f64).collect();

@@ -14,7 +14,7 @@ use std::fmt::Debug;
 ///
 /// # Example
 /// ```
-/// use dg_rs::mesh::Point;
+/// use dgcom::mesh::Point;
 ///
 /// fn distance_from_origin<P: Point>(p: &P) -> f64 {
 ///     p.norm()

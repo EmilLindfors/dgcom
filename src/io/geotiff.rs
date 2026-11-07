@@ -597,7 +597,7 @@ mod tests {
     /// −(10·row + col + 1), the given georeferencing tags and GeoKeys.
     fn write_geotiff(name: &str, tags: &[(Tag, &[f64])], geo_keys: &[u16]) -> std::path::PathBuf {
         use tiff::encoder::{TiffEncoder, colortype::Gray32Float};
-        let path = std::env::temp_dir().join(format!("dg_rs_geotiff_{name}.tif"));
+        let path = std::env::temp_dir().join(format!("dgcom_geotiff_{name}.tif"));
         let data: Vec<f32> = (0..3)
             .flat_map(|row| (0..4).map(move |col| -((10 * row + col + 1) as f32)))
             .collect();
@@ -624,7 +624,7 @@ mod tests {
     /// `tiff` crate's encoder writes neither tiles nor sparse chunks.
     fn write_sparse_tiled(name: &str, nodata: Option<&str>) -> std::path::PathBuf {
         const TILE: u32 = 16;
-        let path = std::env::temp_dir().join(format!("dg_rs_geotiff_{name}.tif"));
+        let path = std::env::temp_dir().join(format!("dgcom_geotiff_{name}.tif"));
         let tile = |t: u32| -> Vec<u8> {
             (0..TILE)
                 .flat_map(|r| (0..TILE).map(move |c| (r, t * TILE + c)))

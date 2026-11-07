@@ -10,7 +10,7 @@ use std::fmt;
 /// # Example
 ///
 /// ```
-/// use dg_rs::types::Bounds2D;
+/// use dgcom::types::Bounds2D;
 ///
 /// // Norwegian coastal domain (approximate)
 /// let bounds = Bounds2D::new(

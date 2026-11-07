@@ -15,7 +15,7 @@
 //!
 //! # Example
 //! ```ignore
-//! use dg_rs::physics::{SWEPhysics2D, PhysicsBuilder};
+//! use dgcom::physics::{SWEPhysics2D, PhysicsBuilder};
 //!
 //! let physics = PhysicsBuilder::swe_2d()
 //!     .with_flux(StandardFlux2D::Roe)

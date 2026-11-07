@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```
-//! use dg_rs::mesh::{Mesh2DBuilder, BoundaryTag};
+//! use dgcom::mesh::{Mesh2DBuilder, BoundaryTag};
 //!
 //! // Simple uniform mesh with default (Wall) boundaries
 //! let mesh = Mesh2DBuilder::new(0.0, 100.0, 0.0, 50.0)
@@ -70,7 +70,7 @@ impl Default for BoundaryConfig {
 /// # Example
 ///
 /// ```
-/// use dg_rs::mesh::{Mesh2DBuilder, BoundaryTag};
+/// use dgcom::mesh::{Mesh2DBuilder, BoundaryTag};
 ///
 /// let mesh = Mesh2DBuilder::new(0.0, 100.0, 0.0, 50.0)
 ///     .with_resolution(20, 10)
@@ -133,8 +133,8 @@ impl Mesh2DBuilder {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::mesh::Mesh2DBuilder;
-    /// use dg_rs::types::Bounds2D;
+    /// use dgcom::mesh::Mesh2DBuilder;
+    /// use dgcom::types::Bounds2D;
     ///
     /// let bounds = Bounds2D::new(0.0, 100e3, 0.0, 50e3);
     /// let mesh = Mesh2DBuilder::from_bounds(bounds)
@@ -150,8 +150,8 @@ impl Mesh2DBuilder {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::mesh::Mesh2DBuilder;
-    /// use dg_rs::types::Resolution2D;
+    /// use dgcom::mesh::Mesh2DBuilder;
+    /// use dgcom::types::Resolution2D;
     ///
     /// let mesh = Mesh2DBuilder::unit_square()
     ///     .with_grid(Resolution2D::new(32, 32))
@@ -168,8 +168,8 @@ impl Mesh2DBuilder {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::mesh::{Mesh2DBuilder, BoundaryTag};
-    /// use dg_rs::types::SideBoundaries;
+    /// use dgcom::mesh::{Mesh2DBuilder, BoundaryTag};
+    /// use dgcom::types::SideBoundaries;
     ///
     /// let bcs = SideBoundaries::new(
     ///     BoundaryTag::Wall,   // south

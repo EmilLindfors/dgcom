@@ -4,6 +4,13 @@ All notable changes to this project should be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Renamed to DGCOM, the Discontinuous Galerkin Coastal Ocean Model (`notes/tech-debt.md`).**
+  - The crate `dg-rs` is now `dgcom`, so `use dg_rs::…` becomes `use dgcom::…`.
+  - "roms-rs" read as a port of ROMS, which this model is not.
+  - Restart, snapshot and particle files keep their format, so files written before the rename still load.
+
 ### Added
 
 - **Why NorKyst-800 carries only a quarter of the inverse barometer (TODO P1.5; `notes/norkyst-issues.md` §6 "Cause").**

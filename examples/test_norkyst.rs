@@ -14,14 +14,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use dg_rs::boundary::{
+    use dgcom::boundary::{
         BCContext2D, CharacteristicOBC, ExternalStateProvider, NestingOptions, OceanModelState,
         ParentDatum, SWEBoundaryCondition2D,
     };
-    use dg_rs::io::{LocalProjection, OceanModelReader};
-    use dg_rs::mesh::{BoundaryTag, Mesh2D};
-    use dg_rs::operators::DGOperators2D;
-    use dg_rs::solver::SWEState2D;
+    use dgcom::io::{LocalProjection, OceanModelReader};
+    use dgcom::mesh::{BoundaryTag, Mesh2D};
+    use dgcom::operators::DGOperators2D;
+    use dgcom::solver::SWEState2D;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let path = args

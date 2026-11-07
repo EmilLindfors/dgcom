@@ -30,7 +30,7 @@ use crate::solver::SWEState2D;
 ///
 /// # Example
 /// ```ignore
-/// use dg_rs::{HydrostaticReconstruction2D, SWEState2D};
+/// use dgcom::{HydrostaticReconstruction2D, SWEState2D};
 ///
 /// let hr = HydrostaticReconstruction2D::standard();
 ///

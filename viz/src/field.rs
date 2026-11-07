@@ -7,16 +7,16 @@
 //! time between the two snapshots around it; in a 3D run (u, v) is the depth mean or
 //! the σ-layer [`ShownLayer`] picks, and in a run with waves the sea state too (the
 //! direction as its vector). A [`Probe`] evaluates a nodal field at a point by
-//! the element's own polynomial (`dg_rs::solver::Probe2D`'s weights).
+//! the element's own polynomial (`dgcom::solver::Probe2D`'s weights).
 //!
 //! World frame: Bevy is +Y up, so mesh (x, y, z) goes to (x − x₀, z·vz, −(y − y₀)), the
 //! origin at the mesh's centre and heights exaggerated `vz` times.
 
 use bevy::prelude::*;
-use dg_rs::mesh::PointLocator2D;
-use dg_rs::operators::DGOperators2D;
-use dg_rs::solver::Probe2D;
-use dg_rs::types::ElementIndex;
+use dgcom::mesh::PointLocator2D;
+use dgcom::operators::DGOperators2D;
+use dgcom::solver::Probe2D;
+use dgcom::types::ElementIndex;
 
 use crate::playback::Playback;
 use crate::scenario::Scenario;

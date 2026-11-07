@@ -31,7 +31,7 @@
 //! # Example
 //!
 //! ```
-//! use dg_rs::vertical::{SigmaGrid, UniformStretching, SongHaidvogelStretching};
+//! use dgcom::vertical::{SigmaGrid, UniformStretching, SongHaidvogelStretching};
 //!
 //! // Create a 35-level grid with ROMS-style stretching
 //! let stretching = SongHaidvogelStretching {
@@ -60,7 +60,7 @@
 //! For 3D simulations, use batch operations to avoid allocations in hot paths:
 //!
 //! ```
-//! use dg_rs::vertical::{SigmaGrid, UniformStretching};
+//! use dgcom::vertical::{SigmaGrid, UniformStretching};
 //!
 //! let grid = SigmaGrid::new(35, UniformStretching);
 //!
@@ -91,7 +91,7 @@
 //! - Critical depth hc = 200-300m for deep fjords
 //!
 //! ```
-//! use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
+//! use dgcom::vertical::{SigmaGrid, SongHaidvogelStretching};
 //!
 //! // Norwegian fjord configuration
 //! let fjord_grid = SigmaGrid::new(

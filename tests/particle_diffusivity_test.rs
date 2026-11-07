@@ -1,5 +1,5 @@
 //! Gates for the random walk in a horizontal diffusivity that varies in
-//! space (`dg_rs::particles::diffusivity`, TODO F.2).
+//! space (`dgcom::particles::diffusivity`, TODO F.2).
 //!
 //! - Visser's well-mixed condition in 2D: a uniform distribution in a closed
 //!   basin stays uniform under a `K(x, y)` varying tenfold, with the drift
@@ -8,14 +8,14 @@
 //!   levels) adds to the tracker's constant: the spread is `2(K_field +
 //!   K_tracker)t`.
 
-use dg_rs::mesh::Mesh2D;
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::particles::{
+use dgcom::mesh::Mesh2D;
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::particles::{
     DiffusivityInTime, HorizontalDiffusivity, NodalVelocity2D, Particle2D, ParticleTracker2D,
     ParticleTracker3D, ParticleVelocity2D, ParticleVelocity3D, WithHorizontalDiffusivity2D,
     WithHorizontalDiffusivity3D,
 };
-use dg_rs::types::ElementIndex;
+use dgcom::types::ElementIndex;
 
 /// Nodal values of `f(x, y)`, element by element.
 fn nodal(mesh: &Mesh2D, ops: &DGOperators2D, f: impl Fn(f64, f64) -> f64) -> Vec<f64> {

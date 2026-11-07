@@ -1,4 +1,4 @@
-//! dg-viz: a 3D view of a dg-rs simulation while it runs.
+//! dg-viz: a 3D view of a dgcom simulation while it runs.
 //!
 //! The solver runs on its own thread ([`solver`]) and sends a snapshot of η and the
 //! depth-averaged current every `--interval` seconds of model time; the viewer plays
@@ -87,7 +87,7 @@
 //!   so a replay's or a `--start`-dated run's
 //! - `--sigma N` σ-levels of a 3D run [16; 12 for `fjord3d`]; `--start TIME` the UTC
 //!   instant of model time 0, for the larvae's daylight [2025-06-15T00:00:00Z]; `--lice
-//!   ladim|johnsen|passive` the larvae's behaviour (`dg_rs::particles::SalmonLice`)
+//!   ladim|johnsen|passive` the larvae's behaviour (`dgcom::particles::SalmonLice`)
 //!   [ladim]; `--sheet density|salinity|temperature|off` what the stratification
 //!   sheet follows at the start ([`stratification`]) [density]; `--layer
 //!   mean|surface|bed|N` the current the water shows at the start (N: σ-layer from the
@@ -186,8 +186,8 @@ use std::sync::Mutex;
 use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
-use dg_rs::mesh::PointLocator2D;
-use dg_rs::time::ModelClock;
+use dgcom::mesh::PointLocator2D;
+use dgcom::time::ModelClock;
 
 use arrows::{Arrows, ArrowsPlugin};
 use cages::{CageLayout, CagesPlugin};
@@ -573,7 +573,7 @@ pub struct Run {
 }
 
 impl Run {
-    /// Build the run the options `given` ask for, under the dg-rs checkout `repo`.
+    /// Build the run the options `given` ask for, under the dgcom checkout `repo`.
     pub fn build(given: Vec<String>, repo: &Path) -> Result<Self, Failed> {
         let args = Args::parse(&given).map_err(|e| fail(2, e))?;
         // A snapshot file holds its own domain; VTU frames are of a Frøya run unless
@@ -680,7 +680,7 @@ impl Run {
                     ),
                 ));
             };
-            let site = dg_rs::io::read_farm_site_file(path)
+            let site = dgcom::io::read_farm_site_file(path)
                 .map_err(|e| fail(1, format!("cannot read the site {}: {e}", path.display())))?;
             let cages = site::site_cages(&site, &projection, &scenario.cages);
             println!(
@@ -899,7 +899,7 @@ impl Run {
         let gauge = match &args.gauge {
             None => None,
             Some(path) => {
-                let file = dg_rs::io::read_tide_gauge_file(path).map_err(|e| {
+                let file = dgcom::io::read_tide_gauge_file(path).map_err(|e| {
                     fail(1, format!("cannot read the gauge {}: {e}", path.display()))
                 })?;
                 let name = file.station.as_ref().map_or_else(
@@ -1157,7 +1157,7 @@ impl Run {
             // The real sun stands over the domain's centre
             place: scenario.projection.map(|p| {
                 let [x, y] = frame.origin;
-                let (lat, lon) = dg_rs::io::CoordinateProjection::xy_to_geo(&p, x, y);
+                let (lat, lon) = dgcom::io::CoordinateProjection::xy_to_geo(&p, x, y);
                 [lat, lon]
             }),
             ..args.photo.clone()

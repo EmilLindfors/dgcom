@@ -5,14 +5,14 @@
 //! Benchmarks Coriolis, Manning friction, bathymetry, and combined source terms.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use dg_rs::mesh::{Bathymetry2D, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{SWESolution2D, SWEState2D};
-use dg_rs::source::{
+use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::solver::{SWESolution2D, SWEState2D};
+use dgcom::source::{
     BathymetrySource2D, CombinedSource2D, CoriolisSource2D, ManningFriction2D, SourceContext2D,
     SourceTerm2D,
 };
-use dg_rs::types::ElementIndex;
+use dgcom::types::ElementIndex;
 
 const G: f64 = 9.81;
 const H_MIN: f64 = 1e-6;

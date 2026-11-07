@@ -9,16 +9,16 @@
 //!    cells for `days` days from `start` (one window request per day and
 //!    variable: THREDDS pays per stored chunk, not per cell).
 //! 3. Depth-average the velocities over the water column
-//!    ([`depth_average_z`](dg_rs::io::depth_average_z)).
+//!    ([`depth_average_z`](dgcom::io::depth_average_z)).
 //! 4. Fit reference constants `(H, G)` of η, ū and v̄ with
-//!    [`HarmonicAnalysis::fit`](dg_rs::analysis::HarmonicAnalysis::fit) (V₀ at the first sample, f and u at the
+//!    [`HarmonicAnalysis::fit`](dgcom::analysis::HarmonicAnalysis::fit) (V₀ at the first sample, f and u at the
 //!    record midpoint), inferring P1 from K1 and K2 from S2: at the
 //!    equilibrium ratios, or with `ratios=<series>` at the ratios NorKyst
 //!    itself carries, fitted from its ζ at one cell over half a year or more
 //!    (`scripts/norkyst_gauge_series.py`), so that the atlas holds NorKyst's
 //!    own K2 and P1 (0.8× and 1.1–1.4× the equilibrium ones in 2026), as
 //!    `froya_real_data nest_tides=theory` needs.
-//! 5. Write the atlas (text format of `dg_rs::boundary::TidalAtlas`).
+//! 5. Write the atlas (text format of `dgcom::boundary::TidalAtlas`).
 //!
 //! `points=lon,lat;lon,lat…` also fits those points (e.g. tide gauges inside
 //! the domain, for validation), snapped to the nearest wet cell, into a
@@ -61,10 +61,10 @@ mod app {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use dg_rs::analysis::{AnalysisError, HarmonicAnalysis, Inference, ReferenceFit};
-    use dg_rs::boundary::{AtlasConstituent, AtlasPoint, TidalAtlas};
-    use dg_rs::io::{depth_average_z, read_tide_gauge_file};
-    use dg_rs::time::ModelClock;
+    use dgcom::analysis::{AnalysisError, HarmonicAnalysis, Inference, ReferenceFit};
+    use dgcom::boundary::{AtlasConstituent, AtlasPoint, TidalAtlas};
+    use dgcom::io::{depth_average_z, read_tide_gauge_file};
+    use dgcom::time::ModelClock;
     use netcdf::Variable;
 
     use super::dap::{attribute_f64, locate_window, retry, slice};
@@ -397,7 +397,7 @@ mod app {
         // Harmonic fits: perimeter cells into `atlas`, requested points into
         // `stations`
         let header = vec![
-            "dg-rs tidal atlas: reference constants (H, Greenwich lag G)".to_string(),
+            "dgcom tidal atlas: reference constants (H, Greenwich lag G)".to_string(),
             format!("source: NorKyst-800 {}", opts.url),
             format!(
                 "record: {} + {} days hourly; fit {} with {} inferred {how}",

@@ -28,7 +28,7 @@
 //! # Example
 //!
 //! ```
-//! use dg_rs::vertical::{SigmaGrid, UniformStretching, SongHaidvogelStretching};
+//! use dgcom::vertical::{SigmaGrid, UniformStretching, SongHaidvogelStretching};
 //!
 //! // Create a 35-level sigma grid with uniform spacing
 //! let grid = SigmaGrid::new(35, UniformStretching);
@@ -91,7 +91,7 @@ impl SigmaGrid {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::vertical::{SigmaGrid, UniformStretching};
+    /// use dgcom::vertical::{SigmaGrid, UniformStretching};
     ///
     /// let grid = SigmaGrid::new(35, UniformStretching);
     /// assert_eq!(grid.n_levels(), 35);
@@ -216,7 +216,7 @@ impl SigmaGrid {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::vertical::{SigmaGrid, UniformStretching};
+    /// use dgcom::vertical::{SigmaGrid, UniformStretching};
     ///
     /// let grid = SigmaGrid::new(10, UniformStretching);
     ///
@@ -275,8 +275,8 @@ impl SigmaGrid {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::vertical::{SigmaGrid, UniformStretching};
-    /// use dg_rs::types::{Sigma, Elevation, Depth};
+    /// use dgcom::vertical::{SigmaGrid, UniformStretching};
+    /// use dgcom::types::{Sigma, Elevation, Depth};
     ///
     /// let grid = SigmaGrid::new(10, UniformStretching);
     /// let sigma = Sigma::new(-0.5);

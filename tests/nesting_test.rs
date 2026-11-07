@@ -23,23 +23,23 @@
 use std::f64::consts::PI;
 use std::sync::Arc;
 
-use dg_rs::boundary::{
+use dgcom::boundary::{
     CharacteristicOBC, InverseBarometer, MultiBoundaryCondition2D, NestingOptions, OceanModelState,
     ParentDatum, Reflective2D, SWEBoundaryCondition2D, StillWater,
 };
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::io::{
+use dgcom::equations::ShallowWater2D;
+use dgcom::io::{
     AtmosphereField, AtmosphereReader, CoordinateProjection, FieldSeries, GeoGrid, LocalProjection,
     OceanModelReader, P_REFERENCE, TimeInterpolation,
 };
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{PhysicsBuilder, SWEPhysics2DBuilder};
-use dg_rs::simulation::Simulation;
-use dg_rs::solver::{SWEFormulation2D, SWESolution2D, SWEState2D};
-use dg_rs::source::{GriddedAtmosphere2D, RHO_AIR, RHO_WATER};
-use dg_rs::time::{ModelClock, SSPRK3};
-use dg_rs::types::ElementIndex;
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{PhysicsBuilder, SWEPhysics2DBuilder};
+use dgcom::simulation::Simulation;
+use dgcom::solver::{SWEFormulation2D, SWESolution2D, SWEState2D};
+use dgcom::source::{GriddedAtmosphere2D, RHO_AIR, RHO_WATER};
+use dgcom::time::{ModelClock, SSPRK3};
+use dgcom::types::ElementIndex;
 
 const G: f64 = 9.81;
 /// 2025-06-15 00:00 UTC

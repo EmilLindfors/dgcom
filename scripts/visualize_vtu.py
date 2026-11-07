@@ -8,7 +8,7 @@
 # ]
 # ///
 """
-Visualize VTU output from dg-rs shallow water simulations.
+Visualize VTU output from dgcom shallow water simulations.
 
 Usage:
     uv run scripts/visualize_vtu.py output/froya/froya_0006.vtu

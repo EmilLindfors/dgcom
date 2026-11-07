@@ -6,8 +6,8 @@
 //! - Dam break evolution
 //! - Coriolis effects
 
-use dg_rs::types::ElementIndex;
-use dg_rs::{
+use dgcom::types::ElementIndex;
+use dgcom::{
     DGOperators2D, GeometricFactors2D, Mesh2D, Reflective2D, SWE2DRhsConfig, SWEFluxType2D,
     SWESolution2D, SWEState2D, ShallowWater2D, compute_dt_swe_2d, compute_rhs_swe_2d,
 };
@@ -19,7 +19,7 @@ fn k(idx: usize) -> ElementIndex {
 const G: f64 = 10.0;
 
 /// Run SSP-RK3 step for 2D SWE.
-fn ssp_rk3_swe_step<BC: dg_rs::SWEBoundaryCondition2D>(
+fn ssp_rk3_swe_step<BC: dgcom::SWEBoundaryCondition2D>(
     q: &mut SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
@@ -60,9 +60,9 @@ fn ssp_rk3_swe_step<BC: dg_rs::SWEBoundaryCondition2D>(
 /// serves as the negative control. (This test used a flat bottom.)
 #[test]
 fn test_lake_at_rest() {
-    use dg_rs::mesh::Bathymetry2D;
-    use dg_rs::solver::SWEFormulation2D;
-    use dg_rs::source::BathymetrySource2D;
+    use dgcom::mesh::Bathymetry2D;
+    use dgcom::solver::SWEFormulation2D;
+    use dgcom::source::BathymetrySource2D;
 
     let bed = |x: f64, y: f64| {
         let slope = 0.5 * (1.0 + ((x - 5_000.0) / 1_200.0).tanh()); // 0 → 1 across the slope
@@ -96,7 +96,7 @@ fn test_lake_at_rest() {
             #[cfg(feature = "parallel")]
             {
                 let parallel =
-                    dg_rs::compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, config, 0.0);
+                    dgcom::compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, config, 0.0);
                 assert_eq!(serial.data, parallel.data, "p={order}: serial ≠ parallel");
             }
             let max = |v: &[f64]| v.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
@@ -625,15 +625,15 @@ fn test_long_term_stability() {
 fn test_multi_day_tidal_run() {
     use std::sync::Arc;
 
-    use dg_rs::boundary::{
+    use dgcom::boundary::{
         CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, TidalConstituent,
     };
-    use dg_rs::mesh::{Bathymetry2D, BoundaryTag};
-    use dg_rs::physics::PhysicsBuilder;
-    use dg_rs::simulation::Simulation;
-    use dg_rs::solver::SWEFormulation2D;
-    use dg_rs::source::{CoriolisSource2D, ManningFriction2D};
-    use dg_rs::time::SSPRK3;
+    use dgcom::mesh::{Bathymetry2D, BoundaryTag};
+    use dgcom::physics::PhysicsBuilder;
+    use dgcom::simulation::Simulation;
+    use dgcom::solver::SWEFormulation2D;
+    use dgcom::source::{CoriolisSource2D, ManningFriction2D};
+    use dgcom::time::SSPRK3;
 
     let (lx, ly, amplitude) = (40_000.0, 20_000.0, 0.5);
     let period = TidalConstituent::m2(amplitude, 0.0).period;

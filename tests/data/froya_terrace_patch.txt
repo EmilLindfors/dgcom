@@ -1,4 +1,4 @@
-# dg-rs patch fixture: the elements of froya_coast.msh within 400 m of element 11048, bed smoothed for 3D (slopes3d), walls around
+# dgcom patch fixture: the elements of froya_coast.msh within 400 m of element 11048, bed smoothed for 3D (slopes3d), walls around
 vertices 32
 0 0
 321.4971820743558 55.123059836354514

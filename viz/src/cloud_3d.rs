@@ -4,7 +4,7 @@
 //! ([`KINDS`]): sea-lice larvae over the top 5 m, swimming by `SalmonLice` (up towards
 //! the light of [`crate::scenario::ThreeD::light`], down out of fresh water) unless
 //! passive; faeces sinking at 3 cm/s over the net's depth; feed pellets sinking at
-//! 10 cm/s over the top 2 m. They move with `dg_rs::particles::ParticleTracker3D`
+//! 10 cm/s over the top 2 m. They move with `dgcom::particles::ParticleTracker3D`
 //! (RK4 in the 3D velocity, linear in time between the solver's states, a horizontal
 //! random walk and Visser's vertical walk in the model's eddy diffusivity); faeces and
 //! feed settle on the bed.
@@ -12,14 +12,14 @@
 //! Each kind is stepped as one slice (a behaviour belongs to a species); the snapshot
 //! lists the particles in release order, so particle `i` is the same in every snapshot.
 
-use dg_rs::mesh::{Bathymetry2D, Mesh2D, MeshPoint};
-use dg_rs::operators::DGOperators2D;
-use dg_rs::particles::{
+use dgcom::mesh::{Bathymetry2D, Mesh2D, MeshPoint};
+use dgcom::operators::DGOperators2D;
+use dgcom::particles::{
     ClearSkyLight, Particle3D, ParticleTracker3D, SalmonLice, Solution3DVelocity,
 };
-use dg_rs::solver::state::Solution3D;
-use dg_rs::source::NetCage;
-use dg_rs::vertical::SigmaGrid;
+use dgcom::solver::state::Solution3D;
+use dgcom::source::NetCage;
+use dgcom::vertical::SigmaGrid;
 
 use crate::particles::{Lice, MAX_STEP, ParticleConfig, ParticleSnapshot, state_of};
 

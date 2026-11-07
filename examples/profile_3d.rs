@@ -20,23 +20,23 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::Mesh2D;
-use dg_rs::mesh::data::Bathymetry2D;
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::Mesh2D;
+use dgcom::mesh::data::Bathymetry2D;
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{
     BottomDrag3D, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, PacanowskiPhilanderMixing,
     PhysicsBuilder, VerticalMixing,
 };
-use dg_rs::solver::rhs::{BarotropicFlux, MomentumAdvectionForm, VerticalAdvection};
-use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{
+use dgcom::solver::rhs::{BarotropicFlux, MomentumAdvectionForm, VerticalAdvection};
+use dgcom::solver::state::Solution3D;
+use dgcom::solver::{
     Blocks, SWEFormulation2D, SWESolution2D, TracerLimiter3DConfig, TracerLimiterType3D,
 };
-use dg_rs::source::CoriolisSource2D;
-use dg_rs::time::{ModeSplitIntegrator, ModeSplitPhysics, StageElements, StepDrag};
-use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
+use dgcom::source::CoriolisSource2D;
+use dgcom::time::{ModeSplitIntegrator, ModeSplitPhysics, StageElements, StepDrag};
+use dgcom::vertical::{SigmaGrid, SongHaidvogelStretching};
 
 const G: f64 = 9.81;
 const RHO0: f64 = 1025.0;
@@ -158,7 +158,7 @@ impl<P: ModeSplitPhysics> ModeSplitPhysics for Timed<'_, P> {
         self.time("end_density", || self.inner.end_density(state, elements))
     }
 
-    fn stage_stencils(&self) -> Vec<dg_rs::time::RhsStencil> {
+    fn stage_stencils(&self) -> Vec<dgcom::time::RhsStencil> {
         self.inner.stage_stencils()
     }
 
@@ -166,7 +166,7 @@ impl<P: ModeSplitPhysics> ModeSplitPhysics for Timed<'_, P> {
         &self,
         state: &mut Solution3D,
         elements: Blocks,
-        stash: &mut dg_rs::time::StageStash,
+        stash: &mut dgcom::time::StageStash,
     ) {
         self.inner.mask_stage(state, elements, stash)
     }

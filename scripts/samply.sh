@@ -1,5 +1,5 @@
 #!/bin/bash
-# Samply profiling script for dg-rs examples
+# Samply profiling script for dgcom examples
 #
 # Samply is a modern sampling profiler with an excellent web UI.
 # It's often easier to use than perf/flamegraph on Linux.

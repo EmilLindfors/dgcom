@@ -1,6 +1,6 @@
 //! The bed and the water as meshes of the DG nodes themselves.
 //!
-//! Each element of order p is drawn as p² quads between its GLL nodes (as `dg_rs::io`'s
+//! Each element of order p is drawn as p² quads between its GLL nodes (as `dgcom::io`'s
 //! VTK writer does), with the elements' own nodes, so jumps between elements show as
 //! they are. Normals are those of the element polynomial ([`Nodes::normals`]), so the
 //! lighting follows the solution rather than the triangulation.

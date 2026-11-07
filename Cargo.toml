@@ -1,8 +1,8 @@
 [package]
-name = "dg-rs"
+name = "dgcom"
 version = "0.1.0"
 edition = "2024"
-description = "Discontinuous Galerkin methods in Rust"
+description = "DGCOM: a discontinuous Galerkin coastal ocean model"
 license = "MIT"
 
 [features]

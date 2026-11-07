@@ -52,7 +52,7 @@ mod app {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use dg_rs::time::ModelClock;
+    use dgcom::time::ModelClock;
 
     use super::dap::{
         Window, arguments, attribute_string, locate_window, parse_bbox, retry, slice,

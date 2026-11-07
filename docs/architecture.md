@@ -18,11 +18,11 @@ This document describes what exists and how it fits together. Open work is in
 
 | Principle | Approach |
 |-----------|----------|
-| Single crate (for now) | 19 modules, ~127k lines; a `dg-core` / `roms-rs` workspace split is the likely end state (TODO P6) |
+| Single crate (for now) | 19 modules, ~127k lines; the crate is `dgcom` (2026-11-07); splitting the DG core from the ocean model into a workspace is the likely end state (TODO P6) |
 | Concrete first | `Mesh1D`, `Mesh2D`; generic traits (`Integrable`, `SourceTerm2D`) added once 2+ implementations existed |
 | faer for LA | Dense element-local operators; QR/SVD available for least-squares (harmonic analysis) |
 | f64 everywhere | Coastal stability requires double precision |
-| Norwegian focus | Fjords, tides, wetting/drying — not generality |
+| Norwegian coast first | Fjords, tides, wetting/drying, tuned on Frøya and Bodø; any coastal domain from a case file next (TODO P8) |
 
 ## Module Structure (current)
 

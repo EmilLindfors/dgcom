@@ -468,7 +468,7 @@ impl SnapshotReader {
             .map_err(|_| SnapshotError::Format("shorter than its magic number".into()))?;
         if &start[..7] != MAGIC {
             return Err(SnapshotError::Format(
-                "wrong magic number (not a dg-rs snapshot)".into(),
+                "wrong magic number (not a dgcom snapshot)".into(),
             ));
         }
         let version = start[7];
@@ -821,7 +821,7 @@ mod tests {
     use crate::types::ElementIndex;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("dg-rs-snapshot-{}-{name}", std::process::id()))
+        std::env::temp_dir().join(format!("dgcom-snapshot-{}-{name}", std::process::id()))
     }
 
     /// A periodic channel with an open end tag: every kind of face

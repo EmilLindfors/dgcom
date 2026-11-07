@@ -38,13 +38,13 @@ use crate::types::Depth;
 /// # Example
 ///
 /// ```
-/// use dg_rs::equations::ShallowWater2D;
+/// use dgcom::equations::ShallowWater2D;
 ///
 /// // Norwegian coast at 60°N
 /// let swe = ShallowWater2D::with_coriolis(9.81, 1.2e-4);
 ///
 /// // Compute fluxes
-/// let state = dg_rs::SWEState2D::from_primitives(2.0, 1.0, 0.5);
+/// let state = dgcom::SWEState2D::from_primitives(2.0, 1.0, 0.5);
 /// let fx = swe.flux_x(&state);
 /// let fy = swe.flux_y(&state);
 /// ```

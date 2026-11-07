@@ -5,7 +5,7 @@
 //! 2. Smagorinsky smoke test: short simulation doesn't blow up
 //! 3. Parallel consistency: parallel RHS matches sequential
 
-use dg_rs::{
+use dgcom::{
     DGOperators2D, GeometricFactors2D, HorizontalViscosity2D, Mesh2D, Reflective2D, SWE2DRhsConfig,
     SWEFluxType2D, SWESolution2D, ShallowWater2D, compute_dt_swe_2d, compute_dt_viscosity,
     compute_rhs_swe_2d,
@@ -13,7 +13,7 @@ use dg_rs::{
 use std::f64::consts::PI;
 
 /// SSP-RK3 step for SWE with viscosity.
-fn ssp_rk3_step<BC: dg_rs::SWEBoundaryCondition2D>(
+fn ssp_rk3_step<BC: dgcom::SWEBoundaryCondition2D>(
     q: &mut SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
@@ -276,7 +276,7 @@ fn test_compute_dt_viscosity() {
 #[cfg(all(feature = "parallel", feature = "simd"))]
 #[test]
 fn test_viscosity_parallel_consistency() {
-    use dg_rs::compute_rhs_swe_2d_parallel;
+    use dgcom::compute_rhs_swe_2d_parallel;
 
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 4, 4);
     let ops = DGOperators2D::new(2);
@@ -325,9 +325,9 @@ fn test_viscosity_parallel_consistency() {
 /// ε·sin(y)·exp(−νt). The same run without viscosity must not decay.
 #[test]
 fn test_physics_builder_viscosity_decays_shear_flow() {
-    use dg_rs::Simulation;
-    use dg_rs::physics::PhysicsBuilder;
-    use dg_rs::time::SSPRK3;
+    use dgcom::Simulation;
+    use dgcom::physics::PhysicsBuilder;
+    use dgcom::time::SSPRK3;
     use std::sync::Arc;
 
     let (nu, eps, t_end) = (0.1, 0.01, 1.0);
@@ -371,9 +371,9 @@ fn test_physics_builder_viscosity_decays_shear_flow() {
 /// ε·sin(y)·exp(−νt) of `test_physics_builder_viscosity_decays_shear_flow`)
 /// run through `Simulation` at CFL 1 with the time step it chooses.
 fn simulated_shear_decay(nu: f64, t_end: f64, local: bool, grade: f64) -> f64 {
-    use dg_rs::Simulation;
-    use dg_rs::physics::PhysicsBuilder;
-    use dg_rs::time::{MultirateSSPRK3, SSPRK3};
+    use dgcom::Simulation;
+    use dgcom::physics::PhysicsBuilder;
+    use dgcom::time::{MultirateSSPRK3, SSPRK3};
     use std::sync::Arc;
 
     let eps = 0.01;
@@ -454,7 +454,7 @@ fn test_viscous_decay_under_local_time_stepping() {
 /// and not far below it.
 #[test]
 fn test_viscous_dt_bounds_the_br1_spectral_radius() {
-    use dg_rs::solver::{SWEFormulation2D, element_dt_viscous_swe_2d};
+    use dgcom::solver::{SWEFormulation2D, element_dt_viscous_swe_2d};
 
     let nu = 1.0;
     let visc = HorizontalViscosity2D::constant(nu);
@@ -517,9 +517,9 @@ fn test_viscous_dt_bounds_the_br1_spectral_radius() {
 /// step. As the shear decays, ν falls with it and the step grows.
 #[test]
 fn smagorinsky_viscosity_bounds_the_time_step() {
-    use dg_rs::Simulation;
-    use dg_rs::physics::{PhysicsBuilder, PhysicsModule};
-    use dg_rs::time::SSPRK3;
+    use dgcom::Simulation;
+    use dgcom::physics::{PhysicsBuilder, PhysicsModule};
+    use dgcom::time::SSPRK3;
     use std::sync::Arc;
 
     let mesh = Arc::new(Mesh2D::uniform_periodic(0.0, 2.0 * PI, 0.0, 2.0 * PI, 8, 8));

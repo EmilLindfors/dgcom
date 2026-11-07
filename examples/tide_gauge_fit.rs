@@ -1,7 +1,7 @@
 //! Harmonic reference constants of a tide-gauge record, optionally compared
 //! with a tidal atlas or with a second series (e.g. NorKyst-800 at the gauge).
 //!
-//! 1. Read a gauge file (`dg_rs::io::read_tide_gauge_file`, ISO times, e.g.
+//! 1. Read a gauge file (`dgcom::io::read_tide_gauge_file`, ISO times, e.g.
 //!    from `scripts/kartverket_gauge.sh`), keep `[from, to)`.
 //! 2. Fit reference constants (`HarmonicAnalysis::fit`) of every constituent
 //!    the record resolves (`HarmonicAnalysis::resolvable`, Rayleigh factor
@@ -31,11 +31,11 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use dg_rs::analysis::{ConstituentComparison, HarmonicAnalysis, Inference, ReferenceFit};
-use dg_rs::boundary::TidalAtlas;
-use dg_rs::io::{TideGaugeFile, read_tide_gauge_file};
-use dg_rs::tides::AdmittanceInference;
-use dg_rs::time::ModelClock;
+use dgcom::analysis::{ConstituentComparison, HarmonicAnalysis, Inference, ReferenceFit};
+use dgcom::boundary::TidalAtlas;
+use dgcom::io::{TideGaugeFile, read_tide_gauge_file};
+use dgcom::tides::AdmittanceInference;
+use dgcom::time::ModelClock;
 
 /// Candidates in priority order: a short record keeps the first ones (the
 /// minor semidiurnals need half a year to a year).
