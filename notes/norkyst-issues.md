@@ -8,7 +8,7 @@ Measured 2026-10-16 against 17 Kartverket gauges from Tregde to Vardø, on NorKy
 2. **NorKyst's N2 was 0.10–0.24 of the observed at every gauge** (median 0.19, phase −6° at Stavanger to −56° at Tromsø) **from January 2024 to February 2026, and is right since March 2026** (0.85–1.18, median 0.99, ±6°). The cause is in MET's tide file: the one that forces the hindcast (`forcing/tide.nc`, created 2023-03-31) has N2/M2 of 0.020–0.034 along the open boundaries against the gauges' 0.21; the one created 2026-02-25 (`static_nc_files/norkyst_tide.nc`) has 0.20–0.26. The 2012–2025 hindcast has N2 at 0.30–0.44 (median 0.38).
 3. **Still wrong in the operational output in 2026:** K2 is 0.81 of the observed (0.78 in 2024–25), and K2/S2 relative to the gauges is 0.80 (0.78), as if K2's nodal factor (f ≈ 1.3 in 2024–26) were not applied; P1 is 1.7× and Q1 1.7× (1.35× in 2024–25), not explained by the forcing file's amplitudes; the minor semidiurnals (2N2, μ2, ν2, L2, λ2) are absent (mostly 0.01–0.13×; 2–7 cm of |ΔZ| together); M4 is 0.23×. The hindcast over 2024–25 differs from the forecasts on the same dates (K2 0.72×, N2 0.38×), and neither matches correct nodal factors; a static tide file used without them is wrong by an amount that changes through the 18.6-year nodal cycle.
 4. **Datum.** NorKyst's mean ζ is 0.28 m below the gauges' mean (median; 0.20–0.40 m, deepest in Finnmark), so 0.22–0.52 m below NN2000 too; it is neither MSL nor NN2000.
-5. **Pressure.** NorKyst's non-tidal ζ responds to sea-level pressure at a quarter of the gauges' rate (−0.22 against −0.80 cm/hPa, daily means against ERA5); the gauge-minus-NorKyst residual regresses on pressure at −0.58 cm/hPa (r = −0.8). So NorKyst's ζ carries little of the inverse barometer, although its configuration has `ATM_PRESS`.
+5. **Pressure.** NorKyst's non-tidal ζ responds to sea-level pressure at a quarter of the gauges' rate (−0.22 against −0.80 cm/hPa, daily means against ERA5); the gauge-minus-NorKyst residual regresses on pressure at −0.58 cm/hPa (r = −0.8). So NorKyst's ζ carries little of the inverse barometer, although its configuration has `ATM_PRESS`. The cause is in the ROMS source: `PRESS_COMPENSATE` acts only in the Flather boundary condition, and NorKyst runs Shchepetkin, so its open boundary holds the parent's level without the IB (section 6).
 6. **Velocities.** The operational output has no ubar/vbar (the hindcast has `ubar_eastward`/`vbar_northward`), and its z-levels stop at 300 m.
 
 MET's answers (2026-11-05) are summarised below under "What MET confirmed". In short: the operational system switched to the new tide file on 2026-03-03; nodal corrections are probably not applied; ζ has no geodetic datum (subtract the model's own time mean); the inverse barometer is applied at the open boundary.
@@ -28,6 +28,7 @@ Correction to the brief: Mausund's K1 1.14× and O1 0.95× came from a year fit 
 | Our fit of gauge and NorKyst on the instants both have, one analysis | `examples/tide_gauge_fit.rs <gauge> compare=<NorKyst> csv=` | `output/norkyst_issues/fits.csv` (and `fits_pre.csv`, gauge against Kartverket's prediction) |
 | Tables, the pair test, UTide, datum, pressure, plots | `scripts/norkyst_tide_report.py` | `tables.md`, `ratios_latitude.png`, `phases_latitude.png`, `n2_monthly.png` |
 | The forcing files themselves | `scripts/norkyst_tide_forcing.py` | `forcing.md` |
+| Pressure on NorKyst's open boundary against the residuals (section 6, "Cause") | `scripts/norkyst_pressure_boundary.py` (ERA5 cached in `data/pressure/boundary/`) | `pressure_boundary.md` |
 | The analysis gates | `cargo test --test harmonic_analysis_test` | `test_n2_q1_recovery_against_independent_astronomy`, `test_thirty_day_n2_q1_under_weather_noise` |
 
 Every comparison uses the instants both series have (NorKyst's aggregation has five 25–27 h gaps in 2024, which are left out, never filled). Ratios are NorKyst over the gauge; ΔG = G_NorKyst − G_gauge (> 0: NorKyst later). Pressure is ERA5 `pressure_msl` from the Open-Meteo archive (cached in `data/pressure/`); MSL and NN2000 come from Kartverket's `locationlevels` (cached in `data/kartverket/`).
@@ -152,7 +153,25 @@ Daily means of the non-tidal residual (UTide year fit removed) against ERA5 sea-
 - NorKyst: −0.07 (Tregde) to −0.56 cm/hPa (Vardø), median −0.22.
 - Gauge − NorKyst: median −0.58 cm/hPa, r −0.48 to −0.82: the pressure explains most of what NorKyst misses (the difference's σ is 9–10 cm).
 
-So NorKyst's ζ carries roughly a quarter of the observed pressure response, least in the south, although the GMD paper says "the atmospheric pressure is also included in the forcing" (`ATM_PRESS`, with `PRESS_COMPENSATE` at the boundaries). Either the published ζ has the inverse barometer removed, or the open boundary holds the level to the parent's (which has no surge; ROMS's `PRESS_COMPENSATE` acts in the Shchepetkin ubar condition, while ζ uses Chapman). For us: `froya_real_data ib=1` adds an inverse barometer that NorKyst mostly lacks, so it does not count it twice (at most ≈ 0.2 of 0.8 cm/hPa).
+So NorKyst's ζ carries roughly a quarter of the observed pressure response, least in the south, although the GMD paper says "the atmospheric pressure is also included in the forcing" (`ATM_PRESS`, with `PRESS_COMPENSATE` at the boundaries). For us: `froya_real_data ib=1` adds an inverse barometer that NorKyst mostly lacks, so it does not count it twice (at most ≈ 0.2 of 0.8 cm/hPa).
+
+**Cause (found 2026-11-07, from the ROMS source): NorKyst's boundary condition never applies `PRESS_COMPENSATE`.** In ROMS, `PRESS_COMPENSATE` appears only in the **Flather** branch of `ROMS/Nonlinear/u2dbc_im.F` and `v2dbc_im.F`. There, the model level is compared with the boundary value as `ζ + (p − 1013.25 hPa)·100/(ρ₀g)` against `zeta_west`. The **Shchepetkin** branch (Mason et al. 2010) has no pressure term, and `zetabc.F` has none in any branch. This holds in the `roms-3.9` tag and in `develop`/`main` (2026-09; NorKyst's operational build uses `roms-4.3_develop`). NorKyst runs `LBC(isFsur) == Che` and `LBC(isUbar), LBC(isVbar) == Shc` on all four edges: Zenodo 10.5281/zenodo.16810677 `roms_norkyst.in` l. 185–187, and the same in `github.com/norkyst/norkyst-operational` `Run/norkyst_v3_KEYWORD.in`. Explicit Chapman uses no external value, so ζ enters from outside only through Shchepetkin's `Zx − zeta_west`, and that has no pressure term. `PRESS_COMPENSATE` is compiled in (`norkyst.h` under `BULK_FLUXES`) but does nothing.
+
+The open boundary therefore relaxes toward the parent's ζ without the inverse barometer, while `ATM_PRESS` acts in the interior. Quasi-statically, NorKyst's ζ ≈ −(p_local − p_boundary)/(ρ₀g): the domain feels only pressure *differences* from its open boundary. A low much larger than the domain hardly shows, which fits the −0.22. MET confirmed (2026-11-07) that in ROMS `PRESS_COMPENSATE` enters the ubar/vbar boundary conditions and not ζ. That holds for the Flather condition, but not for the Shchepetkin condition NorKyst uses.
+
+**Checked against the boundary pressure (2026-11-07, `output/norkyst_issues/pressure_boundary.md`, `scripts/norkyst_pressure_boundary.py`).** Setup:
+- ERA5 sea-level pressure at 83 points on NorKyst's open boundary: every 60th wet cell (≈ 48 km) of the first interior row/column, wet by `mask_rho` of `norkyst_grd_v31.nc`.
+- The open edges: the North Sea (west), the Norwegian Sea from 58.6° N, 3.9° W to 75.7° N, 18.4° E (north), the Barents Sea (east), and on the south edge the Kattegat and a stretch by the Kola coast.
+- The same daily non-tidal residuals as above, 2024-07..2025-07, 17 gauges.
+
+Results:
+- **gauge − NorKyst follows the boundary-mean pressure at −0.78 to −0.85 cm/hPa at all 17 gauges, R² 0.57–0.68, with no trend along the coast.** On the local pressure, R² falls northward, from 0.62–0.68 on the mid coast to 0.29 at Hammerfest and 0.23 at Vardø (slope −0.39 there).
+- **In the north the test can tell the two apart, and it supports the cause.** From Tromsø to Vardø, the local pressure decouples from the boundary mean. There the gauges themselves follow the local pressure (R² 0.43–0.47 against 0.11–0.32 on the boundary mean). The NorKyst deficit follows the boundary mean (0.57–0.63 against 0.23–0.45 on the local pressure). NorKyst itself follows p_loc − p_bnd at −1.0 to −1.4 cm/hPa (R² 0.14–0.42 from Kabelvåg to Vardø), close to the static −0.99 predicted by ζ_NorKyst ≈ −(p_loc − p_bnd)/(ρ₀g).
+- **From Tregde to Rørvik the test cannot tell the two apart.** The gauges follow the local and the boundary pressure about equally (R² ≈ 0.5 for both), and so does the deficit. NorKyst alone shows no response to p_loc − p_bnd (R² ≤ 0.07). There, p_loc − p_bnd is mostly a cross-shelf pressure gradient, so an alongshore geostrophic wind, and its setup confounds NorKyst's own series. The gauge − NorKyst difference removes the wind that both carry, which is why it is the cleaner measure.
+- **The Norwegian Sea boundary carries most of it.** It is the best single edge at every gauge (−0.65 to −0.71, R² 0.54–0.70). Regressed on all four edge means: Norwegian Sea −0.47 to −0.72, Kattegat −0.15 to −0.31, North Sea and Barents ≈ 0 (R² 0.65–0.75). The edges' pressures are correlated, so read the split loosely.
+- **The deficit slope is −0.8, not −0.99.** It matches the gauges' own total response (−0.80). Wind correlates with pressure, so the static and dynamic parts do not separate here.
+
+**For nesting:** what NorKyst lacks is ≈ −0.8 cm/hPa × (p̄_boundary − p₀), with p̄ the mean pressure over NorKyst's open boundary, mainly the Norwegian Sea edge. A fraction of the local IB approximates it in the south and middle: at Mausund, 0.58 × local gives R² 0.67 against 0.63 for the boundary mean. It fails in the north: at Bodø, R² 0.58 against 0.68; at Vardø, 0.23 against 0.63.
 
 ## 7. Velocities
 
@@ -191,8 +210,10 @@ MET Norway answered the questions from this report. Here is what they confirmed,
    - **For us:** take P1 at the equilibrium ratio (P1 = 0.331 K1). Q1 still needs the gauge ratio.
 4. **Pressure:** the inverse barometer is applied to the open-boundary values (ROMS `PRESS_COMPENSATE`).
    - That does not explain our measurement. If NorKyst carried the full inverse barometer, its non-tidal ζ would respond at about −1 cm/hPa, as the gauges do (−0.80), not at −0.22.
-   - Two explanations remain: the published ζ is not the level the model ran with, or the boundary correction does not reach ζ (a Chapman ζ condition held to the parent, with the compensation only in ubar; section 6).
+   - Follow-up answer (2026-11-07): in ROMS, `PRESS_COMPENSATE` enters the ubar/vbar boundary conditions, not ζ.
+   - The ROMS source settles it (section 6, "Cause"): the compensation exists only in the Flather ubar/vbar condition, and NorKyst runs Shchepetkin (`Shc`) with Chapman ζ (`Che`). So it is inactive, and the boundary holds the parent's level without the inverse barometer.
    - **For us:** NorKyst's ζ lacks most of the inverse barometer, so `ib=1` does not count it twice in full.
+   - The correction a NorKyst-nested run needs is −(p_boundary − p₀)/(ρ₀g), with p_boundary the pressure on NorKyst's own open boundary, not a fraction of the local IB. A fraction of the local IB approximates it (TODO P1.5).
    - But `ib=1` adds the full static −0.99 cm/hPa, while gauge minus NorKyst regresses at only −0.58, and the parent already carries ≈ −0.22.
    - So `ib=1` may overshoot the pressure response by up to ≈ 0.4 cm/hPa (≈ 8 cm in a 20 hPa low), if the whole slope is pressure. Part of it is the wind, which correlates with pressure.
    - The option for a fractional inverse barometer exists since 2026-11-05 (`froya_real_data ib=<factor>`, `InverseBarometer::with_factor`). Scoring it on a stormy week is open (TODO P1.5).
@@ -209,7 +230,7 @@ MET Norway answered the questions from this report. Here is what they confirmed,
    - Check the variable names when they do (the hindcast uses `ubar_eastward`/`vbar_northward`).
 8. **The 00 UTC step** at Træna, Bodø, Kabelvåg and Hammerfest: no answer.
 
-Still open on the pressure point (item 4): whether the boundary correction reaches ζ, or only ubar.
+The pressure point (item 4) is answered from the ROMS source (section 6, "Cause"): NorKyst's Shchepetkin boundary condition has no `PRESS_COMPENSATE` term. The boundary-pressure check supports it (section 6: the deficit follows NorKyst's boundary-mean pressure at −0.8 cm/hPa at all 17 gauges, decisively in the north). Still open: whether MET confirms that the operational runs use `Shc`.
 
 ## Caveats and dead ends
 

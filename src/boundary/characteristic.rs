@@ -198,8 +198,10 @@ where
 ///
 /// A parent that carries part of the response already takes a fraction of
 /// it ([`InverseBarometer::with_factor`]): NorKyst-800's ζ responds to
-/// pressure at ≈ −0.22 cm/hPa, a quarter of the static −0.99
-/// (`notes/norkyst-issues.md` §5).
+/// pressure at ≈ −0.22 cm/hPa, a quarter of the static −0.99, because its
+/// Shchepetkin open boundary holds the level to its own parent's without the
+/// inverse barometer (ROMS applies `PRESS_COMPENSATE` in Flather only;
+/// `notes/norkyst-issues.md` §6).
 #[derive(Clone, Debug)]
 pub struct InverseBarometer<P, F> {
     provider: P,
