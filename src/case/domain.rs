@@ -9,12 +9,13 @@
 
 use std::sync::Arc;
 
-use super::schema::{AtlasCorrection, RasterKind, Sampling, SideTag};
+use super::schema::{AtlasCorrection, GaugeCorrection, RasterKind, Sampling, SideTag};
 use super::{CaseError, CaseFile};
-use crate::boundary::{BoundaryCoverage, TidalAtlas};
+use crate::analysis::HarmonicAnalysis;
+use crate::boundary::{BoundaryCoverage, GaugeAdjustment, TidalAtlas};
 use crate::io::{
     BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
-    LocalProjection,
+    LocalProjection, read_tide_gauge_file,
 };
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, read_gmsh_mesh};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
@@ -132,6 +133,11 @@ impl CaseFile {
                     .infer_from_theory()
                     .map_err(|e| CaseError::Invalid(format!("{}: {e}", path.display())))?;
             }
+            if let Some(gauge) = &spec.gauge {
+                for change in self.correct_at_gauge(&mut atlas, gauge)? {
+                    notes.push(format!("tidal atlas {}: {change}", path.display()));
+                }
+            }
             let projection = projection.as_ref().expect("validated: placed");
             let coverage = BoundaryCoverage::of_atlas(
                 &mesh,
@@ -192,6 +198,59 @@ impl CaseFile {
             atlases,
             notes,
         })
+    }
+
+    /// Correct `atlas` at the gauge of `spec`; what changed.
+    fn correct_at_gauge(
+        &self,
+        atlas: &mut TidalAtlas,
+        spec: &GaugeCorrection,
+    ) -> Result<Vec<GaugeAdjustment>, CaseError> {
+        let record_path = self.resolve(&spec.record);
+        let io = |path: &std::path::Path, e: &dyn std::fmt::Display| {
+            CaseError::Io(format!("{}: {e}", path.display()))
+        };
+        let record = read_tide_gauge_file(&record_path).map_err(|e| io(&record_path, &e))?;
+        let station = record.station.as_ref().ok_or_else(|| {
+            CaseError::Invalid(format!(
+                "{}: the record has no station position",
+                record_path.display()
+            ))
+        })?;
+        let (times, values): (Vec<f64>, Vec<f64>) = record
+            .time_series
+            .times()
+            .iter()
+            .copied()
+            .zip(record.time_series.values().iter().copied())
+            .filter(|(_, v)| v.is_finite())
+            .unzip();
+        let fit = HarmonicAnalysis::fit_gauge_record(&times, &values)
+            .map_err(|e| CaseError::Invalid(format!("{}: {e}", record_path.display())))?;
+        let source_path = self.resolve(&spec.source);
+        let source = TidalAtlas::read(&source_path).map_err(|e| io(&source_path, &e))?;
+        let (point, distance) = source
+            .nearest(station.longitude, station.latitude)
+            .filter(|&(_, d)| d <= spec.max_offset_m)
+            .ok_or_else(|| {
+                CaseError::Invalid(format!(
+                    "{}: no point within {} m of the gauge {}",
+                    source_path.display(),
+                    spec.max_offset_m,
+                    station.name
+                ))
+            })?;
+        let gains: Vec<&str> = spec.gains.iter().map(String::as_str).collect();
+        let ratios: Vec<&str> = spec.ratios.iter().map(String::as_str).collect();
+        let changes = atlas
+            .correct_at_gauge(&fit, Some(point), &gains, &ratios)
+            .map_err(|e| {
+                CaseError::Invalid(format!(
+                    "gauge {} ({distance:.0} m from the source point): {e}",
+                    station.name
+                ))
+            })?;
+        Ok(changes)
     }
 
     /// The whole mesh, before land is dropped.

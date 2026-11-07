@@ -166,3 +166,21 @@ stations = "stations.toml"
   - An atlas holding one tide (M2, S2, K1) at every point forces the same tide as `tide` with those constants: the largest difference at the stations over 6 h is 7e-15 m on a tide of up to 0.39 m. This checks that the two routes share the nodal corrections and the Greenwich-lag convention.
   - An atlas covering the lower quarter of a mouth walls the rest, leaving 2 open faces, when `max_closed` allows it, and is refused at the default.
   - A unit test checks that an atlas needs a placed mesh and a start.
+
+## P8.1, fourth part: the gauge correction (2026-11-07)
+
+- **Into the library:** `froya_real_data`'s default atlas correction moved to the library, so the example and case files share one path.
+  - `HarmonicAnalysis::fit_gauge_record` is the whole-record fit of `HarmonicAnalysis::GAUGE_RECORD` (M2 … M6 plus Mf, Mm and Ssa), Rayleigh 1, with P1, K2, N2 and Q1 at equilibrium where the record cannot separate them.
+  - `TidalAtlas::correct_at_gauge(fit, source point, gains, ratios)` scales `gains` by the gauge-over-source complex ratio, then re-infers `ratios` with the gauge's ratios. It returns `GaugeAdjustment`s, whose `Display` is the example's log line.
+  - The example's `corrected_atlas` now calls it. Its release binary from before the change and after it give 0 differing values over 7 frames (1 h, default options), with the same seven adjustments logged.
+- **`[boundary.atlas.gauge]`:** `record` (a gauge file with its position), `source` (a station atlas from the atlas's model), `max_offset_m` (3 km, the example's `STATION_MAX_OFFSET`), `gains` (K1, O1, S2) and `ratios` (N2, Q1, P1, K2).
+  - A source without a point near the gauge is an error. The example instead skips the gains with a message.
+  - It is exclusive with `correction = "theory"`.
+- **Stage 1b of P8.2, bit for bit:** `cases/froya` with the Mausund correction against `froya_real_data hours=1 snapshot_minutes=10 station_minutes=10 rest_hours=0` (its default tide) gives 0 values differing in all 7 frames: K1 × 0.875, −8.6°; O1 × 1.052, +17.2°; S2 × 0.939, +0.1°; N2 = 0.208 × M2; Q1 = 0.434 × O1; P1 = 0.271 × K1; K2 = 0.283 × S2.
+- **A finding at Bodø:** `cases/bodo`'s correction scales NorKyst's O1 by 0.589 (+18.4°) and lags K1 by +16.5°, which `froya_real_data`'s Bodø runs share.
+  - NorKyst's median O1 ratio over the 17 gauges is 1.00 (`notes/norkyst-issues.md`), so this is suspect.
+  - The station-atlas point is 25.5 m deep with zero current. TODO P1.5.
+- **Gates:**
+  - A unit test of `correct_at_gauge`: the gauge's M2 at the source point, the same gain elsewhere, K2 at the gauge's ratio, and the errors.
+  - A case test with a synthetic year-long gauge record (M2 1.2×, +10°; S2 0.9×, −5° over the model) and a synthetic source atlas. The case logs M2 × 1.199, +10.0° and S2 × 0.900, −5.0°; the 0.1 % on M2 is the fit's nodal treatment over the year. A source with no point near the gauge is refused.
+  - A 30-day synthetic record without K2 failed this at first. The fit infers K2 at equilibrium from S2 where 30 days cannot separate them, and a record lacking K2 then biases S2 (0.944, +15°). Real records have K2; the test uses a year.

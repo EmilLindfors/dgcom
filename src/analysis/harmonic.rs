@@ -200,6 +200,26 @@ pub struct HarmonicAnalysis {
 }
 
 impl HarmonicAnalysis {
+    /// Constituents fitted to a tide gauge's whole record, in priority
+    /// order: the forcing's and the long-period ones, so that the seasonal
+    /// and fortnightly signal does not leak into the tides.
+    pub const GAUGE_RECORD: [&'static str; 15] = [
+        "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6", "Mf", "Mm", "Ssa",
+    ];
+
+    /// The reference constants of a tide gauge's whole record (Unix times):
+    /// the [`Self::GAUGE_RECORD`] constituents the record resolves (Rayleigh
+    /// criterion 1), the others of P1, K2, N2 and Q1 inferred at their
+    /// equilibrium ratios.
+    pub fn fit_gauge_record(times: &[f64], values: &[f64]) -> Result<ReferenceFit, AnalysisError> {
+        let length = times
+            .first()
+            .zip(times.last())
+            .map_or(0.0, |(t0, t1)| t1 - t0);
+        Self::resolvable(&Self::GAUGE_RECORD, length, 1.0, &Inference::EQUILIBRIUM)
+            .fit(times, values)
+    }
+
     /// Fit `names`, inferring nothing.
     pub fn new(names: &[&'static str]) -> Self {
         Self {

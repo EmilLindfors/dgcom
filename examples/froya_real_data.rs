@@ -524,8 +524,9 @@ use dgcom::analysis::{
 };
 use dgcom::boundary::{
     AtlasPoint, BCContext2D, BoundaryCoverage, BoundaryLevel, BoundaryTides, CharacteristicOBC,
-    ExternalStateProvider, HarmonicTide, InverseBarometer, MultiBoundaryCondition2D,
-    NestingRelaxation2D, OceanModelState, Reflective2D, SWEBoundaryCondition2D, TidalAtlas,
+    ExternalStateProvider, GaugeAdjustment, HarmonicTide, InverseBarometer,
+    MultiBoundaryCondition2D, NestingRelaxation2D, OceanModelState, Reflective2D,
+    SWEBoundaryCondition2D, TidalAtlas,
 };
 #[cfg(feature = "netcdf")]
 use dgcom::boundary::{NestingOptions, ParentDatum};
@@ -645,11 +646,8 @@ const STATION_MAX_OFFSET: f64 = 3000.0;
 const STATION_CONSTITUENTS: [&str; 12] = [
     "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6",
 ];
-/// Constituents fitted to a gauge's whole record: long-period ones too, so
-/// that the seasonal and fortnightly signal does not leak into the tides
-const GAUGE_CONSTITUENTS: [&str; 15] = [
-    "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6", "Mf", "Mm", "Ssa",
-];
+/// Constituents fitted to a gauge's or current meter's whole record
+const GAUGE_CONSTITUENTS: [&str; 15] = HarmonicAnalysis::GAUGE_RECORD;
 
 /// How a nested run treats its parent's tides (`nest_tides=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2097,7 +2095,7 @@ impl Domain {
                 .zip(gauge.time_series.values().iter().copied())
                 .filter(|(_, v)| v.is_finite())
                 .unzip();
-            let observed_fit = fit_record(&times, &values, &GAUGE_CONSTITUENTS, None);
+            let observed_fit = HarmonicAnalysis::fit_gauge_record(&times, &values);
             let norkyst = atlas
                 .and_then(|a| a.nearest(station.longitude, station.latitude))
                 .filter(|&(p, d)| {
@@ -6417,7 +6415,6 @@ fn corrected_atlas(
     reference: Option<&AtlasReference>,
 ) -> Result<TidalAtlas, Box<dyn std::error::Error>> {
     let mut atlas = atlas.clone();
-    let signed = |lag: f64| (lag + 180.0).rem_euclid(360.0) - 180.0;
     let Some(&AtlasReference {
         station,
         fit,
@@ -6432,43 +6429,25 @@ fn corrected_atlas(
         }
         return Ok(atlas);
     };
-    match norkyst {
-        None if !opts.gauge_gains.is_empty() => println!(
+    if norkyst.is_none() && !opts.gauge_gains.is_empty() {
+        println!(
             "  No NorKyst constants at {station} (station_atlas=): the atlas keeps its own {:?}",
             opts.gauge_gains
-        ),
-        None => {}
-        Some((point, distance)) => {
-            for &name in &opts.gauge_gains {
-                let (Some(gauge), Some(source)) = (
-                    fit.get(name),
-                    point.constituents.iter().find(|c| c.name == name),
-                ) else {
-                    return Err(format!("gauge_gains: {station} or NorKyst lacks {name}").into());
-                };
-                let gain = gauge.amplitude / source.eta.0;
-                let lag = signed(gauge.lag_deg - source.eta.1);
-                atlas.infer(name, name, gain, lag)?;
-                println!(
-                    "  Atlas {name} × {gain:.3}, lag {lag:+.1}° (gauge {station} over NorKyst \
-                     {distance:.0} m from it)"
-                );
-            }
-        }
-    }
-    for &name in &opts.gauge_ratios {
-        let Some(inference) = Inference::EQUILIBRIUM.iter().find(|i| i.name == name) else {
-            return Err(format!("gauge_ratios: {name} is not P1, K2, N2 or Q1").into());
-        };
-        let from = inference.from;
-        let i = Inference::from_reference(name, from, fit)
-            .ok_or(format!("gauge_ratios: {station} lacks {name} or {from}"))?;
-        atlas.infer(name, from, i.amplitude_ratio, i.lag_offset_deg)?;
-        println!(
-            "  Atlas {name} = {:.3} × {from}, lag {:+.1}° (ratio at {station})",
-            i.amplitude_ratio,
-            signed(i.lag_offset_deg)
         );
+    }
+    let adjustments = atlas.correct_at_gauge(
+        fit,
+        norkyst.map(|(point, _)| point),
+        &opts.gauge_gains,
+        &opts.gauge_ratios,
+    )?;
+    for a in &adjustments {
+        match (a, norkyst) {
+            (GaugeAdjustment::Gain { .. }, Some((_, distance))) => {
+                println!("  Atlas {a} (gauge {station} over NorKyst {distance:.0} m from it)")
+            }
+            _ => println!("  Atlas {a} (ratio at {station})"),
+        }
     }
     Ok(atlas)
 }

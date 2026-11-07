@@ -561,3 +561,104 @@ fn an_atlas_walls_the_open_faces_it_does_not_cover() {
     // point at y ≤ 500 m: y ∈ [0, 2000] m
     assert_eq!(open, 2, "{:?}", domain.notes);
 }
+
+/// A year's hourly gauge record (2025) of M2 and S2 (amplitudes, lags) at
+/// (x, y) of the placed mesh, in the format of `scripts/kartverket_gauge.sh`.
+/// A year separates every constituent of the gauge fit, so none is inferred
+/// at a ratio the record lacks.
+fn write_gauge(path: &Path, (x, y): (f64, f64), m2: (f64, f64), s2: (f64, f64)) {
+    use dgcom::io::{CoordinateProjection, LocalProjection};
+    use dgcom::time::ModelClock;
+    let (lat, lon) = LocalProjection::new(ORIGIN.0, ORIGIN.1).xy_to_geo(x, y);
+    // Greenwich lags need V₀ + u, which the clock gives
+    let clock = ModelClock::parse("2025-01-01T00:00:00Z").unwrap();
+    let mut text = format!(
+        "# station: Test\n# id: TST\n# latitude: {lat}\n# longitude: {lon}\n# datum: MSL\n# units: m\n\
+         # columns: datetime water_level(m)\n"
+    );
+    const DAYS: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for hour in 0..365 * 24 {
+        let t = 3600.0 * f64::from(hour);
+        let level: f64 = [("M2", m2), ("S2", s2)]
+            .iter()
+            .map(|&(name, (amp, lag))| {
+                let drift = clock.nodal_drift(name).unwrap().at(t);
+                let omega = 2.0 * PI / constituent_period(name).unwrap();
+                drift.f * amp * (omega * t + drift.phase_offset_rad() - f64::to_radians(lag)).cos()
+            })
+            .sum();
+        let (mut day, h) = (hour / 24, hour % 24);
+        let mut month = 0;
+        while day >= DAYS[month] {
+            day -= DAYS[month];
+            month += 1;
+        }
+        text += &format!(
+            "2025-{:02}-{:02}T{h:02}:00:00Z {level:.5}\n",
+            month + 1,
+            day + 1
+        );
+    }
+    std::fs::write(path, text).unwrap();
+}
+
+/// An atlas corrected at a gauge takes the gauge's M2 and S2 where its
+/// source is the gauge's, and keeps its structure: the gain is the gauge's
+/// constant over the source's.
+#[test]
+fn an_atlas_is_corrected_at_a_gauge() {
+    let dir = tempfile::tempdir().unwrap();
+    let mouth: Vec<(f64, f64)> = (0..=4).map(|i| (0.0, 500.0 * i as f64)).collect();
+    // The boundary atlas and the source at the gauge, both from "the model":
+    // M2 0.3 m, 40°; S2 0.1 m, 75°
+    let model = [("M2", 0.3, 40.0), ("S2", 0.1, 75.0)];
+    write_atlas(&dir.path().join("atlas.txt"), &mouth, &model);
+    write_atlas(&dir.path().join("source.txt"), &[(5000.0, 1000.0)], &model);
+    // The gauge sees M2 1.2× and 10° later, S2 0.9× and 5° earlier
+    write_gauge(
+        &dir.path().join("gauge.txt"),
+        (5200.0, 1000.0),
+        (0.36, 50.0),
+        (0.09, 70.0),
+    );
+    let boundary = r#"[boundary.atlas]
+        file = "atlas.txt"
+        [boundary.atlas.gauge]
+        record = "gauge.txt"
+        source = "source.txt"
+        gains = ["M2", "S2"]
+        ratios = []"#;
+    std::fs::write(dir.path().join("case.toml"), "").unwrap();
+    // `placed_channel` runs it; read its notes from a domain build first
+    let records = placed_channel(dir.path(), boundary).unwrap();
+    let file = CaseFile::read(&dir.path().join("case.toml"), &[]).unwrap();
+    let notes = file.build_domain().unwrap().notes.join("\n");
+    println!("{notes}");
+    // "M2 × 1.199, lag +10.0°": the gain and lag the domain's log records
+    let gain = |name: &str| -> (f64, f64) {
+        let rest = notes.split(&format!("{name} × ")).nth(1).expect(name);
+        let (gain, rest) = rest.split_once(", lag ").unwrap();
+        let lag = rest.split('°').next().unwrap();
+        (gain.parse().unwrap(), lag.parse().unwrap())
+    };
+    // The fit's nodal treatment over the year costs about 0.1 %
+    for (name, expected) in [("M2", (1.2, 10.0)), ("S2", (0.9, -5.0))] {
+        let (g, lag) = gain(name);
+        assert!(
+            (g / expected.0 - 1.0).abs() < 0.003 && (lag - expected.1).abs() < 0.2,
+            "{name}: × {g}, {lag}° against × {}, {}°",
+            expected.0,
+            expected.1
+        );
+    }
+    assert!(records[1].eta_m.iter().any(|e| e.abs() > 0.2));
+
+    // A source with no point near the gauge is refused
+    write_atlas(&dir.path().join("source.txt"), &[(20000.0, 1000.0)], &model);
+    let err = CaseFile::read(&dir.path().join("case.toml"), &[])
+        .unwrap()
+        .build_domain()
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("no point within"), "{err}");
+}

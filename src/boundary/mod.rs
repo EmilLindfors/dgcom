@@ -96,7 +96,9 @@ pub use ocean_columns::{DeepReference, OceanColumnsOptions, OceanModelColumns};
 pub use ocean_nesting::{
     NestingError, NestingOptions, NestingRelaxation2D, OceanModelState, ParentDatum,
 };
-pub use tidal_atlas::{AtlasConstituent, AtlasPoint, BoundaryTides, TidalAtlas, TidalAtlasError};
+pub use tidal_atlas::{
+    AtlasConstituent, AtlasPoint, BoundaryTides, GaugeAdjustment, TidalAtlas, TidalAtlasError,
+};
 pub use tidal_config::{SpongeConfig, TidalBCType, TidalSimulationBuilder};
 
 // Re-export validation types

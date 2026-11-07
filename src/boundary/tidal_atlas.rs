@@ -53,6 +53,7 @@ use thiserror::Error;
 use super::BCContext2D;
 use super::characteristic::{ExternalState, ExternalStateProvider};
 use super::harmonic_tide::tidal_ramp;
+use crate::analysis::{Inference, ReferenceFit};
 use crate::io::CoordinateProjection;
 use crate::mesh::{BoundaryTag, Mesh2D};
 use crate::operators::DGOperators2D;
@@ -139,6 +140,51 @@ pub struct TidalAtlas {
     pub points: Vec<AtlasPoint>,
     /// Free-text provenance (the file's leading comment lines).
     pub header: Vec<String>,
+}
+
+/// One change [`TidalAtlas::correct_at_gauge`] made.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GaugeAdjustment {
+    /// `name` scaled by `gain` and lagged by `lag_deg`.
+    Gain {
+        /// The constituent
+        name: &'static str,
+        /// Gauge over source amplitude
+        gain: f64,
+        /// Gauge minus source lag (degrees, in (−180, 180])
+        lag_deg: f64,
+    },
+    /// `name` re-inferred as `ratio` times `from`, lagged by `lag_deg`.
+    Ratio {
+        /// The constituent
+        name: &'static str,
+        /// Its neighbour
+        from: &'static str,
+        /// The gauge's amplitude ratio
+        ratio: f64,
+        /// The gauge's lag offset (degrees, in (−180, 180])
+        lag_deg: f64,
+    },
+}
+
+impl std::fmt::Display for GaugeAdjustment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Gain {
+                name,
+                gain,
+                lag_deg,
+            } => {
+                write!(f, "{name} × {gain:.3}, lag {lag_deg:+.1}°")
+            }
+            Self::Ratio {
+                name,
+                from,
+                ratio,
+                lag_deg,
+            } => write!(f, "{name} = {ratio:.3} × {from}, lag {lag_deg:+.1}°"),
+        }
+    }
 }
 
 impl TidalAtlas {
@@ -371,6 +417,75 @@ impl TidalAtlas {
             self.infer_by_admittance(inference)?;
         }
         Ok(())
+    }
+
+    /// Correct the atlas at a tide gauge whose reference constants are
+    /// `gauge` ([`HarmonicAnalysis::fit_gauge_record`]).
+    ///
+    /// First each of `gains` is scaled by the complex ratio of the gauge's
+    /// constant to the atlas source's at the gauge (`source`, e.g. the
+    /// nearest point of a station atlas from the same model): that keeps the
+    /// source's spatial structure and fixes it at the gauge. NorKyst-800's
+    /// K1 is 1.14×, +8.6° and its O1 0.95×, −17.3° at Mausund. Without a
+    /// `source` the gains are skipped. Then each of `ratios` (P1, K2, N2 or
+    /// Q1) is re-inferred from its neighbour ([`Inference::EQUILIBRIUM`]'s
+    /// `from`) with the gauge's ratio and lag offset ([`Self::infer`]).
+    /// Returns what was changed, in order.
+    ///
+    /// [`HarmonicAnalysis::fit_gauge_record`]: crate::analysis::HarmonicAnalysis::fit_gauge_record
+    pub fn correct_at_gauge(
+        &mut self,
+        gauge: &ReferenceFit,
+        source: Option<&AtlasPoint>,
+        gains: &[&str],
+        ratios: &[&str],
+    ) -> Result<Vec<GaugeAdjustment>, TidalAtlasError> {
+        let inconsistent = |message: String| TidalAtlasError::Inconsistent(message);
+        let signed = |lag: f64| (lag + 180.0).rem_euclid(360.0) - 180.0;
+        let mut done = Vec::new();
+        if let Some(source) = source {
+            for &name in gains {
+                let name = canonical_name(name)
+                    .ok_or_else(|| inconsistent(format!("unknown constituent {name}")))?;
+                let (Some(at_gauge), Some(at_source)) = (
+                    gauge.get(name),
+                    source.constituents.iter().find(|c| c.name == name),
+                ) else {
+                    return Err(inconsistent(format!(
+                        "gauge gain {name}: the gauge or the source at it lacks {name}"
+                    )));
+                };
+                let gain = at_gauge.amplitude / at_source.eta.0;
+                let lag = signed(at_gauge.lag_deg - at_source.eta.1);
+                self.infer(name, name, gain, lag)?;
+                done.push(GaugeAdjustment::Gain {
+                    name,
+                    gain,
+                    lag_deg: lag,
+                });
+            }
+        }
+        for &name in ratios {
+            let Some(inference) = Inference::EQUILIBRIUM.iter().find(|i| i.name == name) else {
+                return Err(inconsistent(format!(
+                    "gauge ratio {name}: not P1, K2, N2 or Q1"
+                )));
+            };
+            let from = inference.from;
+            let i = Inference::from_reference(inference.name, from, gauge).ok_or_else(|| {
+                inconsistent(format!(
+                    "gauge ratio {name}: the gauge lacks {name} or {from}"
+                ))
+            })?;
+            self.infer(inference.name, from, i.amplitude_ratio, i.lag_offset_deg)?;
+            done.push(GaugeAdjustment::Ratio {
+                name: inference.name,
+                from,
+                ratio: i.amplitude_ratio,
+                lag_deg: signed(i.lag_offset_deg),
+            });
+        }
+        Ok(done)
     }
 
     /// The point nearest to (`lon`, `lat`) and its distance (m, spherical
@@ -911,6 +1026,79 @@ mod tests {
         let ((ua, ug), (va, vg)) = m2.velocity.unwrap();
         assert!((ua - 0.11).abs() < 1e-12 && (ug - 85.0).abs() < 1e-12);
         assert!((va - 0.22).abs() < 1e-12 && (vg - 175.0).abs() < 1e-12);
+    }
+
+    /// The gains fix the atlas at the gauge (here its first point, which is
+    /// also the source point) and keep its structure elsewhere; the ratios
+    /// take the gauge's.
+    #[test]
+    fn a_gauge_correction_fixes_the_atlas_at_the_gauge() {
+        use crate::analysis::{ReferenceConstant, ReferenceFit};
+        let constant = |name, amplitude, lag_deg| ReferenceConstant {
+            name,
+            amplitude,
+            lag_deg,
+            inferred: false,
+        };
+        let gauge = ReferenceFit {
+            mean: 0.0,
+            constants: vec![
+                constant("M2", 1.2, 355.0),
+                constant("S2", 0.4, 30.0),
+                constant("K2", 0.11, 25.0),
+            ],
+            r_squared: 0.99,
+            residual_rms: 0.01,
+        };
+        let mut atlas = TidalAtlas::parse(ATLAS).unwrap();
+        let source = atlas.points[0].clone();
+        let changes = atlas
+            .correct_at_gauge(&gauge, Some(&source), &["M2"], &["K2"])
+            .unwrap();
+        assert_eq!(changes.len(), 2);
+        // At the gauge: the gauge's M2
+        let m2 = atlas.points[0].constituents[0].eta;
+        assert!(
+            (m2.0 - 1.2).abs() < 1e-12 && (m2.1 - 355.0).abs() < 1e-9,
+            "{m2:?}"
+        );
+        // Elsewhere: the same gain and lag, so the structure is kept
+        let m2 = atlas.points[1].constituents[0].eta;
+        assert!(
+            (m2.0 - 1.2).abs() < 1e-12 && (m2.1 - 15.0).abs() < 1e-9,
+            "{m2:?}"
+        );
+        // K2 at the gauge's ratio to S2 and lag offset
+        let s2 = atlas.points[1].constituents[1].eta;
+        let k2 = atlas.points[1]
+            .constituents
+            .iter()
+            .find(|c| c.name == "K2")
+            .unwrap()
+            .eta;
+        assert!((k2.0 / s2.0 - 0.11 / 0.4).abs() < 1e-12);
+        assert!(
+            ((k2.1 - s2.1).rem_euclid(360.0) - 355.0).abs() < 1e-9,
+            "{k2:?} {s2:?}"
+        );
+        assert_eq!(
+            changes[1].to_string(),
+            "K2 = 0.275 × S2, lag -5.0°",
+            "the log line"
+        );
+        // Without a source the gains are skipped; a constituent the gauge
+        // lacks, or a ratio that is not P1, K2, N2 or Q1, is an error
+        let mut atlas = TidalAtlas::parse(ATLAS).unwrap();
+        assert_eq!(
+            atlas.correct_at_gauge(&gauge, None, &["M2"], &[]).unwrap(),
+            vec![]
+        );
+        assert!(
+            atlas
+                .correct_at_gauge(&gauge, Some(&source), &["O1"], &[])
+                .is_err()
+        );
+        assert!(atlas.correct_at_gauge(&gauge, None, &[], &["M2"]).is_err());
     }
 
     /// Corrected minus raw is the correction alone: zero where nothing
