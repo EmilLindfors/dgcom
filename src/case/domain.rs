@@ -3,15 +3,21 @@
 //!
 //! The order follows `examples/froya_real_data.rs`, so that a case
 //! reproduces its runs: build the whole mesh, put the bed on its nodes
-//! (a raster's projected or sampled, then its isolated wet nodes raised),
-//! smooth the slopes if asked, drop the elements with no node below mean
+//! (a raster's projected or sampled), lower the land at the walls if asked,
+//! raise a raster's isolated wet nodes, smooth the slopes if asked, make the
+//! bed a 3D model's if asked (element slopes, cliff shores raised, tidal
+//! ponds filled), drop the elements with no node below mean
 //! sea level, wall the open faces a tidal atlas does not cover, and nest
 //! in a parent model: wall the faces it has no water at, blend the bed to
-//! its across the relaxation band, and correct its tide.
+//! its across the relaxation band, and correct its tide. Last, the stations
+//! are placed, in open water as the example's are
+//! (`Probe2D::in_open_water`).
 
 use std::sync::Arc;
 
-use super::schema::{AtlasCorrection, GaugeCorrection, Nesting, RasterKind, Sampling, SideTag};
+use super::schema::{
+    AtlasCorrection, GaugeCorrection, Nesting, RasterKind, Sampling, SideTag, Slopes3D,
+};
 use super::{CaseError, CaseFile};
 use crate::analysis::HarmonicAnalysis;
 use crate::boundary::{
@@ -21,8 +27,9 @@ use crate::io::{
     BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
     LocalProjection, OceanModelReader, read_tide_gauge_file,
 };
-use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, read_gmsh_mesh};
+use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, PointLocator2D, read_gmsh_mesh};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::Probe2D;
 use crate::types::ElementIndex;
 
 /// Mask cells per raster pixel side of a `"bathymetry"` raster's land mask.
@@ -48,8 +55,22 @@ pub struct Domain {
     /// The parent model of each `[[boundary]]` nested in one, sampled at the
     /// boundary and its relaxation band, its tide corrected
     pub parents: Vec<(SideTag, OceanModelState)>,
+    /// Where each `[[output.station]]` samples the model
+    pub stations: Vec<StationProbe>,
     /// What was done to build it, line by line, for a log
     pub notes: Vec<String>,
+}
+
+/// Where a `[[output.station]]` samples the model.
+#[derive(Clone, Debug)]
+pub struct StationProbe {
+    /// Its name
+    pub name: String,
+    /// The sampling point
+    pub probe: Probe2D,
+    /// How far the point is from the station's position (m): 0 unless it
+    /// was moved into open water
+    pub offset_m: f64,
 }
 
 impl Domain {
@@ -88,24 +109,38 @@ impl CaseFile {
                 .expect("validated: a raster needs a placement");
             let raster = self.raster(&grid, projection, &mut notes)?;
             let sampler = raster.sampler(projection);
-            let mut bed = match b.raster.as_ref().expect("validated").sampling {
+            match b.raster.as_ref().expect("validated").sampling {
                 Sampling::Projected => {
                     Bathymetry2D::project(&grid, &ops, &grid_geom, sampler, raster.pixel_size())
                 }
                 Sampling::Point => Bathymetry2D::from_function(&grid, &ops, &grid_geom, sampler),
-            };
+            }
+        };
+        if b.lower_wall_land {
+            let w = bed.lower_wall_land(&grid, &ops, &grid_geom, b.wall_low_water_m);
+            notes.push(format!(
+                "wall land lowered in {} elements: {} nodes, by up to {:.1} m, {:.4} km³ of water added",
+                w.elements,
+                w.changed,
+                w.max_change,
+                w.volume / 1e9
+            ));
+        }
+        if b.raster.is_some() {
             let raised = bed.raise_isolated_wet_nodes(&grid, &ops, &grid_geom, 0.0);
             notes.push(format!(
                 "{raised} isolated wet nodes raised to the lowest of their neighbours"
             ));
-            bed
-        };
+        }
         if let Some(r_max) = b.smooth_rx0 {
             let s = bed.smooth_rx0(&grid, &ops, &grid_geom, r_max, b.rx0_min_depth_m);
             notes.push(format!(
                 "slope factor r_x0 {:.2} → {:.2} (nodes ≥ {} m deep): {} nodes changed by up to {:.1} m",
                 s.before, s.after, b.rx0_min_depth_m, s.changed, s.max_change
             ));
+        }
+        if let Some(spec) = &b.slopes_3d {
+            Self::bed_for_3d(spec, &grid, &ops, &grid_geom, &mut bed, &mut notes);
         }
 
         let (mut mesh, mut bathymetry, geom) = if case.mesh.drop_land {
@@ -214,6 +249,7 @@ impl CaseFile {
                 )));
             }
         }
+        let stations = self.stations(&mesh, &ops, &bathymetry, projection.as_ref(), &mut notes)?;
         Ok(Domain {
             mesh: Arc::new(mesh),
             ops: Arc::new(ops),
@@ -223,8 +259,132 @@ impl CaseFile {
             projection,
             atlases,
             parents,
+            stations,
             notes,
         })
+    }
+
+    /// Where each `[[output.station]]` samples the model: in open water
+    /// (`Probe2D::in_open_water`), or where it is with
+    /// `open_water_depth_m = 0`.
+    fn stations(
+        &self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        bathymetry: &Bathymetry2D,
+        projection: Option<&LocalProjection>,
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<StationProbe>, CaseError> {
+        let case = &self.case;
+        let locator = PointLocator2D::new(mesh);
+        let mut stations = Vec::new();
+        for s in &case.output.stations {
+            let (x, y) = match (s.x_m, s.y_m, s.lon, s.lat) {
+                (Some(x), Some(y), _, _) => (x, y),
+                (_, _, Some(lon), Some(lat)) => {
+                    projection.expect("validated: placed").geo_to_xy(lat, lon)
+                }
+                _ => unreachable!("validated"),
+            };
+            let (depth, reach) = (s.open_water_depth_m, s.max_offset_m);
+            let at = Probe2D::at(&locator, ops, [x, y]);
+            let found = if depth > 0.0 {
+                Probe2D::in_open_water(&locator, ops, bathymetry, [x, y], depth, reach)
+            } else {
+                at.clone().map(|probe| (probe, 0.0))
+            };
+            let Some((probe, offset_m)) = found else {
+                return Err(CaseError::Invalid(match at {
+                    None => format!(
+                        "station {:?} at ({x:.1}, {y:.1}) m is outside the mesh{}",
+                        s.name,
+                        if case.mesh.drop_land {
+                            " (or on land that was dropped)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Some(_) => format!(
+                        "station {:?} at ({x:.1}, {y:.1}) m has no element at least {depth} m \
+                         deep within {reach} m (`open_water_depth_m = 0` samples it where it is)",
+                        s.name
+                    ),
+                }));
+            };
+            if offset_m > 0.0 {
+                let bed = probe.evaluate(bathymetry.element(probe.element()));
+                notes.push(format!(
+                    "station {:?} sampled {offset_m:.0} m from its position, in the nearest \
+                     element at least {depth} m deep ({:.1} m deep there)",
+                    s.name, -bed
+                ));
+            }
+            stations.push(StationProbe {
+                name: s.name.clone(),
+                probe,
+                offset_m,
+            });
+        }
+        Ok(stations)
+    }
+
+    /// `[bathymetry.slopes_3d]`: smooth the element slopes, then raise the
+    /// cliff shores and fill the tidal ponds, raising the wet nodes either
+    /// leaves isolated after each (`froya_real_data slopes3d=on`'s order).
+    fn bed_for_3d(
+        spec: &Slopes3D,
+        grid: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        bed: &mut Bathymetry2D,
+        notes: &mut Vec<String>,
+    ) {
+        let thin = spec.thin_depth_m;
+        let s = bed.smooth_element_slopes(grid, ops, geom, spec.bound(), thin);
+        notes.push(format!(
+            "smoothed for 3D (within an element r_x0 ≤ {} below {} m, columns ≥ {thin} m, \
+             {} sweeps): {} elements over the bound (largest excess {:.1} m), {} nodes changed \
+             by up to {:.1} m, volume kept; {} elements left over",
+            spec.r_max,
+            spec.free_depth_m,
+            s.sweeps,
+            s.elements_before,
+            s.excess_before,
+            s.changed,
+            s.max_change,
+            s.elements_after
+        ));
+        let high = spec.high_water_m;
+        if spec.raise_cliffs {
+            let deep = spec.cliff_depth_m;
+            let c = bed.raise_cliff_shores(grid, ops, geom, deep, thin, high, high);
+            let raised = bed.raise_isolated_wet_nodes(grid, ops, geom, 0.0);
+            notes.push(format!(
+                "cliff shores raised to land (+{high} m) in {} elements deeper than {deep} m: \
+                 {} nodes, by up to {:.1} m, {:.3} km² of water at mean sea level; {raised} \
+                 isolated wet nodes raised after",
+                c.elements,
+                c.nodes,
+                c.max_raise,
+                c.area / 1e6
+            ));
+        }
+        if spec.fill_ponds {
+            let low = spec.pond_low_water_m;
+            let p = bed.fill_tidal_ponds(grid, ops, geom, low, high, ops.n_nodes);
+            let raised = bed.raise_isolated_wet_nodes(grid, ops, geom, 0.0);
+            notes.push(format!(
+                "tidal ponds between {low} and +{high} m filled to their sills: {} ponds, {} \
+                 nodes, by up to {:.1} m, {:.3} km², {:.2e} m³; {} larger ponds left; {raised} \
+                 isolated wet nodes raised after",
+                p.ponds,
+                p.nodes,
+                p.max_raise,
+                p.area / 1e6,
+                p.volume,
+                p.left
+            ));
+        }
     }
 
     /// Nest the faces tagged `tag` in the parent of `spec`: wall the faces

@@ -14,14 +14,16 @@
 //! What a case can hold so far (P8.1, 2D):
 //! - a rectangle, a Gmsh mesh, or a longitude/latitude box, placed on the
 //!   Earth or not, with the land dropped;
-//! - a uniform, linear or GeoTIFF bed;
+//! - a uniform, linear or GeoTIFF bed, smoothed to a slope factor or for a
+//!   3D model (element slopes, cliff shores, tidal ponds), the land at its
+//!   walls lowered;
 //! - Coriolis (f-plane or beta plane), Manning or quadratic-drag friction,
 //!   viscosity, wetting and drying;
 //! - still-water, harmonic-tide and tidal-atlas open boundaries, and
 //!   nesting in a parent ocean model (NetCDF, with the `netcdf` feature);
 //! - snapshot, VTK, NetCDF and station output.
 //!
-//! Next: the atmosphere, and the example's 3D bed treatments
+//! Next: the atmosphere, and gauge scores at the stations
 //! (`notes/case-files.md`).
 
 mod domain;
@@ -30,7 +32,7 @@ pub mod schema;
 
 use std::path::{Path, PathBuf};
 
-pub use domain::Domain;
+pub use domain::{Domain, StationProbe};
 pub use run::{Progress, RunReport, StationSeries};
 pub use schema::*;
 
@@ -480,6 +482,69 @@ file = \"parent.nc\"
             .replace("[boundary.nesting]", "still = {}\n[boundary.nesting]");
         let err = parse(&both).unwrap().validate().unwrap_err().to_string();
         assert!(err.contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn the_3d_bed_takes_the_examples_defaults_and_checks_its_values() {
+        let with = |extra: &str| format!("{MINIMAL}\n[bathymetry.slopes_3d]\n{extra}\n");
+        let case = parse(&with("")).unwrap();
+        case.validate().unwrap();
+        let b = &case.bathymetry;
+        assert!(!b.lower_wall_land);
+        assert_eq!(b.wall_low_water_m, -2.0);
+        let s = b.slopes_3d.as_ref().unwrap();
+        assert_eq!((s.r_max, s.free_depth_m, s.thin_depth_m), (0.15, 19.0, 0.1));
+        assert_eq!(
+            s.bound(),
+            crate::mesh::ElementSlopeBound::for_pycnocline(19.0)
+        );
+        assert!(s.raise_cliffs && s.fill_ponds);
+        assert_eq!(
+            (s.cliff_depth_m, s.pond_low_water_m, s.high_water_m),
+            (20.0, -1.43, 2.0)
+        );
+        for (extra, needs) in [
+            ("r_max = 1.0", "r_max"),
+            ("r_max = 0.0", "r_max"),
+            ("free_depth_m = -1.0", "free_depth_m"),
+            ("thin_depth_m = 0.0", "thin_depth_m"),
+            ("cliff_depth_m = 0.05", "cliff_depth_m"),
+            ("pond_low_water_m = 2.0", "pond_low_water_m"),
+            ("high_water_m = nan", "high_water_m"),
+        ] {
+            let err = parse(&with(extra))
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needs), "{needs}: {err}");
+        }
+        // A switched-off step is not checked
+        parse(&with("raise_cliffs = false\ncliff_depth_m = 0.05"))
+            .unwrap()
+            .validate()
+            .unwrap();
+        let err =
+            parse(&MINIMAL.replace("depth_m = 10.0", "depth_m = 10.0\nwall_low_water_m = inf"))
+                .unwrap()
+                .validate()
+                .unwrap_err();
+        assert!(err.to_string().contains("wall_low_water_m"), "{err}");
+    }
+
+    #[test]
+    fn stations_sample_in_open_water_by_default() {
+        let with = |extra: &str| {
+            format!("{MINIMAL}\n[[output.station]]\nname = \"s\"\nx_m = 500.0\ny_m = 50.0\n{extra}")
+        };
+        let case = parse(&with("")).unwrap();
+        case.validate().unwrap();
+        let s = &case.output.stations[0];
+        assert_eq!((s.open_water_depth_m, s.max_offset_m), (3.0, 3000.0));
+        for extra in ["open_water_depth_m = -1.0", "max_offset_m = inf"] {
+            let err = parse(&with(extra)).unwrap().validate().unwrap_err();
+            assert!(err.to_string().contains(&extra[..10]), "{err}");
+        }
     }
 
     #[test]

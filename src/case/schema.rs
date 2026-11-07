@@ -229,6 +229,129 @@ pub struct BathymetrySection {
     /// The shallowest depth `smooth_rx0` acts at (m, default 3).
     #[serde(default = "default_rx0_min_depth")]
     pub rx0_min_depth_m: f64,
+    /// Lower the land at the walls of elements that are otherwise water to
+    /// the water beside it (`Bathymetry2D::lower_wall_land`; default false).
+    /// A simplified coastline leaves a strip of the raster's land in front
+    /// of its walls, a fraction of a node spacing wide, that keeps the
+    /// element partly dry at every water level. Only elements wet off their
+    /// walls below `wall_low_water_m` are lowered.
+    #[serde(default)]
+    pub lower_wall_land: bool,
+    /// The lowest water of `lower_wall_land` (m above mean sea level,
+    /// default −2): below the lowest astronomical tide, so that the elements
+    /// it lowers stay wet through the tide.
+    #[serde(default = "default_wall_low_water")]
+    pub wall_low_water_m: f64,
+    /// The bed for a 3D model (default: none). Smooths the bed, keeping its
+    /// volume, until no element's depth range lets a σ-level cross the
+    /// pycnocline between two of its nodes, then raises cliff shores to land
+    /// and fills tidal ponds. A 2D run on this bed shows what the 3D bed
+    /// does to the tide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slopes_3d: Option<Slopes3D>,
+}
+
+/// `[bathymetry.slopes_3d]`: the bed a σ-coordinate model needs (TODO
+/// P1.3, `notes/3d-validation.md`), after the bed rasters and `smooth_rx0`.
+///
+/// 1. Within an element, the slope factor r_x0 between two columns at least
+///    `thin_depth_m` deep is at most `r_max` wherever the deeper one is below
+///    `free_depth_m` (`Bathymetry2D::smooth_element_slopes`). The shores are
+///    the wetting and drying's and do not move.
+/// 2. With `raise_cliffs`, the shore nodes of elements with a node deeper
+///    than `cliff_depth_m`, which a tide would make resolved columns beside
+///    the deep ones, are raised to land at `high_water_m`
+///    (`Bathymetry2D::raise_cliff_shores`).
+/// 3. With `fill_ponds`, the tidal ponds of at most one element's nodes at
+///    water levels from `pond_low_water_m` to `high_water_m` (nodes the open
+///    water does not reach along the grid lines) are filled to their sills
+///    (`Bathymetry2D::fill_tidal_ponds`).
+///
+/// The defaults are `examples/froya_real_data.rs`'s `slopes3d=on`: a summer
+/// pycnocline whose bottom is 19 m deep, and Mausund's lowest (−1.43 m) and
+/// highest (under +2 m) astronomical tides. Set the tidal range for another
+/// coast.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Slopes3D {
+    /// Largest slope factor within an element (default 0.15).
+    #[serde(default = "default_slopes_r_max")]
+    pub r_max: f64,
+    /// Depth above which an element's depth range is free (m, default 19:
+    /// the pycnocline's bottom).
+    #[serde(default = "default_free_depth")]
+    pub free_depth_m: f64,
+    /// Columns shallower than this are thin (m, default 0.1, the 3D model's
+    /// default): the shores, left alone.
+    #[serde(default = "default_thin_depth")]
+    pub thin_depth_m: f64,
+    /// Raise the shore nodes of cliff elements to land (default true).
+    #[serde(default = "default_true")]
+    pub raise_cliffs: bool,
+    /// An element with a node deeper than this is a cliff (m, default 20).
+    #[serde(default = "default_cliff_depth")]
+    pub cliff_depth_m: f64,
+    /// Fill the tidal ponds (default true).
+    #[serde(default = "default_true")]
+    pub fill_ponds: bool,
+    /// The lowest water at which a pond is looked for (m above mean sea
+    /// level, default −1.43).
+    #[serde(default = "default_pond_low_water")]
+    pub pond_low_water_m: f64,
+    /// The highest water (m above mean sea level, default 2): where the
+    /// ponds are looked for up to, and the height cliff shores are raised
+    /// to.
+    #[serde(default = "default_high_water")]
+    pub high_water_m: f64,
+}
+
+impl Slopes3D {
+    /// The library's bound.
+    pub fn bound(&self) -> crate::mesh::ElementSlopeBound {
+        crate::mesh::ElementSlopeBound {
+            r_max: self.r_max,
+            free_depth: self.free_depth_m,
+        }
+    }
+
+    fn validate(&self) -> Result<(), CaseError> {
+        let invalid = |m: String| Err(CaseError::Invalid(format!("bathymetry.slopes_3d.{m}")));
+        if !(self.r_max > 0.0 && self.r_max < 1.0) {
+            return invalid(format!("r_max must lie in (0, 1), not {}", self.r_max));
+        }
+        if !(non_negative(self.free_depth_m) && self.free_depth_m.is_finite()) {
+            return invalid(format!(
+                "free_depth_m must be ≥ 0, not {}",
+                self.free_depth_m
+            ));
+        }
+        if !(positive(self.thin_depth_m) && self.thin_depth_m.is_finite()) {
+            return invalid(format!(
+                "thin_depth_m must be positive, not {}",
+                self.thin_depth_m
+            ));
+        }
+        if self.raise_cliffs
+            && !(self.cliff_depth_m.is_finite() && self.cliff_depth_m > self.thin_depth_m)
+        {
+            return invalid(format!(
+                "cliff_depth_m must be deeper than thin_depth_m ({} m), not {}",
+                self.thin_depth_m, self.cliff_depth_m
+            ));
+        }
+        if !self.high_water_m.is_finite() {
+            return invalid("high_water_m must be finite".into());
+        }
+        if self.fill_ponds
+            && !(self.pond_low_water_m.is_finite() && self.pond_low_water_m < self.high_water_m)
+        {
+            return invalid(format!(
+                "pond_low_water_m must be below high_water_m ({} m), not {}",
+                self.high_water_m, self.pond_low_water_m
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `[bathymetry.raster]`: a GeoTIFF of bed elevation (m, negative under
@@ -678,9 +801,16 @@ pub struct OutputSection {
     /// `output/<run.name>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory: Option<PathBuf>,
-    /// Time between outputs (minutes, default 60).
+    /// Time between outputs of the fields (snapshot, VTK, NetCDF; minutes,
+    /// default 60).
     #[serde(default = "default_interval_minutes")]
     pub interval_minutes: f64,
+    /// Time between station records (minutes, default `interval_minutes`).
+    /// One of the two intervals must be a whole multiple of the other. The
+    /// run's steps land on both (as ROMS's `NSTA` and `NHIS`), so the
+    /// intervals are part of the run, to round-off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub station_interval_minutes: Option<f64>,
     /// The whole state in the viewer's snapshot format,
     /// `<name>.dgsnap` (default true).
     #[serde(default = "default_true")]
@@ -692,10 +822,18 @@ pub struct OutputSection {
     /// CF NetCDF, `<name>.nc` (default false; needs the `netcdf` feature).
     #[serde(default)]
     pub netcdf: bool,
-    /// Points where the surface and the current are recorded at every
-    /// output, into `stations.csv`.
+    /// Points where the surface and the current are recorded every
+    /// `station_interval_minutes`, into `stations.csv`.
     #[serde(default, rename = "station", skip_serializing_if = "Vec::is_empty")]
     pub stations: Vec<Station>,
+}
+
+impl OutputSection {
+    /// Time between station records (minutes).
+    pub fn station_interval(&self) -> f64 {
+        self.station_interval_minutes
+            .unwrap_or(self.interval_minutes)
+    }
 }
 
 impl Default for OutputSection {
@@ -703,6 +841,7 @@ impl Default for OutputSection {
         Self {
             directory: None,
             interval_minutes: default_interval_minutes(),
+            station_interval_minutes: None,
             snapshot: true,
             vtk: false,
             netcdf: false,
@@ -729,6 +868,24 @@ pub struct Station {
     /// Latitude (degrees north)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lat: Option<f64>,
+    /// Sample in open water (m, default 3): at the station if every node of
+    /// its element is at least this deep below mean sea level, else at the
+    /// nearest point of such an element within `max_offset_m`
+    /// (`Probe2D::in_open_water`). A tide gauge at the shore is often in an
+    /// element that is partly land, whose surface mixes in the land's bed.
+    /// 0 samples at the station as it is.
+    #[serde(default = "default_open_water_depth")]
+    pub open_water_depth_m: f64,
+    /// How far a station may be moved into open water (m, default 3000).
+    #[serde(default = "default_max_offset")]
+    pub max_offset_m: f64,
+}
+
+fn default_open_water_depth() -> f64 {
+    3.0
+}
+fn default_max_offset() -> f64 {
+    3000.0
 }
 
 fn default_name() -> String {
@@ -775,6 +932,27 @@ fn default_max_closed() -> f64 {
 }
 fn default_rx0_min_depth() -> f64 {
     3.0
+}
+fn default_wall_low_water() -> f64 {
+    -2.0
+}
+fn default_slopes_r_max() -> f64 {
+    0.15
+}
+fn default_free_depth() -> f64 {
+    19.0
+}
+fn default_thin_depth() -> f64 {
+    0.1 // `Hydrostatic3D::DEFAULT_MIN_COLUMN_DEPTH`
+}
+fn default_cliff_depth() -> f64 {
+    20.0
+}
+fn default_pond_low_water() -> f64 {
+    -1.43
+}
+fn default_high_water() -> f64 {
+    2.0
 }
 fn default_land_elevation() -> f64 {
     5.0
@@ -986,6 +1164,12 @@ impl Case {
         if b.rx0_min_depth_m < 0.0 {
             return invalid("bathymetry.rx0_min_depth_m must be ≥ 0".into());
         }
+        if !b.wall_low_water_m.is_finite() {
+            return invalid("bathymetry.wall_low_water_m must be finite".into());
+        }
+        if let Some(s) = &b.slopes_3d {
+            s.validate()?;
+        }
         let p = &self.physics;
         if !positive(p.gravity) {
             return invalid(format!(
@@ -1133,6 +1317,22 @@ impl Case {
                 o.interval_minutes
             ));
         }
+        if let Some(s) = o.station_interval_minutes {
+            if !(positive(s) && s.is_finite()) {
+                return invalid(format!(
+                    "output.station_interval_minutes must be positive, not {s}"
+                ));
+            }
+            let (fine, coarse) = (s.min(o.interval_minutes), s.max(o.interval_minutes));
+            let ratio = coarse / fine;
+            if (ratio - ratio.round()).abs() > 1e-9 * ratio {
+                return invalid(format!(
+                    "output.interval_minutes ({}) and station_interval_minutes ({s}): one \
+                     must be a whole multiple of the other",
+                    o.interval_minutes
+                ));
+            }
+        }
         if o.netcdf && !cfg!(feature = "netcdf") {
             return invalid(
                 "output.netcdf needs dgcom built with the `netcdf` feature (on by default)".into(),
@@ -1157,6 +1357,17 @@ impl Case {
                 _ => {
                     return invalid(format!(
                         "station {:?} needs x_m and y_m, or lon and lat",
+                        s.name
+                    ));
+                }
+            }
+            for (key, value) in [
+                ("open_water_depth_m", s.open_water_depth_m),
+                ("max_offset_m", s.max_offset_m),
+            ] {
+                if !(non_negative(value) && value.is_finite()) {
+                    return invalid(format!(
+                        "station {:?}: {key} must be ≥ 0, not {value}",
                         s.name
                     ));
                 }
