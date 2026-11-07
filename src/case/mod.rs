@@ -11,11 +11,16 @@
 //!
 //! Paths in a case file are relative to the file's directory.
 //!
-//! What a case can hold so far (P8.1, 2D): a rectangle or a Gmsh mesh, a
-//! uniform or linear bed, Coriolis, Manning or quadratic-drag friction,
-//! viscosity, wetting and drying, still-water and harmonic-tide open
-//! boundaries, and snapshot, VTK, NetCDF and station output. Next: bed
-//! rasters, tidal atlases, nesting in a parent model and the atmosphere
+//! What a case can hold so far (P8.1, 2D):
+//! - a rectangle, a Gmsh mesh, or a longitude/latitude box, placed on the
+//!   Earth or not, with the land dropped;
+//! - a uniform, linear or GeoTIFF bed;
+//! - Coriolis (f-plane or beta plane), Manning or quadratic-drag friction,
+//!   viscosity, wetting and drying;
+//! - still-water, harmonic-tide and tidal-atlas open boundaries;
+//! - snapshot, VTK, NetCDF and station output.
+//!
+//! Next: nesting in a parent model and the atmosphere
 //! (`notes/case-files.md`).
 
 mod domain;
@@ -334,6 +339,52 @@ lon = 8.5
         assert!(parse(&both).unwrap().validate().is_err());
         let backwards = text.replace("[8.0, 63.6, 9.2, 64.0]", "[9.2, 63.6, 8.0, 64.0]");
         assert!(parse(&backwards).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn an_atlas_needs_a_placed_mesh_and_a_start() {
+        let boundary = "
+[[boundary]]
+tag = \"open\"
+atlas = { file = \"a.txt\" }
+";
+        let open = MINIMAL.replace(
+            "ny = 1",
+            "ny = 1
+        west = \"open\"",
+        );
+        let placed = open.replace(
+            "[bathymetry]",
+            "[mesh.origin]
+lat = 63.7
+lon = 8.5
+
+[bathymetry]",
+        );
+        let started = |t: &str| {
+            t.replace(
+                "duration_hours = 1.0",
+                "duration_hours = 1.0
+        start = \"2025-06-15T00:00:00Z\"",
+            )
+        };
+        for (text, needs) in [
+            (format!("{}{boundary}", started(&open)), "placed"),
+            (format!("{placed}{boundary}"), "run.start"),
+        ] {
+            let err = parse(&text).unwrap().validate().unwrap_err().to_string();
+            assert!(err.contains(needs), "{err}");
+        }
+        parse(&format!("{}{boundary}", started(&placed)))
+            .unwrap()
+            .validate()
+            .unwrap();
+        let both = format!(
+            "{}{boundary}still = {{}}
+",
+            started(&placed)
+        );
+        assert!(parse(&both).unwrap().validate().is_err());
     }
 
     #[test]

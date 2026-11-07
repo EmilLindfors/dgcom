@@ -149,3 +149,20 @@ stations = "stations.toml"
 - **Gates (`tests/case_test.rs`):** a synthetic topobathy GeoTIFF of a bay is written in the test, with a sloping bed, land beyond 8.133°E and an island. It is meshed geographically, with the beta plane, Manning friction, open sides and a lon/lat station.
   - A lake at rest over it stays at rest to |u| ≤ 6.8e-14 m/s and |η| ≤ 1.4e-14 m over 1 h, and to 6.6e-14 and 2.1e-14 with local time stepping and SSP-RK3.
   - A raster that misses the mesh, and a station on dropped land, are refused. Three unit tests cover what needs a placed mesh.
+
+## P8.1, third part: tidal atlases (2026-11-07)
+
+- **`[boundary.atlas]`:** a `TidalAtlas` file (the text format of `norkyst_boundary_tides`) projected onto the tag's boundary nodes (`TidalAtlas::boundary_tides`), nodal-corrected from `run.start`, ramped over `ramp_hours`.
+  - It needs a placed mesh and `run.start`, since atlas lags are Greenwich lags. Validation refuses it without them.
+  - An atlas with currents gives the external velocity. One without them takes `boundary.velocity`.
+- **Coverage:** before the boundary is built, `BoundaryCoverage::of_atlas` walls the open faces with a node farther than `coverage_m` (default 5 km, `froya_real_data`'s `ATLAS_COVERAGE`) from an atlas point. More than `max_closed` (default 0.05, the example's `max_closed`) of the tag's faces is an error, as in the example. The domain's notes record how many faces were closed.
+- **Options:** `correction = "theory"` (`TidalAtlas::infer_from_theory`: K2 and P1 at their equilibrium ratios, the minor semidiurnals by admittance) and `transport_scaling` (`BoundaryTides::with_transport_scaling`, the example's `tide_transport`). The gauge correction, the example's default `gauge_gains`/`gauge_ratios` from a gauge record and a station atlas, is not in yet.
+- **Stage 1 of P8.2, bit for bit:** `cases/froya` with the atlas against `froya_real_data gauge_gains= gauge_ratios= hours=1 snapshot_minutes=10 station_minutes=10 rest_hours=0` gives **0 values differing** in all 7 frames: 12 constituents at 1,139 boundary nodes, 0 of 381 faces closed, 1,740 steps each.
+- **`cases/bodo`:**
+  - `bodo_coast.msh` with `origin` at the centre of 13.7–14.55°E, 67.05–67.5°N, the 50 m topobathy and the NorKyst atlas.
+  - The domain: 11,118 of 11,344 elements kept, 905 zero pixels filled, 26 isolated wet nodes raised, 0 of 186 open faces closed. 1 h runs in 15,059 steps, 97 s.
+  - It takes the beta plane at Bodø's latitude. `froya_real_data` applies Frøya's f = 1.31e-4 there, 2.6 % below Bodø's 1.345e-4, so this case is not compared bit for bit with the example.
+- **Gates (`tests/case_test.rs`):**
+  - An atlas holding one tide (M2, S2, K1) at every point forces the same tide as `tide` with those constants: the largest difference at the stations over 6 h is 7e-15 m on a tide of up to 0.39 m. This checks that the two routes share the nodal corrections and the Greenwich-lag convention.
+  - An atlas covering the lower quarter of a mouth walls the rest, leaving 2 open faces, when `max_closed` allows it, and is refused at the default.
+  - A unit test checks that an atlas needs a placed mesh and a start.

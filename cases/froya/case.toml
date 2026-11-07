@@ -1,19 +1,24 @@
-# Frøya–Smøla–Hitra on real bathymetry: a real coastline from a raster.
+# Frøya–Smøla–Hitra: tides on real bathymetry.
 #
-# The domain is a longitude/latitude box meshed as a 120 × 90 rectangle, its
-# bed from Kartverket's 50 m topobathy model. The elements with no node
-# below mean sea level are dropped, their faces becoming the coastline's
-# walls, and the box's sides are open where they cross water. The bed is
-# fetched once (about 4.6 MB, free, no account needed):
+# The domain is a longitude/latitude box meshed as a 120 × 90 rectangle,
+# with its bed from Kartverket's 50 m topobathy model. The elements with no
+# node below mean sea level are dropped, their faces becoming the
+# coastline's walls, and the box's sides are open where they cross water.
+#
+# The open boundary carries NorKyst-800's tide: twelve constituents of level
+# and depth-mean current varying along the boundary, from a tidal atlas
+# fitted to a month of NorKyst. The inputs, fetched once (free, no account
+# needed):
 #
 #   ./scripts/kartverket_topobathy.sh 8.0 63.6 9.2 64.0 50 data/froya_topobathy.tif
+#   cargo run --release --example norkyst_boundary_tides -- \
+#       bbox=8.0,63.6,9.2,64.0 out=data/froya_boundary_tides.txt
 #   dgcom run cases/froya/case.toml
 #
-# The open boundary carries a uniform M2: the same phase all along it, as
-# `examples/froya_real_data.rs tides=none` does. The real tide varies along
-# the boundary and needs a tidal atlas, which case files cannot read yet
-# (TODO P8.1). This case reproduces that example bit for bit
-# (`notes/case-files.md`).
+# This case reproduces `examples/froya_real_data.rs gauge_gains= gauge_ratios=`
+# bit for bit (`notes/case-files.md`). The example's default also corrects
+# the atlas with the Mausund gauge, which case files cannot do yet (TODO
+# P8.1). `correction = "theory"` corrects it without a gauge.
 
 [run]
 name = "froya"
@@ -40,10 +45,9 @@ friction = { manning = 0.025 }
 
 [[boundary]]
 tag = "open"
-velocity = "at_rest"
-[boundary.tide]
+[boundary.atlas]
+file = "../../data/froya_boundary_tides.txt"
 ramp_hours = 1.0
-constituents = [{ name = "M2", amplitude_m = 0.8 }]
 
 [output]
 interval_minutes = 10.0

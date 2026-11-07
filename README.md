@@ -24,9 +24,9 @@ The run writes to `cases/tidal_channel/output/tidal_channel/`:
 Case files cover the 2D model:
 - meshes: rectangles, Gmsh meshes, and longitude/latitude boxes clipped to the water;
 - beds: uniform, sloping, or from a GeoTIFF;
-- open boundaries: still water or a harmonic tide.
+- open boundaries: still water, a harmonic tide, or a tidal atlas.
 
-`cases/froya/case.toml` runs Frøya–Smøla–Hitra on Kartverket's topobathy model. Its header says how to fetch the bed. Tidal atlases, nesting in a parent model and atmospheric forcing are next (`TODO.md` P8).
+`cases/froya/case.toml` and `cases/bodo/case.toml` run Frøya–Smøla–Hitra and Bodø on Kartverket's topobathy model, with NorKyst-800's tide along the open boundary from a tidal atlas. Their headers say how to fetch the inputs. Nesting in a parent model and atmospheric forcing are next (`TODO.md` P8).
 
 ## Windows HDF5/netCDF-C Setup
 

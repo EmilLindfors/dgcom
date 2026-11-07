@@ -395,3 +395,169 @@ fn a_station_on_dropped_land_is_refused() {
     let err = file.run(&mut |_| {}).err().unwrap().to_string();
     assert!(err.contains("inland") && err.contains("dropped"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// Tidal atlases
+// ---------------------------------------------------------------------------
+
+/// Where the placed channels below lie: x = y = 0 here.
+const ORIGIN: (f64, f64) = (63.7, 8.5);
+
+/// An atlas of the level only, with `constituents` (name, amplitude, lag)
+/// at points (x, y) of the placed mesh.
+fn write_atlas(path: &Path, points: &[(f64, f64)], constituents: &[(&str, f64, f64)]) {
+    use dgcom::io::{CoordinateProjection, LocalProjection};
+    let projection = LocalProjection::new(ORIGIN.0, ORIGIN.1);
+    let mut text = String::from("# test atlas\n# lon lat depth name eta_amp eta_lag\n");
+    for &(x, y) in points {
+        let (lat, lon) = projection.xy_to_geo(x, y);
+        for (name, amp, lag) in constituents {
+            text += &format!("{lon:.8} {lat:.8} 10.0 {name} {amp} {lag}\n");
+        }
+    }
+    std::fs::write(path, text).unwrap();
+}
+
+/// A placed channel 30 km long, 2 km wide and 10 m deep, open at its west
+/// end, with the given boundary entry; its stations' records over 6 h.
+fn placed_channel(dir: &Path, boundary: &str) -> Result<Vec<StationSeries>, CaseError> {
+    let text = format!(
+        r#"
+        [run]
+        start = "2025-06-15T00:00:00Z"
+        duration_hours = 6.0
+
+        [mesh]
+        origin = {{ lat = {}, lon = {} }}
+
+        [mesh.rectangle]
+        x_m = [0.0, 30000.0]
+        y_m = [0.0, 2000.0]
+        nx = 15
+        ny = 1
+        west = "open"
+
+        [bathymetry]
+        depth_m = 10.0
+
+        [[boundary]]
+        tag = "open"
+        {boundary}
+
+        [output]
+        directory = "out"
+        interval_minutes = 30.0
+        snapshot = false
+
+        [[output.station]]
+        name = "mouth"
+        x_m = 1000.0
+        y_m = 1000.0
+
+        [[output.station]]
+        name = "head"
+        x_m = 29000.0
+        y_m = 1000.0
+        "#,
+        ORIGIN.0, ORIGIN.1
+    );
+    let path = dir.join("case.toml");
+    std::fs::write(&path, text).unwrap();
+    Ok(CaseFile::read(&path, &[])?.run(&mut |_| {})?.stations)
+}
+
+/// An atlas holding one tide at every point gives the boundary the same
+/// tide as `tide` with those constants: both are nodal-corrected from
+/// `run.start`, with the lags as Greenwich lags.
+#[test]
+fn a_uniform_atlas_forces_the_same_tide_as_its_harmonic_constants() {
+    let constituents = [("M2", 0.3, 40.0), ("S2", 0.1, 75.0), ("K1", 0.05, 200.0)];
+    let dir = tempfile::tempdir().unwrap();
+    let points: Vec<(f64, f64)> = (0..=4).map(|i| (0.0, 500.0 * i as f64)).collect();
+    write_atlas(&dir.path().join("atlas.txt"), &points, &constituents);
+    let atlas = placed_channel(dir.path(), "atlas = { file = \"atlas.txt\" }").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let list: Vec<String> = constituents
+        .iter()
+        .map(|(n, a, g)| format!("{{ name = \"{n}\", amplitude_m = {a}, phase_deg = {g} }}"))
+        .collect();
+    let tide = placed_channel(
+        dir.path(),
+        &format!("tide = {{ constituents = [{}] }}", list.join(", ")),
+    )
+    .unwrap();
+
+    let mut largest = 0.0_f64;
+    for (a, t) in atlas.iter().zip(&tide) {
+        for (ea, et) in a.eta_m.iter().zip(&t.eta_m) {
+            largest = largest.max((ea - et).abs());
+        }
+    }
+    let range = tide[1].eta_m.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+    println!(
+        "atlas against harmonic tide: largest difference {largest:.2e} m (|η| up to {range:.3} m)"
+    );
+    assert!(range > 0.1, "the tide reached the head: {range}");
+    assert!(largest < 1e-9, "{largest} m");
+}
+
+/// Open faces farther than `coverage_m` from the atlas become walls, up to
+/// `max_closed` of them; beyond, the case is refused.
+#[test]
+fn an_atlas_walls_the_open_faces_it_does_not_cover() {
+    let dir = tempfile::tempdir().unwrap();
+    // Points along the lower quarter of the mouth only
+    let points: Vec<(f64, f64)> = (0..=2).map(|i| (0.0, 250.0 * i as f64)).collect();
+    write_atlas(&dir.path().join("atlas.txt"), &points, &[("M2", 0.3, 40.0)]);
+    let text = |max_closed: f64| {
+        format!(
+            r#"
+            [run]
+            start = "2025-06-15T00:00:00Z"
+            duration_hours = 1.0
+
+            [mesh]
+            origin = {{ lat = {}, lon = {} }}
+
+            [mesh.rectangle]
+            x_m = [0.0, 8000.0]
+            y_m = [0.0, 8000.0]
+            nx = 4
+            ny = 8
+            west = "open"
+
+            [bathymetry]
+            depth_m = 10.0
+
+            [[boundary]]
+            tag = "open"
+            atlas = {{ file = "atlas.txt", coverage_m = 1500.0, max_closed = {max_closed} }}
+            "#,
+            ORIGIN.0, ORIGIN.1
+        )
+    };
+    let path = dir.path().join("case.toml");
+    std::fs::write(&path, text(0.05)).unwrap();
+    let err = CaseFile::read(&path, &[])
+        .unwrap()
+        .build_domain()
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("max_closed"), "{err}");
+
+    std::fs::write(&path, text(0.9)).unwrap();
+    let domain = CaseFile::read(&path, &[]).unwrap().build_domain().unwrap();
+    let open = (0..domain.mesh.n_elements)
+        .flat_map(|k| (0..4).map(move |f| (k, f)))
+        .filter(|&(k, f)| {
+            domain
+                .mesh
+                .boundary_tag(dgcom::types::ElementIndex::new(k), f)
+                == Some(dgcom::mesh::BoundaryTag::Open)
+        })
+        .count();
+    // The faces of 1 km along the mouth whose nodes lie within 1.5 km of a
+    // point at y ≤ 500 m: y ∈ [0, 2000] m
+    assert_eq!(open, 2, "{:?}", domain.notes);
+}

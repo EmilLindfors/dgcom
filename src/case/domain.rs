@@ -4,13 +4,14 @@
 //! The order follows `examples/froya_real_data.rs`, so that a case
 //! reproduces its runs: build the whole mesh, put the bed on its nodes
 //! (a raster's projected or sampled, then its isolated wet nodes raised),
-//! smooth the slopes if asked, and drop the elements with no node below
-//! mean sea level.
+//! smooth the slopes if asked, drop the elements with no node below mean
+//! sea level, and wall the open faces a tidal atlas does not cover.
 
 use std::sync::Arc;
 
-use super::schema::{RasterKind, Sampling, SideTag};
+use super::schema::{AtlasCorrection, RasterKind, Sampling, SideTag};
 use super::{CaseError, CaseFile};
+use crate::boundary::{BoundaryCoverage, TidalAtlas};
 use crate::io::{
     BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
     LocalProjection,
@@ -36,6 +37,9 @@ pub struct Domain {
     pub open_tags: Vec<SideTag>,
     /// The projection that places the mesh, if it is placed
     pub projection: Option<LocalProjection>,
+    /// The tidal atlas of each `[[boundary]]` that has one, read and
+    /// corrected
+    pub atlases: Vec<(SideTag, TidalAtlas)>,
     /// What was done to build it, line by line, for a log
     pub notes: Vec<String>,
 }
@@ -96,7 +100,7 @@ impl CaseFile {
             ));
         }
 
-        let (mesh, bathymetry, geom) = if case.mesh.drop_land {
+        let (mut mesh, bathymetry, geom) = if case.mesh.drop_land {
             let has_water = |k: ElementIndex| bed.element(k).iter().any(|&z| z < 0.0);
             let (mesh, kept) = grid.retain_elements(has_water, BoundaryTag::Wall);
             if kept.is_empty() {
@@ -115,6 +119,50 @@ impl CaseFile {
         } else {
             (grid, bed, grid_geom)
         };
+
+        // Tidal atlases: the open faces they do not cover become walls
+        let mut atlases = Vec::new();
+        for b in &case.boundaries {
+            let Some(spec) = &b.atlas else { continue };
+            let path = self.resolve(&spec.file);
+            let mut atlas = TidalAtlas::read(&path)
+                .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
+            if spec.correction == AtlasCorrection::Theory {
+                atlas
+                    .infer_from_theory()
+                    .map_err(|e| CaseError::Invalid(format!("{}: {e}", path.display())))?;
+            }
+            let projection = projection.as_ref().expect("validated: placed");
+            let coverage = BoundaryCoverage::of_atlas(
+                &mesh,
+                &ops,
+                projection,
+                b.tag.boundary_tag(),
+                &atlas,
+                spec.coverage_m,
+            );
+            let closed = coverage.close(&mut mesh, spec.max_closed).map_err(|e| {
+                CaseError::Invalid(format!(
+                    "{}: {e}: an atlas for this domain is needed, or a larger \
+                     boundary.atlas.max_closed",
+                    path.display()
+                ))
+            })?;
+            notes.push(format!(
+                "tidal atlas {} ({} constituents{}): {closed} of {} {:?} faces farther than \
+                 {:.1} km from it made walls",
+                path.display(),
+                atlas.names().len(),
+                match spec.correction {
+                    AtlasCorrection::None => "",
+                    AtlasCorrection::Theory => ", corrected from theory",
+                },
+                coverage.n_faces(),
+                b.tag.name(),
+                spec.coverage_m / 1000.0
+            ));
+            atlases.push((b.tag, atlas));
+        }
 
         let open_tags = open_tags(&mesh)?;
         for tag in &open_tags {
@@ -141,6 +189,7 @@ impl CaseFile {
             bathymetry: Arc::new(bathymetry),
             open_tags,
             projection,
+            atlases,
             notes,
         })
     }
