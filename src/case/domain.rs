@@ -5,17 +5,21 @@
 //! reproduces its runs: build the whole mesh, put the bed on its nodes
 //! (a raster's projected or sampled, then its isolated wet nodes raised),
 //! smooth the slopes if asked, drop the elements with no node below mean
-//! sea level, and wall the open faces a tidal atlas does not cover.
+//! sea level, wall the open faces a tidal atlas does not cover, and nest
+//! in a parent model: wall the faces it has no water at, blend the bed to
+//! its across the relaxation band, and correct its tide.
 
 use std::sync::Arc;
 
-use super::schema::{AtlasCorrection, GaugeCorrection, RasterKind, Sampling, SideTag};
+use super::schema::{AtlasCorrection, GaugeCorrection, Nesting, RasterKind, Sampling, SideTag};
 use super::{CaseError, CaseFile};
 use crate::analysis::HarmonicAnalysis;
-use crate::boundary::{BoundaryCoverage, GaugeAdjustment, TidalAtlas};
+use crate::boundary::{
+    BoundaryCoverage, GaugeAdjustment, NestingOptions, OceanModelState, ParentDatum, TidalAtlas,
+};
 use crate::io::{
     BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
-    LocalProjection, read_tide_gauge_file,
+    LocalProjection, OceanModelReader, read_tide_gauge_file,
 };
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, read_gmsh_mesh};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
@@ -41,6 +45,9 @@ pub struct Domain {
     /// The tidal atlas of each `[[boundary]]` that has one, read and
     /// corrected
     pub atlases: Vec<(SideTag, TidalAtlas)>,
+    /// The parent model of each `[[boundary]]` nested in one, sampled at the
+    /// boundary and its relaxation band, its tide corrected
+    pub parents: Vec<(SideTag, OceanModelState)>,
     /// What was done to build it, line by line, for a log
     pub notes: Vec<String>,
 }
@@ -101,7 +108,7 @@ impl CaseFile {
             ));
         }
 
-        let (mut mesh, bathymetry, geom) = if case.mesh.drop_land {
+        let (mut mesh, mut bathymetry, geom) = if case.mesh.drop_land {
             let has_water = |k: ElementIndex| bed.element(k).iter().any(|&z| z < 0.0);
             let (mesh, kept) = grid.retain_elements(has_water, BoundaryTag::Wall);
             if kept.is_empty() {
@@ -170,6 +177,25 @@ impl CaseFile {
             atlases.push((b.tag, atlas));
         }
 
+        // Parent models: the open faces they have no water at become walls,
+        // and the bed is blended to theirs across the band
+        let mut parents = Vec::new();
+        for b in &case.boundaries {
+            let Some(spec) = &b.nesting else { continue };
+            let projection = projection.as_ref().expect("validated: placed");
+            let parent = self.nest(
+                b.tag,
+                spec,
+                &mut mesh,
+                &ops,
+                &geom,
+                &mut bathymetry,
+                projection,
+                &mut notes,
+            )?;
+            parents.push((b.tag, parent));
+        }
+
         let open_tags = open_tags(&mesh)?;
         for tag in &open_tags {
             if !case.boundaries.iter().any(|b| b.tag == *tag) {
@@ -196,8 +222,164 @@ impl CaseFile {
             open_tags,
             projection,
             atlases,
+            parents,
             notes,
         })
+    }
+
+    /// Nest the faces tagged `tag` in the parent of `spec`: wall the faces
+    /// it has no water at, sample it at the boundary and the band, blend
+    /// the bed, and correct its tide.
+    #[allow(clippy::too_many_arguments)]
+    fn nest(
+        &self,
+        tag: SideTag,
+        spec: &Nesting,
+        mesh: &mut Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        bathymetry: &mut Bathymetry2D,
+        projection: &LocalProjection,
+        notes: &mut Vec<String>,
+    ) -> Result<OceanModelState, CaseError> {
+        let path = self.resolve(&spec.file);
+        let reader = Arc::new(read_parent(&path)?);
+        notes.push(format!("parent {}: {}", path.display(), reader.summary()));
+        let invalid =
+            |e: &dyn std::fmt::Display| CaseError::Invalid(format!("{}: {e}", path.display()));
+        let atlas = spec
+            .atlas
+            .as_ref()
+            .map(|a| {
+                let a = self.resolve(a);
+                TidalAtlas::read(&a).map_err(|e| CaseError::Io(format!("{}: {e}", a.display())))
+            })
+            .transpose()?;
+
+        // The parent's ζ has no datum: its mean comes off
+        let atlas_mean = atlas.as_ref().and_then(TidalAtlas::mean_level);
+        let (datum, datum_source) = match (spec.level_m, atlas_mean) {
+            (Some(level), _) => (ParentDatum::Shift(level), "level_m"),
+            (None, Some(mean)) => (ParentDatum::Shift(-mean), "minus the atlas's mean level"),
+            (None, None) => (
+                ParentDatum::RecordMean,
+                "minus the parent's own mean at the boundary",
+            ),
+        };
+        let mut options = NestingOptions::default()
+            .with_band(1000.0 * spec.band_km)
+            .with_ramp_up(3600.0 * spec.ramp_hours)
+            .with_datum(datum);
+        if spec.transport_scaling == 1.0 {
+            options = options.with_transport_scaling(false);
+        } else {
+            options.max_transport_ratio = spec.transport_scaling;
+        }
+
+        let boundary_tag = tag.boundary_tag();
+        let coverage =
+            BoundaryCoverage::of_parent(mesh, ops, projection, boundary_tag, &reader, &options);
+        let closed = coverage.close(mesh, spec.max_closed).map_err(|e| {
+            CaseError::Invalid(format!(
+                "{}: {e}: a parent cut for this domain is needed \
+                 (`norkyst_nesting_subset bbox=…`), or a larger boundary.nesting.max_closed",
+                path.display()
+            ))
+        })?;
+        notes.push(format!(
+            "parent {}: {closed} of {} {:?} faces without parent water made walls",
+            path.display(),
+            coverage.n_faces(),
+            tag.name()
+        ));
+        let clock = self
+            .case
+            .clock()?
+            .expect("validated: nesting needs a start");
+        let parent =
+            OceanModelState::new(reader, mesh, ops, projection, boundary_tag, clock, &options)
+                .map_err(|e| invalid(&e))?;
+        notes.push(format!(
+            "parent ζ shifted by {:+.3} m to mean sea level ({datum_source}); {} boundary nodes \
+             ({} snapped to a wet parent point), {} nodes in a {} km band",
+            parent.reference_level(),
+            parent.n_boundary_nodes(),
+            parent.n_snapped(),
+            parent.n_band_nodes(),
+            spec.band_km
+        ));
+        if let Some((lo, median, hi)) = parent.depth_ratios(bathymetry) {
+            notes.push(format!(
+                "parent/child depth at the boundary: {lo:.2}–{hi:.2} (median {median:.2})"
+            ));
+        }
+        if spec.blend_bed && spec.band_km > 0.0 {
+            let blended = parent.blend_bathymetry(bathymetry, ops, geom, spec.blend_shore_depth_m);
+            notes.push(format!(
+                "bed blended to the parent's at {blended} nodes of the band (elements with a \
+                 node shallower than {} m kept)",
+                spec.blend_shore_depth_m
+            ));
+        }
+
+        // The parent's tide corrected by (corrected − raw) atlas: the atlas
+        // is the parent's own harmonic fit, so its residual flow stays
+        let parent = match atlas {
+            Some(raw) if spec.correction != AtlasCorrection::None || spec.gauge.is_some() => {
+                let mut corrected = raw.clone();
+                if spec.correction == AtlasCorrection::Theory {
+                    corrected.infer_from_theory().map_err(|e| invalid(&e))?;
+                }
+                if let Some(gauge) = &spec.gauge {
+                    for change in self.correct_at_gauge(&mut corrected, gauge)? {
+                        notes.push(format!("parent's tide: {change}"));
+                    }
+                }
+                let correction = corrected.difference(&raw).map_err(|e| invalid(&e))?;
+                let keeps = |name: &str| {
+                    correction.points.iter().all(|p| {
+                        p.constituents
+                            .iter()
+                            .filter(|c| c.name == name)
+                            .all(|c| c.eta.0 < 1e-3)
+                    })
+                };
+                if spec.correction == AtlasCorrection::Theory && keeps("K2") && keeps("P1") {
+                    notes.push(
+                        "the atlas has K2 and P1 at the equilibrium ratios already, so theory \
+                         adds the minor semidiurnals only (an atlas made with \
+                         `norkyst_boundary_tides ratios=` has the parent's own)"
+                            .into(),
+                    );
+                }
+                let (largest, name) = correction
+                    .points
+                    .iter()
+                    .flat_map(|p| p.constituents.iter().map(|c| (c.eta.0, c.name)))
+                    .fold((0.0, ""), |a, b| if b.0 > a.0 { b } else { a });
+                if largest == 0.0 {
+                    parent
+                } else {
+                    notes.push(format!(
+                        "parent's tide corrected by (corrected − raw) atlas, largest \
+                         {largest:.3} m ({name})"
+                    ));
+                    parent
+                        .with_tidal_correction(
+                            &correction,
+                            projection,
+                            spec.atlas_coverage_m + 1000.0 * spec.band_km,
+                        )
+                        .map_err(|e| invalid(&e))?
+                }
+            }
+            _ => parent,
+        };
+        let t_end = 3600.0 * self.case.run.duration_hours;
+        parent
+            .check_time_coverage(0.0, t_end)
+            .map_err(|e| invalid(&e))?;
+        Ok(parent)
     }
 
     /// Correct `atlas` at the gauge of `spec`; what changed.
@@ -357,6 +539,21 @@ impl CaseFile {
         ));
         Ok(raster)
     }
+}
+
+/// The parent model's output at `path`.
+#[cfg(feature = "netcdf")]
+fn read_parent(path: &std::path::Path) -> Result<OceanModelReader, CaseError> {
+    OceanModelReader::from_file(path).map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))
+}
+
+#[cfg(not(feature = "netcdf"))]
+fn read_parent(path: &std::path::Path) -> Result<OceanModelReader, CaseError> {
+    Err(CaseError::Invalid(format!(
+        "{}: boundary.nesting reads NetCDF, which needs dgcom built with the `netcdf` feature \
+         (on by default)",
+        path.display()
+    )))
 }
 
 /// The longitude/latitude box around a placed mesh, with a margin of 2 % of
