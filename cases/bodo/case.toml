@@ -4,14 +4,16 @@
 # `scripts/gmsh_coastline_mesh.py`), in metres in the local projection about
 # the centre of the box 13.7–14.55°E, 67.05–67.5°N, which `mesh.origin`
 # states. Its bed is Kartverket's 50 m topobathy model, and the open
-# boundary carries NorKyst-800's tide from a tidal atlas. The inputs, made
-# once (free, no account needed):
+# boundary carries NorKyst-800's tide from a tidal atlas, corrected at
+# Kartverket's Bodø gauge. The inputs, made once (free, no account needed):
 #
 #   ./scripts/kartverket_topobathy.sh 13.7 67.05 14.55 67.5 50 data/bodo_topobathy.tif
 #   uv run scripts/gmsh_coastline_mesh.py dem=data/bodo_topobathy.tif \
 #       bbox=13.7,67.05,14.55,67.5 out=data/bodo_coast.msh
 #   cargo run --release --example norkyst_boundary_tides -- \
-#       bbox=13.7,67.05,14.55,67.5 out=data/bodo_boundary_tides.txt
+#       bbox=13.7,67.05,14.55,67.5 out=data/bodo_boundary_tides.txt \
+#       points=14.391,67.288 points_out=data/bodo_station_tides.txt
+#   ./scripts/kartverket_gauge.sh Bodo 67.288 14.391 2024-07-01 2025-07-01
 #   dgcom run cases/bodo/case.toml
 #
 # Unlike `examples/froya_real_data.rs`, which applies Frøya's Coriolis
@@ -43,6 +45,9 @@ tag = "open"
 [boundary.atlas]
 file = "../../data/bodo_boundary_tides.txt"
 ramp_hours = 3.0
+[boundary.atlas.gauge]
+record = "../../data/tide_gauges/bodo_obs.txt"
+source = "../../data/bodo_station_tides.txt"
 
 [output]
 interval_minutes = 10.0

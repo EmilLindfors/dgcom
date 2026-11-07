@@ -7,18 +7,22 @@
 #
 # The open boundary carries NorKyst-800's tide: twelve constituents of level
 # and depth-mean current varying along the boundary, from a tidal atlas
-# fitted to a month of NorKyst. The inputs, fetched once (free, no account
-# needed):
+# fitted to a month of NorKyst. The atlas is corrected at Kartverket's
+# Mausund gauge: NorKyst's K1, O1 and S2 are scaled to the gauge's, and N2,
+# Q1, P1 and K2 take the gauge's ratios to their neighbours. The inputs,
+# fetched once (free, no account needed):
 #
 #   ./scripts/kartverket_topobathy.sh 8.0 63.6 9.2 64.0 50 data/froya_topobathy.tif
 #   cargo run --release --example norkyst_boundary_tides -- \
-#       bbox=8.0,63.6,9.2,64.0 out=data/froya_boundary_tides.txt
+#       bbox=8.0,63.6,9.2,64.0 out=data/froya_boundary_tides.txt \
+#       points=8.665231,63.869331 points_out=data/froya_station_tides.txt
+#   ./scripts/kartverket_gauge.sh Mausund 63.869331 8.665231 2024-07-01 2025-07-01
 #   dgcom run cases/froya/case.toml
 #
-# This case reproduces `examples/froya_real_data.rs gauge_gains= gauge_ratios=`
-# bit for bit (`notes/case-files.md`). The example's default also corrects
-# the atlas with the Mausund gauge, which case files cannot do yet (TODO
-# P8.1). `correction = "theory"` corrects it without a gauge.
+# This case reproduces `examples/froya_real_data.rs` (its 2D tide, the
+# default) bit for bit (`notes/case-files.md`). Without a gauge, drop
+# `[boundary.atlas.gauge]`, or correct the atlas from theory instead
+# (`correction = "theory"`).
 
 [run]
 name = "froya"
@@ -48,6 +52,9 @@ tag = "open"
 [boundary.atlas]
 file = "../../data/froya_boundary_tides.txt"
 ramp_hours = 1.0
+[boundary.atlas.gauge]
+record = "../../data/tide_gauges/mausund_obs.txt"   # a year of hourly levels
+source = "../../data/froya_station_tides.txt"       # NorKyst at the gauge
 
 [output]
 interval_minutes = 10.0

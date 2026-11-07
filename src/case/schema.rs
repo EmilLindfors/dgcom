@@ -469,6 +469,9 @@ pub struct Atlas {
     /// Correct the atlas before use (default `"none"`).
     #[serde(default)]
     pub correction: AtlasCorrection,
+    /// Correct the atlas at a tide gauge instead (default: no gauge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gauge: Option<GaugeCorrection>,
     /// Scale the atlas velocity to carry its source's transport over this
     /// mesh's bed, by at most this factor (default: no scaling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -476,6 +479,34 @@ pub struct Atlas {
     /// The tide is ramped up from 0 over this time (hours, default 1).
     #[serde(default = "default_ramp_hours")]
     pub ramp_hours: f64,
+}
+
+/// `[boundary.atlas.gauge]`: correct the atlas at a tide gauge
+/// ([`crate::boundary::TidalAtlas::correct_at_gauge`]). The gauge's whole
+/// record is fitted ([`crate::analysis::HarmonicAnalysis::fit_gauge_record`]).
+/// `gains` are scaled by the gauge's constant over the atlas source's at
+/// the gauge, which keeps the source's spatial structure and fixes it at
+/// the gauge. `ratios` are then re-inferred from their neighbours with the
+/// gauge's ratios.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GaugeCorrection {
+    /// The gauge's record, with its position in the header (the format of
+    /// `scripts/kartverket_gauge.sh`).
+    pub record: PathBuf,
+    /// The atlas's source at the gauge: an atlas from the same model with a
+    /// point near the gauge (`norkyst_boundary_tides points=…`).
+    pub source: PathBuf,
+    /// Largest distance from the gauge to that point (m, default 3000).
+    #[serde(default = "default_max_offset_m")]
+    pub max_offset_m: f64,
+    /// Constituents scaled at the gauge (default K1, O1, S2).
+    #[serde(default = "default_gains")]
+    pub gains: Vec<String>,
+    /// Constituents re-inferred with the gauge's ratios, of P1, K2, N2 and
+    /// Q1 (default N2, Q1, P1, K2).
+    #[serde(default = "default_ratios")]
+    pub ratios: Vec<String>,
 }
 
 /// A correction of a tidal atlas before use.
@@ -641,6 +672,15 @@ fn default_true() -> bool {
 }
 fn default_ramp_hours() -> f64 {
     1.0
+}
+fn default_max_offset_m() -> f64 {
+    3000.0
+}
+fn default_gains() -> Vec<String> {
+    ["K1", "O1", "S2"].map(String::from).to_vec()
+}
+fn default_ratios() -> Vec<String> {
+    ["N2", "Q1", "P1", "K2"].map(String::from).to_vec()
 }
 fn default_coverage_m() -> f64 {
     5000.0
@@ -860,6 +900,33 @@ impl Case {
                     }
                     if atlas.ramp_hours < 0.0 {
                         return invalid("boundary.atlas.ramp_hours must be ≥ 0".into());
+                    }
+                    if let Some(gauge) = &atlas.gauge {
+                        if atlas.correction != AtlasCorrection::None {
+                            return invalid(
+                                "boundary.atlas: a gauge correction or `correction`, not both"
+                                    .into(),
+                            );
+                        }
+                        if !positive(gauge.max_offset_m) {
+                            return invalid(
+                                "boundary.atlas.gauge.max_offset_m must be positive".into(),
+                            );
+                        }
+                        for name in &gauge.gains {
+                            if canonical_name(name).is_none() {
+                                return invalid(format!(
+                                    "boundary.atlas.gauge.gains: unknown constituent {name:?}"
+                                ));
+                            }
+                        }
+                        for name in &gauge.ratios {
+                            if !["P1", "K2", "N2", "Q1"].contains(&name.as_str()) {
+                                return invalid(format!(
+                                    "boundary.atlas.gauge.ratios: {name:?} is not P1, K2, N2 or Q1"
+                                ));
+                            }
+                        }
                     }
                 }
                 (None, Some(tide), None) => {

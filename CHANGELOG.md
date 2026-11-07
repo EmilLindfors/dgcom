@@ -13,6 +13,11 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Gauge-corrected tidal atlases, in the library and in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
+  - `HarmonicAnalysis::fit_gauge_record` (with the 15 constituents of `HarmonicAnalysis::GAUGE_RECORD`) and `TidalAtlas::correct_at_gauge` (complex gains at the gauge, then the gauge's ratios, returning `GaugeAdjustment`s) move out of `froya_real_data`, which now calls them. The example reproduces its earlier runs bit for bit.
+  - `[boundary.atlas.gauge]` (`record`, `source`, `gains`, `ratios`, `max_offset_m`) applies the correction in a case file.
+  - `cases/froya` and `cases/bodo` use it. `cases/froya` reproduces `froya_real_data`'s default 2D tide run bit for bit.
+
 - **Tidal atlases in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
   - `[boundary.atlas]` forces an open boundary with a tide that varies along it, read from a tidal atlas file (`norkyst_boundary_tides`). Nodal corrections come from `run.start`, and the atlas's velocity is used where it has one.
   - Open faces farther than `coverage_m` (5 km) from the atlas become walls, up to `max_closed` (5 %) of them. `correction = "theory"` corrects the atlas without a gauge (`TidalAtlas::infer_from_theory`), and `transport_scaling` scales the velocity to the mesh's bed.
