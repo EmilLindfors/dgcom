@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use dgcom::case::{CaseFile, Progress};
+use dgcom::case::{CaseFile, Domain, Progress};
 
 const USAGE: &str = "\
 dgcom: the Discontinuous Galerkin Coastal Ocean Model
@@ -62,19 +62,32 @@ fn cli(args: Vec<String>) -> Result<(), String> {
     }
 }
 
-fn check(file: &CaseFile) -> Result<(), String> {
-    let domain = file.build_domain().map_err(|e| e.to_string())?;
+/// The domain's summary and what building it did, one line each.
+fn describe(file: &CaseFile, domain: &Domain) -> Vec<String> {
     let bed = &domain.bathymetry;
-    eprintln!(
-        "ok: {} elements of order {} ({} nodes), bed {:.2} to {:.2} m, output to {}",
+    let mut lines = vec![format!(
+        "{} elements of order {} ({} nodes), bed {:.2} to {:.2} m{}",
         domain.mesh.n_elements,
         domain.ops.order,
         domain.mesh.n_elements * domain.ops.n_nodes,
         bed.min(),
         bed.max(),
-        file.output_dir().display()
-    );
-    print!("{}", file.case.to_toml());
+        match file.case.projection_center() {
+            Some(c) => format!(", placed about {:.4}°N {:.4}°E", c.lat, c.lon),
+            None => String::new(),
+        }
+    )];
+    lines.extend(domain.notes.iter().cloned());
+    lines
+}
+
+fn check(file: &CaseFile) -> Result<(), String> {
+    let domain = file.build_domain().map_err(|e| e.to_string())?;
+    for line in describe(file, &domain) {
+        eprintln!("  {line}");
+    }
+    eprintln!("ok: output to {}", file.output_dir().display());
+    print!("{}", file.case.resolved().to_toml());
     Ok(())
 }
 
@@ -97,7 +110,18 @@ fn run(file: &CaseFile) -> Result<(), String> {
             p.max_speed
         );
     };
-    let done = file.run(&mut report).map_err(|e| e.to_string())?;
+    let domain = file.build_domain().map_err(|e| e.to_string())?;
+    for line in describe(file, &domain) {
+        println!("  {line}");
+    }
+    println!(
+        "  {:?}, CFL {:.3}",
+        case.numerics.integrator,
+        case.numerics.cfl_at(case.mesh.order)
+    );
+    let done = file
+        .run_on(&domain, &mut report)
+        .map_err(|e| e.to_string())?;
     let (v0, v1) = done.volume_m3;
     println!(
         "done: {} steps (dt {:.3}–{:.3} s) in {:.1} s; volume {:.6e} → {:.6e} m³",

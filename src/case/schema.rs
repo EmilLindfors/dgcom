@@ -11,9 +11,12 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::CaseError;
+use crate::io::LocalProjection;
 use crate::mesh::BoundaryTag;
+use crate::solver::{LINEAR_CFL_SAFETY, linear_cfl_swe_2d};
 use crate::tides::{canonical_name, constituent_period};
 use crate::time::ModelClock;
+use crate::time::{IntegratorInfo, Multirate, StandardIntegrator};
 
 /// A complete case: what to run, on which domain, forced how, written where.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -59,7 +62,13 @@ pub struct RunSection {
     pub duration_hours: f64,
 }
 
-/// `[mesh]`: exactly one of `rectangle` and `gmsh`.
+/// `[mesh]`: exactly one of `rectangle`, `gmsh` and `geographic`.
+///
+/// A mesh is in metres. It is placed on the Earth by a local projection
+/// (a transverse Mercator about a point, [`crate::io::LocalProjection`]):
+/// about `geographic`'s centre, or about `origin` for a rectangle or a Gmsh
+/// mesh. A placed mesh can take a bed raster, stations by longitude and
+/// latitude, and the beta plane.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshSection {
@@ -74,6 +83,52 @@ pub struct MeshSection {
     /// `tidal`, `river`; walls otherwise): see `docs/gmsh-meshes.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gmsh: Option<PathBuf>,
+    /// A longitude/latitude box meshed as a rectangle in the projection
+    /// about its centre, with open sides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geographic: Option<Geographic>,
+    /// Where the point x = y = 0 of a rectangle or Gmsh mesh lies on the
+    /// Earth (default: not placed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<GeoPoint>,
+    /// Drop the elements with no node below mean sea level; their faces to
+    /// the kept elements become walls (default true). Land that floods at
+    /// high water needs `false`.
+    #[serde(default = "default_true")]
+    pub drop_land: bool,
+}
+
+/// `[mesh.geographic]`
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Geographic {
+    /// `[west, south, east, north]` (degrees)
+    pub bbox: [f64; 4],
+    /// Elements along x (east)
+    pub nx: usize,
+    /// Elements along y (north)
+    pub ny: usize,
+}
+
+impl Geographic {
+    /// The box's centre.
+    pub fn center(&self) -> GeoPoint {
+        let [w, s, e, n] = self.bbox;
+        GeoPoint {
+            lat: 0.5 * (s + n),
+            lon: 0.5 * (w + e),
+        }
+    }
+}
+
+/// A point on the Earth: `{ lat = 63.8, lon = 8.6 }` (degrees).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeoPoint {
+    /// Latitude (degrees north)
+    pub lat: f64,
+    /// Longitude (degrees east)
+    pub lon: f64,
 }
 
 /// `[mesh.rectangle]`
@@ -118,6 +173,16 @@ pub enum SideTag {
 }
 
 impl SideTag {
+    /// Its name in a case file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Wall => "wall",
+            Self::Open => "open",
+            Self::Tidal => "tidal",
+            Self::River => "river",
+        }
+    }
+
     /// The mesh's tag.
     pub fn boundary_tag(self) -> BoundaryTag {
         match self {
@@ -152,6 +217,73 @@ pub struct BathymetrySection {
     /// A depth varying linearly along a line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ramp: Option<Ramp>,
+    /// A GeoTIFF of bed elevations on longitude/latitude (needs a placed
+    /// mesh).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raster: Option<Raster>,
+    /// Smooth the bed to a slope factor r_x0 = |ΔH|/(H₁ + H₂) of at most
+    /// this between neighbouring nodes at least `rx0_min_depth_m` deep,
+    /// keeping the volume (default: no smoothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smooth_rx0: Option<f64>,
+    /// The shallowest depth `smooth_rx0` acts at (m, default 3).
+    #[serde(default = "default_rx0_min_depth")]
+    pub rx0_min_depth_m: f64,
+}
+
+/// `[bathymetry.raster]`: a GeoTIFF of bed elevation (m, negative under
+/// water) on a longitude/latitude grid. A raster bed also has its isolated
+/// wet nodes (water one node wide, which the mesh does not resolve) raised
+/// to the lowest of their neighbours.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Raster {
+    /// The GeoTIFF.
+    pub file: PathBuf,
+    /// What its pixels hold (default `"bathymetry"`).
+    #[serde(default)]
+    pub kind: RasterKind,
+    /// For `"bathymetry"`: a shapefile of land polygons (e.g. GSHHS) for
+    /// the land mask, at 4 × 4 cells per pixel (default: land where the
+    /// raster is dry or has no data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coastline: Option<PathBuf>,
+    /// The bed of land (m above mean sea level, default 5): the elevation of
+    /// a `"bathymetry"` raster's land, the cap of a `"topobathy"` raster's.
+    #[serde(default = "default_land_elevation")]
+    pub land_elevation_m: f64,
+    /// For `"topobathy"`: fill the pixels that are exactly 0 from their
+    /// surroundings, where the raster marks missing depths with the water
+    /// surface (Kartverket's topobathy model does; default false).
+    #[serde(default)]
+    pub fill_zero_holes: bool,
+    /// How the raster reaches the nodes (default `"projected"`).
+    #[serde(default)]
+    pub sampling: Sampling,
+}
+
+/// What a raster's pixels hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RasterKind {
+    /// Depths below mean sea level; dry and no-data pixels are land.
+    #[default]
+    Bathymetry,
+    /// A complete elevation model, land heights included (no pixel may
+    /// lack data).
+    Topobathy,
+}
+
+/// How a raster reaches the nodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sampling {
+    /// The L2 projection onto each element's polynomials, at the raster's
+    /// resolution: an element's mean bed is the raster's.
+    #[default]
+    Projected,
+    /// The raster's value at each node.
+    Point,
 }
 
 /// `[bathymetry.ramp]`: the depth goes linearly from `depth_m[0]` at
@@ -216,7 +348,8 @@ impl Default for PhysicsSection {
     }
 }
 
-/// `coriolis = { f_plane = 1.2e-4 }` or `coriolis = { latitude = 63.5 }`.
+/// `coriolis = { f_plane = 1.2e-4 }`, `coriolis = { latitude = 63.5 }` or
+/// `coriolis = "beta_plane"`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Coriolis {
@@ -224,6 +357,9 @@ pub enum Coriolis {
     FPlane(f64),
     /// The f-plane at a latitude (degrees north): f = 2Ω sin φ.
     Latitude(f64),
+    /// f = f₀ + β y about the latitude of the mesh's projection centre
+    /// (needs a placed mesh).
+    BetaPlane,
 }
 
 /// `friction = { manning = 0.025 }` or `friction = { drag_coefficient = 0.0025 }`.
@@ -319,23 +455,62 @@ pub struct Constituent {
 }
 
 /// `[numerics]`
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NumericsSection {
-    /// CFL number of the SSP-RK3 step (default 1).
-    #[serde(default = "default_cfl")]
-    pub cfl: f64,
+    /// The time stepper (default `"ssp_rk43"`).
+    #[serde(default)]
+    pub integrator: Integrator,
+    /// CFL number of the step (default: 0.9 times the linear stability
+    /// limit of the order and the stepper, e.g. 1.36 for order 2 with
+    /// SSP-RK(4,3); 1 beyond order 4). The wet/dry positivity bound
+    /// shortens the step further where it binds. The resolved case
+    /// (`case.resolved.toml`) states the value used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfl: Option<f64>,
     /// Upper bound of the time step (s, default none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dt_max_s: Option<f64>,
+    /// Local time stepping: each element steps at its own power-of-two
+    /// fraction of the step, over up to this many levels (default 0: one
+    /// step for all; at most 16).
+    #[serde(default)]
+    pub local_time_stepping_levels: usize,
 }
 
-impl Default for NumericsSection {
-    fn default() -> Self {
-        Self {
-            cfl: default_cfl(),
-            dt_max_s: None,
+/// The time stepper.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Integrator {
+    /// SSP-RK(4,3): four stages, about twice SSP-RK3's step under the
+    /// wet/dry positivity bound.
+    #[default]
+    SspRk43,
+    /// SSP-RK3 (Shu–Osher): three stages.
+    SspRk3,
+}
+
+impl Integrator {
+    /// The crate's stepper.
+    pub fn standard(self) -> StandardIntegrator {
+        match self {
+            Self::SspRk43 => StandardIntegrator::SSPRK43,
+            Self::SspRk3 => StandardIntegrator::SSPRK3,
         }
+    }
+}
+
+impl NumericsSection {
+    /// The CFL number: `cfl`, else its default at polynomial order `order`.
+    pub fn cfl_at(&self, order: usize) -> f64 {
+        self.cfl.unwrap_or_else(|| {
+            let scheme = self
+                .integrator
+                .standard()
+                .ssp_scheme()
+                .expect("an SSP stepper");
+            linear_cfl_swe_2d(order, scheme).map_or(1.0, |limit| LINEAR_CFL_SAFETY * limit)
+        })
     }
 }
 
@@ -386,10 +561,18 @@ impl Default for OutputSection {
 pub struct Station {
     /// Its name in `stations.csv`.
     pub name: String,
-    /// x (m)
-    pub x_m: f64,
+    /// x (m), with `y_m`; or `lon` and `lat` on a placed mesh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_m: Option<f64>,
     /// y (m)
-    pub y_m: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_m: Option<f64>,
+    /// Longitude (degrees east)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lon: Option<f64>,
+    /// Latitude (degrees north)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lat: Option<f64>,
 }
 
 fn default_name() -> String {
@@ -407,8 +590,11 @@ fn default_true() -> bool {
 fn default_ramp_hours() -> f64 {
     1.0
 }
-fn default_cfl() -> f64 {
-    1.0
+fn default_rx0_min_depth() -> f64 {
+    3.0
+}
+fn default_land_elevation() -> f64 {
+    5.0
 }
 fn default_interval_minutes() -> f64 {
     60.0
@@ -442,8 +628,9 @@ impl Case {
                 self.mesh.order
             ));
         }
-        match (&self.mesh.rectangle, &self.mesh.gmsh) {
-            (Some(r), None) => {
+        let m = &self.mesh;
+        match (&m.rectangle, &m.gmsh, &m.geographic) {
+            (Some(r), None, None) => {
                 if !(r.x_m[1] > r.x_m[0] && r.y_m[1] > r.y_m[0]) {
                     return invalid(format!(
                         "mesh.rectangle needs x_m[0] < x_m[1] and y_m[0] < y_m[1], not {:?} and {:?}",
@@ -454,18 +641,86 @@ impl Case {
                     return invalid("mesh.rectangle needs nx and ny of at least 1".into());
                 }
             }
-            (None, Some(_)) => {}
-            _ => return invalid("[mesh] needs exactly one of `rectangle` and `gmsh`".into()),
+            (None, Some(_), None) => {}
+            (None, None, Some(g)) => {
+                let [w, s, e, n] = g.bbox;
+                if !(w < e && s < n && (-90.0..=90.0).contains(&s) && (-90.0..=90.0).contains(&n)) {
+                    return invalid(format!(
+                        "mesh.geographic.bbox must be [west, south, east, north], not {:?}",
+                        g.bbox
+                    ));
+                }
+                if g.nx == 0 || g.ny == 0 {
+                    return invalid("mesh.geographic needs nx and ny of at least 1".into());
+                }
+                if m.origin.is_some() {
+                    return invalid(
+                        "mesh.origin places a rectangle or Gmsh mesh; a geographic mesh is \
+                         placed about its box's centre"
+                            .into(),
+                    );
+                }
+            }
+            _ => {
+                return invalid(
+                    "[mesh] needs exactly one of `rectangle`, `gmsh` and `geographic`".into(),
+                );
+            }
         }
-        match (&self.bathymetry.depth_m, &self.bathymetry.ramp) {
-            (Some(d), None) if d.is_finite() => {}
-            (None, Some(r)) => {
+        if let Some(o) = m.origin
+            && !((-90.0..=90.0).contains(&o.lat) && o.lon.is_finite())
+        {
+            return invalid(format!("mesh.origin {o:?} is not on the Earth"));
+        }
+        let placed = self.placed();
+        let b = &self.bathymetry;
+        match (&b.depth_m, &b.ramp, &b.raster) {
+            (Some(d), None, None) if d.is_finite() => {}
+            (Some(d), None, None) => return invalid(format!("bathymetry.depth_m is {d}")),
+            (None, Some(r), None) => {
                 if r.from_m == r.to_m {
                     return invalid("bathymetry.ramp needs from_m and to_m apart".into());
                 }
             }
-            (Some(d), None) => return invalid(format!("bathymetry.depth_m is {d}")),
-            _ => return invalid("[bathymetry] needs exactly one of `depth_m` and `ramp`".into()),
+            (None, None, Some(r)) => {
+                if !placed {
+                    return invalid(
+                        "bathymetry.raster needs a placed mesh: mesh.geographic, or mesh.origin"
+                            .into(),
+                    );
+                }
+                if !positive(r.land_elevation_m) {
+                    return invalid(format!(
+                        "bathymetry.raster.land_elevation_m must be positive, not {}",
+                        r.land_elevation_m
+                    ));
+                }
+                if r.kind == RasterKind::Topobathy && r.coastline.is_some() {
+                    return invalid(
+                        "bathymetry.raster.coastline is for a \"bathymetry\" raster; a \
+                         \"topobathy\" raster has its own land"
+                            .into(),
+                    );
+                }
+                if r.kind == RasterKind::Bathymetry && r.fill_zero_holes {
+                    return invalid(
+                        "bathymetry.raster.fill_zero_holes is for a \"topobathy\" raster".into(),
+                    );
+                }
+            }
+            _ => {
+                return invalid(
+                    "[bathymetry] needs exactly one of `depth_m`, `ramp` and `raster`".into(),
+                );
+            }
+        }
+        if let Some(r) = b.smooth_rx0
+            && !positive(r)
+        {
+            return invalid(format!("bathymetry.smooth_rx0 must be positive, not {r}"));
+        }
+        if b.rx0_min_depth_m < 0.0 {
+            return invalid("bathymetry.rx0_min_depth_m must be ≥ 0".into());
         }
         let p = &self.physics;
         if !positive(p.gravity) {
@@ -490,12 +745,20 @@ impl Case {
             }
             _ => {}
         }
-        if let Some(Coriolis::Latitude(lat)) = p.coriolis
-            && !(-90.0..=90.0).contains(&lat)
-        {
-            return invalid(format!(
-                "physics.coriolis.latitude must be in [-90, 90], not {lat}"
-            ));
+        match p.coriolis {
+            Some(Coriolis::Latitude(lat)) if !(-90.0..=90.0).contains(&lat) => {
+                return invalid(format!(
+                    "physics.coriolis.latitude must be in [-90, 90], not {lat}"
+                ));
+            }
+            Some(Coriolis::BetaPlane) if !placed => {
+                return invalid(
+                    "physics.coriolis = \"beta_plane\" needs a placed mesh: mesh.geographic, \
+                     or mesh.origin"
+                        .into(),
+                );
+            }
+            _ => {}
         }
         let mut tags = Vec::new();
         for b in &self.boundaries {
@@ -533,10 +796,16 @@ impl Case {
                 }
             }
         }
-        if !positive(self.numerics.cfl) {
+        if let Some(cfl) = self.numerics.cfl
+            && !positive(cfl)
+        {
+            return invalid(format!("numerics.cfl must be positive, not {cfl}"));
+        }
+        if self.numerics.local_time_stepping_levels > Multirate::<StandardIntegrator>::MAX_LEVELS {
             return invalid(format!(
-                "numerics.cfl must be positive, not {}",
-                self.numerics.cfl
+                "numerics.local_time_stepping_levels must be at most {}, not {}",
+                Multirate::<StandardIntegrator>::MAX_LEVELS,
+                self.numerics.local_time_stepping_levels
             ));
         }
         if let Some(dt) = self.numerics.dt_max_s
@@ -562,8 +831,54 @@ impl Case {
                 return invalid(format!("two stations named {:?}", s.name));
             }
             names.push(&s.name);
+            match (s.x_m, s.y_m, s.lon, s.lat) {
+                (Some(_), Some(_), None, None) => {}
+                (None, None, Some(_), Some(_)) if placed => {}
+                (None, None, Some(_), Some(_)) => {
+                    return invalid(format!(
+                        "station {:?} is given by lon and lat, which needs a placed mesh: \
+                         mesh.geographic, or mesh.origin",
+                        s.name
+                    ));
+                }
+                _ => {
+                    return invalid(format!(
+                        "station {:?} needs x_m and y_m, or lon and lat",
+                        s.name
+                    ));
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Whether the mesh is placed on the Earth (`mesh.geographic` or
+    /// `mesh.origin`).
+    pub fn placed(&self) -> bool {
+        self.mesh.geographic.is_some() || self.mesh.origin.is_some()
+    }
+
+    /// The centre of the projection that places the mesh (at x = y = 0), if
+    /// it is placed.
+    pub fn projection_center(&self) -> Option<GeoPoint> {
+        match (&self.mesh.geographic, self.mesh.origin) {
+            (Some(g), _) => Some(g.center()),
+            (None, origin) => origin,
+        }
+    }
+
+    /// The projection that places the mesh, if it is placed.
+    pub fn projection(&self) -> Option<LocalProjection> {
+        self.projection_center()
+            .map(|c| LocalProjection::new(c.lat, c.lon))
+    }
+
+    /// This case with every default stated, as `case.resolved.toml` records
+    /// it: the CFL number computed from the order and stepper.
+    pub fn resolved(&self) -> Self {
+        let mut case = self.clone();
+        case.numerics.cfl = Some(self.numerics.cfl_at(self.mesh.order));
+        case
     }
 
     /// The run's clock, from `run.start`.

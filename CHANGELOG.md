@@ -13,6 +13,16 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Real coastlines in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
+  - New ways to place a mesh: `mesh.geographic` meshes a longitude/latitude box in a local projection; `mesh.origin` places a rectangle or a Gmsh mesh.
+  - A placed mesh takes a GeoTIFF bed with `bathymetry.raster`. Its kind is `bathymetry` (optionally with a GSHHS coastline mask) or `topobathy` (with `fill_zero_holes`). The bed is projected or sampled onto the nodes, and isolated wet nodes are raised.
+  - It also takes `bathymetry.smooth_rx0`, `coriolis = "beta_plane"`, and stations by `lon` and `lat`. NetCDF output gets lat/lon.
+  - `mesh.drop_land` (on by default) drops the elements with no node below mean sea level and walls their faces.
+  - The numerics match `froya_real_data`'s: SSP-RK(4,3) by default, the CFL number from the linear stability limit of the order (`case.resolved.toml` states it), and `local_time_stepping_levels`.
+  - `cases/froya/case.toml` reproduces `froya_real_data tides=none` bit for bit, on the raster rectangle and on `froya_coast.msh`.
+  - `snapshot_compare_3d` compares 2D snapshot files too, and counts the values that differ at all.
+  - `dgcom check` and `run` print what the domain build did.
+
 - **Case files and the `dgcom` binary (TODO P8.1; `notes/case-files.md`, `src/case/`, `src/bin/dgcom.rs`).**
   - A whole 2D run as a TOML (or JSON) case file. Supported so far: a rectangle or a Gmsh mesh, a uniform or sloping bed, gravity, Coriolis (f-plane or latitude), Manning or quadratic-drag friction, viscosity, and wetting and drying.
   - Open boundaries are characteristic, with still water or a harmonic tide outside. The new `velocity` key chooses `at_rest` or `incoming_wave` for level-only data.

@@ -20,6 +20,7 @@ duration_hours = 25.0
 
 [mesh]
 order = 2
+drop_land = false               # keep the flats above mean sea level: they flood
 
 [mesh.rectangle]
 x_m = [0.0, 40000.0]
