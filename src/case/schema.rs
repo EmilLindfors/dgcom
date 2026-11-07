@@ -382,7 +382,7 @@ pub struct InitialSection {
 }
 
 /// `[[boundary]]`: the condition on the faces of one tag; exactly one of
-/// `still` and `tide`. Every open boundary is a characteristic (Flather-type)
+/// `still`, `tide` and `atlas`. Every open boundary is a characteristic (Flather-type)
 /// condition: it lets outgoing waves leave and takes the external state
 /// given here for the incoming one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -396,8 +396,12 @@ pub struct BoundarySection {
     /// A tide, the same along the whole boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tide: Option<Tide>,
-    /// The external velocity, since `still` and `tide` give only a level
-    /// (default `"at_rest"`).
+    /// A tide varying along the boundary, from a tidal atlas (needs a
+    /// placed mesh and `run.start`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atlas: Option<Atlas>,
+    /// The external velocity where the external state is a level only
+    /// (`still`, `tide`, or an atlas without currents; default `"at_rest"`).
     #[serde(default)]
     pub velocity: BoundaryVelocity,
 }
@@ -438,6 +442,54 @@ pub struct Tide {
     /// The tide is ramped up from 0 over this time (hours, default 1).
     #[serde(default = "default_ramp_hours")]
     pub ramp_hours: f64,
+}
+
+/// `[boundary.atlas]`: harmonic constants of the level, and of the
+/// depth-mean current if it has them, at points along the boundary (the
+/// text format of `examples/norkyst_boundary_tides.rs`: lines of
+/// `lon lat depth name eta_amp eta_lag [u_amp u_lag v_amp v_lag]`, lags in
+/// degrees Greenwich, `Z0` the mean level). Each boundary node takes the
+/// constants of the atlas near it, with the nodal corrections of
+/// `run.start`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Atlas {
+    /// The atlas file.
+    pub file: PathBuf,
+    /// Largest distance from a boundary node to an atlas point (m, default
+    /// 5000). Open faces farther away become walls: water the atlas's
+    /// source does not resolve has no tide to force.
+    #[serde(default = "default_coverage_m")]
+    pub coverage_m: f64,
+    /// Largest fraction of the tag's open faces that may become walls for
+    /// lack of coverage (default 0.05); more is an error, since an atlas
+    /// made for another domain would close the boundary.
+    #[serde(default = "default_max_closed")]
+    pub max_closed: f64,
+    /// Correct the atlas before use (default `"none"`).
+    #[serde(default)]
+    pub correction: AtlasCorrection,
+    /// Scale the atlas velocity to carry its source's transport over this
+    /// mesh's bed, by at most this factor (default: no scaling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_scaling: Option<f64>,
+    /// The tide is ramped up from 0 over this time (hours, default 1).
+    #[serde(default = "default_ramp_hours")]
+    pub ramp_hours: f64,
+}
+
+/// A correction of a tidal atlas before use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AtlasCorrection {
+    /// The atlas as it is.
+    #[default]
+    None,
+    /// K2 and P1 at their equilibrium ratios to S2 and K1, and the minor
+    /// semidiurnals 2N2, μ2, ν2, λ2 and L2 by admittance
+    /// ([`crate::boundary::TidalAtlas::infer_from_theory`]): no gauge needed.
+    /// Needs M2, S2, N2 and K1 in the atlas.
+    Theory,
 }
 
 /// One constituent: `{ name = "M2", amplitude_m = 1.0, phase_deg = 0.0 }`.
@@ -589,6 +641,12 @@ fn default_true() -> bool {
 }
 fn default_ramp_hours() -> f64 {
     1.0
+}
+fn default_coverage_m() -> f64 {
+    5000.0
+}
+fn default_max_closed() -> f64 {
+    0.05
 }
 fn default_rx0_min_depth() -> f64 {
     3.0
@@ -772,9 +830,39 @@ impl Case {
                 return invalid(format!("two [[boundary]] entries for tag {:?}", b.tag));
             }
             tags.push(b.tag);
-            match (&b.still, &b.tide) {
-                (Some(_), None) => {}
-                (None, Some(tide)) => {
+            match (&b.still, &b.tide, &b.atlas) {
+                (Some(_), None, None) => {}
+                (None, None, Some(atlas)) => {
+                    if !placed {
+                        return invalid(format!(
+                            "[[boundary]] {:?}: an atlas needs a placed mesh: mesh.geographic, \
+                             or mesh.origin",
+                            b.tag.name()
+                        ));
+                    }
+                    if self.run.start.is_none() {
+                        return invalid(format!(
+                            "[[boundary]] {:?}: an atlas's phases are Greenwich lags, which \
+                             need run.start",
+                            b.tag.name()
+                        ));
+                    }
+                    if !positive(atlas.coverage_m) {
+                        return invalid("boundary.atlas.coverage_m must be positive".into());
+                    }
+                    if !(0.0..=1.0).contains(&atlas.max_closed) {
+                        return invalid("boundary.atlas.max_closed must be in [0, 1]".into());
+                    }
+                    if let Some(r) = atlas.transport_scaling
+                        && !positive(r)
+                    {
+                        return invalid("boundary.atlas.transport_scaling must be positive".into());
+                    }
+                    if atlas.ramp_hours < 0.0 {
+                        return invalid("boundary.atlas.ramp_hours must be ≥ 0".into());
+                    }
+                }
+                (None, Some(tide), None) => {
                     if tide.constituents.is_empty() {
                         return invalid("boundary.tide needs at least one constituent".into());
                     }
@@ -790,8 +878,8 @@ impl Case {
                 }
                 _ => {
                     return invalid(format!(
-                        "[[boundary]] {:?} needs exactly one of `still` and `tide`",
-                        b.tag
+                        "[[boundary]] {:?} needs exactly one of `still`, `tide` and `atlas`",
+                        b.tag.name()
                     ));
                 }
             }

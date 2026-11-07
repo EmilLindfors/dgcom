@@ -13,6 +13,12 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Tidal atlases in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
+  - `[boundary.atlas]` forces an open boundary with a tide that varies along it, read from a tidal atlas file (`norkyst_boundary_tides`). Nodal corrections come from `run.start`, and the atlas's velocity is used where it has one.
+  - Open faces farther than `coverage_m` (5 km) from the atlas become walls, up to `max_closed` (5 %) of them. `correction = "theory"` corrects the atlas without a gauge (`TidalAtlas::infer_from_theory`), and `transport_scaling` scales the velocity to the mesh's bed.
+  - `cases/froya` now uses NorKyst's atlas and reproduces `froya_real_data gauge_gains= gauge_ratios=` bit for bit.
+  - New `cases/bodo`: the coastline-fitted Bodø mesh with the beta plane at Bodø's latitude.
+
 - **Real coastlines in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
   - New ways to place a mesh: `mesh.geographic` meshes a longitude/latitude box in a local projection; `mesh.origin` places a rectangle or a Gmsh mesh.
   - A placed mesh takes a GeoTIFF bed with `bathymetry.raster`. Its kind is `bathymetry` (optionally with a GSHHS coastline mask) or `topobathy` (with `fill_zero_holes`). The bed is projected or sampled onto the nodes, and isolated wet nodes are raised.

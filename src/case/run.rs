@@ -100,13 +100,13 @@ impl CaseFile {
         let opens: Vec<(SideTag, Box<dyn SWEBoundaryCondition2D>)> = case
             .boundaries
             .iter()
-            .map(|b| {
-                let bc: Box<dyn SWEBoundaryCondition2D> = match (&b.still, &b.tide) {
-                    (Some(still), _) => Box::new(with_velocity(
+            .map(|b| -> Result<_, CaseError> {
+                let bc: Box<dyn SWEBoundaryCondition2D> = match (&b.still, &b.tide, &b.atlas) {
+                    (Some(still), _, _) => Box::new(with_velocity(
                         CharacteristicOBC::new(StillWater::at(still.eta_m)),
                         b.velocity,
                     )),
-                    (None, Some(tide)) => {
+                    (None, Some(tide), _) => {
                         let constituents = tide
                             .constituents
                             .iter()
@@ -130,11 +130,37 @@ impl CaseFile {
                         }
                         Box::new(with_velocity(CharacteristicOBC::new(harmonic), b.velocity))
                     }
-                    (None, None) => unreachable!("validated"),
+                    (None, None, Some(spec)) => {
+                        let atlas = domain
+                            .atlases
+                            .iter()
+                            .find_map(|(tag, atlas)| (*tag == b.tag).then_some(atlas))
+                            .expect("read with the domain");
+                        let clock = clock.as_ref().expect("validated: an atlas needs a start");
+                        let projection = domain.projection.as_ref().expect("validated: placed");
+                        let mut tides = atlas
+                            .boundary_tides(
+                                &domain.mesh,
+                                &domain.ops,
+                                projection,
+                                b.tag.boundary_tag(),
+                                clock,
+                                spec.coverage_m,
+                            )
+                            .map_err(|e| {
+                                CaseError::Invalid(format!("{}: {e}", spec.file.display()))
+                            })?
+                            .with_ramp_up(3600.0 * spec.ramp_hours);
+                        if let Some(ratio) = spec.transport_scaling {
+                            tides = tides.with_transport_scaling(ratio);
+                        }
+                        Box::new(with_velocity(CharacteristicOBC::new(tides), b.velocity))
+                    }
+                    (None, None, None) => unreachable!("validated"),
                 };
-                (b.tag, bc)
+                Ok((b.tag, bc))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         let wall = Reflective2D::new();
         let mut bc = MultiBoundaryCondition2D::new(&wall);
         for (tag, open) in &opens {
