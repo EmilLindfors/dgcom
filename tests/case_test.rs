@@ -44,7 +44,10 @@ fn the_example_case_runs_and_records_what_it_ran() {
         mouth.eta_m
     );
     let resolved = std::fs::read_to_string(dir.path().join("case.resolved.toml")).unwrap();
-    assert_eq!(Case::parse(&resolved, false, &[]).unwrap(), file.case);
+    assert_eq!(
+        Case::parse(&resolved, false, &[]).unwrap(),
+        file.case.resolved()
+    );
     let csv = std::fs::read_to_string(dir.path().join("stations.csv")).unwrap();
     assert_eq!(csv.lines().count(), 1 + 3 * 5);
     assert!(dir.path().join("tidal_channel.dgsnap").exists());
@@ -226,4 +229,169 @@ fn a_station_outside_the_mesh_is_refused_before_the_run() {
     .unwrap();
     let err = file.run(&mut |_| {}).err().unwrap().to_string();
     assert!(err.contains("head") && err.contains("outside"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Placed meshes and bed rasters
+// ---------------------------------------------------------------------------
+
+/// Write a geographic (EPSG:4326) Float32 GeoTIFF of `width` × `height`
+/// pixels over `[west, south, east, north]`, pixel (row, col) holding
+/// `elevation(lon, lat)` at its centre.
+fn write_raster(
+    path: &Path,
+    [west, south, east, north]: [f64; 4],
+    (width, height): (u32, u32),
+    elevation: impl Fn(f64, f64) -> f64,
+) {
+    use tiff::encoder::{TiffEncoder, colortype::Gray32Float};
+    use tiff::tags::Tag;
+    let (dlon, dlat) = (
+        (east - west) / f64::from(width),
+        (north - south) / f64::from(height),
+    );
+    let data: Vec<f32> = (0..height)
+        .flat_map(|row| (0..width).map(move |col| (row, col)))
+        .map(|(row, col)| {
+            let lon = west + (f64::from(col) + 0.5) * dlon;
+            let lat = north - (f64::from(row) + 0.5) * dlat;
+            elevation(lon, lat) as f32
+        })
+        .collect();
+    let mut encoder = TiffEncoder::new(std::fs::File::create(path).unwrap()).unwrap();
+    let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
+    let scale = [dlon, dlat, 0.0];
+    let tiepoint = [0.0, 0.0, 0.0, west, north, 0.0];
+    // Geographic model, PixelIsArea, WGS 84
+    let keys: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326];
+    let e = image.encoder();
+    e.write_tag(Tag::ModelPixelScaleTag, &scale[..]).unwrap();
+    e.write_tag(Tag::ModelTiepointTag, &tiepoint[..]).unwrap();
+    e.write_tag(Tag::GeoKeyDirectoryTag, &keys[..]).unwrap();
+    image.write_data(&data).unwrap();
+}
+
+const BAY: [f64; 4] = [8.0, 63.5, 8.2, 63.6];
+
+/// A bay over `BAY`: 20 m deep at its west side, shoaling eastwards to land
+/// beyond 8.133°E (up to +10 m), with a round island near its middle.
+fn bay_elevation(lon: f64, lat: f64) -> f64 {
+    let island = ((lon - 8.07) * 0.445).hypot(lat - 63.55) < 0.006;
+    if island {
+        3.0
+    } else {
+        -20.0 + 30.0 * (lon - 8.0) / 0.2
+    }
+}
+
+/// A case on the bay raster in `dir`, with `extra` appended.
+fn bay_case(dir: &Path, extra: &str) -> Result<CaseFile, CaseError> {
+    write_raster(&dir.join("bay.tif"), BAY, (60, 30), bay_elevation);
+    let text = format!(
+        r#"
+        [run]
+        duration_hours = 1.0
+
+        [mesh.geographic]
+        bbox = {BAY:?}
+        nx = 12
+        ny = 8
+
+        [bathymetry.raster]
+        file = "bay.tif"
+        kind = "topobathy"
+
+        [physics]
+        coriolis = "beta_plane"
+        friction = {{ manning = 0.025 }}
+
+        [[boundary]]
+        tag = "open"
+        still = {{}}
+
+        [output]
+        directory = "out"
+        interval_minutes = 15.0
+
+        [[output.station]]
+        name = "bay"
+        lon = 8.05
+        lat = 63.53
+        {extra}
+        "#
+    );
+    let path = dir.join("case.toml");
+    std::fs::write(&path, text).unwrap();
+    CaseFile::read(&path, &[])
+}
+
+/// Largest speed and surface departure over a run's outputs.
+fn rest_departure(file: &CaseFile) -> (f64, f64, usize) {
+    let domain = file.build_domain().unwrap();
+    let (mut speed, mut eta) = (0.0_f64, 0.0_f64);
+    let report = file
+        .run_on(&domain, &mut |p| {
+            speed = speed.max(p.max_speed);
+            eta = eta.max(p.eta_range.0.abs()).max(p.eta_range.1.abs());
+        })
+        .unwrap();
+    assert!(report.stations[0].eta_m.iter().all(|e| e.abs() < 1e-9));
+    (speed, eta, domain.mesh.n_elements)
+}
+
+/// A lake at rest over a raster bed with land, shores that are partly dry,
+/// an island and open sides holds still water to round-off: the bed reaches
+/// the nodes, the land is dropped and the coastline walled without upsetting
+/// the well-balanced wet/dry scheme; with local time stepping too.
+#[test]
+fn a_placed_raster_bay_at_rest_stays_at_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = bay_case(dir.path(), "").unwrap();
+    let domain = file.build_domain().unwrap();
+    assert!(
+        domain.mesh.n_elements < 12 * 8,
+        "the land east of 8.133°E is dropped: {} elements",
+        domain.mesh.n_elements
+    );
+    assert!(domain.bathymetry.max() > 0.0, "shore nodes on land remain");
+    let (speed, eta, _) = rest_departure(&file);
+    println!("bay at rest: |u| ≤ {speed:.2e} m/s, |η| ≤ {eta:.2e} m");
+    assert!(speed < 1e-9 && eta < 1e-9, "|u| {speed}, |η| {eta}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = bay_case(
+        dir.path(),
+        "\n[numerics]\nlocal_time_stepping_levels = 2\nintegrator = \"ssp_rk3\"\n",
+    )
+    .unwrap();
+    let (speed, eta, _) = rest_departure(&file);
+    println!("bay at rest, local time stepping: |u| ≤ {speed:.2e} m/s, |η| ≤ {eta:.2e} m");
+    assert!(speed < 1e-9 && eta < 1e-9, "|u| {speed}, |η| {eta}");
+}
+
+#[test]
+fn a_raster_that_misses_the_mesh_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = bay_case(dir.path(), "").unwrap();
+    // The same raster, somewhere else
+    write_raster(
+        &dir.path().join("bay.tif"),
+        [10.0, 60.0, 10.2, 60.1],
+        (60, 30),
+        bay_elevation,
+    );
+    let err = file.build_domain().err().unwrap().to_string();
+    assert!(err.contains("covers"), "{err}");
+}
+
+#[test]
+fn a_station_on_dropped_land_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = bay_case(
+        dir.path(),
+        "\n[[output.station]]\nname = \"inland\"\nlon = 8.19\nlat = 63.55\n",
+    )
+    .unwrap();
+    let err = file.run(&mut |_| {}).err().unwrap().to_string();
+    assert!(err.contains("inland") && err.contains("dropped"), "{err}");
 }

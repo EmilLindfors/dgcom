@@ -21,7 +21,12 @@ The run writes to `cases/tidal_channel/output/tidal_channel/`:
 
 `output.vtk = true` adds ParaView files, and `output.netcdf = true` adds CF NetCDF (the default build, which needs HDF5/netCDF-C: see below). `--set key.path=value` overrides any key for a run, e.g. `--set numerics.cfl=0.5`. Unknown keys are errors. Every key and its default is documented in the `dgcom::case::schema` module (`cargo doc --open`).
 
-Case files cover the 2D model with rectangle or Gmsh meshes, uniform or sloping beds, and still-water or harmonic-tide open boundaries. Bed rasters, tidal atlases, nesting in a parent model and atmospheric forcing are next (`TODO.md` P8).
+Case files cover the 2D model:
+- meshes: rectangles, Gmsh meshes, and longitude/latitude boxes clipped to the water;
+- beds: uniform, sloping, or from a GeoTIFF;
+- open boundaries: still water or a harmonic tide.
+
+`cases/froya/case.toml` runs Frøya–Smøla–Hitra on Kartverket's topobathy model. Its header says how to fetch the bed. Tidal atlases, nesting in a parent model and atmospheric forcing are next (`TODO.md` P8).
 
 ## Windows HDF5/netCDF-C Setup
 

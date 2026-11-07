@@ -121,3 +121,31 @@ stations = "stations.toml"
   - Plus the refusal cases above and ten unit tests of the schema: defaults, unknown keys and sections, exactly-one choices, overrides, JSON, the resolved round trip, the ramp.
 - **The example:** `cases/tidal_channel/case.toml` is a channel 40 km long and 4 km wide, its bed going from 30 m down to 2 m above mean sea level, with M2 1.0 m, S2 0.35 m, Coriolis at 63.5°N and Manning 0.025. 25 h runs in 11,503 steps and 7.4 s (release build, `parallel,simd`). The time step falls to 0.08 s on the drying flats.
 - **Not yet in a case:** bed rasters and projections, atlas tides, nesting, the atmosphere, 3D, waves, particles, farms, restarts and `dgcom mesh`. These are the remaining P8.1 lines in `TODO.md`, then P8.2.
+
+## P8.1, second part: placed meshes, bed rasters, the production numerics (2026-11-07)
+
+- **Placing a mesh:**
+  - `mesh.geographic` (a bbox with nx × ny) meshes the box as a rectangle in the `LocalProjection` about its centre, with open sides, as `froya_real_data` does.
+  - `mesh.origin` places a rectangle or a Gmsh mesh: its x = y = 0 is that point.
+  - Only a placed mesh takes a raster, `coriolis = "beta_plane"` (f₀ and β of the centre's latitude, at y = 0) and stations by lon/lat. Validation refuses these without a placement.
+- **Bed rasters** (`[bathymetry.raster]`):
+  - `kind = "bathymetry"` is `BedRaster::from_geotiff`: dry and no-data pixels are land, with a GSHHS `coastline` mask at 4 × 4 cells per pixel if one is given.
+  - `kind = "topobathy"` is `BedRaster::elevation_model`, then `fill_holes` with `fill_zero_holes`, then `clamp_land(land_elevation_m)`.
+  - The crop window is the geographic box, or the mesh's lon/lat extent plus 2 %. A raster that misses the mesh is an error, not a panic.
+  - The raster reaches the nodes `projected` (the default, at the raster's resolution) or by `point`. Isolated wet nodes are then raised, and the bed is smoothed if `smooth_rx0` is set.
+  - `mesh.drop_land` (default true) then drops the elements with no node below mean sea level. `cases/tidal_channel` sets it false, since its flats above mean sea level flood.
+- **Numerics:** `froya_real_data` ran SSP-RK(4,3) at 0.9 × the linear CFL limit, while the first part had SSP-RK3 at CFL 1. The case defaults are now the same as the example's:
+  - `integrator = "ssp_rk43"`;
+  - `cfl` from `linear_cfl_swe_2d × LINEAR_CFL_SAFETY`, e.g. 1.359 at order 2. `case.resolved.toml` writes it out;
+  - `local_time_stepping_levels` (`Multirate`).
+
+  The standing-wave gate gives the same four digits under the new defaults.
+- **Stage 0 of P8.2: bit for bit against `froya_real_data`.**
+  - `cases/froya/case.toml` states the example's defaults: `FROYA_BBOX`, 120 × 90, P2, the 50 m topobathy model with its zero holes filled and land capped at 5 m, f = 1.31e-4, Manning 0.025, M2 0.8 m at rest-velocity with a 1 h ramp, and 10-minute outputs, which equal the example's callbacks. Callbacks shorten the step to land on them, so the outputs must match for the steps to.
+  - Against `froya_real_data tides=none hours=1 snapshot_minutes=10 station_minutes=10 rest_hours=0`, `snapshot_compare_3d` finds **0 values differing** (η, u, v at every node) in all 7 frames: 1,740 steps each, dt 0.798–2.073 s.
+  - On the coastline-fitted `froya_coast.msh` (`mesh=`, with the case's `gmsh` + `origin` at the box centre), 0 values differ over 0.5 h: 12,101 wet elements, 5,889 steps.
+  - The domain logs agree too: 5,183 zero pixels filled, a 1,180 × 891 raster at 50 m with 85.5 % water, 33 isolated wet nodes raised, 9,912 of 10,800 elements kept.
+  - The atlas tides and nesting, the example's real modes, are the next stage. Until they are in a case, no option can leave the example.
+- **Gates (`tests/case_test.rs`):** a synthetic topobathy GeoTIFF of a bay is written in the test, with a sloping bed, land beyond 8.133°E and an island. It is meshed geographically, with the beta plane, Manning friction, open sides and a lon/lat station.
+  - A lake at rest over it stays at rest to |u| ≤ 6.8e-14 m/s and |η| ≤ 1.4e-14 m over 1 h, and to 6.6e-14 and 2.1e-14 with local time stepping and SSP-RK3.
+  - A raster that misses the mesh, and a station on dropped land, are refused. Three unit tests cover what needs a placed mesh.

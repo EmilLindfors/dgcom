@@ -1,13 +1,14 @@
-//! Building and running a case: the 2D production path (`Simulation` +
-//! `SSPRK3` + `SWEPhysics2D`) with the wet/dry defaults of the Frøya runs:
-//! the positivity limiter, the `WetDry` scheme and point-implicit bed
-//! friction.
+//! Running a case: the 2D production path of `examples/froya_real_data.rs`
+//! (`Simulation` + SSP-RK(4,3) or SSP-RK3, optionally multirate, +
+//! `SWEPhysics2D`) with its wet/dry defaults: the positivity limiter, the
+//! `WetDry` scheme and point-implicit bed friction.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::domain::Domain;
 use super::schema::{BoundaryVelocity, Coriolis, Friction, SideTag};
 use super::{CaseError, CaseFile};
 use crate::boundary::{
@@ -15,11 +16,10 @@ use crate::boundary::{
     SWEBoundaryCondition2D, StillWater, TidalConstituent,
 };
 use crate::equations::ShallowWater2D;
-use crate::io::{SnapshotWriter, write_vtk_swe};
-use crate::mesh::{Bathymetry2D, Mesh2D, PointLocator2D, read_gmsh_mesh};
-use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::io::{CoordinateProjection, SnapshotWriter, write_vtk_swe};
+use crate::mesh::PointLocator2D;
 use crate::physics::{PhysicsBuilder, SWEPhysics2D};
-use crate::simulation::Simulation;
+use crate::simulation::{Simulation, SimulationResult};
 use crate::solver::{
     Probe2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, total_mass_2d,
 };
@@ -27,39 +27,11 @@ use crate::source::{
     ChezyFriction2D, CoriolisSource2D, HorizontalViscosity2D, ManningFriction2D, coriolis_parameter,
 };
 use crate::tides::{canonical_name, constituent_period};
-use crate::time::SSPRK3;
+use crate::time::{Multirate, TimeIntegrator};
 use crate::types::ElementIndex;
 
 /// Depth below which the velocity is reported as 0 (m).
 const H_VELOCITY: f64 = WetDryConfig::DEFAULT_H_DRY;
-
-/// The discretized domain of a case.
-pub struct Domain {
-    /// The mesh
-    pub mesh: Arc<Mesh2D>,
-    /// The reference element's operators
-    pub ops: Arc<DGOperators2D>,
-    /// The geometric factors
-    pub geom: Arc<GeometricFactors2D>,
-    /// The bed elevation B (negative under water)
-    pub bathymetry: Arc<Bathymetry2D>,
-    /// The boundary tags the mesh uses, walls left out
-    pub open_tags: Vec<SideTag>,
-}
-
-impl Domain {
-    /// Positions of the nodes, element-major.
-    pub fn node_positions(&self) -> Vec<[f64; 2]> {
-        ElementIndex::iter(self.mesh.n_elements)
-            .flat_map(|k| {
-                (0..self.ops.n_nodes).map(move |i| {
-                    self.mesh
-                        .reference_to_physical(k, self.ops.nodes_r[i], self.ops.nodes_s[i])
-                })
-            })
-            .collect()
-    }
-}
 
 /// Where a run is, at each output.
 #[derive(Clone, Copy, Debug)]
@@ -107,85 +79,19 @@ pub struct RunReport {
 }
 
 impl CaseFile {
-    /// The mesh, operators and bed of the case, with its boundary tags
-    /// checked against the `[[boundary]]` entries.
-    pub fn build_domain(&self) -> Result<Domain, CaseError> {
-        let case = &self.case;
-        let mesh = if let Some(r) = &case.mesh.rectangle {
-            Mesh2D::uniform_rectangle_with_sides(
-                r.x_m[0],
-                r.x_m[1],
-                r.y_m[0],
-                r.y_m[1],
-                r.nx,
-                r.ny,
-                [r.south, r.east, r.north, r.west].map(SideTag::boundary_tag),
-            )
-        } else {
-            let path = self.resolve(case.mesh.gmsh.as_ref().expect("validated"));
-            read_gmsh_mesh(&path)
-                .map_err(|e| CaseError::Io(format!("mesh.gmsh {}: {e}", path.display())))?
-        };
-        let ops = DGOperators2D::new(case.mesh.order);
-        let geom = GeometricFactors2D::compute(&mesh, &ops);
-        let bed = &case.bathymetry;
-        let bathymetry = match (bed.depth_m, &bed.ramp) {
-            (Some(depth), _) => Bathymetry2D::from_function(&mesh, &ops, &geom, |_, _| -depth),
-            (None, Some(ramp)) => {
-                Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| -ramp.depth(x, y))
-            }
-            (None, None) => unreachable!("validated"),
-        };
-
-        // The tags on the mesh's boundary faces
-        let mut open_tags = Vec::new();
-        for k in ElementIndex::iter(mesh.n_elements) {
-            for face in 0..4 {
-                let Some(tag) = mesh.boundary_tag(k, face) else {
-                    continue;
-                };
-                let side = SideTag::from_boundary_tag(tag).ok_or_else(|| {
-                    CaseError::Invalid(format!(
-                        "the mesh has boundary faces tagged {tag:?}; a case names wall, open, \
-                         tidal and river faces only"
-                    ))
-                })?;
-                if side != SideTag::Wall && !open_tags.contains(&side) {
-                    open_tags.push(side);
-                }
-            }
-        }
-        for tag in &open_tags {
-            if !case.boundaries.iter().any(|b| b.tag == *tag) {
-                return Err(CaseError::Invalid(format!(
-                    "the mesh has {tag:?} boundary faces but the case no [[boundary]] with \
-                     tag = {:?}",
-                    tag_name(*tag)
-                )));
-            }
-        }
-        for b in &case.boundaries {
-            if !open_tags.contains(&b.tag) {
-                return Err(CaseError::Invalid(format!(
-                    "[[boundary]] tag = {:?}: the mesh has no faces with that tag",
-                    tag_name(b.tag)
-                )));
-            }
-        }
-        Ok(Domain {
-            mesh: Arc::new(mesh),
-            ops: Arc::new(ops),
-            geom: Arc::new(geom),
-            bathymetry: Arc::new(bathymetry),
-            open_tags,
-        })
-    }
-
     /// Run the case, writing its output and reporting `progress` at every
     /// output time.
     pub fn run(&self, progress: &mut dyn FnMut(&Progress)) -> Result<RunReport, CaseError> {
+        self.run_on(&self.build_domain()?, progress)
+    }
+
+    /// Run the case on `domain`, built by [`Self::build_domain`].
+    pub fn run_on(
+        &self,
+        domain: &Domain,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<RunReport, CaseError> {
         let case = &self.case;
-        let domain = self.build_domain()?;
         let clock = case.clock()?;
         let t_end = 3600.0 * case.run.duration_hours;
         let interval = 60.0 * case.output.interval_minutes;
@@ -239,7 +145,7 @@ impl CaseFile {
                 SideTag::Wall => unreachable!("validated"),
             };
         }
-        let physics = self.physics(&domain, bc);
+        let physics = self.physics(domain, bc);
 
         // Still water at the initial level
         let eta0 = case.initial.eta_m;
@@ -251,31 +157,49 @@ impl CaseFile {
             }
         }
 
-        let mut output = Output::create(self, &domain, clock.as_ref())?;
-        let volume = |q: &SWESolution2D| volume(&domain, q);
+        let mut output = Output::create(self, domain, clock.as_ref())?;
+        let volume = |q: &SWESolution2D| volume(domain, q);
         let volume_start = volume(&q);
 
         let stop = Arc::new(AtomicBool::new(false));
-        let mut sim = Simulation::new(physics, SSPRK3)
-            .with_cfl(case.numerics.cfl)
-            .with_callback_interval(interval)
-            .with_stop(stop.clone());
-        if let Some(dt) = case.numerics.dt_max_s {
-            sim = sim.with_dt_max(dt);
-        }
         let mut failure = None;
-        let result = sim.run_with_callback(&mut q, 0.0, t_end, |q, t| {
+        let callback = |q: &SWESolution2D, t: f64| {
             if failure.is_some() {
                 return;
             }
             match output.write(t, q) {
-                Ok(()) => progress(&summarize(&domain, q, t, t_end)),
+                Ok(()) => progress(&summarize(domain, q, t, t_end)),
                 Err(e) => {
                     failure = Some(e);
                     stop.store(true, Ordering::Relaxed);
                 }
             }
-        });
+        };
+        let numerics = &case.numerics;
+        let cfl = numerics.cfl_at(case.mesh.order);
+        let stepper = numerics.integrator.standard();
+        let result = match numerics.local_time_stepping_levels {
+            0 => drive(
+                Simulation::new(physics, stepper),
+                cfl,
+                interval,
+                numerics.dt_max_s,
+                &stop,
+                &mut q,
+                t_end,
+                callback,
+            ),
+            levels => drive(
+                Simulation::new(physics, Multirate::with_base(stepper, levels)),
+                cfl,
+                interval,
+                numerics.dt_max_s,
+                &stop,
+                &mut q,
+                t_end,
+                callback,
+            ),
+        };
         if let Some(e) = failure {
             return Err(e);
         }
@@ -323,6 +247,12 @@ impl CaseFile {
             Some(Coriolis::Latitude(lat)) => {
                 builder = builder.with_source(CoriolisSource2D::f_plane(coriolis_parameter(lat)));
             }
+            Some(Coriolis::BetaPlane) => {
+                // The projection's centre is at y = 0
+                let center = self.case.projection_center().expect("validated: placed");
+                builder =
+                    builder.with_source(CoriolisSource2D::beta_plane_at_latitude(center.lat, 0.0));
+            }
             None => {}
         }
         match p.friction {
@@ -343,6 +273,33 @@ impl CaseFile {
     }
 }
 
+/// Run `sim` from 0 to `t_end`, calling `callback` every `interval` (and at
+/// the start and the end).
+#[allow(clippy::too_many_arguments)]
+fn drive<BC, I>(
+    sim: Simulation<SWESolution2D, SWEPhysics2D<BC>, I>,
+    cfl: f64,
+    interval: f64,
+    dt_max: Option<f64>,
+    stop: &Arc<AtomicBool>,
+    q: &mut SWESolution2D,
+    t_end: f64,
+    callback: impl FnMut(&SWESolution2D, f64),
+) -> SimulationResult
+where
+    BC: SWEBoundaryCondition2D,
+    I: TimeIntegrator<SWESolution2D>,
+{
+    let mut sim = sim
+        .with_cfl(cfl)
+        .with_callback_interval(interval)
+        .with_stop(stop.clone());
+    if let Some(dt) = dt_max {
+        sim = sim.with_dt_max(dt);
+    }
+    sim.run_with_callback(q, 0.0, t_end, callback)
+}
+
 /// `obc` with the external velocity `velocity` for level-only data.
 fn with_velocity<P: ExternalStateProvider>(
     obc: CharacteristicOBC<P>,
@@ -351,15 +308,6 @@ fn with_velocity<P: ExternalStateProvider>(
     match velocity {
         BoundaryVelocity::AtRest => obc,
         BoundaryVelocity::IncomingWave => obc.with_incoming_wave(),
-    }
-}
-
-fn tag_name(tag: SideTag) -> &'static str {
-    match tag {
-        SideTag::Wall => "wall",
-        SideTag::Open => "open",
-        SideTag::Tidal => "tidal",
-        SideTag::River => "river",
     }
 }
 
@@ -418,10 +366,24 @@ impl<'a> Output<'a> {
             .stations
             .iter()
             .map(|s| {
-                Probe2D::at(&locator, &domain.ops, [s.x_m, s.y_m]).ok_or_else(|| {
+                let (x, y) = match (s.x_m, s.y_m, s.lon, s.lat) {
+                    (Some(x), Some(y), _, _) => (x, y),
+                    (_, _, Some(lon), Some(lat)) => domain
+                        .projection
+                        .as_ref()
+                        .expect("validated: placed")
+                        .geo_to_xy(lat, lon),
+                    _ => unreachable!("validated"),
+                };
+                Probe2D::at(&locator, &domain.ops, [x, y]).ok_or_else(|| {
                     CaseError::Invalid(format!(
-                        "station {:?} at ({}, {}) is outside the mesh",
-                        s.name, s.x_m, s.y_m
+                        "station {:?} at ({x:.1}, {y:.1}) m is outside the mesh{}",
+                        s.name,
+                        if case.mesh.drop_land {
+                            " (or on land that was dropped)"
+                        } else {
+                            ""
+                        }
                     ))
                 })
             })
@@ -438,7 +400,7 @@ impl<'a> Output<'a> {
         let dir = file.output_dir();
         fs::create_dir_all(&dir).map_err(|e| io(&dir.display().to_string(), &e))?;
         let resolved = dir.join("case.resolved.toml");
-        fs::write(&resolved, case.to_toml())
+        fs::write(&resolved, case.resolved().to_toml())
             .map_err(|e| io(&resolved.display().to_string(), &e))?;
         let name = case.run.name.clone();
         let snapshot = if case.output.snapshot {
@@ -469,11 +431,16 @@ impl<'a> Output<'a> {
         let netcdf = if case.output.netcdf {
             use crate::io::{NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig};
             let path = dir.join(format!("{name}.nc"));
-            let (x, y) = domain
-                .node_positions()
-                .into_iter()
-                .map(|[x, y]| (x, y))
-                .unzip();
+            let positions = domain.node_positions();
+            let (x, y): (Vec<f64>, Vec<f64>) = positions.iter().map(|&[x, y]| (x, y)).unzip();
+            let mut mesh_info = NetCDFMeshInfo::from_xy(x, y);
+            if let Some(projection) = &domain.projection {
+                let (lat, lon) = positions
+                    .iter()
+                    .map(|&[x, y]| projection.xy_to_geo(x, y))
+                    .unzip();
+                mesh_info = mesh_info.with_latlon(lat, lon);
+            }
             let mut config = NetCDFWriterConfig::new(path.display().to_string())
                 .with_title(name.clone())
                 .with_source("dgcom")
@@ -482,7 +449,7 @@ impl<'a> Output<'a> {
                 config = config.with_clock(*clock);
             }
             Some(
-                NetCDFWriter::create(config, &NetCDFMeshInfo::from_xy(x, y))
+                NetCDFWriter::create(config, &mesh_info)
                     .map_err(|e| io(&path.display().to_string(), &e))?,
             )
         } else {

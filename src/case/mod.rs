@@ -18,12 +18,14 @@
 //! rasters, tidal atlases, nesting in a parent model and the atmosphere
 //! (`notes/case-files.md`).
 
+mod domain;
 mod run;
 pub mod schema;
 
 use std::path::{Path, PathBuf};
 
-pub use run::{Domain, Progress, RunReport, StationSeries};
+pub use domain::Domain;
+pub use run::{Progress, RunReport, StationSeries};
 pub use schema::*;
 
 /// What can go wrong with a case.
@@ -182,7 +184,10 @@ mod tests {
         assert_eq!(case.mesh.order, 2);
         assert_eq!(case.physics.gravity, 9.81);
         assert!(case.physics.wetting_drying);
-        assert_eq!(case.numerics.cfl, 1.0);
+        assert_eq!(case.numerics.cfl, None);
+        assert_eq!(case.numerics.integrator, Integrator::SspRk43);
+        assert!((case.numerics.cfl_at(2) - 0.9 * 1.51).abs() < 1e-12);
+        assert!(case.mesh.drop_land);
         assert_eq!(case.output.interval_minutes, 60.0);
         assert_eq!(case.mesh.rectangle.as_ref().unwrap().west, SideTag::Wall);
     }
@@ -236,7 +241,7 @@ mod tests {
             "physics.coriolis.latitude = 60".to_string(),
         ];
         let case = Case::parse(MINIMAL, false, &overrides).unwrap();
-        assert_eq!(case.numerics.cfl, 0.5);
+        assert_eq!(case.numerics.cfl, Some(0.5));
         assert_eq!(case.run.name, "sweep");
         assert_eq!(case.physics.coriolis, Some(Coriolis::Latitude(60.0)));
         let err = Case::parse(MINIMAL, false, &["numerics.cfll=0.5".into()]).unwrap_err();
@@ -251,9 +256,12 @@ mod tests {
              [[output.station]]\nname = \"a\"\nx_m = 500.0\ny_m = 50.0\n"
         );
         let case = parse(&text).unwrap();
-        let resolved = case.to_toml();
-        assert_eq!(parse(&resolved).unwrap(), case, "{resolved}");
-        assert!(resolved.contains("cfl = 1.0"), "{resolved}");
+        let text = case.to_toml();
+        assert_eq!(parse(&text).unwrap(), case, "{text}");
+        // The resolved case states the CFL number it computed
+        let resolved = case.resolved();
+        assert_eq!(resolved.numerics.cfl, Some(case.numerics.cfl_at(2)));
+        assert_eq!(parse(&resolved.to_toml()).unwrap(), resolved);
     }
 
     #[test]
@@ -262,7 +270,86 @@ mod tests {
         let json = serde_json::to_string(&case).unwrap();
         assert_eq!(Case::parse(&json, true, &[]).unwrap(), case);
         let with = Case::parse(&json, true, &["numerics.cfl=0.25".into()]).unwrap();
-        assert_eq!(with.numerics.cfl, 0.25);
+        assert_eq!(with.numerics.cfl, Some(0.25));
+    }
+
+    /// What needs the mesh placed on the Earth is refused without it, and
+    /// accepted with `mesh.origin`.
+    #[test]
+    fn rasters_beta_planes_and_lon_lat_stations_need_a_placed_mesh() {
+        let raster = MINIMAL.replace(
+            "depth_m = 10.0",
+            "raster = { file = \"bed.tif\", kind = \"topobathy\" }",
+        );
+        let beta = format!(
+            "{MINIMAL}
+[physics]
+coriolis = \"beta_plane\"
+"
+        );
+        let station = format!(
+            "{MINIMAL}
+[[output.station]]
+name = \"a\"
+lon = 8.5
+lat = 63.7
+"
+        );
+        for text in [&raster, &beta, &station] {
+            let err = parse(text).unwrap().validate().unwrap_err().to_string();
+            assert!(err.contains("placed"), "{err}");
+            let placed = text.replace(
+                "[bathymetry]",
+                "[mesh.origin]
+lat = 63.7
+lon = 8.5
+
+[bathymetry]",
+            );
+            parse(&placed).unwrap().validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_geographic_mesh_is_placed_about_its_centre() {
+        let text = MINIMAL.replace(
+            "[mesh.rectangle]
+        x_m = [0.0, 1000.0]
+        y_m = [0.0, 100.0]",
+            "[mesh.geographic]
+        bbox = [8.0, 63.6, 9.2, 64.0]",
+        );
+        let case = parse(&text).unwrap();
+        case.validate().unwrap();
+        let c = case.projection_center().unwrap();
+        assert!((c.lat - 63.8).abs() < 1e-12 && (c.lon - 8.6).abs() < 1e-12);
+        let both = text.replace(
+            "[bathymetry]",
+            "[mesh.origin]
+lat = 63.7
+lon = 8.5
+
+[bathymetry]",
+        );
+        assert!(parse(&both).unwrap().validate().is_err());
+        let backwards = text.replace("[8.0, 63.6, 9.2, 64.0]", "[9.2, 63.6, 8.0, 64.0]");
+        assert!(parse(&backwards).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn local_time_stepping_has_at_most_sixteen_levels() {
+        let ok = format!(
+            "{MINIMAL}
+[numerics]
+local_time_stepping_levels = 16
+"
+        );
+        parse(&ok).unwrap().validate().unwrap();
+        let err = parse(&ok.replace("= 16", "= 17"))
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("16"), "{err}");
     }
 
     #[test]

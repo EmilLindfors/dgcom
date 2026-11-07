@@ -1,14 +1,17 @@
-//! Compare two 3D snapshot files frame by frame: how far a run that changed
-//! the numerics' round-off (or more) is from a reference run.
+//! Compare two snapshot files frame by frame: how far a run that changed
+//! the numerics' round-off (or more) is from a reference run, or whether two
+//! runs that should agree bit for bit do (a case file against the example it
+//! replaces, TODO P8.2).
 //!
 //! ```text
 //! cargo run --release --example snapshot_compare_3d -- <reference.dgsnap> <run.dgsnap> [min_depth=10]
 //! ```
 //!
 //! For every time both files hold, over the nodes at least `min_depth` (m)
-//! deep in the reference: η, the depth-mean velocity, the surface layer's
-//! velocity and T, as the RMS and the largest difference (with where the
-//! largest is). Both runs must be on the same mesh and levels.
+//! deep in the reference: η, the depth-mean velocity and, for 3D files, the
+//! surface layer's velocity and T, as the RMS and the largest difference
+//! (with where the largest is), and how many values differ at all. Both runs
+//! must be on the same mesh and levels.
 
 use dgcom::io::SnapshotReader;
 
@@ -26,15 +29,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if (b.header().n_points(), b.header().n_levels()) != (n, nl) {
         return Err("the files have different meshes or levels".into());
     }
-    let levels = a.header().levels.clone().ok_or("not a 3D snapshot")?;
-    let field = |name: &str| levels.field(name).ok_or(format!("no layered field {name}"));
-    let (fu, fv, ft) = (field("u")?, field("v")?, field("temp")?);
+    // The layered fields of a 3D file
+    let layered = match a.header().levels.clone() {
+        Some(levels) => {
+            let field = |name: &str| levels.field(name).ok_or(format!("no layered field {name}"));
+            Some((field("u")?, field("v")?, field("temp")?))
+        }
+        None => None,
+    };
     let bed = a.header().bathymetry.clone();
     let times_b = b.times()?;
     println!(
         "nodes ≥ {min_depth} m deep; RMS / max (node) of run − reference\n\
-         {:>8} | {:>7} | {:>19} | {:>19} | {:>19} | {:>19}",
-        "t (h)", "nodes", "η (mm)", "ū (mm/s)", "surface u (mm/s)", "T (m°C)"
+         {:>8} | {:>7} | {:>19} | {:>19} | {:>19} | {:>19} | {:>9}",
+        "t (h)", "nodes", "η (mm)", "ū (mm/s)", "surface u (mm/s)", "T (m°C)", "differ"
     );
     for i in 0..a.n_frames()? {
         let t = a.time(i)?;
@@ -63,8 +71,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let diff = |x: &[f32], y: &[f32], k: usize| f64::from(y[k]) - f64::from(x[k]);
         let top = |p: usize| p * nl + nl - 1;
+        let (surface, temperature) = match layered {
+            Some((fu, fv, ft)) => (
+                stats(&mut deep.iter().map(|&p| {
+                    let (ua, va) = (&fa.layers[fu], &fa.layers[fv]);
+                    let (ub, vb) = (&fb.layers[fu], &fb.layers[fv]);
+                    let d = (diff(ua, ub, top(p))).hypot(diff(va, vb, top(p)));
+                    (p, 1e3 * d)
+                })),
+                stats(&mut deep.iter().flat_map(|&p| {
+                    let (ta, tb) = (&fa.layers[ft], &fb.layers[ft]);
+                    (0..nl).map(move |l| (p, 1e3 * diff(ta, tb, p * nl + l)))
+                })),
+            ),
+            None => ("—".into(), "—".into()),
+        };
+        // Values that differ in any bit, over every node and field
+        let differ = [(&fa.eta, &fb.eta), (&fa.u, &fb.u), (&fa.v, &fb.v)]
+            .into_iter()
+            .chain(fa.layers.iter().zip(&fb.layers))
+            .map(|(x, y)| {
+                x.iter()
+                    .zip(y)
+                    .filter(|(p, q)| p.to_bits() != q.to_bits())
+                    .count()
+            })
+            .sum::<usize>();
         println!(
-            "{:>8.3} | {:>7} | {} | {} | {} | {}",
+            "{:>8.3} | {:>7} | {} | {} | {:>19} | {:>19} | {:>9}",
             t / 3600.0,
             deep.len(),
             stats(&mut deep.iter().map(|&p| (p, 1e3 * diff(&fa.eta, &fb.eta, p)))),
@@ -72,16 +106,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let d = (diff(&fa.u, &fb.u, p)).hypot(diff(&fa.v, &fb.v, p));
                 (p, 1e3 * d)
             })),
-            stats(&mut deep.iter().map(|&p| {
-                let (ua, va) = (&fa.layers[fu], &fa.layers[fv]);
-                let (ub, vb) = (&fb.layers[fu], &fb.layers[fv]);
-                let d = (diff(ua, ub, top(p))).hypot(diff(va, vb, top(p)));
-                (p, 1e3 * d)
-            })),
-            stats(&mut deep.iter().flat_map(|&p| {
-                let (ta, tb) = (&fa.layers[ft], &fb.layers[ft]);
-                (0..nl).map(move |l| (p, 1e3 * diff(ta, tb, p * nl + l)))
-            })),
+            surface,
+            temperature,
+            differ,
         );
     }
     Ok(())
