@@ -4,6 +4,25 @@
 
 DGCOM is not a port of ROMS. It follows ROMS's recipe for the 3D physics and is validated against ROMS-based NorKyst-800.
 
+## Quick start
+
+A run is described by a case file: the mesh, the bed, the physics, the open boundaries and the output, in TOML. The example is an idealized estuary that needs no input data:
+
+```sh
+cargo build --release --bin dgcom --no-default-features --features parallel,simd   # no native NetCDF needed
+./target/release/dgcom check cases/tidal_channel/case.toml   # validate it, print it with every default
+./target/release/dgcom run   cases/tidal_channel/case.toml   # 25 h of tide in a few seconds
+```
+
+The run writes to `cases/tidal_channel/output/tidal_channel/`:
+- `case.resolved.toml`: the case as run, with every default filled in;
+- `stations.csv`: the surface and the current at the case's stations;
+- `tidal_channel.dgsnap`: the whole state, for the viewer in `viz/`.
+
+`output.vtk = true` adds ParaView files, and `output.netcdf = true` adds CF NetCDF (the default build, which needs HDF5/netCDF-C: see below). `--set key.path=value` overrides any key for a run, e.g. `--set numerics.cfl=0.5`. Unknown keys are errors. Every key and its default is documented in the `dgcom::case::schema` module (`cargo doc --open`).
+
+Case files cover the 2D model with rectangle or Gmsh meshes, uniform or sloping beds, and still-water or harmonic-tide open boundaries. Bed rasters, tidal atlases, nesting in a parent model and atmospheric forcing are next (`TODO.md` P8).
+
 ## Windows HDF5/netCDF-C Setup
 
 The default feature set enables NetCDF I/O, so Windows builds need native HDF5 and netCDF-C libraries available to Cargo.

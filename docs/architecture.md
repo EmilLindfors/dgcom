@@ -122,6 +122,8 @@ src/
 │                     # site-to-site connectivity: exposure in contact zones,
 │                     # matrix per release group, spread across seeds
 │                     # (connectivity.rs)
+├── case/             # Case files (TOML/JSON, strict serde schema) built into
+│                     # a 2D run; `src/bin/dgcom.rs` runs them (TODO P8)
 ├── io/               # NetCDF output; parent-ocean and weather-model readers
 │                     # on lon/lat grids (GeoGrid, FieldSeries); VTK, GeoTIFF
 │                     # bathymetry, GSHHS coastline, projections, observations;

@@ -1554,10 +1554,13 @@ dependencies = [
  "netcdf",
  "parquet",
  "rayon",
+ "serde",
+ "serde_json",
  "shapefile",
  "tempfile",
  "thiserror 2.0.17",
  "tiff",
+ "toml",
 ]
 
 [[package]]

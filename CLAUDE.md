@@ -75,6 +75,7 @@ src/
 ├── simulation/     # Simulation / Simulation3D runners
 ├── waves/          # Spectral wave model (action balance on the DG mesh)
 ├── particles/      # Lagrangian particle tracking (2D/3D, lice behaviour)
+├── case/           # Case files (TOML/JSON) → a 2D run; `dgcom run case.toml`
 ├── io/             # NetCDF, VTK, GeoTIFF, coastline, projections, obs readers
 └── analysis/       # Harmonic analysis, skill metrics, tide gauge, ADCP
 ```
@@ -177,6 +178,9 @@ cargo check --no-default-features --features parallel,simd
 ## Quick Commands
 
 ```bash
+# Run a case file (the idealized example needs no data)
+cargo run --release --bin dgcom -- run cases/tidal_channel/case.toml
+
 # Run all tests
 cargo test
 

@@ -33,6 +33,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod analysis;
 pub mod basis;
 pub mod boundary;
+pub mod case;
 pub mod equations;
 pub mod flux;
 pub mod io;
