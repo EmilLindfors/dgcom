@@ -13,8 +13,8 @@ use super::domain::Domain;
 use super::schema::{BoundaryVelocity, Coriolis, Friction, SideTag};
 use super::{CaseError, CaseFile};
 use crate::boundary::{
-    CharacteristicOBC, ExternalStateProvider, HarmonicTide, MultiBoundaryCondition2D, Reflective2D,
-    SWEBoundaryCondition2D, StillWater, TidalConstituent,
+    CharacteristicOBC, ExternalStateProvider, HarmonicTide, InverseBarometer,
+    MultiBoundaryCondition2D, Reflective2D, SWEBoundaryCondition2D, StillWater, TidalConstituent,
 };
 use crate::equations::ShallowWater2D;
 use crate::io::{SnapshotWriter, write_vtk_swe};
@@ -22,7 +22,8 @@ use crate::physics::{PhysicsBuilder, SWEPhysics2D};
 use crate::simulation::{Simulation, SimulationResult};
 use crate::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, total_mass_2d};
 use crate::source::{
-    ChezyFriction2D, CoriolisSource2D, HorizontalViscosity2D, ManningFriction2D, coriolis_parameter,
+    ChezyFriction2D, CoriolisSource2D, GriddedAtmosphere2D, HorizontalViscosity2D,
+    ManningFriction2D, coriolis_parameter,
 };
 use crate::tides::{canonical_name, constituent_period};
 use crate::time::{Multirate, TimeIntegrator};
@@ -100,10 +101,17 @@ impl CaseFile {
                 .min(case.output.station_interval());
 
         // Open boundaries: one characteristic condition per tag
+        let weather_level = domain
+            .atmosphere
+            .as_ref()
+            .filter(|_| case.atmosphere.as_ref().is_some_and(|a| a.pressure));
         let opens: Vec<(SideTag, Box<dyn SWEBoundaryCondition2D>)> = case
             .boundaries
             .iter()
             .map(|b| -> Result<_, CaseError> {
+                // The weather's inverse-barometer level, the fraction this
+                // boundary adds
+                let level = weather_level.map(|a| (a, b.inverse_barometer_fraction()));
                 let bc: Box<dyn SWEBoundaryCondition2D> = match (&b.still, &b.tide, &b.atlas) {
                     _ if b.nesting.is_some() => {
                         let parent = domain
@@ -111,15 +119,11 @@ impl CaseFile {
                             .iter()
                             .find_map(|(tag, parent)| (*tag == b.tag).then_some(parent))
                             .expect("read with the domain");
-                        Box::new(with_velocity(
-                            CharacteristicOBC::new(parent.clone()),
-                            b.velocity,
-                        ))
+                        open_boundary(parent.clone(), b.velocity, level)
                     }
-                    (Some(still), _, _) => Box::new(with_velocity(
-                        CharacteristicOBC::new(StillWater::at(still.eta_m)),
-                        b.velocity,
-                    )),
+                    (Some(still), _, _) => {
+                        open_boundary(StillWater::at(still.eta_m), b.velocity, level)
+                    }
                     (None, Some(tide), _) => {
                         let constituents = tide
                             .constituents
@@ -142,7 +146,7 @@ impl CaseFile {
                         if let Some(clock) = &clock {
                             harmonic = harmonic.with_nodal_corrections(clock);
                         }
-                        Box::new(with_velocity(CharacteristicOBC::new(harmonic), b.velocity))
+                        open_boundary(harmonic, b.velocity, level)
                     }
                     (None, None, Some(spec)) => {
                         let atlas = domain
@@ -168,7 +172,7 @@ impl CaseFile {
                         if let Some(ratio) = spec.transport_scaling {
                             tides = tides.with_transport_scaling(ratio);
                         }
-                        Box::new(with_velocity(CharacteristicOBC::new(tides), b.velocity))
+                        open_boundary(tides, b.velocity, level)
                     }
                     (None, None, None) => unreachable!("validated"),
                 };
@@ -309,6 +313,10 @@ impl CaseFile {
                 builder = builder.with_source(parent.relaxation(60.0 * spec.band_minutes));
             }
         }
+        // The weather: wind stress and pressure gradient
+        if let Some(atmosphere) = &domain.atmosphere {
+            builder = builder.with_source(atmosphere.clone());
+        }
         match p.friction {
             Some(Friction::Manning(n)) => {
                 builder = builder.with_implicit_friction(ManningFriction2D::new(p.gravity, n));
@@ -352,6 +360,23 @@ where
         sim = sim.with_dt_max(dt);
     }
     sim.run_with_callback(q, 0.0, t_end, callback)
+}
+
+/// A characteristic open boundary on `provider`'s external state, with
+/// `velocity` for level-only data, raised by the given fraction of the
+/// weather's inverse-barometer level (`InverseBarometer`).
+fn open_boundary<P: ExternalStateProvider + 'static>(
+    provider: P,
+    velocity: BoundaryVelocity,
+    level: Option<(&GriddedAtmosphere2D, f64)>,
+) -> Box<dyn SWEBoundaryCondition2D> {
+    match level {
+        Some((atmosphere, fraction)) if fraction > 0.0 => {
+            let raised = InverseBarometer::new(provider, atmosphere.clone()).with_factor(fraction);
+            Box::new(with_velocity(CharacteristicOBC::new(raised), velocity))
+        }
+        _ => Box::new(with_velocity(CharacteristicOBC::new(provider), velocity)),
+    }
 }
 
 /// `obc` with the external velocity `velocity` for level-only data.

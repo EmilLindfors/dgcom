@@ -16,7 +16,8 @@
 use std::sync::Arc;
 
 use super::schema::{
-    AtlasCorrection, GaugeCorrection, Nesting, RasterKind, Sampling, SideTag, Slopes3D,
+    AtlasCorrection, AtmosphereSection, GaugeCorrection, Nesting, RasterKind, Sampling, SideTag,
+    Slopes3D,
 };
 use super::{CaseError, CaseFile};
 use crate::analysis::HarmonicAnalysis;
@@ -24,12 +25,13 @@ use crate::boundary::{
     BoundaryCoverage, GaugeAdjustment, NestingOptions, OceanModelState, ParentDatum, TidalAtlas,
 };
 use crate::io::{
-    BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
-    LocalProjection, OceanModelReader, read_tide_gauge_file,
+    AtmosphereReader, BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox,
+    GeoTiffBathymetry, LocalProjection, OceanModelReader, read_tide_gauge_file,
 };
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, PointLocator2D, read_gmsh_mesh};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::Probe2D;
+use crate::source::GriddedAtmosphere2D;
 use crate::types::ElementIndex;
 
 /// Mask cells per raster pixel side of a `"bathymetry"` raster's land mask.
@@ -57,6 +59,8 @@ pub struct Domain {
     pub parents: Vec<(SideTag, OceanModelState)>,
     /// Where each `[[output.station]]` samples the model
     pub stations: Vec<StationProbe>,
+    /// `[atmosphere]`'s weather on the mesh, if any
+    pub atmosphere: Option<GriddedAtmosphere2D>,
     /// What was done to build it, line by line, for a log
     pub notes: Vec<String>,
 }
@@ -250,6 +254,10 @@ impl CaseFile {
             }
         }
         let stations = self.stations(&mesh, &ops, &bathymetry, projection.as_ref(), &mut notes)?;
+        let atmosphere = match &case.atmosphere {
+            Some(spec) => Some(self.atmosphere(spec, &mesh, &ops, projection, &mut notes)?),
+            None => None,
+        };
         Ok(Domain {
             mesh: Arc::new(mesh),
             ops: Arc::new(ops),
@@ -260,8 +268,42 @@ impl CaseFile {
             atlases,
             parents,
             stations,
+            atmosphere,
             notes,
         })
+    }
+
+    /// `[atmosphere]`: the weather sampled at every node of the mesh,
+    /// ramped up, and checked to cover the run.
+    fn atmosphere(
+        &self,
+        spec: &AtmosphereSection,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        projection: Option<LocalProjection>,
+        notes: &mut Vec<String>,
+    ) -> Result<GriddedAtmosphere2D, CaseError> {
+        let case = &self.case;
+        let paths: Vec<_> = spec.files.iter().map(|f| self.resolve(f)).collect();
+        let reader = read_weather(&paths)?;
+        notes.push(format!("weather: {}", reader.summary()));
+        let projection = projection.expect("validated: placed");
+        let clock = case.clock()?.expect("validated: a start");
+        let invalid = |e: String| CaseError::Invalid(format!("[atmosphere]: {e}"));
+        let mut atmosphere =
+            GriddedAtmosphere2D::new(Arc::new(reader), mesh, ops, projection, clock)
+                .map_err(invalid)?
+                .with_ramp_up(3600.0 * spec.ramp_hours);
+        if !spec.wind {
+            atmosphere = atmosphere.without_wind();
+        }
+        if !spec.pressure {
+            atmosphere = atmosphere.without_pressure();
+        }
+        atmosphere
+            .check_time_coverage(0.0, 3600.0 * case.run.duration_hours)
+            .map_err(invalid)?;
+        Ok(atmosphere)
     }
 
     /// Where each `[[output.station]]` samples the model: in open water
@@ -699,6 +741,23 @@ impl CaseFile {
         ));
         Ok(raster)
     }
+}
+
+/// The weather files `paths`, joined in time.
+#[cfg(feature = "netcdf")]
+fn read_weather(paths: &[std::path::PathBuf]) -> Result<AtmosphereReader, CaseError> {
+    AtmosphereReader::from_files(paths).map_err(|e| {
+        let files: Vec<_> = paths.iter().map(|p| p.display().to_string()).collect();
+        CaseError::Io(format!("{}: {e}", files.join(", ")))
+    })
+}
+
+#[cfg(not(feature = "netcdf"))]
+fn read_weather(_paths: &[std::path::PathBuf]) -> Result<AtmosphereReader, CaseError> {
+    Err(CaseError::Invalid(
+        "[atmosphere] reads NetCDF, which needs dgcom built with the `netcdf` feature (on by default)"
+            .into(),
+    ))
 }
 
 /// The parent model's output at `path`.

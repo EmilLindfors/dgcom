@@ -13,6 +13,12 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Weather in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
+  - `[atmosphere]` forces a case with a weather model's 10 m wind and sea-level pressure (`files`, MET Nordic, MEPS, AROME-Arctic or ERA5 NetCDF; `GriddedAtmosphere2D`), ramped up over `ramp_hours`, with `wind` and `pressure` switches.
+  - The open boundaries add the inverse-barometer level: `[[boundary]] inverse_barometer`, a fraction (0–2) that defaults to 1 for still water, tides and atlases and to 0 for nesting (the example's `ib=`).
+  - `cases/froya/weather.toml` (NorKyst nesting under MET Nordic) reproduces `froya_real_data norkyst= met=` bit for bit, also with `ib=0.5` and on the atlas tide.
+  - `--set` reaches into arrays of tables by index: `--set boundary.0.inverse_barometer=0.5`.
+
 - **The 3D bed and wall land in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
   - `[bathymetry.slopes_3d]` is `froya_real_data slopes3d=on`: the element slopes smoothed for a σ-coordinate model (`r_max`, `free_depth_m`, `thin_depth_m`), cliff shores raised to land (`raise_cliffs`, `cliff_depth_m`) and tidal ponds filled (`fill_ponds`, `pond_low_water_m`, `high_water_m`), in the example's order.
   - `[bathymetry] lower_wall_land` is `wall_land=lower` (`wall_low_water_m`, default −2 m).

@@ -38,6 +38,9 @@ pub struct Case {
     /// no entry are walls, and an open tag without one is an error.
     #[serde(default, rename = "boundary", skip_serializing_if = "Vec::is_empty")]
     pub boundaries: Vec<BoundarySection>,
+    /// A weather model's wind and pressure (default: none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atmosphere: Option<AtmosphereSection>,
     /// Time stepping.
     #[serde(default)]
     pub numerics: NumericsSection,
@@ -532,6 +535,50 @@ pub struct BoundarySection {
     /// `"at_rest"`).
     #[serde(default)]
     pub velocity: BoundaryVelocity,
+    /// With `[atmosphere]`'s pressure, the fraction of the inverse-barometer
+    /// level `−(p − p_ref)/(ρg)` added to the external level (0–2; default
+    /// 1, the full response that `still`, `tide` and `atlas` lack, and 0 for
+    /// `nesting`, a parent that carries its own). Without it the boundary
+    /// pins the sea to the wrong level under a low and drives a current
+    /// through itself. NorKyst-800's ζ carries ≈ 0.22 of the static
+    /// response (`notes/norkyst-issues.md` §6), so a fraction may fit a
+    /// nested boundary best.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inverse_barometer: Option<f64>,
+}
+
+impl BoundarySection {
+    /// The fraction of the inverse-barometer level the boundary adds (see
+    /// `inverse_barometer`).
+    pub fn inverse_barometer_fraction(&self) -> f64 {
+        self.inverse_barometer
+            .unwrap_or(if self.nesting.is_some() { 0.0 } else { 1.0 })
+    }
+}
+
+/// `[atmosphere]`: the 10 m wind and the sea-level pressure of a weather
+/// model (MET Nordic, MEPS, AROME-Arctic or ERA5 NetCDF, e.g. from
+/// `met_forcing_subset`; [`crate::source::GriddedAtmosphere2D`] on an
+/// [`crate::io::AtmosphereReader`]; needs a placed mesh, `run.start` and the
+/// `netcdf` feature). The wind stress takes Large & Pond's (1981) drag; the
+/// pressure gradient acts on the whole column, and the open boundaries add
+/// the inverse-barometer level (`[[boundary]] inverse_barometer`). Both
+/// ramp up from zero, with the inverse barometer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AtmosphereSection {
+    /// The weather files, joined in time (consecutive forecast runs or
+    /// analysis hours). They must cover the mesh and the run.
+    pub files: Vec<PathBuf>,
+    /// Ramp-up from zero (hours, default 1).
+    #[serde(default = "default_ramp_hours")]
+    pub ramp_hours: f64,
+    /// The wind stress (default true).
+    #[serde(default = "default_true")]
+    pub wind: bool,
+    /// The pressure gradient (default true).
+    #[serde(default = "default_true")]
+    pub pressure: bool,
 }
 
 /// `[boundary.nesting]`: one-way nesting in a parent ocean model
@@ -1170,6 +1217,32 @@ impl Case {
         if let Some(s) = &b.slopes_3d {
             s.validate()?;
         }
+        if let Some(a) = &self.atmosphere {
+            if !self.placed() {
+                return invalid(
+                    "[atmosphere] needs a placed mesh: mesh.geographic, or mesh.origin".into(),
+                );
+            }
+            if self.run.start.is_none() {
+                return invalid(
+                    "[atmosphere] needs run.start, the weather's instant of time 0".into(),
+                );
+            }
+            if a.files.is_empty() {
+                return invalid("atmosphere.files needs at least one file".into());
+            }
+            if !(non_negative(a.ramp_hours) && a.ramp_hours.is_finite()) {
+                return invalid(format!(
+                    "atmosphere.ramp_hours must be ≥ 0, not {}",
+                    a.ramp_hours
+                ));
+            }
+            if !a.wind && !a.pressure {
+                return invalid(
+                    "[atmosphere] with neither wind nor pressure forces nothing".into(),
+                );
+            }
+        }
         let p = &self.physics;
         if !positive(p.gravity) {
             return invalid(format!(
@@ -1292,6 +1365,22 @@ impl Case {
                     ));
                 }
             }
+            if let Some(f) = b.inverse_barometer {
+                if !(0.0..=2.0).contains(&f) {
+                    return invalid(format!(
+                        "[[boundary]] {:?}: inverse_barometer is a fraction of the response, \
+                         0–2, not {f}",
+                        b.tag.name()
+                    ));
+                }
+                if !self.atmosphere.as_ref().is_some_and(|a| a.pressure) {
+                    return invalid(format!(
+                        "[[boundary]] {:?}: inverse_barometer needs [atmosphere] with its \
+                         pressure",
+                        b.tag.name()
+                    ));
+                }
+            }
         }
         if let Some(cfl) = self.numerics.cfl
             && !positive(cfl)
@@ -1372,6 +1461,12 @@ impl Case {
                     ));
                 }
             }
+        }
+        // Last, so that a build without NetCDF still checks the rest
+        if self.atmosphere.is_some() && !cfg!(feature = "netcdf") {
+            return invalid(
+                "[atmosphere] needs dgcom built with the `netcdf` feature (on by default)".into(),
+            );
         }
         Ok(())
     }

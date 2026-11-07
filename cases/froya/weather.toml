@@ -1,0 +1,63 @@
+# Frøya–Smøla–Hitra nested in NorKyst-800, under MET Nordic's weather.
+#
+# `nested.toml` with the weather: MET Nordic's 10 m wind (Large & Pond
+# drag) and sea-level pressure on every node, ramped up over the first hour.
+# The nested boundary adds none of the inverse-barometer level by default,
+# since NorKyst's ζ carries part of the response; set
+# `inverse_barometer` on the boundary to add a fraction (NorKyst's ζ
+# carries ≈ 0.22 of it, `notes/norkyst-issues.md` §6). The weather, besides
+# `nested.toml`'s inputs, fetched once (free, no account needed):
+#
+#   cargo run --release --example met_forcing_subset -- \
+#       bbox=8.0,63.6,9.2,64.0 start=2025-06-15 hours=72 out=data/froya_met.nc
+#   dgcom run cases/froya/weather.toml
+#
+# This case reproduces `examples/froya_real_data.rs norkyst=data/froya_norkyst.nc
+# met=data/froya_met.nc` bit for bit (`notes/case-files.md`).
+
+[run]
+name = "froya_weather"
+start = "2025-06-15T00:00:00Z"
+duration_hours = 12.42          # one M2 period
+
+[mesh]
+order = 2
+
+[mesh.geographic]
+bbox = [8.0, 63.6, 9.2, 64.0]   # west, south, east, north
+nx = 120
+ny = 90
+
+[bathymetry.raster]
+file = "../../data/froya_topobathy.tif"
+kind = "topobathy"
+fill_zero_holes = true
+land_elevation_m = 5.0
+
+[physics]
+coriolis = { f_plane = 1.31e-4 }
+friction = { manning = 0.025 }
+
+[[boundary]]
+tag = "open"
+[boundary.nesting]
+file = "../../data/froya_norkyst.nc"
+atlas = "../../data/froya_boundary_tides.txt"   # NorKyst's own month-long fit
+band_km = 3.0
+band_minutes = 30.0
+ramp_hours = 1.0
+[boundary.nesting.gauge]
+record = "../../data/tide_gauges/mausund_obs.txt"
+source = "../../data/froya_station_tides.txt"
+
+[atmosphere]
+files = ["../../data/froya_met.nc"]   # MET Nordic: 10 m wind and sea-level pressure
+ramp_hours = 1.0
+
+[output]
+interval_minutes = 10.0
+
+[[output.station]]
+name = "Mausund"
+lat = 63.869331
+lon = 8.665231
