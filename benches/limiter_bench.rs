@@ -5,13 +5,13 @@
 //! Benchmarks Kuzmin and positivity limiters for 2D SWE.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use dg_rs::mesh::Mesh2D;
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{
+use dgcom::mesh::Mesh2D;
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::solver::{
     KuzminParameter2D, SWEState2D, SystemSolution2D, apply_swe_limiters_kuzmin_2d,
     swe_cell_averages_2d, swe_kuzmin_limiter_2d, swe_positivity_limiter_2d,
 };
-use dg_rs::types::ElementIndex;
+use dgcom::types::ElementIndex;
 
 /// Setup a test problem with oscillatory solution (needs limiting).
 fn setup_problem(

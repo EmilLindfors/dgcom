@@ -3,25 +3,25 @@
 //! Verifies that the solver achieves the expected order of accuracy (N+1)
 //! for smooth solutions, where N is the polynomial order.
 
-use dg_rs::{
+use dgcom::{
     BoundaryCondition, DGOperators1D, DGSolution1D, Mesh1D, compute_dt, compute_rhs, ssp_rk3_step,
     ssp_rk3_step_timed,
 };
 // 2D imports
-use dg_rs::{
+use dgcom::{
     Advection2D, AdvectionFluxType, DGOperators2D, DGSolution2D, GeometricFactors2D, Mesh2D,
     PeriodicBC2D, compute_dt_advection_2d, compute_rhs_advection_2d, ssp_rk3_step_2d_timed,
 };
 // SWE 2D imports
-use dg_rs::{
+use dgcom::{
     Reflective2D, SWE2DRhsConfig, SWEFluxType2D, SWESolution2D, ShallowWater2D, compute_dt_swe_2d,
     compute_rhs_swe_2d,
 };
 // SWE 1D imports
-use dg_rs::boundary::ReflectiveBC;
-use dg_rs::source::SourceTerm;
-use dg_rs::time::{SSPRK3, TimeIntegrator};
-use dg_rs::{
+use dgcom::boundary::ReflectiveBC;
+use dgcom::source::SourceTerm;
+use dgcom::time::{SSPRK3, TimeIntegrator};
+use dgcom::{
     SWEFluxType, SWERhsConfig, SWESolution, SWEState, ShallowWater1D, compute_dt_swe,
     compute_rhs_swe,
 };
@@ -1007,11 +1007,11 @@ mod manufactured {
 
 struct ManufacturedSource;
 
-impl dg_rs::SourceTerm2D for ManufacturedSource {
-    fn evaluate(&self, ctx: &dg_rs::SourceContext2D) -> dg_rs::SWEState2D {
+impl dgcom::SourceTerm2D for ManufacturedSource {
+    fn evaluate(&self, ctx: &dgcom::SourceContext2D) -> dgcom::SWEState2D {
         let (x, y) = ctx.position;
         let (s_h, s_hu, s_hv) = manufactured::source(x, y, ctx.time);
-        dg_rs::SWEState2D::new(s_h, s_hu, s_hv)
+        dgcom::SWEState2D::new(s_h, s_hu, s_hv)
     }
 
     fn name(&self) -> &'static str {
@@ -1041,7 +1041,7 @@ fn periodic_mesh(l: f64, n: usize, distorted: bool) -> Mesh2D {
 /// L2 depth error of a split form on an n×n periodic mesh (`WetDry`: subcell
 /// finite volumes in elements with a node shallower than `subcell_depth`).
 fn run_swe_2d_split_form_manufactured(
-    formulation: dg_rs::SWEFormulation2D,
+    formulation: dgcom::SWEFormulation2D,
     subcell_depth: f64,
     distorted: bool,
     n: usize,
@@ -1049,7 +1049,7 @@ fn run_swe_2d_split_form_manufactured(
     t_final: f64,
     cfl: f64,
 ) -> f64 {
-    use dg_rs::mesh::Bathymetry2D;
+    use dgcom::mesh::Bathymetry2D;
     use manufactured::{G, U, V, bed, depth};
 
     let l = std::f64::consts::SQRT_2;
@@ -1099,7 +1099,7 @@ fn run_swe_2d_split_form_manufactured(
 }
 
 fn check_split_form_convergence(
-    formulation: dg_rs::SWEFormulation2D,
+    formulation: dgcom::SWEFormulation2D,
     order: usize,
     cfl: f64,
     min_order: f64,
@@ -1108,7 +1108,7 @@ fn check_split_form_convergence(
 }
 
 fn check_split_form_convergence_with(
-    formulation: dg_rs::SWEFormulation2D,
+    formulation: dgcom::SWEFormulation2D,
     subcell_depth: f64,
     distorted: bool,
     resolutions: &[usize],
@@ -1155,20 +1155,20 @@ fn check_split_form_convergence_with(
 #[test]
 fn test_convergence_swe_2d_split_form_p2() {
     // P2 → 3rd order expected
-    check_split_form_convergence(dg_rs::SWEFormulation2D::EntropyStable, 2, 0.1, 2.5);
+    check_split_form_convergence(dgcom::SWEFormulation2D::EntropyStable, 2, 0.1, 2.5);
 }
 
 #[test]
 fn test_convergence_swe_2d_split_form_p3() {
     // P3 → 4th order expected
-    check_split_form_convergence(dg_rs::SWEFormulation2D::EntropyStable, 3, 0.05, 3.5);
+    check_split_form_convergence(dgcom::SWEFormulation2D::EntropyStable, 3, 0.05, 3.5);
 }
 
 #[test]
 fn test_convergence_swe_2d_wet_dry_split_form() {
     // Fully wet: flux differencing with hydrostatic-HLL faces keeps N+1
-    check_split_form_convergence(dg_rs::SWEFormulation2D::WetDry, 2, 0.1, 2.5);
-    check_split_form_convergence(dg_rs::SWEFormulation2D::WetDry, 3, 0.05, 3.5);
+    check_split_form_convergence(dgcom::SWEFormulation2D::WetDry, 2, 0.1, 2.5);
+    check_split_form_convergence(dgcom::SWEFormulation2D::WetDry, 3, 0.05, 3.5);
 }
 
 #[test]
@@ -1180,7 +1180,7 @@ fn test_convergence_swe_2d_wet_dry_subcells() {
     // reconstruction: P2 1.37, then 0.68 from 16 → 32.
     for order in 1..=3 {
         check_split_form_convergence_with(
-            dg_rs::SWEFormulation2D::WetDry,
+            dgcom::SWEFormulation2D::WetDry,
             f64::INFINITY,
             false,
             &[4, 8, 16],
@@ -1201,10 +1201,10 @@ fn test_convergence_swe_2d_split_form_distorted_mesh() {
     // N+1 on distorted periodic meshes as on uniform ones. Measured 8 → 16:
     // EntropyStable P2 2.95, P3 3.88; WetDry (fully wet) P2 2.95, P3 3.89
     for (formulation, order, cfl, min_order) in [
-        (dg_rs::SWEFormulation2D::EntropyStable, 2, 0.1, 2.5),
-        (dg_rs::SWEFormulation2D::EntropyStable, 3, 0.05, 3.5),
-        (dg_rs::SWEFormulation2D::WetDry, 2, 0.1, 2.5),
-        (dg_rs::SWEFormulation2D::WetDry, 3, 0.05, 3.5),
+        (dgcom::SWEFormulation2D::EntropyStable, 2, 0.1, 2.5),
+        (dgcom::SWEFormulation2D::EntropyStable, 3, 0.05, 3.5),
+        (dgcom::SWEFormulation2D::WetDry, 2, 0.1, 2.5),
+        (dgcom::SWEFormulation2D::WetDry, 3, 0.05, 3.5),
     ] {
         check_split_form_convergence_with(
             formulation,
@@ -1225,7 +1225,7 @@ fn test_convergence_swe_2d_wet_dry_subcells_distorted_mesh() {
     // P1 1.92, P2 1.74, P3 1.86; P2 16 → 32: 1.91 (uniform mesh: 1.90)
     for order in 1..=3 {
         check_split_form_convergence_with(
-            dg_rs::SWEFormulation2D::WetDry,
+            dgcom::SWEFormulation2D::WetDry,
             f64::INFINITY,
             true,
             &[4, 8, 16],

@@ -17,13 +17,13 @@
 
 use std::f64::consts::PI;
 
-use dg_rs::analysis::HarmonicAnalysis;
-use dg_rs::boundary::{CharacteristicOBC, ExternalState, MultiBoundaryCondition2D, Reflective2D};
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, PointLocator2D};
-use dg_rs::solver::Probe2D;
-use dg_rs::tides::constituent_period;
-use dg_rs::time::{ModelClock, SSPRK3, TimeIntegrator};
-use dg_rs::{
+use dgcom::analysis::HarmonicAnalysis;
+use dgcom::boundary::{CharacteristicOBC, ExternalState, MultiBoundaryCondition2D, Reflective2D};
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, PointLocator2D};
+use dgcom::solver::Probe2D;
+use dgcom::tides::constituent_period;
+use dgcom::time::{ModelClock, SSPRK3, TimeIntegrator};
+use dgcom::{
     DGOperators2D, GeometricFactors2D, Mesh2D, SWE2DRhsConfig, SWEFormulation2D, SWESolution2D,
     SWEState2D, ShallowWater2D, compute_rhs_swe_2d,
 };
@@ -97,7 +97,7 @@ fn stations_recover_the_progressive_tide_and_its_current_ellipse() {
     let mut series = vec![(Vec::new(), Vec::new(), Vec::new(), Vec::new()); stations.len()];
 
     let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
-    for k in dg_rs::types::ElementIndex::iter(mesh.n_elements) {
+    for k in dgcom::types::ElementIndex::iter(mesh.n_elements) {
         for i in 0..ops.n_nodes {
             q.set_state(k, i, SWEState2D::new(DEPTH, 0.0, 0.0));
         }

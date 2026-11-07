@@ -19,11 +19,11 @@
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
-use dg_rs::boundary::{CharacteristicOBC, MultiBoundaryCondition2D, Reflective2D, StillWater};
-use dg_rs::mesh::{Bathymetry2D, GmshError, read_gmsh_mesh};
-use dg_rs::time::{SSPRK3, TimeIntegrator};
-use dg_rs::types::ElementIndex;
-use dg_rs::{
+use dgcom::boundary::{CharacteristicOBC, MultiBoundaryCondition2D, Reflective2D, StillWater};
+use dgcom::mesh::{Bathymetry2D, GmshError, read_gmsh_mesh};
+use dgcom::time::{SSPRK3, TimeIntegrator};
+use dgcom::types::ElementIndex;
+use dgcom::{
     BoundaryTag, DGOperators2D, GeometricFactors2D, Mesh2D, SWE2DRhsConfig, SWEFormulation2D,
     SWESolution2D, SWEState2D, ShallowWater2D, compute_dt_swe_2d, compute_rhs_swe_2d,
 };

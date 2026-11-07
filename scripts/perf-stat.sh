@@ -1,5 +1,5 @@
 #!/bin/bash
-# Quick performance stats for dg-rs examples
+# Quick performance stats for dgcom examples
 #
 # Runs the example with perf stat to get CPU counters like:
 # - Instructions, cycles, IPC

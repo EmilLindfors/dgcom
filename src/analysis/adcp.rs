@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use dg_rs::analysis::{ADCPStation, ADCPValidationResult, CurrentTimeSeries};
+//! use dgcom::analysis::{ADCPStation, ADCPValidationResult, CurrentTimeSeries};
 //!
 //! // Define station
 //! let station = ADCPStation::new("Froya_ADCP", 8.85, 63.75)

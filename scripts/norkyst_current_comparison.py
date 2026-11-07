@@ -73,7 +73,7 @@ def read_vtu(path, names=("points", "u", "v", "eta", "bathymetry", "h")):
 
 
 def local_projection(lat0, lon0):
-    """dg-rs `LocalProjection` (WGS84 radii of curvature at lat0)."""
+    """dgcom `LocalProjection` (WGS84 radii of curvature at lat0)."""
     a, e2 = 6378137.0, 6.69437999014e-3
     s = math.sin(math.radians(lat0))
     per_lat = a * (1 - e2) / (1 - e2 * s * s) ** 1.5 * math.pi / 180

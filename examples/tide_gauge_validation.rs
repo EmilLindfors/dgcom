@@ -19,22 +19,22 @@
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
-use dg_rs::SWEFluxType2D;
-use dg_rs::analysis::{
+use dgcom::SWEFluxType2D;
+use dgcom::analysis::{
     HarmonicAnalysis, Inference, PrecomputedExtractor, StabilityMonitor, StabilityThresholds,
     TideGaugeStation, TimeSeries,
 };
-use dg_rs::boundary::{
+use dgcom::boundary::{
     CharacteristicOBC, HarmonicTidal2D, MultiBoundaryCondition2D, Reflective2D, TidalConstituent,
 };
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::solver::{
     SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d, compute_rhs_swe_2d, swe_positivity_limiter_2d,
 };
-use dg_rs::source::CoriolisSource2D;
-use dg_rs::types::ElementIndex;
+use dgcom::source::CoriolisSource2D;
+use dgcom::types::ElementIndex;
 
 /// Helper for typed element indices
 fn k(idx: usize) -> ElementIndex {
@@ -156,7 +156,7 @@ fn generate_observations(data: &StationTidalData, times: &[f64], noise_amplitude
 }
 
 /// SSP-RK3 time stepping for SWE with positivity limiter.
-fn ssp_rk3_step<BC: dg_rs::SWEBoundaryCondition2D>(
+fn ssp_rk3_step<BC: dgcom::SWEBoundaryCondition2D>(
     q: &mut SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
@@ -505,7 +505,7 @@ fn main() {
         &Inference::EQUILIBRIUM,
     );
     println!("  Harmonic analysis: {:?}", analysis.names());
-    let (results, summary) = dg_rs::validate_stations(
+    let (results, summary) = dgcom::validate_stations(
         &stations,
         &extractor,
         &obs_trimmed,

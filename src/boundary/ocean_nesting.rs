@@ -73,9 +73,9 @@
 //! # Example
 //!
 //! ```ignore
-//! use dg_rs::boundary::{CharacteristicOBC, NestingOptions, OceanModelState};
-//! use dg_rs::io::{LocalProjection, OceanModelReader};
-//! use dg_rs::time::ModelClock;
+//! use dgcom::boundary::{CharacteristicOBC, NestingOptions, OceanModelState};
+//! use dgcom::io::{LocalProjection, OceanModelReader};
+//! use dgcom::time::ModelClock;
 //!
 //! let reader = Arc::new(OceanModelReader::from_file("norkyst_subset.nc")?);
 //! let clock = ModelClock::parse("2025-06-15T00:00:00Z")?;

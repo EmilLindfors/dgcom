@@ -1,7 +1,7 @@
 //! A finished run played back from its output instead of the solver.
 //!
 //! Two kinds of output replay:
-//! - A snapshot file (`dg_rs::io::SnapshotWriter`, `.dgsnap`), as
+//! - A snapshot file (`dgcom::io::SnapshotWriter`, `.dgsnap`), as
 //!   `examples/froya_real_data.rs snapshot_minutes=N` writes it: f32 η, u, v per node,
 //!   with the mesh, the bed, the clock and the stations in its header; a 3D file
 //!   (`examples/farm_3d.rs snapshot=`, or a live 3D run saved by the viewer) adds the
@@ -9,10 +9,10 @@
 //!   scenario is built from the file alone ([`Scenario::from_snapshot`]: mesh, bed,
 //!   cages, σ-grid), so the run's domain data and builder are not needed.
 //!   The particles, if the run had them, are in a particle file beside it
-//!   ([`particle_path`], `dg_rs::io::ParticleFileWriter`), and are attached to the
+//!   ([`particle_path`], `dgcom::io::ParticleFileWriter`), and are attached to the
 //!   frames of the same time. A [`SnapshotSink`] writes both from the viewer's own
 //!   snapshots (`--save-snapshot`, live or replayed).
-//! - A directory of VTU frames (`froya_NNNN.vtu`, `dg_rs::io::write_vtk_swe`): every
+//! - A directory of VTU frames (`froya_NNNN.vtu`, `dgcom::io::write_vtk_swe`): every
 //!   element's nodes in the solver's order, with `eta`, `u`, `v`, `bathymetry` and the
 //!   model time (`TimeValue`), in ASCII. These carry no mesh connectivity, so the
 //!   scenario is built as the run was (Frøya), and [`Replay::vtu`] checks the first
@@ -42,14 +42,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-use dg_rs::io::{
+use dgcom::io::{
     ParticleFileReader, ParticleFileWriter, ParticleFrame, SnapshotError, SnapshotFrame,
     SnapshotLayout, SnapshotReader, SnapshotWriter,
 };
-use dg_rs::source::CageFootprint;
-use dg_rs::time::ModelClock;
-use dg_rs::types::ElementIndex;
-use dg_rs::waves::SeaStateFields;
+use dgcom::source::CageFootprint;
+use dgcom::time::ModelClock;
+use dgcom::types::ElementIndex;
+use dgcom::waves::SeaStateFields;
 use rayon::prelude::*;
 
 use crate::cloud_3d::KINDS;
@@ -857,7 +857,7 @@ fn tail(path: &Path) -> Result<String, Box<dyn Error>> {
 pub fn station_record(
     dir: &Path,
     at: [f64; 2],
-    projection: &impl dg_rs::io::CoordinateProjection,
+    projection: &impl dgcom::io::CoordinateProjection,
 ) -> Option<StationRecord> {
     let mut best: Option<(f64, StationRecord)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -866,7 +866,7 @@ pub fn station_record(
         if !(name.starts_with("station_") && name.ends_with(".txt")) {
             continue;
         }
-        let Ok(file) = dg_rs::io::read_tide_gauge_file(&path) else {
+        let Ok(file) = dgcom::io::read_tide_gauge_file(&path) else {
             continue;
         };
         let Some(station) = &file.station else {
@@ -938,8 +938,8 @@ mod tests {
     /// within reach, the nearest of several.
     #[test]
     fn the_runs_record_of_the_trace_point_is_found() {
-        use dg_rs::io::{CoordinateProjection, LocalProjection, TideGaugeFile};
-        use dg_rs::{TideGaugeStation, TimeSeries};
+        use dgcom::io::{CoordinateProjection, LocalProjection, TideGaugeFile};
+        use dgcom::{TideGaugeStation, TimeSeries};
         let dir = std::env::temp_dir().join(format!("dg-viz-station-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let projection = LocalProjection::new(63.87, 8.66);
@@ -948,7 +948,7 @@ mod tests {
             let series = TimeSeries::new(&[1.0e9, 1.0e9 + 600.0], &[eta, -eta]);
             let file = TideGaugeFile::from_time_series(series)
                 .with_station(TideGaugeStation::new(name, lon, lat));
-            dg_rs::io::write_tide_gauge_file(&dir.join(format!("station_{slug}.txt")), &file)
+            dgcom::io::write_tide_gauge_file(&dir.join(format!("station_{slug}.txt")), &file)
                 .unwrap();
         };
         write("near", "Near", [120.0, -80.0], 0.5);
@@ -968,8 +968,8 @@ mod tests {
 
     #[test]
     fn a_snapshot_file_is_served_frame_by_frame() {
-        use dg_rs::mesh::{Mesh2D, PointLocator2D};
-        use dg_rs::operators::DGOperators2D;
+        use dgcom::mesh::{Mesh2D, PointLocator2D};
+        use dgcom::operators::DGOperators2D;
         use std::time::Duration;
 
         // η = t everywhere, in five frames ten minutes apart, then two more while it
@@ -1056,8 +1056,8 @@ mod tests {
     /// field, and a replay saved again keeps it.
     #[test]
     fn a_runs_waves_replay_and_save_again() {
-        use dg_rs::mesh::Mesh2D;
-        use dg_rs::operators::DGOperators2D;
+        use dgcom::mesh::Mesh2D;
+        use dgcom::operators::DGOperators2D;
         use std::time::Duration;
 
         let dir = std::env::temp_dir();

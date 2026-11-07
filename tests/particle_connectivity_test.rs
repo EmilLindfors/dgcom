@@ -1,5 +1,5 @@
 //! Gates for connectivity statistics from tracked particles
-//! (`dg_rs::particles::connectivity`, TODO F.2).
+//! (`dgcom::particles::connectivity`, TODO F.2).
 //!
 //! - A uniform current carries particles from one cage through another: each
 //!   one's exposure is its chord through the receiving footprint over the
@@ -10,9 +10,9 @@
 //!   error, two ensembles of the same layout agree within their standard
 //!   errors, and a layout with the receiver further away differs by many.
 
-use dg_rs::mesh::Mesh2D;
-use dg_rs::operators::DGOperators2D;
-use dg_rs::particles::{
+use dgcom::mesh::Mesh2D;
+use dgcom::operators::DGOperators2D;
+use dgcom::particles::{
     ConnectivityEnsemble, ConnectivityMatrix, ConnectivityRecorder, ContactZone, NodalVelocity2D,
     Particle2D, ParticleTracker2D,
 };

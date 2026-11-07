@@ -61,16 +61,16 @@ mod app {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use dg_rs::analysis::{HarmonicAnalysis, Inference, TidalEllipse};
-    use dg_rs::io::{
+    use dgcom::analysis::{HarmonicAnalysis, Inference, TidalEllipse};
+    use dgcom::io::{
         CoordinateProjection, LocalProjection, OceanModelReader, ProfileLevels, ProfileSeries,
         SnapshotFrame, SnapshotReader, Stencil, TimeInterpolation, east_axis,
     };
-    use dg_rs::mesh::PointLocator2D;
-    use dg_rs::operators::DGOperators2D;
-    use dg_rs::solver::Probe2D;
-    use dg_rs::time::ModelClock;
-    use dg_rs::types::ElementIndex;
+    use dgcom::mesh::PointLocator2D;
+    use dgcom::operators::DGOperators2D;
+    use dgcom::solver::Probe2D;
+    use dgcom::time::ModelClock;
+    use dgcom::types::ElementIndex;
 
     /// The Kattholmen point is the centre of the site's NYTEK boundary
     /// (`data/sites/14042.txt`), among the cages; the register's position
@@ -777,7 +777,7 @@ mod app {
     /// the stencil and in time.
     fn deepest_valid(
         series: &ProfileSeries,
-        time: &dg_rs::io::TimeStencil,
+        time: &dgcom::io::TimeStencil,
         stencil: &Stencil,
         depths: &[f64],
         bed: f64,

@@ -19,7 +19,7 @@ use crate::menu::{self, Menu};
 use crate::screen::Screen;
 use crate::{Failed, Run};
 
-/// The dg-rs checkout: data, meshes and `output/` are found under it.
+/// The dgcom checkout: data, meshes and `output/` are found under it.
 #[derive(Resource)]
 pub struct Repo(pub PathBuf);
 

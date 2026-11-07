@@ -25,16 +25,16 @@
 
 use std::f64::consts::PI;
 
-use dg_rs::boundary::{
+use dgcom::boundary::{
     CharacteristicOBC, ElevationOnly, ExternalState, MultiBoundaryCondition2D, ParentTimeSeries,
     Reflective2D, SWEBoundaryCondition2D, StillWater,
 };
-use dg_rs::flux::SWEFluxType2D;
-use dg_rs::io::{BoundaryTimeSeries, TimeSeriesRecord};
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag};
-use dg_rs::time::{SSPRK3, TimeIntegrator};
-use dg_rs::types::ElementIndex;
-use dg_rs::{
+use dgcom::flux::SWEFluxType2D;
+use dgcom::io::{BoundaryTimeSeries, TimeSeriesRecord};
+use dgcom::mesh::{Bathymetry2D, BoundaryTag};
+use dgcom::time::{SSPRK3, TimeIntegrator};
+use dgcom::types::ElementIndex;
+use dgcom::{
     DGOperators2D, GeometricFactors2D, Mesh2D, SWE2DRhsConfig, SWEFormulation2D, SWESolution2D,
     SWEState2D, ShallowWater2D, compute_dt_swe_2d, compute_rhs_swe_2d,
 };
@@ -558,8 +558,8 @@ fn lake_at_rest_is_exact_with_open_boundaries() {
 /// too; still water at mean sea level outside drives flow through them.
 #[test]
 fn inverse_barometer_at_open_boundaries_keeps_the_sea_at_rest() {
-    use dg_rs::boundary::InverseBarometer;
-    use dg_rs::source::AtmosphericPressure2D;
+    use dgcom::boundary::InverseBarometer;
+    use dgcom::source::AtmosphericPressure2D;
 
     let domain = Domain::new(Mesh2D::uniform_rectangle_with_bc(
         0.0,

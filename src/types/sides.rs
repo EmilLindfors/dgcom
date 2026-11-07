@@ -13,8 +13,8 @@ use std::fmt;
 /// # Example
 ///
 /// ```
-/// use dg_rs::types::SideBoundaries;
-/// use dg_rs::mesh::BoundaryTag;
+/// use dgcom::types::SideBoundaries;
+/// use dgcom::mesh::BoundaryTag;
 ///
 /// let bcs = SideBoundaries::new(
 ///     BoundaryTag::Wall,   // south

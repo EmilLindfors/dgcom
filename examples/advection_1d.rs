@@ -7,7 +7,7 @@
 //!
 //! After time t, exact solution is u(x, t) = sin(pi * (x - a*t))
 
-use dg_rs::{
+use dgcom::{
     BoundaryCondition, DGOperators1D, DGSolution1D, Mesh1D, compute_dt, compute_rhs,
     ssp_rk3_step_timed,
 };

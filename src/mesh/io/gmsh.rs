@@ -51,7 +51,7 @@
 //!
 //! ## Example
 //! ```no_run
-//! use dg_rs::mesh::read_gmsh_mesh;
+//! use dgcom::mesh::read_gmsh_mesh;
 //! use std::path::Path;
 //!
 //! let mesh = read_gmsh_mesh(Path::new("mesh.msh")).expect("Failed to read mesh");

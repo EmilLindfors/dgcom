@@ -5,8 +5,8 @@
 //! Compares performance of different numerical flux schemes for 2D SWE.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use dg_rs::flux::{hll_flux_swe_2d, roe_flux_swe_2d, rusanov_flux_swe_2d};
-use dg_rs::solver::SWEState2D;
+use dgcom::flux::{hll_flux_swe_2d, roe_flux_swe_2d, rusanov_flux_swe_2d};
+use dgcom::solver::SWEState2D;
 
 const H_MIN: f64 = 1e-6;
 

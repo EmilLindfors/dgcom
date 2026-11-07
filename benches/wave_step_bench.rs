@@ -18,10 +18,10 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::types::ElementIndex;
-use dg_rs::waves::{SourceTerms, SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, Wind};
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::types::ElementIndex;
+use dgcom::waves::{SourceTerms, SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, Wind};
 
 const G: f64 = 9.81;
 const LX: f64 = 60_000.0;

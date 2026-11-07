@@ -1536,7 +1536,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dg-rs"
+name = "dgcom"
 version = "0.1.0"
 dependencies = [
  "approx",

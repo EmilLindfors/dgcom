@@ -11,13 +11,13 @@
 //!   steady profiles of the light threshold and of a halocline, and develop
 //!   and die in degree-days from the model's temperature.
 
-use dg_rs::mesh::Mesh2D;
-use dg_rs::operators::DGOperators2D;
-use dg_rs::particles::{
+use dgcom::mesh::Mesh2D;
+use dgcom::operators::DGOperators2D;
+use dgcom::particles::{
     ConstantLight, LiceStage, Particle3D, ParticleBehaviour3D, ParticleStatus, ParticleTracker3D,
     ParticleVelocity3D, SalmonLice,
 };
-use dg_rs::types::ElementIndex;
+use dgcom::types::ElementIndex;
 
 /// `K(z, D)` and `∂K/∂z` of a diffusivity profile.
 type Profile = fn(f64, f64) -> (f64, f64);
@@ -255,10 +255,10 @@ fn sinking_particles_settle_on_the_bed() {
 /// stripped of its drift it does not.
 #[test]
 fn the_model_diffusivity_keeps_a_well_mixed_population_well_mixed() {
-    use dg_rs::mesh::Bathymetry2D;
-    use dg_rs::particles::Solution3DVelocity;
-    use dg_rs::solver::state::Solution3D;
-    use dg_rs::vertical::{SigmaGrid, UniformStretching};
+    use dgcom::mesh::Bathymetry2D;
+    use dgcom::particles::Solution3DVelocity;
+    use dgcom::solver::state::Solution3D;
+    use dgcom::vertical::{SigmaGrid, UniformStretching};
 
     let (mesh, ops) = mesh();
     let (depth, n_levels, u_star) = (10.0, 20, 0.01);
@@ -448,10 +448,10 @@ fn a_halocline_traps_swimming_larvae() {
 /// without temperature does not develop them.
 #[test]
 fn larvae_develop_and_die_in_degree_days() {
-    use dg_rs::mesh::Bathymetry2D;
-    use dg_rs::particles::Solution3DVelocity;
-    use dg_rs::solver::state::Solution3D;
-    use dg_rs::vertical::{SigmaGrid, UniformStretching};
+    use dgcom::mesh::Bathymetry2D;
+    use dgcom::particles::Solution3DVelocity;
+    use dgcom::solver::state::Solution3D;
+    use dgcom::vertical::{SigmaGrid, UniformStretching};
 
     let (mesh, ops) = mesh();
     let n_levels = 4;

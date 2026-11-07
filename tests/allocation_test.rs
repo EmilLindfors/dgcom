@@ -11,16 +11,16 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::PhysicsBuilder;
-use dg_rs::simulation::Simulation;
-use dg_rs::solver::{SWEFormulation2D, SWESolution2D, SWEState2D, WetDryConfig};
-use dg_rs::source::{BathymetrySource2D, ManningFriction2D};
-use dg_rs::time::SSPRK3;
-use dg_rs::types::ElementIndex;
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::PhysicsBuilder;
+use dgcom::simulation::Simulation;
+use dgcom::solver::{SWEFormulation2D, SWESolution2D, SWEState2D, WetDryConfig};
+use dgcom::source::{BathymetrySource2D, ManningFriction2D};
+use dgcom::time::SSPRK3;
+use dgcom::types::ElementIndex;
 
 struct CountingAllocator;
 

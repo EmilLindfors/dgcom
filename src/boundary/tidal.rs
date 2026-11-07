@@ -249,7 +249,7 @@ impl TidalBC {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::boundary::TidalBC;
+    /// use dgcom::boundary::TidalBC;
     ///
     /// // Create M2 tide with 6-hour ramp-up (half an M2 period)
     /// let bc = TidalBC::m2_only(0.0, 0.5, 0.0, 9.81)

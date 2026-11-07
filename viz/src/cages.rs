@@ -7,7 +7,7 @@
 //! to a veil instead of shimmering. Each cage rides the surface: its height follows η
 //! at its centre.
 //!
-//! The drag model (`dg_rs::source::CageDrag2D`) sees only the footprint and net depth;
+//! The drag model (`dgcom::source::CageDrag2D`) sees only the footprint and net depth;
 //! the collar is decoration.
 
 use std::f32::consts::TAU;
@@ -17,7 +17,7 @@ use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use dg_rs::source::{CageFootprint, NetCage};
+use dgcom::source::{CageFootprint, NetCage};
 
 use crate::field::{Field, Frame, Probe};
 use crate::screen::{RUN, RunResources, Screen, Viewing};

@@ -9,7 +9,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use dg_rs::solver::{SWEDiagnostics2D, DiagnosticsTracker};
+//! use dgcom::solver::{SWEDiagnostics2D, DiagnosticsTracker};
 //!
 //! // Compute diagnostics at current time
 //! let diag = SWEDiagnostics2D::compute(&q, &mesh, &ops, &geom, g, dt);

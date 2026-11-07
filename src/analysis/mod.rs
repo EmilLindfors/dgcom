@@ -20,7 +20,7 @@
 //! the rest ([`Inference`]). Failures are [`AnalysisError`]s.
 //!
 //! ```ignore
-//! use dg_rs::analysis::{HarmonicAnalysis, Inference};
+//! use dgcom::analysis::{HarmonicAnalysis, Inference};
 //!
 //! // Hourly water levels at Unix times
 //! let analysis = HarmonicAnalysis::resolvable(
@@ -37,7 +37,7 @@
 //! # Example - Tide Gauge Validation
 //!
 //! ```ignore
-//! use dg_rs::analysis::{TideGaugeStation, StationValidationResult, TimeSeries};
+//! use dgcom::analysis::{TideGaugeStation, StationValidationResult, TimeSeries};
 //!
 //! let station = TideGaugeStation::new("Bergen", 5.32, 60.39);
 //! let model = TimeSeries::new(&times, &model_values);

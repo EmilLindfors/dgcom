@@ -23,7 +23,7 @@ use std::ops::{Add, Mul, Neg, Sub};
 /// # Example
 ///
 /// ```
-/// use dg_rs::types::Depth;
+/// use dgcom::types::Depth;
 ///
 /// let h = Depth::new(200.0);  // 200m deep water
 /// assert_eq!(h.meters(), 200.0);
@@ -94,7 +94,7 @@ impl From<Depth> for f64 {
 /// # Example
 ///
 /// ```
-/// use dg_rs::types::Elevation;
+/// use dgcom::types::Elevation;
 ///
 /// let high_tide = Elevation::new(1.5);   // 1.5m above MSL
 /// let low_tide = Elevation::new(-0.8);   // 0.8m below MSL
@@ -176,7 +176,7 @@ impl Neg for Elevation {
 /// # Example
 ///
 /// ```
-/// use dg_rs::types::{Sigma, Depth, Elevation};
+/// use dgcom::types::{Sigma, Depth, Elevation};
 ///
 /// let sigma = Sigma::new(-0.5);  // Mid-depth
 /// let h = Depth::new(100.0);
@@ -280,7 +280,7 @@ impl From<Sigma> for f64 {
 /// # Example
 ///
 /// ```
-/// use dg_rs::types::PhysicalZ;
+/// use dgcom::types::PhysicalZ;
 ///
 /// let z_surface = PhysicalZ::new(0.5);    // 0.5m above MSL (high tide)
 /// let z_midwater = PhysicalZ::new(-50.0); // 50m below MSL

@@ -21,17 +21,17 @@
 use std::f64::consts::PI;
 use std::sync::Arc;
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D};
-use dg_rs::solver::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D};
+use dgcom::solver::{
     SWEFormulation2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
     linear_cfl_subcells_swe_2d, linear_cfl_swe_2d, positivity_cfl_swe_2d,
 };
-use dg_rs::time::SspScheme;
-use dg_rs::types::{Depth, ElementIndex};
+use dgcom::time::SspScheme;
+use dgcom::types::{Depth, ElementIndex};
 use faer::Mat;
 
 const G: f64 = 9.81;

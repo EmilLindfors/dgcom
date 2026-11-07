@@ -8,23 +8,23 @@
 
 use std::sync::Arc;
 
-use dg_rs::boundary::{
+use dgcom::boundary::{
     CharacteristicOBC, MultiBoundaryCondition2D, Nesting3D, NestingBand3D, ReferenceColumns,
     Reflective2D, StillWater,
 };
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{
     BottomDrag3D, Forcing, GlsMixing, Hydrostatic3D, ImplicitVerticalAdvection, LinearEOS,
     PhysicsBuilder,
 };
-use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
-use dg_rs::source::{CoriolisSource2D, River, RiverProfile, RiverSeries, RiverSources};
-use dg_rs::time::{ModeSplitIntegrator, SspScheme};
-use dg_rs::types::ElementIndex;
-use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
+use dgcom::solver::state::Solution3D;
+use dgcom::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+use dgcom::source::{CoriolisSource2D, River, RiverProfile, RiverSeries, RiverSources};
+use dgcom::time::{ModeSplitIntegrator, SspScheme};
+use dgcom::types::ElementIndex;
+use dgcom::vertical::{SigmaGrid, SongHaidvogelStretching};
 
 pub const G: f64 = 9.81;
 pub const RHO0: f64 = 1025.0;

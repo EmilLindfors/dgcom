@@ -18,6 +18,11 @@
 - [ ] Build the `netcdf` feature in CI. It is excluded because it needs native HDF5/netCDF-C, so the NetCDF reader and nesting tests (P0.20) only run locally. `cargo check --features netcdf/static` builds HDF5 and netCDF-C from source with CMake and no conda (verified on Windows 2026-09-25: ~5.5 min cold, cached afterwards); use it for a CI job, and consider it as the documented local alternative to conda.
 - [ ] Characteristic-based limiting for the 2D SWE system (1D version exists but is dead code; was P2.4). Likely subsumed by P1.2.
 - [x] ~~Consolidate the root markdown files into `docs/`.~~ Done 2026-10-10: `OUTLINE.md` → `docs/architecture.md`, `ACCURACY.md` → `docs/accuracy.md`, `REVIEW.md` → `notes/review-2026-09-25.md`; the outdated ones deleted (see CHANGELOG). Decide crate vs repo name; `dg-core`/`roms-rs` workspace split.
+- Name settled 2026-11-07: **DGCOM**, the Discontinuous Galerkin Coastal Ocean Model. The crate `dg-rs` became `dgcom`. The repo `roms-rs` is renamed to match; GitHub redirects the old URLs.
+  - Why not "roms-rs" (or "RUOMS"): either reads as a Rust port of ROMS, which this is not. ROMS uses finite differences on a structured grid; this model uses DG on unstructured meshes and follows ROMS only in its 3D recipe.
+  - DGCOM has the same shape as FVCOM (method + ocean model), so modellers read it at once.
+  - Checked candidates: DGOM is taken by an existing DG ocean model repo (`zhoubing34/DGOM`); the crate `strom` is taken; DGCOM was free on crates.io and on GitHub.
+  - Unchanged on purpose: the binary magic numbers (`DGRST2D`, `DGSNAP`, `DGPART`), so old restarts and snapshots still load; the conda environment `roms-rs` in the setup docs; the viewer package `dg-viz`.
 
 ## Unknown command-line options (P6)
 

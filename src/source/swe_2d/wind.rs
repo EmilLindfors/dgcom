@@ -29,7 +29,7 @@
 //! # Example
 //!
 //! ```
-//! use dg_rs::source::{WindStress2D, DragCoefficient};
+//! use dgcom::source::{WindStress2D, DragCoefficient};
 //!
 //! // Constant 10 m/s wind from the west
 //! let wind = WindStress2D::constant(10.0, 0.0);

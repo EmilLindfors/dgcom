@@ -19,27 +19,27 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::replay::SnapshotSink;
-use dg_rs::boundary::{
+use dgcom::boundary::{
     CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Nesting3D, NestingBand3D,
     ReferenceColumns, Reflective2D, SWEBoundaryCondition2D,
 };
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::BoundaryTag;
-use dg_rs::physics::{
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::BoundaryTag;
+use dgcom::physics::{
     BottomDrag3D, ConstantMixing, EquationOfState, Forcing as Forcing3D, GlsMixing, Hydrostatic3D,
     ImplicitVerticalAdvection, LinearEOS, PhysicsBuilder, VerticalMixing,
 };
-use dg_rs::simulation::{Simulation, Simulation3D};
-use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{
+use dgcom::simulation::{Simulation, Simulation3D};
+use dgcom::solver::state::Solution3D;
+use dgcom::solver::{
     SWESolution2D, SWEState2D, StandardLimiter2D, TracerLimiter3DConfig, TracerLimiterType3D,
     TracerReferenceProfile, WetDryConfig,
 };
-use dg_rs::source::{
+use dgcom::source::{
     CageDrag2D, CoriolisSource2D, HorizontalViscosity2D, ManningFriction2D, SourceContext2D,
     SourceTerm2D, SpongeProfile,
 };
-use dg_rs::time::{ModeSplitIntegrator, MultirateSSPRK3, SSPRK3};
+use dgcom::time::{ModeSplitIntegrator, MultirateSSPRK3, SSPRK3};
 
 use crate::cloud_3d::Cloud3D;
 use crate::particles::{Cloud, ParticleConfig, ParticleSnapshot};
@@ -154,7 +154,7 @@ pub struct Snapshot {
 }
 
 /// The sea state at one instant, node by node: a coupled wave run's
-/// (`dg_rs::waves::SeaStateFields`, a snapshot file's surface fields).
+/// (`dgcom::waves::SeaStateFields`, a snapshot file's surface fields).
 #[derive(Clone, Debug, Default)]
 pub struct Waves {
     /// Significant wave height H_s (m)
@@ -172,7 +172,7 @@ pub struct Waves {
 }
 
 impl Waves {
-    /// The fields in the order of `dg_rs::waves::SeaStateFields::NAMES`.
+    /// The fields in the order of `dgcom::waves::SeaStateFields::NAMES`.
     pub fn fields(&self) -> [&Vec<f32>; 7] {
         [
             &self.hs,
@@ -339,11 +339,11 @@ fn spawn_2d(
     let forcing = scenario.forcing.clone();
     let mut q = scenario.at_rest();
     std::thread::Builder::new()
-        .name("dg-rs solver".into())
+        .name("dgcom solver".into())
         .spawn(move || {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(config.threads)
-                .thread_name(|i| format!("dg-rs rayon {i}"))
+                .thread_name(|i| format!("dgcom rayon {i}"))
                 .build()
                 .expect("solver thread pool");
             pool.install(|| {
@@ -439,11 +439,11 @@ fn spawn_3d(
     let cages = scenario.cages.clone();
     let forcing = scenario.forcing.clone();
     std::thread::Builder::new()
-        .name("dg-rs solver".into())
+        .name("dgcom solver".into())
         .spawn(move || {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(config.threads)
-                .thread_name(|i| format!("dg-rs rayon {i}"))
+                .thread_name(|i| format!("dgcom rayon {i}"))
                 .build()
                 .expect("solver thread pool");
             pool.install(|| {
@@ -629,7 +629,7 @@ mod tests {
     use super::*;
     use crate::particles::Lice;
     use crate::scenario::Mixing;
-    use dg_rs::time::ModelClock;
+    use dgcom::time::ModelClock;
 
     /// The fjord farm in 3D on its own mesh, P1 on 8 σ-levels.
     fn fjord_3d() -> Scenario {

@@ -1,5 +1,5 @@
 //! Fish farm sites on the map (`--site FILE`): a Fiskeridirektoratet site file
-//! (`scripts/fiskeridir_site.sh`, read by `dg_rs::io::farm_site`) placed by the
+//! (`scripts/fiskeridir_site.sh`, read by `dgcom::io::farm_site`) placed by the
 //! scenario's projection.
 //!
 //! The site's cages ([`site_cages`], `FarmSite::cage_layout`: the file's `cage` lines,
@@ -15,9 +15,9 @@
 //! the drag.
 
 use bevy::prelude::*;
-use dg_rs::io::{CageGrid, FarmSite, LocalProjection, MooringKind};
-use dg_rs::mesh::PointLocator2D;
-use dg_rs::source::NetCage;
+use dgcom::io::{CageGrid, FarmSite, LocalProjection, MooringKind};
+use dgcom::mesh::PointLocator2D;
+use dgcom::source::NetCage;
 
 use crate::field::{Field, Frame, Nodes, Probe};
 use crate::scenario::Scenario;
@@ -64,7 +64,7 @@ pub fn site_cages(
 pub fn site_centre(site: &FarmSite, projection: &LocalProjection) -> [f64; 2] {
     let points = site.boundary_xy(projection);
     if points.is_empty() {
-        let (x, y) = dg_rs::io::CoordinateProjection::geo_to_xy(
+        let (x, y) = dgcom::io::CoordinateProjection::geo_to_xy(
             projection,
             site.position[1],
             site.position[0],
@@ -99,7 +99,7 @@ impl SiteDrawing {
         locator: &PointLocator2D,
     ) -> Self {
         let xy = |[lon, lat]: [f64; 2]| {
-            let (x, y) = dg_rs::io::CoordinateProjection::geo_to_xy(projection, lat, lon);
+            let (x, y) = dgcom::io::CoordinateProjection::geo_to_xy(projection, lat, lon);
             [x, y]
         };
         let bed = |p: [f64; 2]| {

@@ -9,12 +9,12 @@
 //! - Scalar vs SIMD derivative combination
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use dg_rs::solver::{
+use dgcom::solver::{
     apply_diff_matrix_scalar, apply_lift_scalar, combine_derivatives_scalar, coriolis_source_scalar,
 };
 
 #[cfg(feature = "simd")]
-use dg_rs::solver::{apply_diff_matrix, apply_lift, combine_derivatives, coriolis_source};
+use dgcom::solver::{apply_diff_matrix, apply_lift, combine_derivatives, coriolis_source};
 
 /// Generate deterministic pseudo-random data for benchmarks.
 fn random_vec(n: usize, seed: u64) -> Vec<f64> {

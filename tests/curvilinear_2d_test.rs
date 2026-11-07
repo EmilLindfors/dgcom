@@ -16,16 +16,16 @@
 
 use std::f64::consts::PI;
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::flux::{SWENodeState2D, swe_entropy_variables_2d};
-use dg_rs::mesh::{Bathymetry2D, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::flux::{SWENodeState2D, swe_entropy_variables_2d};
+use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::solver::{
     SWE2DRhsConfig, SWEFormulation2D, SWESolution2D, SWEState2D, compute_rhs_swe_2d,
 };
-use dg_rs::source::HorizontalViscosity2D;
-use dg_rs::types::ElementIndex;
+use dgcom::source::HorizontalViscosity2D;
+use dgcom::types::ElementIndex;
 
 const G: f64 = 9.81;
 const L: f64 = 1000.0;

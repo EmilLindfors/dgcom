@@ -7,15 +7,15 @@
 
 use std::time::Instant;
 
-use dg_rs::SWEState2D;
-use dg_rs::mesh::{BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::SWESolution2D;
-use dg_rs::solver::burn::{
+use dgcom::SWEState2D;
+use dgcom::mesh::{BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::solver::SWESolution2D;
+use dgcom::solver::burn::{
     BurnConnectivity, BurnGeometricFactors2D, BurnOperators2D, BurnRhsConfig, BurnSWESolution2D,
 };
-use dg_rs::time::{compute_dt_burn, ssp_rk3_step_burn};
-use dg_rs::types::ElementIndex;
+use dgcom::time::{compute_dt_burn, ssp_rk3_step_burn};
+use dgcom::types::ElementIndex;
 
 #[cfg(feature = "burn-cuda")]
 use burn_cuda::{Cuda, CudaDevice};
@@ -129,7 +129,7 @@ fn main() {
 
     println!("\n--- Individual RHS timing ---");
     // Time just the RHS computation
-    use dg_rs::solver::burn::compute_rhs_swe_2d_burn;
+    use dgcom::solver::burn::compute_rhs_swe_2d_burn;
     for i in 0..5 {
         let t0 = Instant::now();
         let _rhs =

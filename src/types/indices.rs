@@ -112,7 +112,7 @@ define_index!(
     /// # Example
     ///
     /// ```
-    /// use dg_rs::types::ElementIndex;
+    /// use dgcom::types::ElementIndex;
     ///
     /// let elem = ElementIndex::new(42);
     /// assert_eq!(elem.get(), 42);
@@ -129,7 +129,7 @@ define_index!(
     /// # Example
     ///
     /// ```
-    /// use dg_rs::types::FaceIndex;
+    /// use dgcom::types::FaceIndex;
     ///
     /// let face = FaceIndex::new(10);
     /// assert_eq!(face.get(), 10);
@@ -146,7 +146,7 @@ define_index!(
     /// # Example
     ///
     /// ```
-    /// use dg_rs::types::NodeIndex;
+    /// use dgcom::types::NodeIndex;
     ///
     /// let node = NodeIndex::new(3);
     /// assert_eq!(node.get(), 3);
@@ -163,7 +163,7 @@ define_index!(
     /// # Example
     ///
     /// ```
-    /// use dg_rs::types::LevelIndex;
+    /// use dgcom::types::LevelIndex;
     ///
     /// let level = LevelIndex::new(5);
     /// assert_eq!(level.get(), 5);
@@ -182,7 +182,7 @@ impl ElementIndex {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::types::ElementIndex;
+    /// use dgcom::types::ElementIndex;
     ///
     /// let indices: Vec<_> = ElementIndex::iter(5).collect();
     /// assert_eq!(indices.len(), 5);
@@ -208,7 +208,7 @@ impl NodeIndex {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::types::NodeIndex;
+    /// use dgcom::types::NodeIndex;
     ///
     /// let indices: Vec<_> = NodeIndex::iter(9).collect();
     /// assert_eq!(indices.len(), 9);
@@ -226,7 +226,7 @@ impl FaceIndex {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::types::FaceIndex;
+    /// use dgcom::types::FaceIndex;
     ///
     /// let indices: Vec<_> = FaceIndex::iter(3).collect();
     /// assert_eq!(indices.len(), 3);
@@ -244,7 +244,7 @@ impl LevelIndex {
     /// # Example
     ///
     /// ```
-    /// use dg_rs::types::LevelIndex;
+    /// use dgcom::types::LevelIndex;
     ///
     /// let indices: Vec<_> = LevelIndex::iter(10).collect();
     /// assert_eq!(indices.len(), 10);

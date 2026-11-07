@@ -24,10 +24,10 @@ use std::collections::HashMap;
 use std::f64::consts::TAU;
 use std::sync::Arc;
 
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::types::ElementIndex;
-use dg_rs::waves::{
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::types::ElementIndex;
+use dgcom::waves::{
     DEFAULT_LIMITER, DEFAULT_RATE_LIMITER, GrowthLimiter, SourceIntegration, SourceTerms,
     SpectralGrid, WaveModel2D, WaveWorkspace, Wind, wavenumber,
 };

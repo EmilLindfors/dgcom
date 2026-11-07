@@ -1256,7 +1256,7 @@ mod tests {
 
     #[test]
     fn the_sun_stands_where_it_should_at_froya() {
-        let clock = |s: &str| dg_rs::time::ModelClock::parse(s).unwrap().unix(0.0);
+        let clock = |s: &str| dgcom::time::ModelClock::parse(s).unwrap().unix(0.0);
         let (lat, lon) = (63.87, 8.70);
         // Midsummer: at local noon (11:25 UTC) due south, 90° − φ + 23.44° up; at
         // midnight due north, just under the horizon

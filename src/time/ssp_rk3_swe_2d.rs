@@ -9,7 +9,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
+//! use dgcom::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
 //!
 //! let config = SWE2DTimeConfig::new(0.3, 9.81, 0.01)
 //!     .with_kuzmin_limiters(1.0);

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fetch Kartverket water levels at a tide gauge into the text format of
-# `dg_rs::io::read_tide_gauge_file` (ISO times in UTC, metres above MSL).
+# `dgcom::io::read_tide_gauge_file` (ISO times in UTC, metres above MSL).
 #
 # Source: Kartverket's tide API (https://vannstand.kartverket.no/tideapi_en.html),
 # which serves observations (`obs`) or predictions (`pre`) for a location.

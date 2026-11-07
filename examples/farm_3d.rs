@@ -108,37 +108,37 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 use std::time::Instant;
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::io::{ParticleFileWriter, ParticleFrame, SnapshotWriter, status_code};
-use dg_rs::mesh::data::Bathymetry2D;
-use dg_rs::mesh::{Mesh2D, PointLocator2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::particles::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::io::{ParticleFileWriter, ParticleFrame, SnapshotWriter, status_code};
+use dgcom::mesh::data::Bathymetry2D;
+use dgcom::mesh::{Mesh2D, PointLocator2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::particles::{
     ClearSkyLight, ConnectivityEnsemble, ConnectivityRecorder, Contact, ContactZone,
     DiffusivityInTime, HorizontalDiffusivity, HorizontalDiffusivityField, Particle3D,
     ParticleStatus, ParticleTracker3D, ParticleVelocity3D, SalmonLice, Solution3DVelocity,
     StokesDrift, WithHorizontalDiffusivity3D, WithStokesDrift3D,
 };
-use dg_rs::physics::cage_drag::{for_each_caged_node, layer_coefficient};
-use dg_rs::physics::{
+use dgcom::physics::cage_drag::{for_each_caged_node, layer_coefficient};
+use dgcom::physics::{
     BottomDrag3D, ConstantMixing, EquationOfState, Forcing, GlsMixing, Hydrostatic3D, LinearEOS,
     PhysicsBuilder, SWEPhysics2D, VerticalMixing,
 };
-use dg_rs::simulation::{Simulation, Simulation3D};
-use dg_rs::solver::rhs::VerticalAdvection;
-use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{
+use dgcom::simulation::{Simulation, Simulation3D};
+use dgcom::solver::rhs::VerticalAdvection;
+use dgcom::solver::state::Solution3D;
+use dgcom::solver::{
     PotentialEnergy3D, Probe2D, SWESolution2D, SWEState2D, TracerBounds, TracerLimiter3DConfig,
 };
-use dg_rs::source::{
+use dgcom::source::{
     CageDrag2D, ChezyFriction2D, CoriolisSource2D, HorizontalViscosity2D, NetCage, SourceContext2D,
     SourceTerm2D,
 };
-use dg_rs::time::{ModeSplitIntegrator, ModelClock, SSPRK3};
-use dg_rs::types::ElementIndex;
-use dg_rs::vertical::{SigmaGrid, UniformStretching};
-use dg_rs::waves::{SpectralGrid, StokesDriftField, WaveModel2D};
+use dgcom::time::{ModeSplitIntegrator, ModelClock, SSPRK3};
+use dgcom::types::ElementIndex;
+use dgcom::vertical::{SigmaGrid, UniformStretching};
+use dgcom::waves::{SpectralGrid, StokesDriftField, WaveModel2D};
 
 const G: f64 = 9.81;
 const RHO0: f64 = 1025.0;

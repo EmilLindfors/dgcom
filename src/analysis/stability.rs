@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use dg_rs::analysis::{StabilityMonitor, StabilityThresholds};
+//! use dgcom::analysis::{StabilityMonitor, StabilityThresholds};
 //!
 //! let mut monitor = StabilityMonitor::new(StabilityThresholds::tidal_default());
 //!

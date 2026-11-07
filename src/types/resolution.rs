@@ -10,7 +10,7 @@ use std::fmt;
 /// # Example
 ///
 /// ```
-/// use dg_rs::types::Resolution2D;
+/// use dgcom::types::Resolution2D;
 ///
 /// let res = Resolution2D::new(100, 50);
 /// assert_eq!(res.nx(), 100);

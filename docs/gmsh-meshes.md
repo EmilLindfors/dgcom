@@ -103,8 +103,8 @@ Mesh and save it with `gmsh fjord.geo -2 -format msh41 -o fjord.msh`. Then load
 it and dispatch the conditions by tag:
 
 ```rust
-use dg_rs::boundary::{CharacteristicOBC, MultiBoundaryCondition2D, Reflective2D};
-use dg_rs::mesh::read_gmsh_mesh;
+use dgcom::boundary::{CharacteristicOBC, MultiBoundaryCondition2D, Reflective2D};
+use dgcom::mesh::read_gmsh_mesh;
 
 let mesh = read_gmsh_mesh(std::path::Path::new("fjord.msh"))?;
 let wall = Reflective2D::new();
@@ -116,7 +116,7 @@ The cages themselves do not need to be meshed. A cage is usually smaller than
 an element, and `CageDrag2D` weights its drag onto the nodes it covers:
 
 ```rust
-use dg_rs::source::{CageDrag2D, NetCage};
+use dgcom::source::{CageDrag2D, NetCage};
 
 // Two 50 m ring cages with 20 m nets, solidity 0.25 (clean netting)
 let cages = [

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Fetch Kartverket's national topobathy terrain model (land heights and sea
 # depths in one seamless grid) as a GeoTIFF in longitude/latitude (EPSG:4326),
-# for `dg_rs::io::GeoTiffBathymetry` / `BedRaster`.
+# for `dgcom::io::GeoTiffBathymetry` / `BedRaster`.
 #
 # Source: the WCS "Topobaty nasjonal detaljert terrengmodell 25833"
 # (https://wcs.geonorge.no/skwms1/wcs.hoyde-dtm-nhm-topobathy-25833), free,

@@ -24,7 +24,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use dg_rs::physics::{EquationOfState, LinearEOS};
+use dgcom::physics::{EquationOfState, LinearEOS};
 
 use crate::actions::{Act, Action};
 use crate::colormap::{Lut, PLASMA};

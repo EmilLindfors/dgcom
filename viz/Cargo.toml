@@ -2,18 +2,18 @@
 name = "dg-viz"
 version = "0.1.0"
 edition = "2024"
-description = "3D viewer for dg-rs coastal simulations, built on Bevy"
+description = "3D viewer for dgcom coastal simulations, built on Bevy"
 license = "MIT"
 publish = false
 default-run = "dg-viz"
 
-# A workspace of its own, so building and testing dg-rs never compiles Bevy.
+# A workspace of its own, so building and testing dgcom never compiles Bevy.
 [workspace]
 
 [dependencies]
 bevy = "0.20.0"
 # The viewer runs the solver in-process and reads no NetCDF: no native HDF5/netCDF-C needed.
-dg-rs = { path = "..", default-features = false, features = ["parallel", "simd"] }
+dgcom = { path = "..", default-features = false, features = ["parallel", "simd"] }
 rayon = "1.10"
 
 # Bevy and the solver are far too slow unoptimised.
@@ -21,11 +21,11 @@ rayon = "1.10"
 opt-level = 3
 
 # The solver is generic (`Simulation<P, I>`, the physics builder), so its hot loops are
-# compiled here, at this crate's level, not at dg-rs's: opt-level 0 runs them many times slower.
+# compiled here, at this crate's level, not at dgcom's: opt-level 0 runs them many times slower.
 [profile.dev]
 opt-level = 3
 
 # The solver's debug assertions sit in its hot loops.
-[profile.dev.package.dg-rs]
+[profile.dev.package.dgcom]
 debug-assertions = false
 overflow-checks = false

@@ -21,20 +21,20 @@
 
 use std::sync::Arc;
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder};
-use dg_rs::simulation::Simulation;
-use dg_rs::solver::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder};
+use dgcom::simulation::Simulation;
+use dgcom::solver::{
     KuzminParameter2D, SWEFormulation2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
 };
-use dg_rs::source::{HorizontalViscosity2D, ManningFriction2D, SourceContext2D, SourceTerm2D};
-use dg_rs::time::{
+use dgcom::source::{HorizontalViscosity2D, ManningFriction2D, SourceContext2D, SourceTerm2D};
+use dgcom::time::{
     IntegratorInfo, Multirate, MultirateSSPRK3, SSPRK3, SspScheme, StandardIntegrator,
 };
-use dg_rs::types::{Depth, ElementIndex};
+use dgcom::types::{Depth, ElementIndex};
 
 const G: f64 = 9.81;
 
@@ -306,8 +306,8 @@ fn one_level_matches_global(base: StandardIntegrator, viscosity: Option<Horizont
 /// including dry, shoreline and boundary elements.
 #[test]
 fn subset_rhs_matches_the_full_rhs() {
-    use dg_rs::physics::PhysicsModule;
-    use dg_rs::solver::{SWE2DRhsConfig, compute_rhs_swe_2d_into, compute_rhs_swe_2d_where_into};
+    use dgcom::physics::PhysicsModule;
+    use dgcom::solver::{SWE2DRhsConfig, compute_rhs_swe_2d_into, compute_rhs_swe_2d_where_into};
 
     let setup = Setup::new(Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 500.0, 8, 4), 2);
     let mut q = shoreline_state(&setup);
@@ -677,7 +677,7 @@ fn kuzmin_limiter_is_rejected() {
 fn farm_refinement_saves_rhs_work() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/gmsh/fjord_farm.msh");
-    let setup = Setup::new(dg_rs::mesh::read_gmsh_mesh(&path).expect("farm mesh"), 1);
+    let setup = Setup::new(dgcom::mesh::read_gmsh_mesh(&path).expect("farm mesh"), 1);
     let bed = |x: f64, y: f64| -(30.0 + 120.0 * (1.0 - x / 12_000.0)) - 10.0 * (y / 2_000.0).sin();
     let physics = setup
         .builder()
@@ -857,7 +857,7 @@ fn viscous_run_converges_to_the_global_solution() {
 /// whole-state operations bit for bit, and count the same clips.
 #[test]
 fn finishing_a_stage_by_element_matches_the_whole_state() {
-    use dg_rs::time::BarotropicPhysics;
+    use dgcom::time::BarotropicPhysics;
 
     let setup = Setup::new(Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 500.0, 8, 4), 2);
     let physics = shoreline_physics(&setup);

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetch a fish farm site from Fiskeridirektoratet into a farm site file
-# (`dg_rs::io::read_farm_site_file`, TODO F.1):
+# (`dgcom::io::read_farm_site_file`, TODO F.1):
 #
 # - the site's register entry (Akvakulturregisteret: name, position,
 #   capacity), from the public pub-aqua API;

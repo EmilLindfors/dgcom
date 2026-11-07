@@ -24,8 +24,8 @@ use bevy::text::FontSize;
 use bevy::ui::RelativeCursorPosition;
 use bevy::window::{FileDragAndDrop, PrimaryWindow};
 use bevy::winit::{UpdateMode, WinitSettings};
-use dg_rs::io::SnapshotReader;
-use dg_rs::time::ModelClock;
+use dgcom::io::SnapshotReader;
+use dgcom::time::ModelClock;
 
 use crate::loading::Launch;
 use crate::screen::Screen;

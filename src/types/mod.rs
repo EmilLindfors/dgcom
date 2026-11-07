@@ -13,7 +13,7 @@
 //! # Example
 //!
 //! ```
-//! use dg_rs::types::{Bounds2D, Resolution2D, Depth, Elevation, Sigma};
+//! use dgcom::types::{Bounds2D, Resolution2D, Depth, Elevation, Sigma};
 //!
 //! // Domain bounds with clear semantics
 //! let bounds = Bounds2D::new(0.0, 100e3, 0.0, 50e3);

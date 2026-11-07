@@ -5,21 +5,21 @@
 
 use std::sync::Arc;
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::io::{AtmosphereReader, CoordinateProjection, FieldSeries, GeoGrid, LocalProjection};
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{PhysicsBuilder, SWEPhysics2DBuilder};
-use dg_rs::simulation::Simulation;
-use dg_rs::solver::{SWESolution2D, SWEState2D};
-use dg_rs::source::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::io::{AtmosphereReader, CoordinateProjection, FieldSeries, GeoGrid, LocalProjection};
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{PhysicsBuilder, SWEPhysics2DBuilder};
+use dgcom::simulation::Simulation;
+use dgcom::solver::{SWESolution2D, SWEState2D};
+use dgcom::source::{
     BottomFriction2D, ChezyFriction2D, GriddedAtmosphere2D, SourceContext2D, SourceTerm2D,
     WaveCurrentFriction2D, WaveForce2D,
 };
-use dg_rs::time::{ModelClock, SSPRK3};
-use dg_rs::types::ElementIndex;
-use dg_rs::waves::{
+use dgcom::time::{ModelClock, SSPRK3};
+use dgcom::types::ElementIndex;
+use dgcom::waves::{
     CoupledWaves2D, SourceTerms, SpectralGrid, WaveCoupling2D, WaveForceForm, WaveModel2D,
     WaveSolution, WaveWorkspace, group_velocity, wavenumber,
 };
@@ -1153,13 +1153,13 @@ fn the_dissipation_force_drives_the_longshore_current_and_no_other() {
 /// or a surface-intensified breaking force with the Stokes return flow).
 #[test]
 fn a_longshore_current_in_3d_has_the_viscous_profile_of_a_uniform_force() {
-    use dg_rs::physics::vertical_mixing::{ConstantMixing, Forcing};
-    use dg_rs::physics::{BottomDrag3D, Hydrostatic3D, LinearEOS};
-    use dg_rs::simulation::Simulation3D;
-    use dg_rs::solver::state::Solution3D;
-    use dg_rs::source::CoriolisSource2D;
-    use dg_rs::time::ModeSplitIntegrator;
-    use dg_rs::vertical::{SigmaGrid, UniformStretching};
+    use dgcom::physics::vertical_mixing::{ConstantMixing, Forcing};
+    use dgcom::physics::{BottomDrag3D, Hydrostatic3D, LinearEOS};
+    use dgcom::simulation::Simulation3D;
+    use dgcom::solver::state::Solution3D;
+    use dgcom::source::CoriolisSource2D;
+    use dgcom::time::ModeSplitIntegrator;
+    use dgcom::vertical::{SigmaGrid, UniformStretching};
 
     let beach = Beach::new();
     let direction = std::f64::consts::FRAC_PI_2 - 20f64.to_radians();

@@ -395,7 +395,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P6** Feature-gate `tiff`/`shapefile`/`geo` behind `geodata`.
 - [ ] **P6** Retire the mostly dead `solver/simd/` with the `Standard` kernel (P1.2).
 - [ ] **P6** The other examples still ignore options they do not read: `wave_growth` (its `fetch` reads keys during the run), `norkyst_boundary_tides`, `tide_gauge_fit` and `common/dap.rs`'s `arguments()` (whose users also drop bare flags). Move them onto `common/arguments.rs` (`Arguments::refuse_unread` after the last read). Its unit tests run only with `cargo test --example <name>`, not in CI.
-- [ ] **P6** Decide crate vs repo name and a `dg-core`/`roms-rs` split.
+- [ ] **P6** Decide whether to split the DG core from the ocean model into a workspace (the name is settled: `dgcom`, 2026-11-07).
 - [ ] **P6** Characteristic-based limiting for 2D SWE (likely subsumed by P1.2).
 - [ ] **P6** Low priority: faer 0.23 → 0.24 (setup-time solves only).
 - [ ] **P6** `Hydrostatic3D`'s configuration is 20 public fields and 23 consuming `with_*` builders, so it can change between steps while caches assume it fixed (the kept advection of `G` since 2026-10-16, keyed on the state only): make it private once built, or invalidate the caches on change.

@@ -1,4 +1,4 @@
-//! Gates of the spectral wave model (`dg_rs::waves`, TODO F.4): the DG
+//! Gates of the spectral wave model (`dgcom::waves`, TODO F.4): the DG
 //! propagation converges at its order, the propagation with refraction keeps the
 //! total action, and the steady states of shoaling, refraction on a sloping shelf
 //! (Snell's law) and a following current (conservation of the absolute frequency)
@@ -9,10 +9,10 @@
 use std::f64::consts::{PI, TAU};
 use std::sync::Arc;
 
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::types::ElementIndex;
-use dg_rs::waves::{
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::types::ElementIndex;
+use dgcom::waves::{
     DEFAULT_RATE_LIMITER, GrowthLimiter, SourceIntegration, SourceTerms, SpectralAdvection,
     SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, Wind, group_velocity, wavenumber,
 };

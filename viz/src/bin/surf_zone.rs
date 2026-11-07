@@ -45,17 +45,17 @@ use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use rayon::prelude::*;
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{PhysicsBuilder, SWEPhysics2DBuilder};
-use dg_rs::simulation::Simulation;
-use dg_rs::solver::{SWESolution2D, SWEState2D};
-use dg_rs::source::{ChezyFriction2D, SourceContext2D, SourceTerm2D, WaveForce2D};
-use dg_rs::time::SSPRK3;
-use dg_rs::types::ElementIndex;
-use dg_rs::waves::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{PhysicsBuilder, SWEPhysics2DBuilder};
+use dgcom::simulation::Simulation;
+use dgcom::solver::{SWESolution2D, SWEState2D};
+use dgcom::source::{ChezyFriction2D, SourceContext2D, SourceTerm2D, WaveForce2D};
+use dgcom::time::SSPRK3;
+use dgcom::types::ElementIndex;
+use dgcom::waves::{
     SourceTerms, SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, breaking_fraction,
     wavenumber,
 };

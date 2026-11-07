@@ -72,21 +72,21 @@ use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use dg_rs::io::{CageGrid, CoordinateProjection, FarmSite, read_farm_site_file};
-use dg_rs::mesh::data::Bathymetry2D;
-use dg_rs::mesh::{Mesh2D, PointLocator2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::particles::{
+use dgcom::io::{CageGrid, CoordinateProjection, FarmSite, read_farm_site_file};
+use dgcom::mesh::data::Bathymetry2D;
+use dgcom::mesh::{Mesh2D, PointLocator2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::particles::{
     ConnectivityMatrix, ConnectivityRecorder, ContactZone, Particle2D, ParticleStatus,
     ParticleTracker2D, SWEVelocity2D, WalkTracer,
 };
-use dg_rs::physics::cage_drag::{for_each_caged_node, layer_coefficient};
-use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{Probe2D, SWESolution2D, WetDryConfig};
-use dg_rs::source::{CageDrag2D, CageFootprint, NetCage};
-use dg_rs::time::ModelClock;
-use dg_rs::types::ElementIndex;
-use dg_rs::vertical::SigmaGrid;
+use dgcom::physics::cage_drag::{for_each_caged_node, layer_coefficient};
+use dgcom::solver::state::Solution3D;
+use dgcom::solver::{Probe2D, SWESolution2D, WetDryConfig};
+use dgcom::source::{CageDrag2D, CageFootprint, NetCage};
+use dgcom::time::ModelClock;
+use dgcom::types::ElementIndex;
+use dgcom::vertical::SigmaGrid;
 
 use crate::arguments::Arguments;
 

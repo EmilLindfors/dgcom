@@ -24,9 +24,9 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::text::FontSize;
 use bevy::window::PrimaryWindow;
-use dg_rs::io::{CoordinateProjection, LocalProjection};
-use dg_rs::mesh::{Mesh2D, PointLocator2D};
-use dg_rs::operators::DGOperators2D;
+use dgcom::io::{CoordinateProjection, LocalProjection};
+use dgcom::mesh::{Mesh2D, PointLocator2D};
+use dgcom::operators::DGOperators2D;
 use std::sync::Arc;
 
 use crate::actions::{Act, Action};

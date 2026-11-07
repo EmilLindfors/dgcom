@@ -12,7 +12,7 @@
 //!
 //! # Example
 //! ```ignore
-//! use dg_rs::mesh::{MeshTopology, MeshGeometry, FaceConnection};
+//! use dgcom::mesh::{MeshTopology, MeshGeometry, FaceConnection};
 //!
 //! fn print_mesh_info<M: MeshGeometry>(mesh: &M) {
 //!     println!("Elements: {}", mesh.n_elements());

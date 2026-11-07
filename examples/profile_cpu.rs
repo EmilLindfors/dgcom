@@ -7,26 +7,26 @@
 
 use std::time::Instant;
 
-use dg_rs::SWEFluxType2D;
-use dg_rs::SWEState2D;
-use dg_rs::boundary::{MultiBoundaryCondition2D, Reflective2D};
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D};
-use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
-use dg_rs::types::ElementIndex;
+use dgcom::SWEFluxType2D;
+use dgcom::SWEState2D;
+use dgcom::boundary::{MultiBoundaryCondition2D, Reflective2D};
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::solver::{SWE2DRhsConfig, SWESolution2D};
+use dgcom::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
+use dgcom::types::ElementIndex;
 
 // Use the best available RHS function based on enabled features
 #[cfg(not(all(feature = "parallel", feature = "simd")))]
-use dg_rs::solver::compute_rhs_swe_2d;
+use dgcom::solver::compute_rhs_swe_2d;
 #[cfg(all(feature = "parallel", feature = "simd"))]
-use dg_rs::solver::compute_rhs_swe_2d_parallel;
+use dgcom::solver::compute_rhs_swe_2d_parallel;
 
 #[cfg(not(all(feature = "parallel", feature = "simd")))]
-use dg_rs::solver::compute_dt_swe_2d;
+use dgcom::solver::compute_dt_swe_2d;
 #[cfg(all(feature = "parallel", feature = "simd"))]
-use dg_rs::solver::compute_dt_swe_2d_parallel;
+use dgcom::solver::compute_dt_swe_2d_parallel;
 
 fn k(idx: usize) -> ElementIndex {
     ElementIndex::new(idx)

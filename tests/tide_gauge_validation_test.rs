@@ -2,7 +2,7 @@
 //!
 //! Tests the full workflow from synthetic model output to validation metrics.
 
-use dg_rs::analysis::{
+use dgcom::analysis::{
     HarmonicAnalysis, PrecomputedExtractor, StationValidationResult, TideGaugeStation, TimeSeries,
     ValidationSummary, norwegian_stations, validate_stations,
 };

@@ -1,4 +1,4 @@
-//! Gates for Lagrangian particle tracking (`dg_rs::particles`, TODO F.2).
+//! Gates for Lagrangian particle tracking (`dgcom::particles`, TODO F.2).
 //!
 //! - Solid-body rotation, a field the bilinear elements hold exactly: one
 //!   revolution returns to the start to the RK4 error, converging at fourth
@@ -17,19 +17,19 @@
 
 use std::sync::Arc;
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{BoundaryTag, Mesh2D, PointLocator2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::particles::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{BoundaryTag, Mesh2D, PointLocator2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::particles::{
     NodalVelocity2D, Particle2D, ParticleStatus, ParticleTracker2D, SWEVelocity2D,
 };
-use dg_rs::physics::PhysicsBuilder;
-use dg_rs::simulation::Simulation;
-use dg_rs::solver::{SWESolution2D, SWEState2D};
-use dg_rs::source::{SourceContext2D, SourceTerm2D};
-use dg_rs::time::SSPRK3;
-use dg_rs::types::ElementIndex;
+use dgcom::physics::PhysicsBuilder;
+use dgcom::simulation::Simulation;
+use dgcom::solver::{SWESolution2D, SWEState2D};
+use dgcom::source::{SourceContext2D, SourceTerm2D};
+use dgcom::time::SSPRK3;
+use dgcom::types::ElementIndex;
 
 /// `nx × ny` elements over `[x0, x1] × [y0, y1]` with the interior vertices
 /// displaced: general convex quadrilaterals, straight outer walls.

@@ -18,20 +18,20 @@
 use std::f64::consts::PI;
 use std::sync::Arc;
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2DBuilder};
-use dg_rs::simulation::Simulation;
-use dg_rs::solver::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2DBuilder};
+use dgcom::simulation::Simulation;
+use dgcom::solver::{
     KuzminParameter2D, LINEAR_CFL_SAFETY, POSITIVITY_RELAXATION_SAFETY, PositivityBound,
     SWEFormulation2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
     element_dt_swe_2d, linear_cfl_subcells_swe_2d, positivity_cfl_swe_2d,
 };
-use dg_rs::source::{BathymetrySource2D, ManningFriction2D, SpatiallyVaryingManning2D};
-use dg_rs::time::{SSPRK3, SspScheme};
-use dg_rs::types::{Depth, ElementIndex};
+use dgcom::source::{BathymetrySource2D, ManningFriction2D, SpatiallyVaryingManning2D};
+use dgcom::time::{SSPRK3, SspScheme};
+use dgcom::types::{Depth, ElementIndex};
 
 const G: f64 = 9.81;
 

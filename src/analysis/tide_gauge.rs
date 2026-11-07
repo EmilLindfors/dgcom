@@ -14,8 +14,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use dg_rs::analysis::{TideGaugeStation, StationValidationResult};
-//! use dg_rs::analysis::TimeSeries;
+//! use dgcom::analysis::{TideGaugeStation, StationValidationResult};
+//! use dgcom::analysis::TimeSeries;
 //!
 //! // Define stations
 //! let bergen = TideGaugeStation::new("Bergen", 5.32, 60.39)

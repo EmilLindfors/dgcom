@@ -2,7 +2,7 @@
 //! solver thread, drawn riding the water surface (2D) or at their depth (3D).
 //!
 //! [`Cloud`] lives on the solver thread of a 2D run. At every snapshot it moves its particles from
-//! the previous snapshot to this one with `dg_rs::particles::ParticleTracker2D` (RK4
+//! the previous snapshot to this one with `dgcom::particles::ParticleTracker2D` (RK4
 //! on the depth-averaged current, linear in time between the two states, plus a
 //! horizontal random walk), then releases a new batch spread over each cage's
 //! footprint, and reports every particle's position, the surface η there, its state
@@ -23,11 +23,11 @@ use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use dg_rs::mesh::Mesh2D;
-use dg_rs::operators::DGOperators2D;
-use dg_rs::particles::{Particle2D, ParticleStatus, ParticleTracker2D, SWEVelocity2D};
-use dg_rs::solver::{SWESolution2D, WetDryConfig};
-use dg_rs::source::NetCage;
+use dgcom::mesh::Mesh2D;
+use dgcom::operators::DGOperators2D;
+use dgcom::particles::{Particle2D, ParticleStatus, ParticleTracker2D, SWEVelocity2D};
+use dgcom::solver::{SWESolution2D, WetDryConfig};
+use dgcom::source::NetCage;
 
 use crate::actions::{Act, Action};
 use crate::camera::OrbitCamera;
@@ -57,7 +57,7 @@ pub const SETTLED: u8 = 3;
 pub const DEAD: u8 = 4;
 pub const STATES: usize = 5;
 
-/// What the lice larvae of a 3D run do (`dg_rs::particles::SalmonLice`).
+/// What the lice larvae of a 3D run do (`dgcom::particles::SalmonLice`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lice {
     /// The operational IMR model's parameters

@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use dg_rs::io::{NetCDFWriter, NetCDFWriterConfig};
+//! use dgcom::io::{NetCDFWriter, NetCDFWriterConfig};
 //!
 //! let config = NetCDFWriterConfig::new("output.nc")
 //!     .with_title("Froya Simulation")
@@ -113,7 +113,7 @@ impl NetCDFWriterConfig {
             path: path.into(),
             title: None,
             institution: None,
-            source: Some("dg-rs".to_string()),
+            source: Some("dgcom".to_string()),
             history: None,
             references: None,
             comment: None,
@@ -366,7 +366,7 @@ impl NetCDFWriter {
         let now = Utc::now();
         file.add_attribute(
             "history",
-            format!("{}: Created by dg-rs", now.format("%Y-%m-%d %H:%M:%S UTC")).as_str(),
+            format!("{}: Created by dgcom", now.format("%Y-%m-%d %H:%M:%S UTC")).as_str(),
         )?;
 
         Ok(Self {

@@ -6,8 +6,8 @@
 //! 3. Geostrophic balance (Coriolis equilibrium)
 //! 4. Sponge layer wave absorption
 
-use dg_rs::types::ElementIndex;
-use dg_rs::{
+use dgcom::types::ElementIndex;
+use dgcom::{
     DGOperators2D, GeometricFactors2D, Mesh2D, Reflective2D, SWE2DRhsConfig, SWESolution2D,
     SWEState2D, ShallowWater2D, compute_dt_swe_2d, compute_rhs_swe_2d,
     source::{CombinedSource2D, CoriolisSource2D, SpongeLayer2D},
@@ -21,7 +21,7 @@ fn k(idx: usize) -> ElementIndex {
 const G: f64 = 9.81;
 
 /// Helper to compute one SSP-RK3 step with source terms
-fn ssp_rk3_step_with_sources<BC: dg_rs::SWEBoundaryCondition2D>(
+fn ssp_rk3_step_with_sources<BC: dgcom::SWEBoundaryCondition2D>(
     q: &mut SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,

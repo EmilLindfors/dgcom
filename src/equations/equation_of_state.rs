@@ -87,7 +87,7 @@ impl EquationOfState {
     ///
     /// # Example
     /// ```
-    /// use dg_rs::equations::EquationOfState;
+    /// use dgcom::equations::EquationOfState;
     ///
     /// let eos = EquationOfState::new();
     ///

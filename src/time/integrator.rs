@@ -7,8 +7,8 @@
 //!
 //! # Example
 //! ```
-//! use dg_rs::time::{Integrable, TimeIntegrator, SSPRK3};
-//! use dg_rs::solver::DGSolution1D;
+//! use dgcom::time::{Integrable, TimeIntegrator, SSPRK3};
+//! use dgcom::solver::DGSolution1D;
 //!
 //! // DGSolution1D implements Integrable
 //! let mut u = DGSolution1D::new(4, 3);
@@ -41,8 +41,8 @@
 ///
 /// # Example
 /// ```
-/// use dg_rs::time::Integrable;
-/// use dg_rs::solver::DGSolution1D;
+/// use dgcom::time::Integrable;
+/// use dgcom::solver::DGSolution1D;
 ///
 /// let mut u = DGSolution1D::new(4, 3);
 /// for v in &mut u.data { *v = 1.0; }
@@ -301,8 +301,8 @@ impl SspScheme {
 ///
 /// # Example
 /// ```
-/// use dg_rs::time::{Integrable, TimeIntegrator, SSPRK3};
-/// use dg_rs::solver::DGSolution1D;
+/// use dgcom::time::{Integrable, TimeIntegrator, SSPRK3};
+/// use dgcom::solver::DGSolution1D;
 ///
 /// let mut u = DGSolution1D::new(4, 3);
 /// for v in &mut u.data { *v = 1.0; }

@@ -5,18 +5,18 @@
 //! Benchmarks SSP-RK3 time integration and diagnostic computations.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::Mesh2D;
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{PhysicsBuilder, SWEPhysics2D};
-use dg_rs::simulation::Simulation;
-use dg_rs::solver::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::Mesh2D;
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{PhysicsBuilder, SWEPhysics2D};
+use dgcom::simulation::Simulation;
+use dgcom::solver::{
     DiagnosticsTracker, SWE2DRhsConfig, SWEDiagnostics2D, SWESolution2D, SWEState2D,
     compute_dt_swe_2d, compute_rhs_swe_2d,
 };
-use dg_rs::time::SSPRK3;
-use dg_rs::types::ElementIndex;
+use dgcom::time::SSPRK3;
+use dgcom::types::ElementIndex;
 use std::sync::Arc;
 
 /// Setup a test problem.

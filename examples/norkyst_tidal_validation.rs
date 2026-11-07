@@ -3,7 +3,7 @@
 //! This wires the full P1.5 comparison path:
 //!
 //! 1. Read `norkyst-client --format text` point output with
-//!    [`dg_rs::io::read_norkyst_text_file`] → a sea-surface-height (`zeta`) series.
+//!    [`dgcom::io::read_norkyst_text_file`] → a sea-surface-height (`zeta`) series.
 //! 2. Fit reference constants `(H, G)` with [`HarmonicAnalysis`] (the
 //!    astronomy and nodal corrections are in its basis, so they compare
 //!    directly with a catalogue): the constituents the record resolves, the
@@ -41,9 +41,9 @@
 //! The reference constants it prints are directly comparable to a catalogue
 //! (Kartverket / ROMS / NorKyst harmonic constants).
 
-use dg_rs::analysis::{HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit, TimeSeries};
-use dg_rs::io::read_norkyst_text_file;
-use dg_rs::time::ModelClock;
+use dgcom::analysis::{HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit, TimeSeries};
+use dgcom::io::read_norkyst_text_file;
+use dgcom::time::ModelClock;
 
 /// Constituents to fit in priority order: a short record keeps the first.
 const CANDIDATES: [&str; 11] = [
@@ -167,7 +167,7 @@ fn load_zeta(path: &str, lon: f64, lat: f64) -> Option<TimeSeries> {
         #[cfg(feature = "parquet")]
         {
             println!("Reading NorKyst grid parquet: {path}");
-            let data = match dg_rs::io::read_norkyst_parquet_glob(p) {
+            let data = match dgcom::io::read_norkyst_parquet_glob(p) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("error: {e}");

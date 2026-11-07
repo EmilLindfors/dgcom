@@ -13,7 +13,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use dg_rs::solver::burn::{BurnOperators2D, BurnSWESolution2D, compute_rhs_swe_2d_burn};
+//! use dgcom::solver::burn::{BurnOperators2D, BurnSWESolution2D, compute_rhs_swe_2d_burn};
 //! use burn::backend::Wgpu;
 //!
 //! // Initialize operators on GPU

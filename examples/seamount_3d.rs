@@ -12,7 +12,7 @@
 //! slope would follow from vertical diffusion: Phillips 1970, Wunsch 1970);
 //! a small vertical viscosity.
 //!
-//! What it found (2026-10-01; see `dg_rs::solver::rhs::baroclinic`): with
+//! What it found (2026-10-01; see `dgcom::solver::rhs::baroclinic`): with
 //! the constant-depth PGF and conservative tracer advection a stratified
 //! fluid at rest over the slope was unstable, round-off growing tenfold
 //! every 6 h even for constant N², at any time step and against any
@@ -47,21 +47,21 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::Mesh2DBuilder;
-use dg_rs::mesh::data::Bathymetry2D;
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, PhysicsBuilder};
-use dg_rs::solver::rhs::{MomentumAdvectionForm, PressureGradientForm, VerticalAdvection};
-use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::Mesh2DBuilder;
+use dgcom::mesh::data::Bathymetry2D;
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, PhysicsBuilder};
+use dgcom::solver::rhs::{MomentumAdvectionForm, PressureGradientForm, VerticalAdvection};
+use dgcom::solver::state::Solution3D;
+use dgcom::solver::{
     SWEFormulation2D, TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile,
 };
-use dg_rs::source::CoriolisSource2D;
-use dg_rs::time::ModeSplitIntegrator;
-use dg_rs::types::ElementIndex;
-use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching, UniformStretching};
+use dgcom::source::CoriolisSource2D;
+use dgcom::time::ModeSplitIntegrator;
+use dgcom::types::ElementIndex;
+use dgcom::vertical::{SigmaGrid, SongHaidvogelStretching, UniformStretching};
 
 const G: f64 = 9.81;
 const RHO0: f64 = 1025.0;

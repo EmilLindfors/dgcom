@@ -19,7 +19,7 @@
 //! multiplies the amplitude by `f` and adds `(V₀ + u)` to `φ`:
 //!
 //! ```
-//! use dg_rs::tides::{AstronomicalArguments, correct_amplitude_phase, nodal_correction};
+//! use dgcom::tides::{AstronomicalArguments, correct_amplitude_phase, nodal_correction};
 //!
 //! // Raw catalogue constituent: amplitude H and internal phase φ = −G.
 //! let (h, phi) = (0.45_f64, -125.3_f64.to_radians());

@@ -26,18 +26,18 @@
 use std::f64::consts::PI;
 use std::sync::Arc;
 
-use dg_rs::boundary::Reflective2D;
-use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{Bathymetry2D, Mesh2D};
-use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::physics::{ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, PhysicsBuilder};
-use dg_rs::solver::rhs::{MetricForm, PressureGradientForm, compute_pressure_gradient};
-use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{DGSolution2D, SWEFormulation2D, TracerLimiter3DConfig, TracerLimiterType3D};
-use dg_rs::source::CoriolisSource2D;
-use dg_rs::time::ModeSplitIntegrator;
-use dg_rs::types::ElementIndex;
-use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching, UniformStretching};
+use dgcom::boundary::Reflective2D;
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::{ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, PhysicsBuilder};
+use dgcom::solver::rhs::{MetricForm, PressureGradientForm, compute_pressure_gradient};
+use dgcom::solver::state::Solution3D;
+use dgcom::solver::{DGSolution2D, SWEFormulation2D, TracerLimiter3DConfig, TracerLimiterType3D};
+use dgcom::source::CoriolisSource2D;
+use dgcom::time::ModeSplitIntegrator;
+use dgcom::types::ElementIndex;
+use dgcom::vertical::{SigmaGrid, SongHaidvogelStretching, UniformStretching};
 
 const G: f64 = 9.81;
 const RHO0: f64 = 1025.0;
