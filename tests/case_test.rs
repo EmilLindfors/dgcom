@@ -1136,3 +1136,167 @@ fn the_bed_is_blended_to_the_parents_across_the_band() {
         .unwrap();
     assert!(kept.bathymetry.data.iter().all(|&b| b == -10.0));
 }
+
+// ---------------------------------------------------------------------------
+// The atmosphere (NetCDF)
+// ---------------------------------------------------------------------------
+
+/// Hourly weather from `run.start` for `hours` on a regular
+/// longitude/latitude grid over the placed channel: a uniform 10 m wind of
+/// `u10` m/s towards the east and a uniform sea-level pressure `msl_pa`.
+#[cfg(feature = "netcdf")]
+fn write_weather(path: &Path, hours: usize, u10: f64, msl_pa: f64) {
+    use dgcom::io::{CoordinateProjection, LocalProjection};
+    let projection = LocalProjection::new(ORIGIN.0, ORIGIN.1);
+    let (lat0, lon0) = projection.xy_to_geo(-10_000.0, -10_000.0);
+    let (lat1, lon1) = projection.xy_to_geo(20_000.0, 12_000.0);
+    let n = 8;
+    let axis = |a: f64, b: f64| -> Vec<f64> {
+        (0..n)
+            .map(|i| a + (b - a) * i as f64 / (n - 1) as f64)
+            .collect()
+    };
+    let mut file = netcdf::create(path).unwrap();
+    file.add_dimension("time", hours + 1).unwrap();
+    file.add_dimension("lat", n).unwrap();
+    file.add_dimension("lon", n).unwrap();
+    let mut var = file.add_variable::<f64>("lat", &["lat"]).unwrap();
+    var.put_values(&axis(lat0, lat1), ..).unwrap();
+    let mut var = file.add_variable::<f64>("lon", &["lon"]).unwrap();
+    var.put_values(&axis(lon0, lon1), ..).unwrap();
+    let mut var = file.add_variable::<f64>("time", &["time"]).unwrap();
+    var.put_attribute("units", "seconds since 1970-01-01 00:00:00")
+        .unwrap();
+    let times: Vec<f64> = (0..=hours)
+        .map(|h| START_UNIX + 3600.0 * h as f64)
+        .collect();
+    var.put_values(&times, ..).unwrap();
+    let field = |value: f64| vec![value as f32; (hours + 1) * n * n];
+    for (name, value, units) in [
+        ("u10", u10, "m s-1"),
+        ("v10", 0.0, "m s-1"),
+        ("msl", msl_pa, "Pa"),
+    ] {
+        let mut var = file
+            .add_variable::<f32>(name, &["time", "lat", "lon"])
+            .unwrap();
+        var.put_attribute("units", units).unwrap();
+        var.put_values(&field(value), ..).unwrap();
+    }
+}
+
+/// A placed channel 10 km long, 2 km wide and 10 m deep, still water at its
+/// open west end (`boundary` appended to its `[[boundary]]`), under the
+/// weather of `weather.nc` for `hours`, with stations at its mouth and head.
+#[cfg(feature = "netcdf")]
+fn weathered_channel(dir: &Path, boundary: &str, hours: f64) -> Vec<StationSeries> {
+    let text = format!(
+        r#"
+        [run]
+        start = "2025-06-15T00:00:00Z"
+        duration_hours = {hours}
+
+        [mesh]
+        origin = {{ lat = {}, lon = {} }}
+
+        [mesh.rectangle]
+        x_m = [0.0, 10000.0]
+        y_m = [0.0, 2000.0]
+        nx = 10
+        ny = 2
+        west = "open"
+
+        [bathymetry]
+        depth_m = 10.0
+
+        [physics]
+        friction = {{ manning = 0.025 }}
+
+        [[boundary]]
+        tag = "open"
+        still = {{}}
+        {boundary}
+
+        [atmosphere]
+        files = ["weather.nc"]
+
+        [output]
+        directory = "out"
+        interval_minutes = 30.0
+        snapshot = false
+
+        [[output.station]]
+        name = "mouth"
+        x_m = 500.0
+        y_m = 1000.0
+
+        [[output.station]]
+        name = "head"
+        x_m = 9500.0
+        y_m = 1000.0
+        "#,
+        ORIGIN.0, ORIGIN.1
+    );
+    let path = dir.join("case.toml");
+    std::fs::write(&path, text).unwrap();
+    CaseFile::read(&path, &[])
+        .unwrap()
+        .run(&mut |_| {})
+        .unwrap()
+        .stations
+}
+
+/// Under a uniform low the open boundary takes the inverse-barometer level
+/// and the channel settles to it, −Δp/(ρg); with `inverse_barometer = 0`
+/// the boundary holds mean sea level, and a uniform pressure, which has no
+/// gradient, moves nothing.
+#[cfg(feature = "netcdf")]
+#[test]
+fn a_low_lowers_the_channel_to_its_inverse_barometer_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let dp = 1000.0;
+    write_weather(&dir.path().join("weather.nc"), 13, 0.0, 101_325.0 + dp);
+    let ib = -dp / (1025.0 * 9.81);
+    let full = weathered_channel(dir.path(), "", 12.0);
+    let half = weathered_channel(dir.path(), "inverse_barometer = 0.5", 12.0);
+    let none = weathered_channel(dir.path(), "inverse_barometer = 0.0", 12.0);
+    let last = |s: &[StationSeries]| *s[1].eta_m.last().unwrap();
+    println!(
+        "head after 12 h under +10 hPa: {:.5} m (theory {ib:.5}), half {:.5}, none {:.2e}",
+        last(&full),
+        last(&half),
+        last(&none)
+    );
+    assert!(
+        (last(&full) - ib).abs() < 0.005 * ib.abs(),
+        "{}",
+        last(&full)
+    );
+    assert!(
+        (last(&half) - 0.5 * ib).abs() < 0.005 * ib.abs(),
+        "{}",
+        last(&half)
+    );
+    assert!(last(&none).abs() < 1e-9, "{}", last(&none));
+}
+
+/// A uniform wind towards the closed head sets the sea up against it: at
+/// rest, the slope balances the stress, ∂η/∂x = τ/(ρ g h), so the head
+/// stands τ L/(ρ g h) above the mouth (L the 9 km between the stations).
+#[cfg(feature = "netcdf")]
+#[test]
+fn a_wind_sets_the_channel_up_against_its_head() {
+    use dgcom::source::{DragCoefficient, RHO_AIR, RHO_WATER};
+    let dir = tempfile::tempdir().unwrap();
+    let wind = 10.0;
+    write_weather(&dir.path().join("weather.nc"), 25, wind, 101_325.0);
+    let stations = weathered_channel(dir.path(), "", 24.0);
+    let tau = RHO_AIR * DragCoefficient::LargePond.compute(wind) * wind * wind;
+    let theory = tau * 9000.0 / (RHO_WATER * 9.81 * 10.0);
+    let setup = stations[1].eta_m.last().unwrap() - stations[0].eta_m.last().unwrap();
+    println!("set-up over 9 km under {wind} m/s: {setup:.5} m (theory {theory:.5})");
+    assert!(
+        (setup - theory).abs() < 0.01 * theory,
+        "{setup} against {theory}"
+    );
+}

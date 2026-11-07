@@ -21,9 +21,11 @@
 //!   viscosity, wetting and drying;
 //! - still-water, harmonic-tide and tidal-atlas open boundaries, and
 //!   nesting in a parent ocean model (NetCDF, with the `netcdf` feature);
+//! - a weather model's wind and pressure, with the inverse-barometer level
+//!   at the open boundaries (NetCDF);
 //! - snapshot, VTK, NetCDF and station output.
 //!
-//! Next: the atmosphere, and gauge scores at the stations
+//! Next: gauge scores at the stations, and the 3D model
 //! (`notes/case-files.md`).
 
 mod domain;
@@ -136,7 +138,9 @@ impl Case {
     }
 }
 
-/// Set `key.path=value` in `table`, creating tables on the way.
+/// Set `key.path=value` in `table`, creating tables on the way. A number
+/// after an array of tables picks its entry: `boundary.0.ramp_hours` is the
+/// first `[[boundary]]`'s.
 fn apply_override(table: &mut toml::Table, assignment: &str) -> Result<(), String> {
     let (path, value) = assignment
         .split_once('=')
@@ -150,10 +154,29 @@ fn apply_override(table: &mut toml::Table, assignment: &str) -> Result<(), Strin
     let keys: Vec<&str> = path.split('.').collect();
     let (last, parents) = keys.split_last().expect("split yields one key at least");
     let mut current = table;
-    for key in parents {
+    let mut parents = parents.iter().peekable();
+    while let Some(key) = parents.next() {
         let entry = current
             .entry(key.to_string())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let entry = match entry {
+            toml::Value::Array(entries) => {
+                let index = parents
+                    .next()
+                    .and_then(|i| i.parse::<usize>().ok())
+                    .ok_or_else(|| {
+                        format!("override {path:?}: {key} is a list; pick an entry, {key}.0")
+                    })?;
+                let n = entries.len();
+                entries.get_mut(index).ok_or_else(|| {
+                    format!(
+                        "override {path:?}: {key} has {n} entries, not {}",
+                        index + 1
+                    )
+                })?
+            }
+            entry => entry,
+        };
         current = entry
             .as_table_mut()
             .ok_or_else(|| format!("override {path:?}: {key} is not a table"))?;
@@ -254,6 +277,25 @@ mod tests {
         assert_eq!(case.physics.coriolis, Some(Coriolis::Latitude(60.0)));
         let err = Case::parse(MINIMAL, false, &["numerics.cfll=0.5".into()]).unwrap_err();
         assert!(err.contains("cfll"), "{err}");
+
+        // An entry of an array of tables, by its index
+        let two = format!(
+            "{}\n[[output.station]]\nname = \"a\"\nx_m = 1.0\ny_m = 1.0\n\
+             [[output.station]]\nname = \"b\"\nx_m = 2.0\ny_m = 2.0\n",
+            MINIMAL.replace("ny = 1", "ny = 1\n        west = \"open\"")
+        );
+        let case = Case::parse(&two, false, &["output.station.1.x_m=5.0".into()]).unwrap();
+        assert_eq!(
+            (case.output.stations[0].x_m, case.output.stations[1].x_m),
+            (Some(1.0), Some(5.0))
+        );
+        for (bad, says) in [
+            ("output.station.2.x_m=5.0", "has 2 entries"),
+            ("output.station.x_m=5.0", "pick an entry"),
+        ] {
+            let err = Case::parse(&two, false, &[bad.into()]).unwrap_err();
+            assert!(err.contains(says), "{bad}: {err}");
+        }
     }
 
     #[test]
@@ -544,6 +586,89 @@ file = \"parent.nc\"
         for extra in ["open_water_depth_m = -1.0", "max_offset_m = inf"] {
             let err = parse(&with(extra)).unwrap().validate().unwrap_err();
             assert!(err.to_string().contains(&extra[..10]), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_atmosphere_needs_a_placed_mesh_and_a_start() {
+        let open = MINIMAL.replace("ny = 1", "ny = 1\n        west = \"open\"");
+        let placed = open.replace(
+            "[bathymetry]",
+            "[mesh.origin]\nlat = 63.7\nlon = 8.5\n\n[bathymetry]",
+        );
+        let started = placed.replace(
+            "duration_hours = 1.0",
+            "duration_hours = 1.0\n        start = \"2025-06-15T00:00:00Z\"",
+        );
+        let weather = |extra: &str| format!("\n[atmosphere]\nfiles = [\"met.nc\"]\n{extra}\n");
+        let boundary =
+            |extra: &str| format!("\n[[boundary]]\ntag = \"open\"\nstill = {{}}\n{extra}\n");
+        let check = |text: String| parse(&text).unwrap().validate().map_err(|e| e.to_string());
+        for (text, says) in [
+            (format!("{open}{}{}", boundary(""), weather("")), "placed"),
+            (
+                format!("{placed}{}{}", boundary(""), weather("")),
+                "run.start",
+            ),
+            (
+                format!("{started}{}{}", boundary(""), weather("ramp_hours = -1.0")),
+                "ramp_hours",
+            ),
+            (
+                format!(
+                    "{started}{}{}",
+                    boundary(""),
+                    weather("wind = false\npressure = false")
+                ),
+                "neither",
+            ),
+            (
+                format!("{started}{}", boundary("inverse_barometer = 0.5")),
+                "[atmosphere]",
+            ),
+            (
+                format!(
+                    "{started}{}{}",
+                    boundary("inverse_barometer = 0.5"),
+                    weather("pressure = false")
+                ),
+                "pressure",
+            ),
+            (
+                format!(
+                    "{started}{}{}",
+                    boundary("inverse_barometer = 3.0"),
+                    weather("")
+                ),
+                "0–2",
+            ),
+        ] {
+            let err = check(text).unwrap_err();
+            assert!(err.contains(says), "{says}: {err}");
+        }
+        let text = format!("{started}{}{}", boundary(""), weather(""));
+        let case = parse(&text).unwrap();
+        let a = case.atmosphere.as_ref().unwrap();
+        assert_eq!((a.ramp_hours, a.wind, a.pressure), (1.0, true, true));
+        // The full response at a still or tidal boundary, none at a nested one
+        assert_eq!(case.boundaries[0].inverse_barometer_fraction(), 1.0);
+        let mut nested = case.boundaries[0].clone();
+        nested.still = None;
+        nested.nesting = parse(
+            "[run]\nduration_hours = 1.0\n[mesh.rectangle]\nx_m = [0.0, 1.0]\ny_m = [0.0, 1.0]\n\
+             nx = 1\nny = 1\n[bathymetry]\ndepth_m = 1.0\n[[boundary]]\ntag = \"open\"\n\
+             [boundary.nesting]\nfile = \"p.nc\"\n",
+        )
+        .unwrap()
+        .boundaries[0]
+            .nesting
+            .clone();
+        assert_eq!(nested.inverse_barometer_fraction(), 0.0);
+        if cfg!(feature = "netcdf") {
+            case.validate().unwrap();
+        } else {
+            let err = case.validate().unwrap_err().to_string();
+            assert!(err.contains("netcdf"), "{err}");
         }
     }
 
