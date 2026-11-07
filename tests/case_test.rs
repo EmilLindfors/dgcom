@@ -53,6 +53,53 @@ fn the_example_case_runs_and_records_what_it_ran() {
     assert!(dir.path().join("tidal_channel.dgsnap").exists());
 }
 
+/// Stations every 10 minutes with the fields every 30: the stations are
+/// recorded every 10 minutes, the snapshot every 30, and the run is the
+/// one that writes everything every 10 minutes, value for value (its steps
+/// land on the station times).
+#[test]
+fn stations_can_be_recorded_more_often_than_the_fields() {
+    let run = |overrides: &[&str]| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut all = vec![
+            "run.duration_hours=2.0".to_string(),
+            format!("output.directory={:?}", dir.path().display().to_string()),
+        ];
+        all.extend(overrides.iter().map(|s| s.to_string()));
+        let file = CaseFile::read(Path::new(EXAMPLE), &all).unwrap();
+        let report = file.run(&mut |_| {}).unwrap();
+        let frames = dgcom::io::SnapshotReader::open(dir.path().join("tidal_channel.dgsnap"))
+            .unwrap()
+            .n_frames()
+            .unwrap();
+        (report, frames)
+    };
+    let (split, split_frames) = run(&["output.station_interval_minutes=10.0"]);
+    let (every, every_frames) = run(&["output.interval_minutes=10.0"]);
+    assert_eq!((split_frames, every_frames), (5, 13));
+    for (a, b) in split.stations.iter().zip(&every.stations) {
+        assert_eq!(a.time_s.len(), 13, "{}", a.name);
+        assert_eq!(
+            (&a.time_s, &a.eta_m, &a.u_m_s),
+            (&b.time_s, &b.eta_m, &b.u_m_s)
+        );
+    }
+    assert_eq!(split.n_steps, every.n_steps);
+
+    let dir = tempfile::tempdir().unwrap();
+    let err = CaseFile::read(
+        Path::new(EXAMPLE),
+        &[
+            "output.station_interval_minutes=20.0".to_string(),
+            format!("output.directory={:?}", dir.path().display().to_string()),
+        ],
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("whole multiple"), "{err}");
+}
+
 /// Amplitude and phase (rad) of the M2 fit to `s` from time `from` on.
 fn m2_fit(s: &StationSeries, from: f64) -> (f64, f64) {
     let omega = 2.0 * PI / constituent_period("M2").unwrap();
@@ -396,6 +443,40 @@ fn a_station_on_dropped_land_is_refused() {
     assert!(err.contains("inland") && err.contains("dropped"), "{err}");
 }
 
+/// A gauge on a quay is on land in the mesh: it samples the nearest element
+/// in open water (at least 3 m deep), whose surface is the water's, and
+/// with `open_water_depth_m = 0` it is refused where it is.
+#[test]
+fn a_gauge_on_land_beside_the_water_is_moved_into_open_water() {
+    let quay = "\n[[output.station]]\nname = \"quay\"\nlon = 8.14\nlat = 63.53\n";
+    let dir = tempfile::tempdir().unwrap();
+    let file = bay_case(dir.path(), quay).unwrap();
+    let domain = file.build_domain().unwrap();
+    let moved = &domain.stations[1];
+    println!("quay: sampled {:.0} m from its position", moved.offset_m);
+    assert!(
+        moved.offset_m > 1000.0 && moved.offset_m < 3000.0,
+        "{}",
+        moved.offset_m
+    );
+    assert_eq!(
+        domain.stations[0].offset_m, 0.0,
+        "the bay's is in open water"
+    );
+    assert!(
+        domain.notes.iter().any(|n| n.contains("\"quay\" sampled")),
+        "{:?}",
+        domain.notes
+    );
+    let report = file.run_on(&domain, &mut |_| {}).unwrap();
+    assert!(report.stations[1].eta_m.iter().all(|e| e.abs() < 1e-9));
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = bay_case(dir.path(), &format!("{quay}open_water_depth_m = 0\n")).unwrap();
+    let err = file.build_domain().err().unwrap().to_string();
+    assert!(err.contains("quay") && err.contains("dropped"), "{err}");
+}
+
 // ---------------------------------------------------------------------------
 // Tidal atlases
 // ---------------------------------------------------------------------------
@@ -661,6 +742,171 @@ fn an_atlas_is_corrected_at_a_gauge() {
         .err()
         .unwrap();
     assert!(err.to_string().contains("no point within"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// The bed treatments of `froya_real_data`: wall land, the 3D bed
+// ---------------------------------------------------------------------------
+
+/// A fjord over `BAY`, south to north: a 25 m shelf, a 60 m basin, a strip
+/// of shore at +0.5 m (dry at mean sea level, wet at high water) and land
+/// at +3 m with a dip to +0.5 m in it, a pond at high water.
+fn fjord_elevation(lon: f64, lat: f64) -> f64 {
+    let dip = ((lon - 8.1) / 0.012).hypot((lat - 63.585) / 0.006) < 1.0;
+    match lat {
+        _ if dip => 0.5,
+        l if l < 63.53 => -25.0,
+        l if l < 63.56 => -60.0,
+        l if l < 63.57 => 0.5,
+        _ => 3.0,
+    }
+}
+
+/// A case on the fjord raster in `dir`, sampled at the nodes, its land
+/// kept, with `bathymetry` appended to its `[bathymetry]`.
+fn fjord_case(dir: &Path, bathymetry: &str) -> CaseFile {
+    write_raster(&dir.join("fjord.tif"), BAY, (200, 100), fjord_elevation);
+    let text = format!(
+        r#"
+        [run]
+        duration_hours = 1.0
+
+        [mesh]
+        drop_land = false
+        [mesh.geographic]
+        bbox = {BAY:?}
+        nx = 12
+        ny = 8
+
+        [bathymetry]
+        {bathymetry}
+        [bathymetry.raster]
+        file = "fjord.tif"
+        kind = "topobathy"
+        sampling = "point"
+
+        [physics]
+        friction = {{ manning = 0.025 }}
+
+        [[boundary]]
+        tag = "open"
+        still = {{}}
+        "#
+    );
+    let path = dir.join("case.toml");
+    std::fs::write(&path, text).unwrap();
+    CaseFile::read(&path, &[]).unwrap()
+}
+
+/// `[bathymetry.slopes_3d]` is `froya_real_data slopes3d=on`: the library's
+/// element slopes, cliff shores and tidal ponds, in its order, each
+/// followed by the isolated wet nodes raised, on the raster's bed.
+#[test]
+fn the_3d_bed_is_the_librarys_in_the_examples_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = fjord_case(dir.path(), "").build_domain().unwrap();
+    let (mesh, ops, geom) = (&plain.mesh, &plain.ops, &plain.geom);
+    let mut bed = (*plain.bathymetry).clone();
+    let s = bed.smooth_element_slopes(
+        mesh,
+        ops,
+        geom,
+        dgcom::mesh::ElementSlopeBound::for_pycnocline(19.0),
+        0.1,
+    );
+    let c = bed.raise_cliff_shores(mesh, ops, geom, 20.0, 0.1, 2.0, 2.0);
+    bed.raise_isolated_wet_nodes(mesh, ops, geom, 0.0);
+    let p = bed.fill_tidal_ponds(mesh, ops, geom, -1.43, 2.0, ops.n_nodes);
+    bed.raise_isolated_wet_nodes(mesh, ops, geom, 0.0);
+    println!(
+        "fjord: {} nodes smoothed, {} cliff shore nodes raised, {} ponds ({} nodes) filled",
+        s.changed, c.nodes, p.ponds, p.nodes
+    );
+    assert!(
+        s.changed > 0 && c.nodes > 0 && p.nodes > 0,
+        "every step acts on the fjord"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let treated = fjord_case(dir.path(), "[bathymetry.slopes_3d]")
+        .build_domain()
+        .unwrap();
+    assert_eq!(treated.mesh.n_elements, mesh.n_elements);
+    assert_eq!(treated.bathymetry.data, bed.data);
+    for step in ["smoothed for 3D", "cliff shores", "tidal ponds"] {
+        assert!(
+            treated.notes.iter().any(|n| n.contains(step)),
+            "{step}: {:?}",
+            treated.notes
+        );
+    }
+
+    // Each step can be left out
+    let dir = tempfile::tempdir().unwrap();
+    let smoothed = fjord_case(
+        dir.path(),
+        "[bathymetry.slopes_3d]\nraise_cliffs = false\nfill_ponds = false",
+    )
+    .build_domain()
+    .unwrap();
+    let mut only = (*plain.bathymetry).clone();
+    only.smooth_element_slopes(
+        mesh,
+        ops,
+        geom,
+        dgcom::mesh::ElementSlopeBound::for_pycnocline(19.0),
+        0.1,
+    );
+    assert_eq!(smoothed.bathymetry.data, only.data);
+}
+
+/// `lower_wall_land` is `froya_real_data wall_land=lower`: a channel whose
+/// bed rises to +1 m at its north wall has the wall's land lowered to the
+/// water beside it, before anything else is done to the bed.
+#[test]
+fn wall_land_is_lowered_to_the_water_beside_it() {
+    let case = |extra: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("case.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+                [run]
+                duration_hours = 1.0
+                [mesh]
+                drop_land = false
+                [mesh.rectangle]
+                x_m = [0.0, 4000.0]
+                y_m = [0.0, 1000.0]
+                nx = 4
+                ny = 2
+                [bathymetry]
+                ramp = {{ from_m = [0.0, 0.0], to_m = [0.0, 1000.0], depth_m = [20.0, -1.0] }}
+                {extra}
+                "#
+            ),
+        )
+        .unwrap();
+        CaseFile::read(&path, &[]).unwrap().build_domain().unwrap()
+    };
+    let plain = case("");
+    let lowered = case("lower_wall_land = true");
+    let mut bed = (*plain.bathymetry).clone();
+    let w = bed.lower_wall_land(&plain.mesh, &plain.ops, &plain.geom, -2.0);
+    assert!(w.changed > 0 && w.volume > 0.0, "{w:?}");
+    assert_eq!(lowered.bathymetry.data, bed.data);
+    assert!(
+        lowered.bathymetry.max() < 0.0,
+        "the wall's land is under water: {}",
+        lowered.bathymetry.max()
+    );
+    assert!(
+        lowered
+            .notes
+            .iter()
+            .any(|n| n.contains("wall land lowered"))
+    );
 }
 
 // ---------------------------------------------------------------------------

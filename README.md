@@ -26,7 +26,7 @@ Case files cover the 2D model:
 - beds: uniform, sloping, or from a GeoTIFF;
 - open boundaries: still water, a harmonic tide, or a tidal atlas.
 
-`cases/froya/case.toml` and `cases/bodo/case.toml` run Frøya–Smøla–Hitra and Bodø on Kartverket's topobathy model, with NorKyst-800's tide along the open boundary from a tidal atlas. Their headers say how to fetch the inputs. `cases/froya/nested.toml` and `cases/bodo/nested.toml` nest the same domains in NorKyst-800 instead (`[boundary.nesting]`: the parent's level and current at the boundary, a relaxation band, the bed blended to the parent's). Atmospheric forcing is next (`TODO.md` P8).
+`cases/froya/case.toml` and `cases/bodo/case.toml` run Frøya–Smøla–Hitra and Bodø on Kartverket's topobathy model, with NorKyst-800's tide along the open boundary from a tidal atlas. Their headers say how to fetch the inputs. `cases/froya/nested.toml` and `cases/bodo/nested.toml` nest the same domains in NorKyst-800 instead (`[boundary.nesting]`: the parent's level and current at the boundary, a relaxation band, the bed blended to the parent's). `cases/{bodo,froya}/scored_2026-06-12.toml` are the validation's scored nested runs (`notes/validation.md`), with the bed a 3D model needs (`[bathymetry.slopes_3d]`). Atmospheric forcing is next (`TODO.md` P8).
 
 ## Windows HDF5/netCDF-C Setup
 

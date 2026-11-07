@@ -542,8 +542,7 @@ use dgcom::io::{
     write_tide_gauge_file, write_vtk_swe,
 };
 use dgcom::mesh::{
-    Bathymetry2D, BoundaryTag, ElementSlopeBound, Mesh2D, MeshPoint, PointLocator2D,
-    inverse_bilinear, read_gmsh_mesh,
+    Bathymetry2D, BoundaryTag, ElementSlopeBound, Mesh2D, PointLocator2D, read_gmsh_mesh,
 };
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
 use dgcom::physics::{
@@ -2162,37 +2161,16 @@ impl Domain {
     /// a coarse mesh leaves pockets there that hold water above the tide.
     /// The probe, its distance from `p` and its still-water depth.
     fn probe(&self, locator: &PointLocator2D, p: [f64; 2]) -> Option<(Probe2D, f64, f64)> {
-        let submerged = |k: ElementIndex| {
-            self.bathymetry
-                .element(k)
-                .iter()
-                .all(|&b| b <= -STATION_MIN_DEPTH)
-        };
-        let depth = |probe: &Probe2D| -probe.evaluate(self.bathymetry.element(probe.element()));
-        if let Some(probe) = Probe2D::at(locator, &self.ops, p)
-            && submerged(probe.element())
-        {
-            let d = depth(&probe);
-            return Some((probe, 0.0, d));
-        }
-        // The station's reference coordinates clamped to the element: its
-        // nearest point on a rectangle (the Frøya grid), close to it on any
-        // convex quadrilateral
-        let (distance, point) = ElementIndex::iter(self.mesh.n_elements)
-            .filter(|&k| submerged(k))
-            .filter_map(|k| {
-                let [r, s] = inverse_bilinear(&self.mesh.element_vertices(k), p)
-                    .unwrap_or([0.0, 0.0])
-                    .map(|c| c.clamp(-1.0, 1.0));
-                let [x, y] = self.mesh.reference_to_physical(k, r, s);
-                let distance = (x - p[0]).hypot(y - p[1]);
-                (distance <= STATION_MAX_OFFSET)
-                    .then_some((distance, MeshPoint { element: k, r, s }))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))?;
-        let probe = Probe2D::new(&self.mesh, &self.ops, point);
-        let d = depth(&probe);
-        Some((probe, distance, d))
+        let (probe, offset) = Probe2D::in_open_water(
+            locator,
+            &self.ops,
+            &self.bathymetry,
+            p,
+            STATION_MIN_DEPTH,
+            STATION_MAX_OFFSET,
+        )?;
+        let depth = -probe.evaluate(self.bathymetry.element(probe.element()));
+        Some((probe, offset, depth))
     }
 
     fn volume(&self, q: &SWESolution2D) -> f64 {

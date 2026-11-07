@@ -13,6 +13,13 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The 3D bed and wall land in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
+  - `[bathymetry.slopes_3d]` is `froya_real_data slopes3d=on`: the element slopes smoothed for a σ-coordinate model (`r_max`, `free_depth_m`, `thin_depth_m`), cliff shores raised to land (`raise_cliffs`, `cliff_depth_m`) and tidal ponds filled (`fill_ponds`, `pond_low_water_m`, `high_water_m`), in the example's order.
+  - `[bathymetry] lower_wall_land` is `wall_land=lower` (`wall_low_water_m`, default −2 m).
+  - Case stations sample in open water, as the example's do (`Probe2D::in_open_water`, moved from `froya_real_data`): at the station if every node of its element is at least `open_water_depth_m` (3 m) deep, else at the nearest point of such an element within `max_offset_m` (3 km). A gauge at the shore sat in an element that is partly land, whose surface mixed in the land's bed through the P2 basis: Bodø's gauge read −0.31 m with the sea at rest. `open_water_depth_m = 0` samples where the station is.
+  - `[output] station_interval_minutes` records the stations more often than the fields (default: as often). The run's steps land on both, so the two intervals are part of the run to round-off: the scored runs wrote stations every 10 minutes and snapshots hourly, and a case writing only hourly differed from them by up to 1.8 mm in η.
+  - `cases/bodo/scored_2026-06-12.toml` and `cases/froya/scored_2026-06-12.toml` reproduce the scored 2026-06-12 nested 2D runs (`nest_tides=theory`; 3.0 cm at Bodø, 4.2 cm at Mausund) bit for bit.
+
 - **Nesting in a parent model in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
   - `[boundary.nesting]` nests an open boundary in a parent ocean model's NetCDF output (`OceanModelState`): the parent's ζ, ū and v̄ at the boundary, ramped up from rest, with transport scaling (`transport_scaling`, default 3), a relaxation band (`band_km` 3, `band_minutes` 30), the bed blended to the parent's across it (`blend_bed`, shores shallower than `blend_shore_depth_m` kept), and walls where the parent has no water (`max_closed`).
   - The parent's datum: `level_m`, else minus the `Z0` of its own tidal atlas (`atlas`), else its own month-long mean. Its tide can be corrected through that atlas, from theory (`correction = "theory"`) or at a gauge (`[boundary.nesting.gauge]`), keeping its residual flow.

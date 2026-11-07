@@ -17,13 +17,10 @@ use crate::boundary::{
     SWEBoundaryCondition2D, StillWater, TidalConstituent,
 };
 use crate::equations::ShallowWater2D;
-use crate::io::{CoordinateProjection, SnapshotWriter, write_vtk_swe};
-use crate::mesh::PointLocator2D;
+use crate::io::{SnapshotWriter, write_vtk_swe};
 use crate::physics::{PhysicsBuilder, SWEPhysics2D};
 use crate::simulation::{Simulation, SimulationResult};
-use crate::solver::{
-    Probe2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, total_mass_2d,
-};
+use crate::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, total_mass_2d};
 use crate::source::{
     ChezyFriction2D, CoriolisSource2D, HorizontalViscosity2D, ManningFriction2D, coriolis_parameter,
 };
@@ -95,7 +92,12 @@ impl CaseFile {
         let case = &self.case;
         let clock = case.clock()?;
         let t_end = 3600.0 * case.run.duration_hours;
-        let interval = 60.0 * case.output.interval_minutes;
+        // The run lands on the finer of the field and station intervals
+        let interval = 60.0
+            * case
+                .output
+                .interval_minutes
+                .min(case.output.station_interval());
 
         // Open boundaries: one characteristic condition per tag
         let opens: Vec<(SideTag, Box<dyn SWEBoundaryCondition2D>)> = case
@@ -205,8 +207,9 @@ impl CaseFile {
             if failure.is_some() {
                 return;
             }
-            match output.write(t, q) {
-                Ok(()) => progress(&summarize(domain, q, t, t_end)),
+            match output.write(t, q, false) {
+                Ok(false) => {}
+                Ok(true) => progress(&summarize(domain, q, t, t_end)),
                 Err(e) => {
                     failure = Some(e);
                     stop.store(true, Ordering::Relaxed);
@@ -250,7 +253,7 @@ impl CaseFile {
         }
         // The last output, unless the run ended on an output time
         if output.last_time < result.final_time - 1e-6 * interval {
-            output.write(result.final_time, &q)?;
+            output.write(result.final_time, &q, true)?;
         }
         Ok(RunReport {
             final_time_s: result.final_time,
@@ -397,10 +400,12 @@ struct Output<'a> {
     vtk_frames: Option<usize>,
     #[cfg(feature = "netcdf")]
     netcdf: Option<crate::io::NetCDFWriter>,
-    probes: Vec<Probe2D>,
     stations: Vec<StationSeries>,
     csv: Option<BufWriter<File>>,
     last_time: f64,
+    /// Time between field outputs and between station records (s)
+    field_every: f64,
+    station_every: f64,
 }
 
 impl<'a> Output<'a> {
@@ -411,36 +416,7 @@ impl<'a> Output<'a> {
     ) -> Result<Self, CaseError> {
         let case = &file.case;
         let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
-        let locator = PointLocator2D::new(&domain.mesh);
-        let probes = case
-            .output
-            .stations
-            .iter()
-            .map(|s| {
-                let (x, y) = match (s.x_m, s.y_m, s.lon, s.lat) {
-                    (Some(x), Some(y), _, _) => (x, y),
-                    (_, _, Some(lon), Some(lat)) => domain
-                        .projection
-                        .as_ref()
-                        .expect("validated: placed")
-                        .geo_to_xy(lat, lon),
-                    _ => unreachable!("validated"),
-                };
-                Probe2D::at(&locator, &domain.ops, [x, y]).ok_or_else(|| {
-                    CaseError::Invalid(format!(
-                        "station {:?} at ({x:.1}, {y:.1}) m is outside the mesh{}",
-                        s.name,
-                        if case.mesh.drop_land {
-                            " (or on land that was dropped)"
-                        } else {
-                            ""
-                        }
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let stations = case
-            .output
+        let stations: Vec<StationSeries> = domain
             .stations
             .iter()
             .map(|s| StationSeries {
@@ -480,7 +456,9 @@ impl<'a> Output<'a> {
         };
         #[cfg(feature = "netcdf")]
         let netcdf = if case.output.netcdf {
-            use crate::io::{NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig};
+            use crate::io::{
+                CoordinateProjection, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig,
+            };
             let path = dir.join(format!("{name}.nc"));
             let positions = domain.node_positions();
             let (x, y): (Vec<f64>, Vec<f64>) = positions.iter().map(|&[x, y]| (x, y)).unzip();
@@ -506,7 +484,7 @@ impl<'a> Output<'a> {
         } else {
             None
         };
-        let csv = if probes.is_empty() {
+        let csv = if stations.is_empty() {
             None
         } else {
             let path = dir.join("stations.csv");
@@ -525,18 +503,22 @@ impl<'a> Output<'a> {
             vtk_frames,
             #[cfg(feature = "netcdf")]
             netcdf,
-            probes,
             stations,
             csv,
             last_time: f64::NEG_INFINITY,
+            field_every: 60.0 * case.output.interval_minutes,
+            station_every: 60.0 * case.output.station_interval(),
         })
     }
 
-    fn write(&mut self, t: f64, q: &SWESolution2D) -> Result<(), CaseError> {
+    /// Record the stations at `t`.
+    fn record_stations(&mut self, t: f64, q: &SWESolution2D) -> Result<(), CaseError> {
         let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
         let domain = self.domain;
-        for (probe, series) in self.probes.iter().zip(&mut self.stations) {
-            let s = probe.sample_swe(q, Some(&domain.bathymetry), H_VELOCITY);
+        for (station, series) in domain.stations.iter().zip(&mut self.stations) {
+            let s = station
+                .probe
+                .sample_swe(q, Some(&domain.bathymetry), H_VELOCITY);
             series.time_s.push(t);
             series.eta_m.push(s.eta);
             series.u_m_s.push(s.u);
@@ -548,6 +530,26 @@ impl<'a> Output<'a> {
         }
         if let Some(csv) = &mut self.csv {
             csv.flush().map_err(|e| io("stations.csv", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Record the stations at `t` if it is a station time, and the fields if
+    /// it is a field time (both at the `last` output); whether the fields
+    /// were written.
+    fn write(&mut self, t: f64, q: &SWESolution2D, last: bool) -> Result<bool, CaseError> {
+        let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
+        let domain = self.domain;
+        let on = |every: f64| {
+            let n = t / every;
+            last || (n - n.round()).abs() < 1e-6
+        };
+        self.last_time = t;
+        if on(self.station_every) {
+            self.record_stations(t, q)?;
+        }
+        if !on(self.field_every) {
+            return Ok(false);
         }
         if let Some(snapshot) = &mut self.snapshot {
             snapshot
@@ -593,8 +595,7 @@ impl<'a> Output<'a> {
                 .write_timestep(t, &h, &eta, Some(&u), Some(&v))
                 .map_err(|e| io("NetCDF", &e))?;
         }
-        self.last_time = t;
-        Ok(())
+        Ok(true)
     }
 
     /// The stations' records; the writers flush every frame as it is written.

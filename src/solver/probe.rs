@@ -17,7 +17,7 @@
 //! Velocities are in the mesh axes; rotate them to east/north with the
 //! projection's local grid convergence ([`crate::io::east_axis`]).
 
-use crate::mesh::{Bathymetry2D, Mesh2D, MeshPoint, PointLocator2D};
+use crate::mesh::{Bathymetry2D, Mesh2D, MeshPoint, PointLocator2D, inverse_bilinear};
 use crate::operators::DGOperators2D;
 use crate::solver::SWESolution2D;
 use crate::types::ElementIndex;
@@ -134,6 +134,55 @@ impl Probe2D {
             u,
             v,
         }
+    }
+
+    /// A probe for a station at `p` in open water, with its distance from
+    /// `p` (m): at `p` if every node of its element has its bed at least
+    /// `min_depth` (m) below mean sea level, else at the nearest point of
+    /// such an element no farther than `max_offset` (m) from `p`. `None` if
+    /// there is none.
+    ///
+    /// # Why
+    ///
+    /// A tide gauge stands at the shore, often in an element that is partly
+    /// land in the mesh. There `η = h + B` mixes the land nodes' bed into the
+    /// surface through the basis: at rest, `h = 0` and `B > 0` at a land node,
+    /// whose weight at the gauge can be negative on a P2 element, so the
+    /// surface reads wrong by a fraction of the land's height (−0.31 m at
+    /// Bodø's gauge, with land at +5 m). In an element that stays wet
+    /// through the tide the surface is the water's.
+    ///
+    /// The nearest point of an element is its reference coordinates of `p`
+    /// clamped to the element: exact on parallelograms, close to it on other
+    /// convex quadrilaterals. The search is over every element, once per
+    /// station.
+    pub fn in_open_water(
+        locator: &PointLocator2D,
+        ops: &DGOperators2D,
+        bathymetry: &Bathymetry2D,
+        p: [f64; 2],
+        min_depth: f64,
+        max_offset: f64,
+    ) -> Option<(Self, f64)> {
+        let mesh = locator.mesh();
+        let open = |k: ElementIndex| bathymetry.element(k).iter().all(|&b| b <= -min_depth);
+        if let Some(probe) = Self::at(locator, ops, p)
+            && open(probe.element())
+        {
+            return Some((probe, 0.0));
+        }
+        let (distance, point) = ElementIndex::iter(mesh.n_elements)
+            .filter(|&k| open(k))
+            .filter_map(|k| {
+                let [r, s] = inverse_bilinear(&mesh.element_vertices(k), p)
+                    .unwrap_or([0.0, 0.0])
+                    .map(|c| c.clamp(-1.0, 1.0));
+                let [x, y] = mesh.reference_to_physical(k, r, s);
+                let distance = (x - p[0]).hypot(y - p[1]);
+                (distance <= max_offset).then_some((distance, MeshPoint { element: k, r, s }))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))?;
+        Some((Self::new(mesh, ops, point), distance))
     }
 }
 
@@ -267,5 +316,55 @@ mod tests {
         let sample = probe.sample_swe(&q, None, 1e-3);
         assert_eq!((sample.u, sample.v), (0.0, 0.0));
         assert_eq!(sample.eta, sample.h);
+    }
+
+    /// A station in an element that is partly land reads the land's bed in
+    /// its surface at rest; moved to the nearest element under water, it
+    /// reads the water's.
+    #[test]
+    fn a_station_on_the_shore_is_moved_into_open_water() {
+        // Four 1 km elements: two 10 m deep, then the shore (its east nodes
+        // on land at +5 m), then land
+        let mesh = Mesh2D::uniform_rectangle(0.0, 4000.0, 0.0, 1000.0, 4, 1);
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let bed =
+            Bathymetry2D::from_function(
+                &mesh,
+                &ops,
+                &geom,
+                |x, _| {
+                    if x <= 2000.0 { -10.0 } else { 5.0 }
+                },
+            );
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for (i, &b) in bed.element(k).iter().enumerate() {
+                q.set_state(k, i, SWEState2D::new((-b).max(0.0), 0.0, 0.0));
+            }
+        }
+        let locator = PointLocator2D::new(&mesh);
+        let shore = [2250.0, 500.0];
+        let at = Probe2D::at(&locator, &ops, shore).unwrap();
+        let eta_at = at.sample_swe(&q, Some(&bed), 1e-3).eta;
+        assert!(
+            eta_at.abs() > 1.0,
+            "the shore element reads its land: {eta_at}"
+        );
+
+        let (moved, offset) =
+            Probe2D::in_open_water(&locator, &ops, &bed, shore, 3.0, 1000.0).unwrap();
+        assert!((offset - 250.0).abs() < 1e-9, "{offset}");
+        let [x, y] = moved.position();
+        assert!((x - 2000.0).abs() < 1e-9 && (y - 500.0).abs() < 1e-9);
+        assert_eq!(moved.element().as_usize(), 1);
+        assert_eq!(moved.sample_swe(&q, Some(&bed), 1e-3).eta, 0.0);
+
+        // In open water it stays; too far from open water there is none
+        let (stays, offset) =
+            Probe2D::in_open_water(&locator, &ops, &bed, [1500.0, 500.0], 3.0, 1000.0).unwrap();
+        assert_eq!((offset, stays.element().as_usize()), (0.0, 1));
+        assert!(Probe2D::in_open_water(&locator, &ops, &bed, shore, 3.0, 200.0).is_none());
+        assert!(Probe2D::in_open_water(&locator, &ops, &bed, shore, 20.0, 1e6).is_none());
     }
 }

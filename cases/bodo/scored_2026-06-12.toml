@@ -1,0 +1,71 @@
+# Bodø, 2026-06-12: the scored nested 2D run (`notes/validation.md`,
+# "Raw-forcing re-score on 2026-06-12" and its `nest_tides=theory` outcome).
+#
+# `nested.toml`'s domain on the coastline mesh, nested in a day of NorKyst-800
+# whose tide is corrected from theory, with no gauge: the atlas infers K2
+# and P1 at NorKyst's own ratios, and the correction moves them to the
+# equilibrium ratios (`notes/boundaries-nesting.md`, 2026-11-06). The bed is
+# the 3D model's (`[bathymetry.slopes_3d]`), as in the scored runs, which
+# shared the bed with their 3D runs, and the Coriolis parameter is
+# `froya_real_data`'s f-plane. At the Bodø gauge this run scores 3.0 cm
+# centred RMSE against the observations over hours 3–24 (11.8 cm without
+# `correction`, NorKyst's tide as it is). The inputs, fetched once:
+#
+#   cargo run --release --example norkyst_nesting_subset -- \
+#       bbox=13.7,67.05,14.55,67.5 start=2026-06-12 hours=28 wind=1 profiles=1 \
+#       out=data/bodo_norkyst_3d_2026-06-12.nc
+#   cargo run --release --example norkyst_boundary_tides -- \
+#       bbox=13.7,67.05,14.55,67.5 start=2026-06-01 days=30 spacing_km=1.0 \
+#       ratios=data/norkyst_gauges/2026-04_2026-10/BOO.txt \
+#       out=data/bodo_boundary_tides_2026-06_nkratios.txt
+#   dgcom run cases/bodo/scored_2026-06-12.toml
+#
+# (`ratios=` takes K2/S2 and P1/K1 from NorKyst's half-year series at the
+# gauge, `notes/norkyst-issues.md`; the mesh and bed raster are
+# `nested.toml`'s.)
+#
+# This case reproduces the scored run (`output/p34_2026-06-12/run.sh
+# bodo_2d_theory`) bit for bit (`notes/case-files.md`).
+
+[run]
+name = "bodo_2026-06-12"
+start = "2026-06-12T00:00:00Z"
+duration_hours = 24.0
+
+[mesh]
+order = 2
+gmsh = "../../data/bodo_coast.msh"
+origin = { lat = 67.275, lon = 14.125 }
+
+[bathymetry.raster]
+file = "../../data/bodo_topobathy.tif"
+kind = "topobathy"
+fill_zero_holes = true
+land_elevation_m = 5.0
+
+[bathymetry.slopes_3d]
+thin_depth_m = 1.0              # the scored runs' `debug_3d=thin=1`
+
+[physics]
+coriolis = { f_plane = 1.31e-4 }
+friction = { manning = 0.025 }
+
+[[boundary]]
+tag = "open"
+[boundary.nesting]
+file = "../../data/bodo_norkyst_3d_2026-06-12.nc"
+atlas = "../../data/bodo_boundary_tides_2026-06_nkratios.txt"
+correction = "theory"
+ramp_hours = 3.0
+
+[numerics]
+local_time_stepping_levels = 8
+
+[output]
+interval_minutes = 60.0
+station_interval_minutes = 10.0   # the example's `station_minutes=10`: the steps land on both
+
+[[output.station]]
+name = "Bodø"
+lat = 67.288
+lon = 14.391
