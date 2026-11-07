@@ -8,13 +8,15 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Generic cases and case files (P8) — [notes/case-files.md](notes/case-files.md)
 
-- [ ] **P8.1** A case-file schema (`serde` structs, `deny_unknown_fields`, TOML; JSON from the same structs) and a binary with `run`, `check` and `mesh`, for the 2D path: mesh (Gmsh, or a rectangle clipped to water), bed raster, Coriolis from latitude, friction, still/harmonic/atlas/nesting boundaries, atmosphere, NetCDF output and stations. Ship an idealized case that needs no download, with a CI smoke run.
-- [ ] **P8.1** Write the resolved case (defaults filled in) next to the output and into restarts, and compare it on resume (closes P5.3's gap).
+- [ ] **P8.1** Extend the case layer (`src/case/`, since 2026-11-07) to the real-data 2D inputs: a bed raster (GeoTIFF/topobathy) on a projected lon/lat domain with the land mask and the rectangle clipped to water, the `froya_real_data` bed treatments (rx0 smoothing, isolated wet nodes), Coriolis per node from latitude, a tidal-atlas boundary (`BoundaryTides`), nesting in a parent (`OceanModelState` + relaxation band), and the atmosphere (`met=`, inverse barometer).
+- [ ] **P8.1** `dgcom mesh case.toml`: build the mesh and bed and write them (VTK, Gmsh) to inspect before a run.
+- [ ] **P8.1** Restarts for case runs: write the resolved case into the restart, and compare it on resume (closes P5.3's gap; the resolved case is already written next to the output).
+- [ ] **P8.1** `NetCDFWriter` names u, v `eastward`/`northward_sea_water_velocity`, but a case's velocities are along the mesh axes (x, y), east and north only on an unrotated projection: name them by the axes, or rotate them east/north when the case has a projection (with P5.2).
 - [ ] **P8.2** Move `froya_real_data` onto the case layer in stages (2D tides, nesting, 3D, waves, farm), deleting each option from the example as it moves, with Frøya and Bodø as case files. At each stage the 2026-06-12 nested scores (3.0 cm at Bodø, 4.2 cm at Mausund) must reproduce bit for bit.
 - [ ] **P8.2** Lift the Frøya constants into the case: `F_CORIOLIS` (per node from latitude), `FROYA_BBOX`, `DEM`, `MANNING_N`, `STATION_CONSTITUENTS`/`GAUGE_CONSTITUENTS`.
 - [ ] **P8.3** Read ROMS inputs: the grid file (`h`, `mask_rho`, lon/lat) as bed and mask; the tidal forcing file (`tide_Eamp`/`Ephase`/`Cmax`/…, from TPXO/FES) as a `TidalAtlas`; boundary and climatology files (`zeta_west`, …) as a parent.
 - [ ] **P8.4** `docs/coming-from-roms.md`: map `ocean.in` keywords to case keys, and list what has no equivalent yet. Pair it with ROMS output names (P5.2).
-- [ ] **P8.5** README quickstart (install, run the idealized case, view the output), plus a test case ROMS users know (estuary or tidal channel), compared against ROMS.
+- [ ] **P8.5** A test case ROMS users know (an estuary or tidal channel) run from a case file and compared against ROMS; the README quickstart runs `cases/tidal_channel` (2026-11-07), which is checked against linear theory, not ROMS.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 

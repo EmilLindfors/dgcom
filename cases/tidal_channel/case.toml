@@ -1,0 +1,70 @@
+# A tidal channel: an idealized estuary that needs no input data.
+#
+# A channel 40 km long and 4 km wide, open to the sea at its west end, its
+# bed rising from 30 m at the mouth to 2 m above mean sea level at the head,
+# so the upper few kilometres are tidal flats that flood and drain. M2 and
+# S2 enter at the mouth; rotation and bed friction act inside.
+#
+#   dgcom check cases/tidal_channel/case.toml   # validate, print with defaults
+#   dgcom run   cases/tidal_channel/case.toml   # run (seconds in a release build)
+#
+# Output goes to cases/tidal_channel/output/tidal_channel/: the case as run
+# (case.resolved.toml), the stations' records (stations.csv) and the whole
+# state for the viewer (tidal_channel.dgsnap). Paths are relative to this
+# file. Every key and its default: the `dgcom::case::schema` documentation.
+
+[run]
+name = "tidal_channel"
+start = "2025-06-15T00:00:00Z"  # tidal phases below are Greenwich lags
+duration_hours = 25.0
+
+[mesh]
+order = 2
+
+[mesh.rectangle]
+x_m = [0.0, 40000.0]
+y_m = [0.0, 4000.0]
+nx = 40
+ny = 4
+west = "open"                   # the other sides are walls
+
+[bathymetry.ramp]               # depth along the channel, constant across it
+from_m = [0.0, 2000.0]
+to_m = [40000.0, 2000.0]
+depth_m = [30.0, -2.0]          # negative: land at mean sea level
+
+[physics]
+coriolis = { latitude = 63.5 }
+friction = { manning = 0.025 }
+
+[[boundary]]
+tag = "open"
+# The tide gives a level only, so the boundary needs a velocity outside:
+# "at_rest" (the default) holds the level at an antinode of a standing tide,
+# and a wave entering from outside arrives at half the amplitude below;
+# "incoming_wave" delivers a progressive tide at the full amplitude.
+velocity = "at_rest"
+[boundary.tide]
+ramp_hours = 2.0
+constituents = [
+  { name = "M2", amplitude_m = 1.0, phase_deg = 0.0 },
+  { name = "S2", amplitude_m = 0.35, phase_deg = 30.0 },
+]
+
+[output]
+interval_minutes = 30.0
+
+[[output.station]]
+name = "mouth"
+x_m = 2000.0
+y_m = 2000.0
+
+[[output.station]]
+name = "middle"
+x_m = 20000.0
+y_m = 2000.0
+
+[[output.station]]
+name = "head"
+x_m = 34000.0
+y_m = 2000.0

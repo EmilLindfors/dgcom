@@ -13,6 +13,17 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Case files and the `dgcom` binary (TODO P8.1; `notes/case-files.md`, `src/case/`, `src/bin/dgcom.rs`).**
+  - A whole 2D run as a TOML (or JSON) case file. Supported so far: a rectangle or a Gmsh mesh, a uniform or sloping bed, gravity, Coriolis (f-plane or latitude), Manning or quadratic-drag friction, viscosity, and wetting and drying.
+  - Open boundaries are characteristic, with still water or a harmonic tide outside. The new `velocity` key chooses `at_rest` or `incoming_wave` for level-only data.
+  - Output: snapshots, VTK, CF NetCDF and `stations.csv`.
+  - Strict schema: unknown keys are errors with their line, and every default is defined once. `--set key.path=value` overrides any key.
+  - Each run writes `case.resolved.toml`, the case with every default filled in.
+  - `dgcom check` validates a case and builds its mesh without running; `dgcom run` runs it.
+  - Example: `cases/tidal_channel/case.toml`, an estuary with tidal flats that needs no data. 25 h runs in 7 s in a release build.
+  - `tests/case_test.rs` checks the case layer against linear theory. The M2 standing wave in a frictionless channel matches A cos k(L − x) at the mouth and head to four digits, for both boundary velocities.
+  - New dependencies: `serde`, `toml`, `serde_json`, which were already in the lock file.
+
 - **Plan for generic case files (TODO P8; `notes/case-files.md`).** The next focus is running any coastal domain from a TOML case file and a binary, not only the hard-wired Frøya and Bodø examples. The plan covers the schema, effective-configuration records for resume, moving `froya_real_data` onto the case layer, ROMS grid/tide/boundary inputs and a "coming from ROMS" guide.
 
 - **Why NorKyst-800 carries only a quarter of the inverse barometer (TODO P1.5; `notes/norkyst-issues.md` §6 "Cause").**
