@@ -1,0 +1,58 @@
+# Bodø and Saltstraumen's approaches nested in NorKyst-800.
+#
+# `case.toml`'s domain, with the open boundary nested in NorKyst-800
+# instead of forced by a tidal atlas: NorKyst's hourly level and depth-mean
+# current, a 3 km relaxation band across which the bed is blended to
+# NorKyst's, NorKyst's mean level taken off with its own atlas's `Z0`, and
+# its tide corrected at Kartverket's Bodø gauge (see `case.toml` for the
+# atlas and gauge inputs, and TODO P1.5 for the O1 gain this gives here).
+# The parent, fetched once:
+#
+#   cargo run --release --example norkyst_nesting_subset -- \
+#       bbox=13.7,67.05,14.55,67.5 start=2025-06-15 hours=72 profiles=1 \
+#       out=data/bodo_norkyst_3d.nc
+#   dgcom run cases/bodo/nested.toml
+#
+# For NorKyst's tide as it is (the primary score of `notes/validation.md`
+# P3.4), drop `[boundary.nesting.gauge]`.
+
+[run]
+name = "bodo_nested"
+start = "2025-06-15T00:00:00Z"
+duration_hours = 24.0
+
+[mesh]
+order = 2
+gmsh = "../../data/bodo_coast.msh"
+origin = { lat = 67.275, lon = 14.125 }
+
+[bathymetry.raster]
+file = "../../data/bodo_topobathy.tif"
+kind = "topobathy"
+fill_zero_holes = true
+land_elevation_m = 5.0
+
+[physics]
+coriolis = "beta_plane"
+friction = { manning = 0.025 }
+
+[[boundary]]
+tag = "open"
+[boundary.nesting]
+file = "../../data/bodo_norkyst_3d.nc"
+atlas = "../../data/bodo_boundary_tides.txt"
+ramp_hours = 3.0
+[boundary.nesting.gauge]
+record = "../../data/tide_gauges/bodo_obs.txt"
+source = "../../data/bodo_station_tides.txt"
+
+[numerics]
+local_time_stepping_levels = 8
+
+[output]
+interval_minutes = 10.0
+
+[[output.station]]
+name = "Bodø"
+lat = 67.288
+lon = 14.391

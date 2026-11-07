@@ -13,6 +13,11 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Nesting in a parent model in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
+  - `[boundary.nesting]` nests an open boundary in a parent ocean model's NetCDF output (`OceanModelState`): the parent's ζ, ū and v̄ at the boundary, ramped up from rest, with transport scaling (`transport_scaling`, default 3), a relaxation band (`band_km` 3, `band_minutes` 30), the bed blended to the parent's across it (`blend_bed`, shores shallower than `blend_shore_depth_m` kept), and walls where the parent has no water (`max_closed`).
+  - The parent's datum: `level_m`, else minus the `Z0` of its own tidal atlas (`atlas`), else its own month-long mean. Its tide can be corrected through that atlas, from theory (`correction = "theory"`) or at a gauge (`[boundary.nesting.gauge]`), keeping its residual flow.
+  - `cases/froya/nested.toml` reproduces `froya_real_data norkyst=data/froya_norkyst.nc` bit for bit with `nest_tides` corrected, raw and theory. `cases/bodo/nested.toml` nests Bodø.
+
 - **Gauge-corrected tidal atlases, in the library and in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
   - `HarmonicAnalysis::fit_gauge_record` (with the 15 constituents of `HarmonicAnalysis::GAUGE_RECORD`) and `TidalAtlas::correct_at_gauge` (complex gains at the gauge, then the gauge's ratios, returning `GaugeAdjustment`s) move out of `froya_real_data`, which now calls them. The example reproduces its earlier runs bit for bit.
   - `[boundary.atlas.gauge]` (`record`, `source`, `gains`, `ratios`, `max_offset_m`) applies the correction in a case file.

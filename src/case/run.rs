@@ -1,7 +1,8 @@
 //! Running a case: the 2D production path of `examples/froya_real_data.rs`
 //! (`Simulation` + SSP-RK(4,3) or SSP-RK3, optionally multirate, +
 //! `SWEPhysics2D`) with its wet/dry defaults: the positivity limiter, the
-//! `WetDry` scheme and point-implicit bed friction.
+//! `WetDry` scheme and point-implicit bed friction. A nested boundary's
+//! relaxation band is a source term after the Coriolis force, as there.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -102,6 +103,17 @@ impl CaseFile {
             .iter()
             .map(|b| -> Result<_, CaseError> {
                 let bc: Box<dyn SWEBoundaryCondition2D> = match (&b.still, &b.tide, &b.atlas) {
+                    _ if b.nesting.is_some() => {
+                        let parent = domain
+                            .parents
+                            .iter()
+                            .find_map(|(tag, parent)| (*tag == b.tag).then_some(parent))
+                            .expect("read with the domain");
+                        Box::new(with_velocity(
+                            CharacteristicOBC::new(parent.clone()),
+                            b.velocity,
+                        ))
+                    }
                     (Some(still), _, _) => Box::new(with_velocity(
                         CharacteristicOBC::new(StillWater::at(still.eta_m)),
                         b.velocity,
@@ -280,6 +292,19 @@ impl CaseFile {
                     builder.with_source(CoriolisSource2D::beta_plane_at_latitude(center.lat, 0.0));
             }
             None => {}
+        }
+        // The nesting's relaxation bands
+        for (tag, parent) in &domain.parents {
+            let spec = self
+                .case
+                .boundaries
+                .iter()
+                .find(|b| b.tag == *tag)
+                .and_then(|b| b.nesting.as_ref())
+                .expect("a parent per nested boundary");
+            if spec.band_km > 0.0 {
+                builder = builder.with_source(parent.relaxation(60.0 * spec.band_minutes));
+            }
         }
         match p.friction {
             Some(Friction::Manning(n)) => {

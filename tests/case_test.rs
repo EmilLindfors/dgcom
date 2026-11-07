@@ -662,3 +662,231 @@ fn an_atlas_is_corrected_at_a_gauge() {
         .unwrap();
     assert!(err.to_string().contains("no point within"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// Nesting in a parent model (NetCDF)
+// ---------------------------------------------------------------------------
+
+/// 2025-06-15 00:00 UTC, the placed channels' `run.start`, in Unix seconds.
+#[cfg(feature = "netcdf")]
+const START_UNIX: f64 = 1_749_945_600.0;
+
+/// A parent model's output on a regular longitude/latitude grid over x in
+/// `x_m` and y in [-10, 12] km of the placed mesh: hourly from `run.start`
+/// for `hours`, ζ = `zeta` and the current at rest everywhere, `depth_m`
+/// deep.
+#[cfg(feature = "netcdf")]
+fn write_parent(path: &Path, x_m: [f64; 2], hours: usize, zeta: f64, depth_m: f64) {
+    use dgcom::io::{CoordinateProjection, LocalProjection};
+    let projection = LocalProjection::new(ORIGIN.0, ORIGIN.1);
+    let (lat0, lon0) = projection.xy_to_geo(x_m[0], -10_000.0);
+    let (lat1, lon1) = projection.xy_to_geo(x_m[1], 12_000.0);
+    let n = 12;
+    let axis = |a: f64, b: f64| -> Vec<f64> {
+        (0..n)
+            .map(|i| a + (b - a) * i as f64 / (n - 1) as f64)
+            .collect()
+    };
+    let mut file = netcdf::create(path).unwrap();
+    file.add_dimension("time", hours + 1).unwrap();
+    file.add_dimension("lat", n).unwrap();
+    file.add_dimension("lon", n).unwrap();
+    let mut var = file.add_variable::<f64>("lat", &["lat"]).unwrap();
+    var.put_values(&axis(lat0, lat1), ..).unwrap();
+    let mut var = file.add_variable::<f64>("lon", &["lon"]).unwrap();
+    var.put_values(&axis(lon0, lon1), ..).unwrap();
+    let mut var = file.add_variable::<f64>("time", &["time"]).unwrap();
+    var.put_attribute("units", "seconds since 1970-01-01 00:00:00")
+        .unwrap();
+    let times: Vec<f64> = (0..=hours)
+        .map(|h| START_UNIX + 3600.0 * h as f64)
+        .collect();
+    var.put_values(&times, ..).unwrap();
+    let mut var = file.add_variable::<f32>("h", &["lat", "lon"]).unwrap();
+    var.put_values(&vec![depth_m as f32; n * n], ..).unwrap();
+    let field = |value: f64| vec![value as f32; (hours + 1) * n * n];
+    for (name, value) in [
+        ("zeta", zeta),
+        ("ubar_eastward", 0.0),
+        ("vbar_northward", 0.0),
+    ] {
+        let mut var = file
+            .add_variable::<f32>(name, &["time", "lat", "lon"])
+            .unwrap();
+        var.put_values(&field(value), ..).unwrap();
+    }
+}
+
+/// A placed channel 10 km long, 2 km wide and 10 m deep, nested at its west
+/// end with `nesting` (a `[boundary.nesting]` body), run for `hours`.
+#[cfg(feature = "netcdf")]
+fn nested_channel(dir: &Path, nesting: &str, hours: f64) -> CaseFile {
+    let text = format!(
+        r#"
+        [run]
+        start = "2025-06-15T00:00:00Z"
+        duration_hours = {hours}
+
+        [mesh]
+        origin = {{ lat = {}, lon = {} }}
+
+        [mesh.rectangle]
+        x_m = [0.0, 10000.0]
+        y_m = [0.0, 2000.0]
+        nx = 10
+        ny = 2
+        west = "open"
+
+        [bathymetry]
+        depth_m = 10.0
+
+        [physics]
+        friction = {{ manning = 0.025 }}
+
+        [[boundary]]
+        tag = "open"
+        [boundary.nesting]
+        {nesting}
+
+        [output]
+        directory = "out"
+        interval_minutes = 30.0
+        snapshot = false
+
+        [[output.station]]
+        name = "head"
+        x_m = 9500.0
+        y_m = 1000.0
+        "#,
+        ORIGIN.0, ORIGIN.1
+    );
+    let path = dir.join("case.toml");
+    std::fs::write(&path, text).unwrap();
+    CaseFile::read(&path, &[]).unwrap()
+}
+
+/// The channel fills to the parent's level less its mean: `level_m`, else
+/// minus the mean level `Z0` of the parent's atlas. Without either, the
+/// parent's own mean needs a month of record, and a few hours are refused.
+#[cfg(feature = "netcdf")]
+#[test]
+fn a_nested_channel_fills_to_its_parents_level_less_its_mean() {
+    let dir = tempfile::tempdir().unwrap();
+    write_parent(
+        &dir.path().join("parent.nc"),
+        [-10_000.0, 25_000.0],
+        8,
+        0.3,
+        10.0,
+    );
+    let mouth: Vec<(f64, f64)> = (0..=4).map(|i| (0.0, 500.0 * i as f64)).collect();
+    write_atlas(
+        &dir.path().join("atlas.txt"),
+        &mouth,
+        &[("Z0", 0.1, 0.0), ("M2", 0.0, 0.0)],
+    );
+    // A slow ramp next to the channel's quarter-wave period (≈ 1.1 h)
+    for datum in ["level_m = -0.1", "atlas = \"atlas.txt\""] {
+        let file = nested_channel(
+            dir.path(),
+            &format!("file = \"parent.nc\"\nramp_hours = 2.0\n{datum}"),
+            5.0,
+        );
+        let report = file.run(&mut |_| {}).unwrap();
+        let head = &report.stations[0].eta_m;
+        let last = head[head.len() - 1];
+        println!("{datum}: η at the head {last:.4} m");
+        assert!((last - 0.2).abs() < 0.01, "{datum}: η {last} m");
+        let filled = report.volume_m3.1 - report.volume_m3.0;
+        assert!(
+            (filled / (0.2 * 10_000.0 * 2_000.0) - 1.0).abs() < 0.05,
+            "{filled} m³"
+        );
+    }
+    let err = nested_channel(dir.path(), "file = \"parent.nc\"", 1.0)
+        .build_domain()
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("days"), "{err}");
+}
+
+/// A parent with no water near the open faces walls them, up to
+/// `max_closed`; past it, the case is refused. A run longer than the
+/// parent's record is refused before it starts.
+#[cfg(feature = "netcdf")]
+#[test]
+fn a_parent_that_misses_the_boundary_or_the_run_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    // Cut for a domain 5 km further east: nothing within 2 km of the mouth
+    write_parent(
+        &dir.path().join("east.nc"),
+        [5_000.0, 25_000.0],
+        8,
+        0.3,
+        10.0,
+    );
+    let err = nested_channel(dir.path(), "file = \"east.nc\"\nlevel_m = 0.0", 1.0)
+        .build_domain()
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("max_closed"), "{err}");
+
+    write_parent(
+        &dir.path().join("short.nc"),
+        [-10_000.0, 25_000.0],
+        2,
+        0.3,
+        10.0,
+    );
+    let file = nested_channel(dir.path(), "file = \"short.nc\"\nlevel_m = 0.0", 3.0);
+    let err = file.build_domain().err().unwrap();
+    println!("{err}");
+    assert!(err.to_string().contains("short.nc"), "{err}");
+    nested_channel(dir.path(), "file = \"short.nc\"\nlevel_m = 0.0", 2.0)
+        .build_domain()
+        .unwrap();
+}
+
+/// The bed is blended to the parent's across the band: the parent's depth
+/// on the boundary, the case's own beyond the band, and in between a
+/// weight that falls with the distance. `blend_bed = false` keeps it.
+#[cfg(feature = "netcdf")]
+#[test]
+fn the_bed_is_blended_to_the_parents_across_the_band() {
+    let dir = tempfile::tempdir().unwrap();
+    write_parent(
+        &dir.path().join("parent.nc"),
+        [-10_000.0, 25_000.0],
+        4,
+        0.0,
+        20.0,
+    );
+    let nesting = "file = \"parent.nc\"\nlevel_m = 0.0\nband_km = 3.0";
+    let domain = nested_channel(dir.path(), nesting, 1.0)
+        .build_domain()
+        .unwrap();
+    let positions = domain.node_positions();
+    let (mut at_mouth, mut beyond, mut between) = (Vec::new(), Vec::new(), Vec::new());
+    for (&[x, _], &b) in positions.iter().zip(&domain.bathymetry.data) {
+        match x {
+            x if x < 1.0 => at_mouth.push(b),
+            x if x > 3_001.0 => beyond.push(b),
+            x if (1_400.0..1_600.0).contains(&x) => between.push(b),
+            _ => {}
+        }
+    }
+    assert!(
+        at_mouth.iter().all(|&b| (b + 20.0).abs() < 1e-9),
+        "{at_mouth:?}"
+    );
+    assert!(beyond.iter().all(|&b| b == -10.0), "{beyond:?}");
+    assert!(
+        between.iter().all(|&b| b < -10.5 && b > -19.5),
+        "{between:?}"
+    );
+
+    let kept = nested_channel(dir.path(), &format!("{nesting}\nblend_bed = false"), 1.0)
+        .build_domain()
+        .unwrap();
+    assert!(kept.bathymetry.data.iter().all(|&b| b == -10.0));
+}

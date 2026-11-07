@@ -1,0 +1,63 @@
+# Frøya–Smøla–Hitra nested in NorKyst-800.
+#
+# `case.toml`'s domain, with the open boundary nested in NorKyst-800 instead
+# of forced by a tidal atlas: NorKyst's hourly level and depth-mean current
+# (its tides, the Norwegian Coastal Current and the wind-driven flow), with
+# a 3 km relaxation band inside the boundary across which the bed is blended
+# to NorKyst's. NorKyst's level has no geodetic datum; its mean comes off
+# as minus the mean level of its own tidal atlas, and its tide is corrected
+# at Kartverket's Mausund gauge as in `case.toml`, keeping its residual
+# flow. The inputs, besides `case.toml`'s, fetched once:
+#
+#   cargo run --release --example norkyst_nesting_subset -- \
+#       bbox=8.0,63.6,9.2,64.0 start=2025-06-15 hours=72 out=data/froya_norkyst.nc
+#   dgcom run cases/froya/nested.toml
+#
+# This case reproduces `examples/froya_real_data.rs norkyst=data/froya_norkyst.nc`
+# bit for bit (`notes/case-files.md`). For NorKyst's tide as it is, drop
+# `[boundary.nesting.gauge]`; to correct it without a gauge, use
+# `correction = "theory"` with an atlas made with
+# `norkyst_boundary_tides ratios=` (`notes/boundaries-nesting.md`).
+
+[run]
+name = "froya_nested"
+start = "2025-06-15T00:00:00Z"
+duration_hours = 12.42          # one M2 period
+
+[mesh]
+order = 2
+
+[mesh.geographic]
+bbox = [8.0, 63.6, 9.2, 64.0]   # west, south, east, north
+nx = 120
+ny = 90
+
+[bathymetry.raster]
+file = "../../data/froya_topobathy.tif"
+kind = "topobathy"
+fill_zero_holes = true
+land_elevation_m = 5.0
+
+[physics]
+coriolis = { f_plane = 1.31e-4 }
+friction = { manning = 0.025 }
+
+[[boundary]]
+tag = "open"
+[boundary.nesting]
+file = "../../data/froya_norkyst.nc"
+atlas = "../../data/froya_boundary_tides.txt"   # NorKyst's own month-long fit
+band_km = 3.0
+band_minutes = 30.0
+ramp_hours = 1.0
+[boundary.nesting.gauge]
+record = "../../data/tide_gauges/mausund_obs.txt"
+source = "../../data/froya_station_tides.txt"
+
+[output]
+interval_minutes = 10.0
+
+[[output.station]]
+name = "Mausund"
+lat = 63.869331
+lon = 8.665231

@@ -400,10 +400,83 @@ pub struct BoundarySection {
     /// placed mesh and `run.start`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub atlas: Option<Atlas>,
+    /// Nested in a parent ocean model: its level and depth-mean current at
+    /// the boundary (needs a placed mesh and `run.start`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nesting: Option<Nesting>,
     /// The external velocity where the external state is a level only
-    /// (`still`, `tide`, or an atlas without currents; default `"at_rest"`).
+    /// (`still`, `tide`, or an atlas or parent without currents; default
+    /// `"at_rest"`).
     #[serde(default)]
     pub velocity: BoundaryVelocity,
+}
+
+/// `[boundary.nesting]`: one-way nesting in a parent ocean model
+/// ([`crate::boundary::OceanModelState`]). The boundary takes the parent's
+/// ζ, ū and v̄ (its tides, coastal current and wind-driven flow), interpolated
+/// in space and cubically in time, ramped up from rest. The velocity is
+/// scaled to carry the parent's transport over this mesh's bed. A band
+/// inside the boundary relaxes the state towards the parent, and the bed is
+/// blended to the parent's across it.
+///
+/// The parent's ζ has no geodetic datum, so its mean comes off: `level_m`
+/// if given, else minus the mean level `Z0` of `atlas` (the parent's own
+/// harmonic fit over a month), else minus the parent file's own mean over
+/// the boundary, which must then be a month long.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Nesting {
+    /// The parent's output: NetCDF with ζ, ū and v̄ on a longitude/latitude
+    /// grid (`norkyst_nesting_subset`; needs the `netcdf` feature).
+    pub file: PathBuf,
+    /// Width of the relaxation band inside the boundary (km, default 3; 0
+    /// for none, and then no bed blending either).
+    #[serde(default = "default_band_km")]
+    pub band_km: f64,
+    /// Relaxation timescale at the boundary (minutes, default 30). The
+    /// relaxation is explicit: keep it well above the time step.
+    #[serde(default = "default_band_minutes")]
+    pub band_minutes: f64,
+    /// Blend the bed to the parent's across the band (default true), so the
+    /// two carry the same transport at the boundary.
+    #[serde(default = "default_true")]
+    pub blend_bed: bool,
+    /// The blending leaves the elements with a node shallower than this
+    /// alone (m, default 2): the parent's grid has no shores.
+    #[serde(default = "default_blend_shore_depth")]
+    pub blend_shore_depth_m: f64,
+    /// Largest factor the transport scaling may change the parent's
+    /// velocity by (default 3; 1 keeps the parent's velocity).
+    #[serde(default = "default_transport_ratio")]
+    pub transport_scaling: f64,
+    /// Largest fraction of the tag's open faces that may become walls where
+    /// the parent has no water (default 0.05); more is an error, since a
+    /// parent cut for another domain would close the boundary.
+    #[serde(default = "default_max_closed")]
+    pub max_closed: f64,
+    /// The parent is ramped up from rest over this time (hours, default 1).
+    #[serde(default = "default_ramp_hours")]
+    pub ramp_hours: f64,
+    /// Added to the parent's ζ (m; default: from `atlas`, or the parent's
+    /// own mean).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_m: Option<f64>,
+    /// The parent's own tidal atlas (`norkyst_boundary_tides`): its `Z0`
+    /// sets the datum, and it is what `correction` or `gauge` corrects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atlas: Option<PathBuf>,
+    /// Largest distance from a nested node to a point of `atlas` (m, default
+    /// 5000, plus the band's width).
+    #[serde(default = "default_coverage_m")]
+    pub atlas_coverage_m: f64,
+    /// Correct the parent's tide (default `"none"`): the parent gets
+    /// (corrected atlas − atlas) added, which keeps its residual flow.
+    #[serde(default)]
+    pub correction: AtlasCorrection,
+    /// Correct the parent's tide at a tide gauge instead (default: no
+    /// gauge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gauge: Option<GaugeCorrection>,
 }
 
 /// The velocity outside an open boundary whose external state is a level
@@ -670,6 +743,18 @@ fn default_gravity() -> f64 {
 fn default_true() -> bool {
     true
 }
+fn default_band_km() -> f64 {
+    3.0
+}
+fn default_band_minutes() -> f64 {
+    30.0
+}
+fn default_blend_shore_depth() -> f64 {
+    2.0
+}
+fn default_transport_ratio() -> f64 {
+    3.0
+}
 fn default_ramp_hours() -> f64 {
     1.0
 }
@@ -703,8 +788,89 @@ fn positive(x: f64) -> bool {
     x > 0.0
 }
 
+/// Whether `x` is 0 or more (false for NaN).
+fn non_negative(x: f64) -> bool {
+    x >= 0.0
+}
+
 /// Polynomial orders the case layer accepts.
 const ORDERS: std::ops::RangeInclusive<usize> = 1..=8;
+
+impl Nesting {
+    /// Check the section's values.
+    fn validate(&self) -> Result<(), CaseError> {
+        let invalid = |msg: &str| Err(CaseError::Invalid(format!("boundary.nesting.{msg}")));
+        if !(non_negative(self.band_km) && self.band_km.is_finite()) {
+            return invalid("band_km must be ≥ 0");
+        }
+        if !positive(self.band_minutes) {
+            return invalid("band_minutes must be positive");
+        }
+        if !non_negative(self.blend_shore_depth_m) {
+            return invalid("blend_shore_depth_m must be ≥ 0");
+        }
+        if !(self.transport_scaling >= 1.0 && self.transport_scaling.is_finite()) {
+            return invalid("transport_scaling must be ≥ 1");
+        }
+        if !(0.0..=1.0).contains(&self.max_closed) {
+            return invalid("max_closed must be in [0, 1]");
+        }
+        if !non_negative(self.ramp_hours) {
+            return invalid("ramp_hours must be ≥ 0");
+        }
+        if self.level_m.is_some_and(|level| !level.is_finite()) {
+            return invalid("level_m must be finite");
+        }
+        if !positive(self.atlas_coverage_m) {
+            return invalid("atlas_coverage_m must be positive");
+        }
+        if self.atlas.is_none()
+            && (self.correction != AtlasCorrection::None || self.gauge.is_some())
+        {
+            return Err(CaseError::Invalid(
+                "boundary.nesting: correcting the parent's tide needs its tidal atlas (`atlas`)"
+                    .into(),
+            ));
+        }
+        validate_gauge("boundary.nesting", self.correction, self.gauge.as_ref())
+    }
+}
+
+/// Check a tide correction of `section` (`boundary.atlas` or
+/// `boundary.nesting`): `correction` or `gauge`, and the gauge's terms.
+fn validate_gauge(
+    section: &str,
+    correction: AtlasCorrection,
+    gauge: Option<&GaugeCorrection>,
+) -> Result<(), CaseError> {
+    let Some(gauge) = gauge else {
+        return Ok(());
+    };
+    let invalid = |msg: String| Err(CaseError::Invalid(msg));
+    if correction != AtlasCorrection::None {
+        return invalid(format!(
+            "{section}: a gauge correction or `correction`, not both"
+        ));
+    }
+    if !positive(gauge.max_offset_m) {
+        return invalid(format!("{section}.gauge.max_offset_m must be positive"));
+    }
+    for name in &gauge.gains {
+        if canonical_name(name).is_none() {
+            return invalid(format!(
+                "{section}.gauge.gains: unknown constituent {name:?}"
+            ));
+        }
+    }
+    for name in &gauge.ratios {
+        if !["P1", "K2", "N2", "Q1"].contains(&name.as_str()) {
+            return invalid(format!(
+                "{section}.gauge.ratios: {name:?} is not P1, K2, N2 or Q1"
+            ));
+        }
+    }
+    Ok(())
+}
 
 impl Case {
     /// Check what the types cannot: one choice where the schema offers
@@ -870,9 +1036,9 @@ impl Case {
                 return invalid(format!("two [[boundary]] entries for tag {:?}", b.tag));
             }
             tags.push(b.tag);
-            match (&b.still, &b.tide, &b.atlas) {
-                (Some(_), None, None) => {}
-                (None, None, Some(atlas)) => {
+            match (&b.still, &b.tide, &b.atlas, &b.nesting) {
+                (Some(_), None, None, None) => {}
+                (None, None, Some(atlas), None) => {
                     if !placed {
                         return invalid(format!(
                             "[[boundary]] {:?}: an atlas needs a placed mesh: mesh.geographic, \
@@ -901,35 +1067,26 @@ impl Case {
                     if atlas.ramp_hours < 0.0 {
                         return invalid("boundary.atlas.ramp_hours must be ≥ 0".into());
                     }
-                    if let Some(gauge) = &atlas.gauge {
-                        if atlas.correction != AtlasCorrection::None {
-                            return invalid(
-                                "boundary.atlas: a gauge correction or `correction`, not both"
-                                    .into(),
-                            );
-                        }
-                        if !positive(gauge.max_offset_m) {
-                            return invalid(
-                                "boundary.atlas.gauge.max_offset_m must be positive".into(),
-                            );
-                        }
-                        for name in &gauge.gains {
-                            if canonical_name(name).is_none() {
-                                return invalid(format!(
-                                    "boundary.atlas.gauge.gains: unknown constituent {name:?}"
-                                ));
-                            }
-                        }
-                        for name in &gauge.ratios {
-                            if !["P1", "K2", "N2", "Q1"].contains(&name.as_str()) {
-                                return invalid(format!(
-                                    "boundary.atlas.gauge.ratios: {name:?} is not P1, K2, N2 or Q1"
-                                ));
-                            }
-                        }
-                    }
+                    validate_gauge("boundary.atlas", atlas.correction, atlas.gauge.as_ref())?;
                 }
-                (None, Some(tide), None) => {
+                (None, None, None, Some(nesting)) => {
+                    if !placed {
+                        return invalid(format!(
+                            "[[boundary]] {:?}: nesting needs a placed mesh: mesh.geographic, \
+                             or mesh.origin",
+                            b.tag.name()
+                        ));
+                    }
+                    if self.run.start.is_none() {
+                        return invalid(format!(
+                            "[[boundary]] {:?}: nesting needs run.start, the parent's instant \
+                             of time 0",
+                            b.tag.name()
+                        ));
+                    }
+                    nesting.validate()?;
+                }
+                (None, Some(tide), None, None) => {
                     if tide.constituents.is_empty() {
                         return invalid("boundary.tide needs at least one constituent".into());
                     }
@@ -945,7 +1102,8 @@ impl Case {
                 }
                 _ => {
                     return invalid(format!(
-                        "[[boundary]] {:?} needs exactly one of `still`, `tide` and `atlas`",
+                        "[[boundary]] {:?} needs exactly one of `still`, `tide`, `atlas` and \
+                         `nesting`",
                         b.tag.name()
                     ));
                 }

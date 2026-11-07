@@ -17,10 +17,11 @@
 //! - a uniform, linear or GeoTIFF bed;
 //! - Coriolis (f-plane or beta plane), Manning or quadratic-drag friction,
 //!   viscosity, wetting and drying;
-//! - still-water, harmonic-tide and tidal-atlas open boundaries;
+//! - still-water, harmonic-tide and tidal-atlas open boundaries, and
+//!   nesting in a parent ocean model (NetCDF, with the `netcdf` feature);
 //! - snapshot, VTK, NetCDF and station output.
 //!
-//! Next: nesting in a parent model and the atmosphere
+//! Next: the atmosphere, and the example's 3D bed treatments
 //! (`notes/case-files.md`).
 
 mod domain;
@@ -385,6 +386,100 @@ lon = 8.5
             started(&placed)
         );
         assert!(parse(&both).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn nesting_needs_a_placed_mesh_a_start_and_an_atlas_to_correct() {
+        let open = MINIMAL.replace(
+            "ny = 1",
+            "ny = 1
+        west = \"open\"",
+        );
+        let placed = open.replace(
+            "[bathymetry]",
+            "[mesh.origin]
+lat = 63.7
+lon = 8.5
+
+[bathymetry]",
+        );
+        let started = |t: &str| {
+            t.replace(
+                "duration_hours = 1.0",
+                "duration_hours = 1.0
+        start = \"2025-06-15T00:00:00Z\"",
+            )
+        };
+        let nested = |extra: &str| {
+            format!(
+                "
+[[boundary]]
+tag = \"open\"
+[boundary.nesting]
+file = \"parent.nc\"
+{extra}
+"
+            )
+        };
+        for (text, needs) in [
+            (format!("{}{}", started(&open), nested("")), "placed"),
+            (format!("{placed}{}", nested("")), "run.start"),
+            (
+                format!("{}{}", started(&placed), nested("correction = \"theory\"")),
+                "atlas",
+            ),
+            (
+                format!(
+                    "{}{}",
+                    started(&placed),
+                    nested("[boundary.nesting.gauge]\nrecord = \"g.txt\"\nsource = \"s.txt\"")
+                ),
+                "atlas",
+            ),
+            (
+                format!("{}{}", started(&placed), nested("transport_scaling = 0.5")),
+                "transport_scaling",
+            ),
+            (
+                format!("{}{}", started(&placed), nested("band_minutes = 0")),
+                "band_minutes",
+            ),
+            (
+                format!("{}{}", started(&placed), nested("band_km = -1")),
+                "band_km",
+            ),
+            (
+                format!(
+                    "{}{}",
+                    started(&placed),
+                    nested(
+                        "atlas = \"a.txt\"\ncorrection = \"theory\"\n[boundary.nesting.gauge]\nrecord = \"g.txt\"\nsource = \"s.txt\""
+                    )
+                ),
+                "not both",
+            ),
+        ] {
+            let err = parse(&text).unwrap().validate().unwrap_err().to_string();
+            assert!(err.contains(needs), "{needs}: {err}");
+        }
+        let case = parse(&format!(
+            "{}{}",
+            started(&placed),
+            nested("atlas = \"a.txt\"\ncorrection = \"theory\"")
+        ))
+        .unwrap();
+        case.validate().unwrap();
+        let n = case.boundaries[0].nesting.as_ref().unwrap();
+        assert_eq!(
+            (n.band_km, n.band_minutes, n.blend_bed, n.ramp_hours),
+            (3.0, 30.0, true, 1.0)
+        );
+        assert_eq!((n.transport_scaling, n.max_closed), (3.0, 0.05));
+        // One external state per boundary
+        let both = format!("{}{}", started(&placed), nested(""))
+            .replace("[boundary.nesting]", "still = {}\n[boundary.nesting]");
+        let err = parse(&both).unwrap().validate().unwrap_err().to_string();
+        assert!(err.contains("exactly one"), "{err}");
     }
 
     #[test]

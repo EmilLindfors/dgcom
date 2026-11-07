@@ -184,3 +184,22 @@ stations = "stations.toml"
   - A unit test of `correct_at_gauge`: the gauge's M2 at the source point, the same gain elsewhere, K2 at the gauge's ratio, and the errors.
   - A case test with a synthetic year-long gauge record (M2 1.2×, +10°; S2 0.9×, −5° over the model) and a synthetic source atlas. The case logs M2 × 1.199, +10.0° and S2 × 0.900, −5.0°; the 0.1 % on M2 is the fit's nodal treatment over the year. A source with no point near the gauge is refused.
   - A 30-day synthetic record without K2 failed this at first. The fit infers K2 at equilibrium from S2 where 30 days cannot separate them, and a record lacking K2 then biases S2 (0.944, +15°). Real records have K2; the test uses a year.
+
+## P8.1, fifth part: nesting (2026-11-07)
+
+- **`[boundary.nesting]`:** `froya_real_data`'s 2D nesting (`norkyst=`) in a case file, on the library's `OceanModelState`. The domain build does what the example's `Domain::nesting` and `correct_parent_tides` do, in the same order:
+  1. Read the parent (`OceanModelReader::from_file`; the `netcdf` feature. Without it the case is refused with that reason).
+  2. The datum: `level_m`, else minus `TidalAtlas::mean_level` of `atlas` (the raw atlas, as the example), else `ParentDatum::RecordMean`, which refuses records shorter than 29 days.
+  3. Wall the open faces the parent has no water near (`BoundaryCoverage::of_parent`, `max_closed`).
+  4. Sample the parent at the boundary and the band, then blend the bed (`blend_bathymetry` with `blend_shore_depth_m`, the example's `-WALL_LOW_WATER` = 2 m).
+  5. Correct the parent's tide by (corrected − raw) atlas, from theory or at a gauge (the `[boundary.atlas.gauge]` code), within `atlas_coverage_m` + the band.
+  6. Check the parent covers the run.
+  - The run adds the band (`OceanModelState::relaxation`) as a source after the Coriolis force, as the example does, and the boundary is `CharacteristicOBC` on the parent (`velocity` applies only to a parent without currents).
+- **Stage 2 of P8.2, bit for bit:** `cases/froya/nested.toml` against `froya_real_data norkyst=data/froya_norkyst.nc hours=1 snapshot_minutes=10 station_minutes=10 rest_hours=0`, 0 values differing in all 7 frames, for `nest_tides=corrected` (the gauge section), `raw` (without it) and `theory` (`correction = "theory"`). Both logs agree on the datum (+0.282 m), 1139 boundary nodes (16 snapped), 19084 band nodes, 16804 blended nodes, the seven gauge adjustments and the correction's largest term (N2 0.147 m; L2 0.019 m for theory, whose atlas has K2 and P1 at the equilibrium ratios: the case notes it as the example does).
+- **Not yet the scored runs:** the 2026-06-12 runs (`output/p34_2026-06-12/run.sh`) also used `slopes3d=on`, whose bed treatment (3D rx0 smoothing, cliff shores raised to land, tidal ponds filled) case files do not have. That, and `ib=` with the atmosphere, are what is left of the 2D path (TODO P8.1).
+- **`cases/bodo/nested.toml`:** builds on `data/bodo_norkyst_3d.nc` (datum +0.288 m, no walls, 579 boundary nodes, 17433 band nodes). It takes the beta plane, so it is not the example's run.
+- **Gates** (`tests/case_test.rs`, with the `netcdf` feature; a synthetic parent written with the `netcdf` crate):
+  - `a_nested_channel_fills_to_its_parents_level_less_its_mean`: a parent at ζ = 0.3 m with `level_m = -0.1`, and again with an atlas of `Z0` = 0.1: the channel's head settles at 0.2000 m, its volume within 5 % of 0.2 m over the channel. Without either, the 8 h record is refused for the datum.
+  - `a_parent_that_misses_the_boundary_or_the_run_is_refused`: a parent cut 5 km east of the mouth (`max_closed`), and a 2 h parent for a 3 h run.
+  - `the_bed_is_blended_to_the_parents_across_the_band`: the parent's 20 m on the boundary, the case's 10 m beyond the 3 km band, in between at 1.5 km, and 10 m everywhere with `blend_bed = false`.
+  - Unit (no NetCDF): `nesting_needs_a_placed_mesh_a_start_and_an_atlas_to_correct`, the defaults and the value checks.
