@@ -24,6 +24,7 @@ The files were split out of the old 1,500-line `TODO.md` on 2026-10-10, verbatim
 | [3d-validation.md](3d-validation.md) | 3D test cases (estuary, seamount, lock exchange, …) | P4.6 |
 | [operational.md](operational.md) | Rivers, ROMS-compatible output, restarts, the operational pipeline, future research | P5, P7 |
 | [tech-debt.md](tech-debt.md) | Legacy integrators, config enums, re-exports, error handling, CI | P6 |
+| [case-files.md](case-files.md) | Generic cases: the TOML case-file schema, the binary, ROMS inputs and the "coming from ROMS" doc | P8 |
 | [correctness-bugs.md](correctness-bugs.md) | The confirmed bugs from the 2026-09-25 review (all fixed except the GPU) | P0 |
 | [history.md](history.md) | Items resolved before the 2026-09-25 review, completed phases | — |
 | [review-2026-09-25.md](review-2026-09-25.md) | The full-crate review that set the current direction (historical; source comments cite its §s) | — |

@@ -13,6 +13,8 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Plan for generic case files (TODO P8; `notes/case-files.md`).** The next focus is running any coastal domain from a TOML case file and a binary, not only the hard-wired Frøya and Bodø examples. The plan covers the schema, effective-configuration records for resume, moving `froya_real_data` onto the case layer, ROMS grid/tide/boundary inputs and a "coming from ROMS" guide.
+
 - **Why NorKyst-800 carries only a quarter of the inverse barometer (TODO P1.5; `notes/norkyst-issues.md` §6 "Cause").**
   - In ROMS (3.9 through `develop`), `PRESS_COMPENSATE` acts only in the Flather ubar/vbar boundary condition.
   - NorKyst runs Shchepetkin ubar/vbar with Chapman ζ (its published `roms_norkyst.in` and `norkyst-operational`). So the compensation is inactive, and the open boundary holds the parent's level without the inverse barometer.
