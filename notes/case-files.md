@@ -24,7 +24,7 @@ The aquaculture work continues on top of this. Frøya and Bodø become case file
   - `mesh case.toml`: build the mesh and write it to Gmsh/VTK to inspect
   - Overrides as `--set physics.manning = 0.03` for sweeps.
 
-  The binary's name waits on the crate-vs-repo name (P6).
+  The binary is `dgcom` (`dgcom run case.toml`), after the crate (renamed 2026-11-07, PR #192).
 - **One path.** Each part of `froya_real_data` that moves into the case layer is deleted from the example (CLAUDE.md: no duplicate paths). The example ends as a thin wrapper or disappears.
 
 ## Schema sketch
