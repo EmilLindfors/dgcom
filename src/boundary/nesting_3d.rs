@@ -153,6 +153,57 @@ impl ParentColumns3D for ReferenceColumns {
     }
 }
 
+/// Start `state` from `parent`'s columns at time 0: every node at rest at
+/// mean sea level (`η = max(B, 0)` over its bed `bed[node]`), and at the wet
+/// nodes the parent covers its velocity, temperature and salinity at the
+/// layer centres of `sigma`, marked in `covered` (the others are left as
+/// they are, and unmarked). `parent` `None` marks none.
+pub fn sample_columns(
+    parent: Option<&dyn ParentColumns3D>,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    sigma: &SigmaGrid,
+    bed: &[f64],
+    state: &mut Solution3D,
+    covered: &mut [bool],
+) {
+    let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+    let (mut u, mut v, mut temp, mut salt) =
+        (vec![0.0; nl], vec![0.0; nl], vec![0.0; nl], vec![0.0; nl]);
+    for (idx, &b) in bed.iter().enumerate() {
+        let eta = b.max(0.0);
+        state.eta.data[idx] = eta;
+        covered[idx] = false;
+        let Some(parent) = parent.filter(|_| b < 0.0) else {
+            continue;
+        };
+        let (k, i) = (idx / nn, idx % nn);
+        let [x, y] =
+            mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i]);
+        let ctx = ColumnContext3D {
+            time: 0.0,
+            node: idx,
+            position: (x, y),
+            bed: b,
+            eta,
+        };
+        let out = ParentColumn {
+            u: &mut u,
+            v: &mut v,
+            temp: &mut temp,
+            salt: &mut salt,
+        };
+        if parent.column(&ctx, sigma, out) {
+            let column = idx * nl..(idx + 1) * nl;
+            state.u[column.clone()].copy_from_slice(&u);
+            state.v[column.clone()].copy_from_slice(&v);
+            state.temp[column.clone()].copy_from_slice(&temp);
+            state.salt[column].copy_from_slice(&salt);
+            covered[idx] = true;
+        }
+    }
+}
+
 /// The relaxation band of a [`Nesting3D`].
 #[derive(Clone, Copy, Debug)]
 pub struct NestingBand3D {

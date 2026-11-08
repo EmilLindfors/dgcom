@@ -77,6 +77,58 @@ pub struct Solution3D {
 }
 
 impl Solution3D {
+    /// Set the temperature and salinity of the columns `fill` picks from
+    /// `profile(z) → (T, S)` at their layer centres
+    /// `z = η + σ_l (η − B)`, over the bed `bed[node]` and the surface `eta`
+    /// already in the state.
+    pub fn fill_tracers(
+        &mut self,
+        sigma: &crate::vertical::SigmaGrid,
+        bed: &[f64],
+        fill: impl Fn(usize) -> bool,
+        profile: impl Fn(f64) -> (f64, f64),
+    ) {
+        let nl = self.n_levels;
+        for idx in (0..bed.len()).filter(|&idx| fill(idx)) {
+            let eta = self.eta.data[idx];
+            for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                let z = eta + s * (eta - bed[idx]);
+                (self.temp[idx * nl + l], self.salt[idx * nl + l]) = profile(z);
+            }
+        }
+    }
+
+    /// Keep only the shear of the velocity of the columns `sheared` picks
+    /// (each layer minus the column's depth mean on `sigma`) and set the
+    /// others at rest: a parent's vertical structure under a depth mean at
+    /// rest, for a run whose depth mean ramps up from rest. The number of
+    /// sheared columns.
+    pub fn keep_shear(
+        &mut self,
+        sigma: &crate::vertical::SigmaGrid,
+        sheared: impl Fn(usize) -> bool,
+    ) -> usize {
+        let nl = self.n_levels;
+        let mut n = 0;
+        for idx in 0..self.n_elements * self.n_nodes {
+            let keep = sheared(idx);
+            let column = idx * nl..(idx + 1) * nl;
+            for field in [&mut self.u, &mut self.v] {
+                let values = &mut field[column.clone()];
+                let mean = if keep {
+                    sigma.depth_average(values)
+                } else {
+                    0.0
+                };
+                values
+                    .iter_mut()
+                    .for_each(|x| *x = if keep { *x - mean } else { 0.0 });
+            }
+            n += usize::from(keep);
+        }
+        n
+    }
+
     /// Create a new 3D solution initialized to zero.
     pub fn new(n_elements: usize, n_nodes: usize, n_levels: usize) -> Self {
         let n_3d = n_elements * n_nodes * n_levels;
