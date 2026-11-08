@@ -44,6 +44,9 @@ pub struct Case {
     /// A 3D run: σ-levels, mode splitting, vertical mixing (default: 2D).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub three_d: Option<ThreeDSection>,
+    /// Spectral waves coupled to the 2D run (default: none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waves: Option<WavesSection>,
     /// Time stepping.
     #[serde(default)]
     pub numerics: NumericsSection,
@@ -102,6 +105,61 @@ pub struct MeshSection {
     /// high water needs `false`.
     #[serde(default = "default_true")]
     pub drop_land: bool,
+}
+
+impl MeshSection {
+    /// Check the mesh's order and its one source, `name` in the messages.
+    pub(crate) fn validate_shape(&self, name: &str) -> Result<(), CaseError> {
+        let invalid = |msg: String| Err(CaseError::Invalid(msg));
+        if !ORDERS.contains(&self.order) {
+            return invalid(format!(
+                "{name}.order must be {}–{}, not {}",
+                ORDERS.start(),
+                ORDERS.end(),
+                self.order
+            ));
+        }
+        let m = self;
+        match (&m.rectangle, &m.gmsh, &m.geographic) {
+            (Some(r), None, None) => {
+                if !(r.x_m[1] > r.x_m[0] && r.y_m[1] > r.y_m[0]) {
+                    return invalid(format!(
+                        "{name}.rectangle needs x_m[0] < x_m[1] and y_m[0] < y_m[1], not {:?} and {:?}",
+                        r.x_m, r.y_m
+                    ));
+                }
+                if r.nx == 0 || r.ny == 0 {
+                    return invalid(format!("{name}.rectangle needs nx and ny of at least 1"));
+                }
+            }
+            (None, Some(_), None) => {}
+            (None, None, Some(g)) => {
+                let [w, s, e, n] = g.bbox;
+                if !(w < e && s < n && (-90.0..=90.0).contains(&s) && (-90.0..=90.0).contains(&n)) {
+                    return invalid(format!(
+                        "{name}.geographic.bbox must be [west, south, east, north], not {:?}",
+                        g.bbox
+                    ));
+                }
+                if g.nx == 0 || g.ny == 0 {
+                    return invalid(format!("{name}.geographic needs nx and ny of at least 1"));
+                }
+                if m.origin.is_some() {
+                    return invalid(
+                        "mesh.origin places a rectangle or Gmsh mesh; a geographic mesh is \
+                         placed about its box's centre"
+                            .into(),
+                    );
+                }
+            }
+            _ => {
+                return invalid(format!(
+                    "[{name}] needs exactly one of `rectangle`, `gmsh` and `geographic`"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `[mesh.geographic]`
@@ -779,6 +837,271 @@ impl ThreeDSection {
     }
 }
 
+/// `[waves]`: a spectral wave model (`crate::waves::WaveModel2D`, TODO F.4)
+/// coupled two-way to the 2D run every `exchange_minutes`
+/// (`crate::waves::CoupledWaves2D`, `Simulation::run_with_exchange`): the
+/// waves take the run's water level and current, and give it their force
+/// (linear in time across each interval) and their bed stress's enhancement
+/// of its friction, both ramped up over `ramp_hours`. The defaults are
+/// `examples/froya_real_data.rs wave_coupling=`'s.
+///
+/// - **Spectrum:** `frequencies` × `directions` components over
+///   `f_min_hz`–`f_max_hz`.
+/// - **Mesh:** the run's, or `[waves.mesh]` of its own (the `[mesh]`
+///   schema, in the run's projection; the case's `[bathymetry]` on it).
+/// - **Sources:** SWAN's physics (Komen, the DIA, JONSWAP friction,
+///   Battjes–Janssen), integrated as WAM does (`sources = "wam"`: implicit in
+///   the DIA's diagonal, Hersbach & Janssen's growth limiter, 4 propagation
+///   steps per source step, CFL 1) or as SWAN does (`"swan"`: frozen rates,
+///   the per-step limiter, every step, CFL 0.5); `integration`, `limiter`,
+///   `substeps` and `cfl` set either part alone.
+/// - **The sea:** `[waves.sea]`, a JONSWAP sea through the open boundaries
+///   and everywhere at the start, or `[waves.spectra]`, a parent wave
+///   model's spectra on the open boundary (MET Norway's MyWave WAM,
+///   `met_wave_subset`; needs a placed mesh, `run.start` and NetCDF) and its
+///   mean everywhere at the start.
+/// - **Wind:** `[atmosphere]`'s per wave node, else the parent spectra's,
+///   else none.
+///
+/// Snapshots carry the sea state at every node (H_s, T_p, direction, …),
+/// linear in time between the exchanges.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WavesSection {
+    /// Minutes between exchanges with the run: a whole multiple of the
+    /// run's output and station intervals.
+    pub exchange_minutes: f64,
+    /// Frequencies of the spectrum (default 25).
+    #[serde(default = "default_wave_frequencies")]
+    pub frequencies: usize,
+    /// Directions of the spectrum (default 36).
+    #[serde(default = "default_wave_directions")]
+    pub directions: usize,
+    /// Lowest frequency (Hz, default 0.04).
+    #[serde(default = "default_wave_f_min")]
+    pub f_min_hz: f64,
+    /// Highest frequency (Hz, default 0.5).
+    #[serde(default = "default_wave_f_max")]
+    pub f_max_hz: f64,
+    /// The waves' own mesh (default: the run's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<MeshSection>,
+    /// How the sources are integrated (default `"wam"`).
+    #[serde(default)]
+    pub sources: WaveSources,
+    /// `"frozen"` or `"implicit"` rates (default: as `sources`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<WaveIntegration>,
+    /// Growth limiter: `"ris"`, `"rate"` or `"rate_both_signs"` (default:
+    /// as `sources`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limiter: Option<WaveLimiter>,
+    /// Propagation steps per source step (default: 4 for `wam`, 1 for
+    /// `swan`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub substeps: Option<usize>,
+    /// CFL number of the propagation (default: 1 for `wam`, 0.5 for
+    /// `swan`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfl: Option<f64>,
+    /// Dry land takes the waves, as the coast does (default true); false
+    /// treats it as water of the minimum depth.
+    #[serde(default = "default_true")]
+    pub absorbing_land: bool,
+    /// Scale each node's spectrum to breaking's `H_rms ≤ γ d` after every
+    /// step (default true).
+    #[serde(default = "default_true")]
+    pub depth_limit: bool,
+    /// The waves' force on the run (default `"dissipation"`: the momentum
+    /// their sinks take, Dingemans et al. 1987; `"stress"`: the radiation
+    /// stress's divergence).
+    #[serde(default)]
+    pub force: WaveForce,
+    /// Cap on the refraction's turning rate (rad/s, default none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turning_rad_s: Option<f64>,
+    /// Refraction and frequency shifting stepped implicitly (default true:
+    /// otherwise the currents over the shallows set the waves' step by
+    /// frequency shifting, 0.6 s against the geographic 7 s at 1 km).
+    #[serde(default = "default_true")]
+    pub implicit: bool,
+    /// Ramp-up of the waves' force and bed stress (hours, default 1).
+    #[serde(default = "default_ramp_hours")]
+    pub ramp_hours: f64,
+    /// A JONSWAP sea through the open boundaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sea: Option<WaveSea>,
+    /// A parent wave model's spectra on the open boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectra: Option<WaveSpectra>,
+}
+
+/// `[waves] sources`
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaveSources {
+    /// As WAM integrates them
+    #[default]
+    Wam,
+    /// As SWAN integrates them
+    Swan,
+}
+
+/// `[waves] integration`
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaveIntegration {
+    /// The rates at the step's start
+    Frozen,
+    /// Implicit in the DIA's diagonal
+    Implicit,
+}
+
+/// `[waves] limiter`
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaveLimiter {
+    /// SWAN's per-step limiter (Ris)
+    Ris,
+    /// Hersbach & Janssen's, proportional to the step
+    Rate,
+    /// The same on the losses too, as ecWAM
+    RateBothSigns,
+}
+
+/// `[waves] force`
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaveForce {
+    /// The momentum the waves' sinks take
+    #[default]
+    Dissipation,
+    /// The radiation stress's divergence
+    Stress,
+}
+
+/// `[waves.sea]`: a JONSWAP spectrum (peak enhancement 3.3, cos^4
+/// spreading).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaveSea {
+    /// Significant wave height (m)
+    pub hs_m: f64,
+    /// Peak period (s)
+    pub tp_s: f64,
+    /// The direction the waves come from (degrees clockwise from north)
+    pub from_deg: f64,
+}
+
+/// `[waves.spectra]`: a parent wave model's spectra at its points
+/// (`io::WaveSpectraFile`, e.g. from `met_wave_subset`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaveSpectra {
+    /// The file
+    pub file: PathBuf,
+    /// Each open-boundary node takes the inverse-distance mean of this many
+    /// nearest points (default 2).
+    #[serde(default = "default_wave_neighbours")]
+    pub neighbours: usize,
+}
+
+impl WavesSection {
+    /// The source integration, its limiter, substeps and CFL number.
+    pub fn integration(&self) -> (WaveIntegration, Option<WaveLimiter>, usize, f64) {
+        let wam = self.sources == WaveSources::Wam;
+        (
+            self.integration.unwrap_or(if wam {
+                WaveIntegration::Implicit
+            } else {
+                WaveIntegration::Frozen
+            }),
+            match self.limiter {
+                Some(WaveLimiter::Ris) => None,
+                Some(other) => Some(other),
+                None if wam => Some(WaveLimiter::Rate),
+                None => None,
+            },
+            self.substeps.unwrap_or(if wam { 4 } else { 1 }),
+            self.cfl.unwrap_or(if wam { 1.0 } else { 0.5 }),
+        )
+    }
+
+    fn validate(&self, case: &Case) -> Result<(), CaseError> {
+        let invalid = |m: String| Err(CaseError::Invalid(format!("waves.{m}")));
+        let o = &case.output;
+        let callback = o.interval_minutes.min(o.station_interval());
+        let ratio = self.exchange_minutes / callback;
+        if !(positive(self.exchange_minutes)
+            && ratio.round() >= 1.0
+            && (ratio - ratio.round()).abs() <= 1e-9 * ratio)
+        {
+            return invalid(format!(
+                "exchange_minutes ({}) must be a whole multiple of the outputs' {callback} min",
+                self.exchange_minutes
+            ));
+        }
+        if self.frequencies < 3 || self.directions < 4 {
+            return invalid("needs at least 3 frequencies and 4 directions".into());
+        }
+        if !(positive(self.f_min_hz) && self.f_min_hz < self.f_max_hz && self.f_max_hz.is_finite())
+        {
+            return invalid("needs 0 < f_min_hz < f_max_hz".into());
+        }
+        if self.substeps == Some(0) {
+            return invalid("substeps must be at least 1".into());
+        }
+        if let Some(cfl) = self.cfl
+            && !(positive(cfl) && cfl.is_finite())
+        {
+            return invalid(format!("cfl must be positive, not {cfl}"));
+        }
+        if let Some(r) = self.turning_rad_s
+            && !(positive(r) && r.is_finite())
+        {
+            return invalid(format!("turning_rad_s must be positive, not {r}"));
+        }
+        if !(non_negative(self.ramp_hours) && self.ramp_hours.is_finite()) {
+            return invalid(format!("ramp_hours must be ≥ 0, not {}", self.ramp_hours));
+        }
+        match (&self.sea, &self.spectra) {
+            (Some(sea), None) => {
+                if !(positive(sea.hs_m) && positive(sea.tp_s) && sea.from_deg.is_finite()) {
+                    return invalid("sea needs a positive hs_m and tp_s, and from_deg".into());
+                }
+            }
+            (None, Some(spectra)) => {
+                if !case.placed() || case.run.start.is_none() {
+                    return invalid(
+                        "spectra needs a placed mesh and run.start (the parent's points are on \
+                         the Earth, its times in UTC)"
+                            .into(),
+                    );
+                }
+                if spectra.neighbours == 0 {
+                    return invalid("spectra.neighbours must be at least 1".into());
+                }
+            }
+            _ => return invalid("needs exactly one of [waves.sea] and [waves.spectra]".into()),
+        }
+        if let Some(m) = &self.mesh {
+            if m.origin.is_some() {
+                return invalid(
+                    "mesh.origin: the waves' mesh is in the run's projection (the run's origin)"
+                        .into(),
+                );
+            }
+            if m.geographic.is_some() && !case.placed() {
+                return invalid("mesh.geographic needs the run's mesh placed".into());
+            }
+        }
+        if case.three_d.is_some() {
+            return invalid("couples to a 2D run; [three_d] has no waves yet".into());
+        }
+        Ok(())
+    }
+}
+
 /// `[boundary.nesting]`: one-way nesting in a parent ocean model
 /// ([`crate::boundary::OceanModelState`]). The boundary takes the parent's
 /// ζ, ū and v̄ (its tides, coastal current and wind-driven flow), interpolated
@@ -1200,6 +1523,21 @@ fn default_slopes_r_max() -> f64 {
 fn default_free_depth() -> f64 {
     19.0
 }
+fn default_wave_frequencies() -> usize {
+    25
+}
+fn default_wave_directions() -> usize {
+    36
+}
+fn default_wave_f_min() -> f64 {
+    0.04
+}
+fn default_wave_f_max() -> f64 {
+    0.5
+}
+fn default_wave_neighbours() -> usize {
+    2
+}
 fn default_theta_s() -> f64 {
     5.0
 }
@@ -1350,53 +1688,8 @@ impl Case {
             ));
         }
         self.clock()?;
-        if !ORDERS.contains(&self.mesh.order) {
-            return invalid(format!(
-                "mesh.order must be {}–{}, not {}",
-                ORDERS.start(),
-                ORDERS.end(),
-                self.mesh.order
-            ));
-        }
+        self.mesh.validate_shape("mesh")?;
         let m = &self.mesh;
-        match (&m.rectangle, &m.gmsh, &m.geographic) {
-            (Some(r), None, None) => {
-                if !(r.x_m[1] > r.x_m[0] && r.y_m[1] > r.y_m[0]) {
-                    return invalid(format!(
-                        "mesh.rectangle needs x_m[0] < x_m[1] and y_m[0] < y_m[1], not {:?} and {:?}",
-                        r.x_m, r.y_m
-                    ));
-                }
-                if r.nx == 0 || r.ny == 0 {
-                    return invalid("mesh.rectangle needs nx and ny of at least 1".into());
-                }
-            }
-            (None, Some(_), None) => {}
-            (None, None, Some(g)) => {
-                let [w, s, e, n] = g.bbox;
-                if !(w < e && s < n && (-90.0..=90.0).contains(&s) && (-90.0..=90.0).contains(&n)) {
-                    return invalid(format!(
-                        "mesh.geographic.bbox must be [west, south, east, north], not {:?}",
-                        g.bbox
-                    ));
-                }
-                if g.nx == 0 || g.ny == 0 {
-                    return invalid("mesh.geographic needs nx and ny of at least 1".into());
-                }
-                if m.origin.is_some() {
-                    return invalid(
-                        "mesh.origin places a rectangle or Gmsh mesh; a geographic mesh is \
-                         placed about its box's centre"
-                            .into(),
-                    );
-                }
-            }
-            _ => {
-                return invalid(
-                    "[mesh] needs exactly one of `rectangle`, `gmsh` and `geographic`".into(),
-                );
-            }
-        }
         if let Some(o) = m.origin
             && !((-90.0..=90.0).contains(&o.lat) && o.lon.is_finite())
         {
@@ -1761,7 +2054,19 @@ impl Case {
                 );
             }
         }
+        if let Some(w) = &self.waves {
+            w.validate(self)?;
+            if let Some(m) = &w.mesh {
+                m.validate_shape("waves.mesh")?;
+            }
+        }
         // Last, so that a build without NetCDF still checks the rest
+        if self.waves.as_ref().is_some_and(|w| w.spectra.is_some()) && !cfg!(feature = "netcdf") {
+            return invalid(
+                "[waves.spectra] needs dgcom built with the `netcdf` feature (on by default)"
+                    .into(),
+            );
+        }
         if self.atmosphere.is_some() && !cfg!(feature = "netcdf") {
             return invalid(
                 "[atmosphere] needs dgcom built with the `netcdf` feature (on by default)".into(),

@@ -287,6 +287,89 @@ fn a_stratified_basin_at_rest_stays_at_rest_in_3d() {
     );
 }
 
+/// A swell through the open end of a deep channel, coupled to the run: a
+/// JONSWAP sea of 1 m, 8 s from the west fills the 30 m channel at the
+/// start and comes in through the boundary. Without wind, in water about
+/// as deep as a third of its wavelength, the sea keeps its height (the
+/// largest H_s 1.000–1.015 m over the hour), the coupled run stays near
+/// rest (|ū| 2e-6 m/s), and the snapshots carry the sea state.
+#[test]
+fn a_swell_through_a_deep_channel_keeps_its_height() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("case.toml");
+    std::fs::write(
+        &path,
+        r#"
+        [run]
+        duration_hours = 1.0
+
+        [mesh]
+        order = 1
+        [mesh.rectangle]
+        x_m = [0.0, 6000.0]
+        y_m = [0.0, 2000.0]
+        nx = 12
+        ny = 4
+        west = "open"
+
+        [bathymetry]
+        depth_m = 30.0
+
+        [physics]
+        friction = { manning = 0.025 }
+
+        [[boundary]]
+        tag = "open"
+        still = {}
+
+        [waves]
+        exchange_minutes = 10.0
+        frequencies = 12
+        directions = 12
+        [waves.sea]
+        hs_m = 1.0
+        tp_s = 8.0
+        from_deg = 270.0
+
+        [output]
+        directory = "out"
+        interval_minutes = 10.0
+        "#,
+    )
+    .unwrap();
+    let file = CaseFile::read(&path, &[]).unwrap();
+    let mut hs = Vec::new();
+    let mut speed = 0.0_f64;
+    let report = file
+        .run(&mut |p| {
+            hs.push(p.max_hs.unwrap());
+            speed = speed.max(p.max_speed);
+        })
+        .unwrap();
+    println!(
+        "swell, 1 h: largest H_s {:?} m, |ū| ≤ {speed:.2e} m/s; {:?}",
+        hs, report.notes
+    );
+    assert_eq!(hs.len(), 7, "0 to 60 min");
+    assert!(
+        hs.iter().all(|&h| (0.9..=1.02).contains(&h)),
+        "the swell keeps its height: {hs:?}"
+    );
+    assert!(speed < 0.05, "the run stays near rest: {speed}");
+    assert!(report.notes.iter().any(|n| n.contains("6 exchanges")));
+    let mut snapshot =
+        dgcom::io::SnapshotReader::open(dir.path().join("out").join("case.dgsnap")).unwrap();
+    let frame = snapshot.read_frame(6).unwrap();
+    assert_eq!(frame.surface.len(), 7, "the sea state's fields");
+    let hs_field = &frame.surface[0];
+    let largest = hs_field.iter().fold(0.0_f32, |m, &h| m.max(h));
+    assert!(
+        (largest as f64 - hs[6]).abs() < 1e-6,
+        "{largest} against {}",
+        hs[6]
+    );
+}
+
 /// Amplitude and phase (rad) of the M2 fit to `s` from time `from` on.
 fn m2_fit(s: &StationSeries, from: f64) -> (f64, f64) {
     let omega = 2.0 * PI / constituent_period("M2").unwrap();

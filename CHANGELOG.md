@@ -13,6 +13,11 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Coupled waves in case files (TODO P8.2 stage 4; `notes/case-files.md`).**
+  - `[waves]` couples the spectral wave model to the 2D run every `exchange_minutes` (`CoupledWaves2D`): on the run's mesh or a mesh of its own (`[waves.mesh]`, the `[mesh]` schema in the run's projection, the case's bed on it), a JONSWAP sea (`[waves.sea]`) or a parent wave model's spectra on the boundary (`[waves.spectra]`), `[atmosphere]`'s wind per wave node or the parent's, WAM's or SWAN's source integration (`sources`, with `integration`, `limiter`, `substeps`, `cfl`), absorbing land, the depth limit, the force form and implicit refraction. Snapshots carry the sea state, and the progress line the largest H_s.
+  - `waves::SeaStateFrames` (the sea state at the outputs, linear between the exchanges) moved from `froya_real_data` into the library.
+  - `cases/froya/storm_2025-10-09.toml` reproduces `froya_real_data … wave_coupling=10 wave_mesh=60,45 implicit=1 wave_spectra=…` bit for bit, the sea state included; `snapshot_compare_3d` counts the surface fields' differences too.
+
 - **3D runs in case files (TODO P8.2 stage 3; `notes/case-files.md`).**
   - `[three_d]` runs `Hydrostatic3D` under the case's 2D module in a `Simulation3D` with mode splitting: `levels` σ-layers (Song–Haidvogel `theta_s`, `theta_b`, `hc_m`), GLS mixing (`mixing`), a log-layer bottom drag (`bottom_roughness_m`, replacing `[physics] friction`), thin columns (`thin_depth_m`, also the default of `[bathymetry.slopes_3d]`), the 3D and barotropic schemes, CFL numbers and local time stepping, the open faces' band, an initial `profile` where no parent covers, and the weather's wind on the columns with COARE 3.5 heat fluxes (`heat`, `jerlov`). The defaults are `froya_real_data levels=N tide3d=1`'s.
   - A nested boundary whose parent has profiles starts the run from its columns and nests the 3D fields in them across the band.

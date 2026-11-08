@@ -282,7 +282,7 @@ impl CaseFile {
 
         // The run: the steps land on the field outputs; the stations are
         // recorded at the first step on or after their times
-        let mut output = Output::create(self, domain, clock.as_ref(), Some(&sigma))?;
+        let mut output = Output::create(self, domain, clock.as_ref(), Some(&sigma), &[])?;
         let field_every = 60.0 * case.output.interval_minutes;
         let station_every = 60.0 * case.output.station_interval();
         let mut q = SWESolution2D::new(ne, nn);

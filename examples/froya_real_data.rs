@@ -570,7 +570,7 @@ use dgcom::vertical::MeanProfile;
 use dgcom::waves::{BoundarySpectra, PointSpectra, WindSeries};
 use dgcom::waves::{
     CoupledWaves2D, CoupledWavesStats, DEFAULT_RATE_LIMITER, GrowthLimiter, SeaStateFields,
-    SourceIntegration, SourceTerms, SpectralGrid, WaveForceForm, WaveModel2D, Wind,
+    SeaStateFrames, SourceIntegration, SourceTerms, SpectralGrid, WaveForceForm, WaveModel2D, Wind,
 };
 use farm_site::{FarmCase, FarmOptions, FarmRecord, FarmRun};
 
@@ -2806,7 +2806,8 @@ fn tidal_run<'a>(
         None => None,
     };
     // The waves' sea state for the snapshot frames
-    let sea = (waves.is_some() && snapshot.is_some()).then(|| RefCell::new(SeaStates::default()));
+    let sea =
+        (waves.is_some() && snapshot.is_some()).then(|| RefCell::new(SeaStateFrames::default()));
     let mut n_callbacks = n_callbacks_done;
     let mut frame = frames_done;
     let mut write_error = None;
@@ -2994,45 +2995,7 @@ struct Coupling<'a> {
     interval: f64,
     report_every: f64,
     report: &'a mut dyn FnMut(&CoupledWaves2D, f64),
-    sea: Option<&'a RefCell<SeaStates>>,
-}
-
-/// The coupled waves' sea state at the two ends of the coupling interval the
-/// circulation is in, for the snapshot frames within it (linear in time
-/// between them, as the force is).
-#[derive(Default)]
-struct SeaStates {
-    before: Option<(f64, [Vec<f32>; 7])>,
-    after: Option<(f64, [Vec<f32>; 7])>,
-    /// The fields at a frame's time
-    now: [Vec<f32>; 7],
-}
-
-impl SeaStates {
-    /// The waves' sea state at their time `t`, the start of the next interval
-    /// the first time and its end after that.
-    fn push(&mut self, waves: &CoupledWaves2D, t: f64) {
-        self.before = self.after.take();
-        self.after = Some((t, waves.sea_state().as_f32()));
-    }
-
-    /// The fields at time `t`, in the order of `SeaStateFields::NAMES`.
-    fn at(&mut self, t: f64) -> Vec<&[f32]> {
-        let (Some((t1, b)), a) = (&self.after, &self.before) else {
-            return Vec::new();
-        };
-        let (t0, a) = a.as_ref().map_or((*t1, b), |(t0, a)| (*t0, a));
-        let w = if t1 > &t0 {
-            ((t - t0) / (t1 - t0)).clamp(0.0, 1.0) as f32
-        } else {
-            1.0
-        };
-        for ((out, a), b) in self.now.iter_mut().zip(a).zip(b) {
-            out.clear();
-            out.extend(a.iter().zip(b).map(|(a, b)| a + w * (b - a)));
-        }
-        self.now.iter().map(Vec::as_slice).collect()
-    }
+    sea: Option<&'a RefCell<SeaStateFrames>>,
 }
 
 /// Run the tide from `t_start` to `t_end`, with the waves of `coupling`
@@ -3065,7 +3028,7 @@ where
             interval,
             |physics, q, t, t_next| {
                 if let Some(sea) = sea
-                    && sea.borrow().after.is_none()
+                    && sea.borrow().is_empty()
                 {
                     sea.borrow_mut().push(waves, t);
                 }

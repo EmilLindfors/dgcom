@@ -10,8 +10,9 @@
 //! For every time both files hold, over the nodes at least `min_depth` (m)
 //! deep in the reference: η, the depth-mean velocity and, for 3D files, the
 //! surface layer's velocity and T, as the RMS and the largest difference
-//! (with where the largest is), and how many values differ at all. Both runs
-//! must be on the same mesh and levels.
+//! (with where the largest is), and how many values differ at all, the
+//! surface fields (a coupled run's sea state) included. Both runs must be on
+//! the same mesh and levels.
 
 use dgcom::io::SnapshotReader;
 
@@ -86,10 +87,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             None => ("—".into(), "—".into()),
         };
-        // Values that differ in any bit, over every node and field
+        // Values that differ in any bit, over every node and field (the
+        // surface fields too: a coupled run's sea state)
         let differ = [(&fa.eta, &fb.eta), (&fa.u, &fb.u), (&fa.v, &fb.v)]
             .into_iter()
             .chain(fa.layers.iter().zip(&fb.layers))
+            .chain(fa.surface.iter().zip(&fb.surface))
             .map(|(x, y)| {
                 x.iter()
                     .zip(y)

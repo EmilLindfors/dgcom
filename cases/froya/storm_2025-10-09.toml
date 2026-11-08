@@ -1,0 +1,79 @@
+# Frøya–Smøla–Hitra in the storm of 2025-10-09, with coupled waves.
+#
+# The coastline-fitted mesh under MET Nordic's wind and pressure, the tide
+# from NorKyst-800's atlas corrected at Mausund (as `case.toml`), and
+# spectral waves coupled two-way every 10 minutes (`[waves]`): the waves
+# run on a 1 km P1 grid of their own over the same bed, take the tide's
+# level and current and MET Nordic's wind at every wave node, and give the
+# tide their force and bed stress. MET Norway's MyWave WAM 800 m forecast
+# of 2025-10-08 00 UTC is the sea on the open boundary (H_s at the western
+# point 3.5 → 7.2 m across the peak). The inputs, besides `case.toml`'s
+# raster and atlas, fetched once (free, no account needed):
+#
+#   uv run scripts/gmsh_coastline_mesh.py dem=data/froya_topobathy.tif \
+#       bbox=8.0,63.6,9.2,64.0 out=data/froya_coast.msh
+#   cargo run --release --example met_forcing_subset -- \
+#       start=2025-10-08 hours=72 out=data/froya_met_20251008.nc
+#   cargo run --release --example met_wave_subset -- out=data/froya_wave_spectra.nc
+#   ./scripts/kartverket_gauge.sh Mausund 63.869331 8.665231 2025-10-07 2025-10-11
+#   dgcom run cases/froya/storm_2025-10-09.toml
+#
+# (`met_wave_subset` fetches the latest forecast; this one is of
+# 2025-10-08.) This case is `froya_real_data mesh=data/froya_coast.msh lts=8
+# start=2025-10-09T00:00:00Z met=… wave_coupling=10 wave_mesh=60,45
+# implicit=1 wave_spectra=…` bit for bit (`notes/case-files.md`); the run is
+# measured against WAM at its points in `notes/waves.md` ("A storm at Frøya").
+# A day took 66 min on 24 threads, three quarters of it the waves.
+
+[run]
+name = "froya_storm"
+start = "2025-10-09T00:00:00Z"
+duration_hours = 24.0
+
+[mesh]
+order = 2
+gmsh = "../../data/froya_coast.msh"
+origin = { lat = 63.8, lon = 8.6 }
+
+[bathymetry.raster]
+file = "../../data/froya_topobathy.tif"
+kind = "topobathy"
+fill_zero_holes = true
+land_elevation_m = 5.0
+
+[physics]
+coriolis = { f_plane = 1.31e-4 }
+friction = { manning = 0.025 }
+
+[[boundary]]
+tag = "open"
+[boundary.atlas]
+file = "../../data/froya_boundary_tides.txt"
+ramp_hours = 1.0
+[boundary.atlas.gauge]
+record = "../../data/tide_gauges/mausund_obs.txt"
+source = "../../data/froya_station_tides.txt"
+
+[atmosphere]
+files = ["../../data/froya_met_20251008.nc"]
+
+[waves]
+exchange_minutes = 10.0
+[waves.mesh]                          # 1 km P1 over the box, the run's bed on it
+order = 1
+geographic = { bbox = [8.0, 63.6, 9.2, 64.0], nx = 60, ny = 45 }
+[waves.spectra]
+file = "../../data/froya_wave_spectra.nc"
+
+[numerics]
+local_time_stepping_levels = 8
+
+[output]
+interval_minutes = 60.0
+station_interval_minutes = 10.0
+
+[[output.station]]
+name = "Mausund"
+lat = 63.869331
+lon = 8.665231
+gauge = "../../data/tide_gauges/mausund_obs_202510.txt"
