@@ -281,3 +281,28 @@ stations = "stations.toml"
 - **Gates:**
   - `a_swell_through_a_deep_channel_keeps_its_height` (`tests/case_test.rs`, no NetCDF): a JONSWAP swell (1 m, 8 s, from the west) in a 30 m channel coupled every 10 minutes keeps the largest H_s at 1.000–1.015 m over an hour, the run near rest (|ū| 2e-6 m/s), 6 exchanges, and the last snapshot's H_s field is the progress line's.
   - Unit: `waves_take_the_examples_defaults_and_their_checks` (WAM's and SWAN's integration defaults; the refusals).
+
+## P8.2, stage 5: the farm's cages (2026-11-08)
+
+- **`[farm]`** is the physics of `froya_real_data site=`: the site file (`read_farm_site_file`), its cages (`FarmSite::cage_layout` with a `CageGrid` of `cage_spacing_m`, `cage_radius_m`, `net_depth_m`, `solidity`; `RING_160M`'s by default), each checked inside the mesh, their drag per length scaled by `drag_share` (the example's `FarmRun::Open`, `Control` and `Cages` are 0, its `farm_control`, and 1). In 2D `CageDrag2D` on the depth mean (`physics()`; not in `swe_builder`, which the 3D run shares); in 3D on the layers the nets reach (`Hydrostatic3D::with_cage_drag`, after the tracer limiter, as the example), not on the 3D run's 2D module (the example's `builder_without_friction` has none).
+- **Not moved:** the example's farm analysis (`examples/common/farm_site.rs`: the wake against the open run, the residual, the drag on the farm, the runs' divergence, the particles' connectivity). A case runs one of the runs; the analysis over runs and the particles are TODO F.1 and F.2.
+- **The raster's cut (found on the way).** The first comparison differed at t = 0 in 25 values of η (33.5 mm at most): the example cuts the raster to its `bbox=` (444 × 380 pixels, 1404 zero pixels filled), the case cut it to the mesh's extent with a 2 % margin (461 × 395, 1540 filled), and `fill_holes` fills from the surroundings within the cut, so the beds differed at a few nodes (82 tidal ponds against 81). The Frøya cases matched because `froya_topobathy.tif` is the Frøya box, so any wider window is clipped to it; the Mausund box lies inside it. `[bathymetry.raster] crop` now states the cut; the dependence itself is TODO P1.6. The window was also the run's `[mesh.geographic]` box for every mesh: a geographic `[waves.mesh]` now takes its own box.
+- **Bit for bit:** `cases/froya/kattholmen_farm.toml` (with `crop`) against `froya_real_data mesh=data/mausund_kattholmen.msh bbox=8.45,63.78,8.90,63.95 tides=data/mausund_boundary_tides.txt norkyst=data/froya_norkyst.nc slopes3d=on debug_3d=thin=1 lts=8 ramp_hours=3 cs=0.1 nu=0.1 site=data/sites/14042.txt farm_runs=cages`, 1 h with 10-minute snapshots: 0 values differ in all 7 frames (8 cages, C_d·a 0.0207 1/m). The same case with `--set farm.drag_share=0` departs from it by up to 5.5 mm/s in ū at 1 h (RMS 0.25 mm/s): the drag acts.
+- **Gates:**
+  - `a_farms_cages_slow_the_current_through_it` (`tests/case_test.rs`, no NetCDF): three cages of 25 m radius across a placed 10 km channel, 20 m deep, with an M2 tide through it: the mean speed through the farm 0.1515 m/s against 0.1612 without, and `drag_share = 0` the channel without a farm value for value.
+  - Unit: `a_farm_takes_a_ring_frames_defaults_and_needs_a_placed_mesh`.
+
+## Opportunities noticed during the migration (2026-11-08)
+
+Each is a `TODO.md` line under its area; the context:
+
+- **Provenance (P8.1).** The scored 2026-06-12 3D run was built from `6f9e558`, which is not in main's history. Its 3D numerics happened to equal main's (stage 3); nothing in its output said which build made it beyond the `BUILD_COMMIT` file kept by hand. A case's `case.resolved.toml` and snapshot metadata should carry the version and commit.
+- **Viewer metadata (P8.1).** `froya_real_data` writes the stations and the projection into its snapshots (`snapshot_metadata`), which `dg-viz` draws the land and the stations from; case snapshots carry `source` and `case` only.
+- **The output schedule is part of the run (P8.1).** `Simulation` lands its steps on the callback times, so a run's outputs change it by round-off (stage 2: a case writing hourly differed from the scored run, which recorded stations every 10 minutes, by 1.8 mm in η over the day). `station_interval_minutes` made the schedules equal; the general question is whether outputs should perturb a run at all.
+- **3D stations (P8.1)** are recorded at the first step on or after their times, so their series are irregular by up to a step; the 2D run's land exactly.
+- **The example's duplicated drivers (P8.2).** With every mode in case files, `froya_real_data`'s `tidal_run`, `tidal_run_3d`, `coupled_waves` and the farm's runs duplicate the case runner. Its diagnostics (`debug_3d=`, `profile=`, `waves=N`, the farm's report) are worth keeping as tools over case files; the rest can go with its options.
+- **The cut-dependent bed (P1.6)**, above.
+- **`Nesting3D::new` panics on no tags (P4.2)** although it returns a `Result`; the case guards it for closed basins.
+- **The slope drift at rest (P4.2):** 2e-7 m/s in 2 h over a 30 → 10 m slope, open or closed, against 1e-14 flat (stage 3's gate). Running it with mixing off would split the physical diffusion-driven flow from the pressure gradient's error as the profile leaves its reference.
+- **`GriddedAtmosphere2D` configuration panics once cloned (P6):** `split_for_3d` needs sole ownership, so a case's domain splits the weather before the waves, the boundary's level or anything else can hold it. Switches per handle would remove the build order.
+- **The farm's analysis (F.1) and particles (F.2)** as case-level tools, and **waves with 3D (F.4)**, which case files refuse as the example does not couple them.

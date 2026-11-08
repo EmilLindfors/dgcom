@@ -257,6 +257,10 @@ impl CaseFile {
             d.shear_smagorinsky
         })
         .with_tracer_limiter(limiter);
+        // The farm's cages on the layers their nets reach
+        if let Some(drag) = super::cage_drag(domain) {
+            physics = physics.with_cage_drag(drag);
+        }
         if let Some(nesting) = nesting {
             physics = physics.with_nesting(nesting);
         }

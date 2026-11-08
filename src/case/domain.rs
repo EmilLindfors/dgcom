@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use super::schema::{
-    AtlasCorrection, AtmosphereSection, GaugeCorrection, MeshSection, Nesting, RasterKind,
-    Sampling, SideTag, Slopes3D,
+    AtlasCorrection, AtmosphereSection, FarmSection, GaugeCorrection, MeshSection, Nesting,
+    RasterKind, Sampling, SideTag, Slopes3D,
 };
 use super::{CaseError, CaseFile};
 use crate::analysis::{GaugeRecord, HarmonicAnalysis, TideGaugeStation};
@@ -26,12 +26,14 @@ use crate::boundary::{
 };
 use crate::io::{
     AtmosphereReader, BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox,
-    GeoTiffBathymetry, LocalProjection, OceanModelReader, read_tide_gauge_file,
+    GeoTiffBathymetry, LocalProjection, OceanModelReader, read_farm_site_file,
+    read_tide_gauge_file,
 };
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, PointLocator2D, read_gmsh_mesh};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::Coare35;
 use crate::solver::Probe2D;
+use crate::source::{CageFootprint, NetCage};
 use crate::source::{GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress};
 use crate::types::ElementIndex;
 use crate::waves::{PointSpectra, WindSeries};
@@ -72,6 +74,8 @@ pub struct Domain {
     pub parent_reader: Option<Arc<OceanModelReader>>,
     /// `[waves]`: their mesh, bed, sea and weather
     pub waves: Option<WaveDomain>,
+    /// `[farm]`: the cages, their drag scaled by `drag_share`
+    pub cages: Vec<NetCage>,
     /// What was done to build it, line by line, for a log
     pub notes: Vec<String>,
 }
@@ -270,14 +274,79 @@ impl CaseFile {
             fluxes_3d,
             parent_reader,
             waves: None,
+            cages: Vec::new(),
             notes,
         };
+        if let Some(farm) = &case.farm {
+            let projection = projection.as_ref().expect("validated: placed");
+            let mut notes = Vec::new();
+            domain.cages = self.cages(farm, &domain, projection, &mut notes)?;
+            domain.notes.extend(notes);
+        }
         if case.waves.is_some() {
             let mut notes = Vec::new();
             domain.waves = Some(self.wave_domain(&domain, projection.as_ref(), &mut notes)?);
             domain.notes.extend(notes);
         }
         Ok(domain)
+    }
+
+    /// `[farm]`: the site's cages, their drag scaled by `drag_share`.
+    fn cages(
+        &self,
+        farm: &FarmSection,
+        domain: &Domain,
+        projection: &LocalProjection,
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<NetCage>, CaseError> {
+        let path = self.resolve(&farm.site);
+        let site = read_farm_site_file(&path)
+            .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
+        let cages = site.cage_layout(projection, &farm.grid());
+        let circles: Vec<([f64; 2], f64)> = cages
+            .iter()
+            .filter_map(|c| match c.footprint {
+                CageFootprint::Circle { center, radius } => Some((center, radius)),
+                _ => None,
+            })
+            .collect();
+        if circles.is_empty() {
+            return Err(CaseError::Invalid(format!(
+                "{}: no cages (no `cage` lines and no frame)",
+                path.display()
+            )));
+        }
+        let locator = PointLocator2D::new(&domain.mesh);
+        if let Some((c, _)) = circles.iter().find(|(c, _)| locator.locate(*c).is_none()) {
+            return Err(CaseError::Invalid(format!(
+                "{}: a cage at ({:.1}, {:.1}) km is outside the mesh",
+                path.display(),
+                c[0] / 1e3,
+                c[1] / 1e3
+            )));
+        }
+        let n = circles.len() as f64;
+        let centre = [0, 1].map(|d| circles.iter().map(|(c, _)| c[d]).sum::<f64>() / n);
+        let (lat, lon) = projection.xy_to_geo(centre[0], centre[1]);
+        notes.push(format!(
+            "farm: site {} {}, {} cages of radius {:.1} m, nets {:.0} m deep, solidity {} \
+             (C_d·a {:.4} 1/m), centred at {lat:.5}°N {lon:.5}°E; drag share {}",
+            site.number,
+            site.name,
+            cages.len(),
+            circles[0].1,
+            cages[0].net_depth,
+            farm.solidity,
+            cages[0].drag_per_length,
+            farm.drag_share
+        ));
+        Ok(cages
+            .into_iter()
+            .map(|c| NetCage {
+                drag_per_length: farm.drag_share * c.drag_per_length,
+                ..c
+            })
+            .collect())
     }
 
     /// `[waves]`: the waves' mesh (their own or the run's), the parent's
@@ -791,7 +860,7 @@ impl CaseFile {
             Bathymetry2D::from_function(&grid, &ops, &grid_geom, |x, y| -ramp.depth(x, y))
         } else {
             let projection = projection.expect("validated: a raster needs a placement");
-            let raster = self.raster(&grid, projection, notes)?;
+            let raster = self.raster(m, &grid, projection, notes)?;
             let sampler = raster.sampler(projection);
             match b.raster.as_ref().expect("validated").sampling {
                 Sampling::Projected => {
@@ -891,6 +960,7 @@ impl CaseFile {
     /// The bed raster, cropped to the mesh.
     fn raster(
         &self,
+        m: &MeshSection,
         grid: &Mesh2D,
         projection: &LocalProjection,
         notes: &mut Vec<String>,
@@ -898,12 +968,15 @@ impl CaseFile {
         let spec = self.case.bathymetry.raster.as_ref().expect("validated");
         let path = self.resolve(&spec.file);
         let io = |e: &dyn std::fmt::Display| CaseError::Io(format!("{}: {e}", path.display()));
-        let window = match &self.case.mesh.geographic {
-            Some(g) => {
+        // `crop`, else the mesh's own box (a geographic mesh's), else its
+        // extent with a margin
+        let window = match (spec.crop, &m.geographic) {
+            (Some([w, s, e, n]), _) => GeoBoundingBox::new(w, s, e, n),
+            (None, Some(g)) => {
                 let [w, s, e, n] = g.bbox;
                 GeoBoundingBox::new(w, s, e, n)
             }
-            None => mesh_window(grid, projection),
+            (None, None) => mesh_window(grid, projection),
         };
         let tiff = GeoTiffBathymetry::load(&path).map_err(|e| io(&e))?;
         let have = tiff.bbox();

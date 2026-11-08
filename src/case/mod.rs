@@ -28,9 +28,11 @@
 //! - a 3D run (`[three_d]`): σ-layers under the depth mean, started from
 //!   and nested in a parent's columns or a profile;
 //! - spectral waves coupled to the 2D run (`[waves]`), on its mesh or their
-//!   own, from a JONSWAP sea or a parent wave model's spectra.
+//!   own, from a JONSWAP sea or a parent wave model's spectra;
+//! - a fish farm's net cages dragging on the flow (`[farm]`).
 //!
-//! Next: the farm (`notes/case-files.md`).
+//! Next: the farm's analysis and particles (TODO F.1, F.2), and retiring
+//! `froya_real_data`'s moved modes (`notes/case-files.md`).
 
 mod domain;
 mod run;
@@ -857,6 +859,50 @@ file = \"parent.nc\"
                     with(sea)
                 ),
                 "three_d",
+            ),
+        ] {
+            let err = parse(&text).unwrap().validate().unwrap_err().to_string();
+            assert!(err.contains(says), "{says}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_farm_takes_a_ring_frames_defaults_and_needs_a_placed_mesh() {
+        let farm = |extra: &str| format!("\n[farm]\nsite = \"site.txt\"\n{extra}\n");
+        let placed = MINIMAL.replace(
+            "[bathymetry]",
+            "[mesh.origin]\nlat = 63.7\nlon = 8.5\n\n[bathymetry]",
+        );
+        let case = parse(&format!("{placed}{}", farm(""))).unwrap();
+        case.validate().unwrap();
+        let f = case.farm.as_ref().unwrap();
+        let ring = crate::io::CageGrid::RING_160M;
+        assert_eq!(
+            (
+                f.cage_spacing_m,
+                f.cage_radius_m,
+                f.net_depth_m,
+                f.solidity,
+                f.drag_share
+            ),
+            (
+                ring.spacing,
+                ring.radius,
+                ring.net_depth,
+                ring.solidity,
+                1.0
+            )
+        );
+        for (text, says) in [
+            (format!("{MINIMAL}{}", farm("")), "placed"),
+            (format!("{placed}{}", farm("solidity = 1.0")), "solidity"),
+            (
+                format!("{placed}{}", farm("drag_share = -0.1")),
+                "drag_share",
+            ),
+            (
+                format!("{placed}{}", farm("net_depth_m = 0.0")),
+                "net_depth_m",
             ),
         ] {
             let err = parse(&text).unwrap().validate().unwrap_err().to_string();

@@ -13,6 +13,11 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Fish farms in case files (TODO P8.2 stage 5; `notes/case-files.md`).**
+  - `[farm]` lays a Fiskeridirektoratet site's net cages out (`FarmSite::cage_layout`, a 160 m ring frame by default: `cage_spacing_m`, `cage_radius_m`, `net_depth_m`, `solidity`) and drags them on the depth mean in 2D and on the layers their nets reach in 3D. `drag_share` scales the drag: 0 is the same case without the cages, 0.1 the example's control run.
+  - `[bathymetry.raster] crop` states the window the raster is cut to (a filled topobathy bed depends on the cut, TODO P1.6), and a mesh's raster window is now its own box (the waves' mesh read the run's).
+  - `cases/froya/kattholmen_farm.toml` reproduces the cages' run of `froya_real_data`'s Kattholmen command bit for bit.
+
 - **Coupled waves in case files (TODO P8.2 stage 4; `notes/case-files.md`).**
   - `[waves]` couples the spectral wave model to the 2D run every `exchange_minutes` (`CoupledWaves2D`): on the run's mesh or a mesh of its own (`[waves.mesh]`, the `[mesh]` schema in the run's projection, the case's bed on it), a JONSWAP sea (`[waves.sea]`) or a parent wave model's spectra on the boundary (`[waves.spectra]`), `[atmosphere]`'s wind per wave node or the parent's, WAM's or SWAN's source integration (`sources`, with `integration`, `limiter`, `substeps`, `cfl`), absorbing land, the depth limit, the force form and implicit refraction. Snapshots carry the sea state, and the progress line the largest H_s.
   - `waves::SeaStateFrames` (the sea state at the outputs, linear between the exchanges) moved from `froya_real_data` into the library.
