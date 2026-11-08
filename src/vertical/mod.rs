@@ -105,9 +105,11 @@
 //! assert!(z[39] > -5.0);    // Top level near surface
 //! ```
 
+mod mean_profile;
 mod sigma;
 mod stretching;
 
+pub use mean_profile::MeanProfile;
 pub use sigma::SigmaGrid;
 pub use stretching::{
     DoubleTanhStretching, ROMSVstretching4, SongHaidvogelStretching, Stretching, UniformStretching,

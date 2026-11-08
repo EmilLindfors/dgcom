@@ -13,6 +13,12 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **3D runs in case files (TODO P8.2 stage 3; `notes/case-files.md`).**
+  - `[three_d]` runs `Hydrostatic3D` under the case's 2D module in a `Simulation3D` with mode splitting: `levels` σ-layers (Song–Haidvogel `theta_s`, `theta_b`, `hc_m`), GLS mixing (`mixing`), a log-layer bottom drag (`bottom_roughness_m`, replacing `[physics] friction`), thin columns (`thin_depth_m`, also the default of `[bathymetry.slopes_3d]`), the 3D and barotropic schemes, CFL numbers and local time stepping, the open faces' band, an initial `profile` where no parent covers, and the weather's wind on the columns with COARE 3.5 heat fluxes (`heat`, `jerlov`). The defaults are `froya_real_data levels=N tide3d=1`'s.
+  - A nested boundary whose parent has profiles starts the run from its columns and nests the 3D fields in them across the band.
+  - The library holds the example's 3D start: `vertical::MeanProfile`, `boundary::sample_columns`, `Solution3D::fill_tracers` and `keep_shear` (the example calls them; its 3D run is unchanged bit for bit).
+  - `cases/bodo/scored_3d_2026-06-12.toml` reproduces `froya_real_data levels=20 tide3d=1` (the scored 3D Bodø run) bit for bit, and the scored run's own output for its first 2 h.
+
 - **Gauge scores in case files and the library (TODO P8.1; `notes/case-files.md`).**
   - `[[output.station]] gauge = "obs.txt"` scores a station's surface against a tide gauge's record after `[output] spinup_hours` (default: the longest ramp of the forcing): the skill against the observations and against the gauge's own tidal prediction (RMSE, centred RMSE, bias, correlation, spreads), and the reference constants against the gauge's, into `gauge_skill.csv` and `gauge_constituents.csv`, in `RunReport` and in `dgcom run`'s log.
   - The library holds the example's scoring now: `GaugeRecord` (a gauge's finite samples and whole-record fit), `GaugeComparison` and `SkillScore` (`analysis`), `HarmonicAnalysis::fit_with_reference` and `HarmonicAnalysis::STATION_RECORD`. `froya_real_data`'s station report is built on them and prints the same numbers. A run too short for any constituent keeps its skill scores.

@@ -24,9 +24,11 @@
 //! - a weather model's wind and pressure, with the inverse-barometer level
 //!   at the open boundaries (NetCDF);
 //! - snapshot, VTK, NetCDF and station output, the stations scored
-//!   against tide gauges.
+//!   against tide gauges;
+//! - a 3D run (`[three_d]`): σ-layers under the depth mean, started from
+//!   and nested in a parent's columns or a profile.
 //!
-//! Next: the 3D model (`notes/case-files.md`).
+//! Next: the waves and the farm (`notes/case-files.md`).
 
 mod domain;
 mod run;
@@ -535,7 +537,15 @@ file = \"parent.nc\"
         assert!(!b.lower_wall_land);
         assert_eq!(b.wall_low_water_m, -2.0);
         let s = b.slopes_3d.as_ref().unwrap();
-        assert_eq!((s.r_max, s.free_depth_m, s.thin_depth_m), (0.15, 19.0, 0.1));
+        assert_eq!(
+            (s.r_max, s.free_depth_m, s.thin_depth_m),
+            (0.15, 19.0, None)
+        );
+        assert_eq!(
+            s.thin_depth(None),
+            0.1,
+            "Hydrostatic3D's default without [three_d]"
+        );
         assert_eq!(
             s.bound(),
             crate::mesh::ElementSlopeBound::for_pycnocline(19.0)
@@ -714,6 +724,78 @@ file = \"parent.nc\"
         );
         // Still water has no ramp
         assert_eq!(parse(MINIMAL).unwrap().spinup_hours(), 0.0);
+    }
+
+    #[test]
+    fn a_3d_run_takes_the_examples_defaults_and_refuses_what_it_replaces() {
+        let profile = "profile = [[0.0, 12.0, 32.0], [-20.0, 8.0, 34.0]]";
+        let three_d = |extra: &str| format!("{MINIMAL}\n[three_d]\nlevels = 10\n{extra}\n");
+        let case = parse(&three_d(profile)).unwrap();
+        case.validate().unwrap();
+        let d = case.three_d.as_ref().unwrap();
+        assert_eq!(
+            (d.theta_s, d.theta_b, d.hc_m, d.thin_depth_m),
+            (5.0, 0.4, 10.0, 1.0)
+        );
+        assert_eq!((d.cfl(), d.dt_max_s, d.barotropic_cfl), (4.0, 60.0, 2.0));
+        assert_eq!((d.barotropic_levels, d.levels_lts), (2, 0));
+        assert_eq!(
+            (d.mixing, d.bottom_roughness_m),
+            (Mixing3D::KEpsilon, 0.003)
+        );
+        assert_eq!(
+            parse(&three_d(&format!("{profile}\nscheme = \"ssp_rk3\"")))
+                .unwrap()
+                .three_d
+                .unwrap()
+                .cfl(),
+            2.0
+        );
+        // The profile: linear between its points, held beyond
+        assert_eq!(d.profile_at(5.0), Some((12.0, 32.0)));
+        assert_eq!(d.profile_at(-10.0), Some((10.0, 33.0)));
+        assert_eq!(d.profile_at(-50.0), Some((8.0, 34.0)));
+        // A 3D step reads its forcing a third of its longest step past the end
+        assert_eq!(case.forcing_end_s(), 3600.0 + 20.0);
+        // The bed's thin depth is the 3D model's
+        let with_slopes = parse(
+            &three_d(profile).replace("depth_m = 10.0", "depth_m = 10.0\n[bathymetry.slopes_3d]"),
+        )
+        .unwrap();
+        let slopes = with_slopes.bathymetry.slopes_3d.as_ref().unwrap();
+        assert_eq!(slopes.thin_depth(with_slopes.three_d.as_ref()), 1.0);
+
+        for (text, says) in [
+            (
+                three_d(profile).replace("levels = 10", "levels = 1"),
+                "levels",
+            ),
+            (three_d(""), "profile"),
+            (
+                three_d("profile = [[-20.0, 8.0, 34.0], [0.0, 12.0, 32.0]]"),
+                "top down",
+            ),
+            (three_d(&format!("{profile}\ntheta_b = 2.0")), "theta_b"),
+            (three_d(&format!("{profile}\njerlov = \"IX\"")), "jerlov"),
+            (
+                three_d(profile).replace(
+                    "[bathymetry]",
+                    "[physics]\nfriction = { manning = 0.025 }\n[bathymetry]",
+                ),
+                "friction",
+            ),
+            (
+                format!("{}\n[numerics]\ncfl = 0.5\n", three_d(profile)),
+                "[numerics]",
+            ),
+            (
+                format!("{}\n[output]\nvtk = true\n", three_d(profile)),
+                "2D only",
+            ),
+        ] {
+            let err = parse(&text).unwrap().validate().unwrap_err().to_string();
+            assert!(err.contains(says), "{says}: {err}");
+        }
     }
 
     #[test]

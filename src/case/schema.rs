@@ -41,6 +41,9 @@ pub struct Case {
     /// A weather model's wind and pressure (default: none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub atmosphere: Option<AtmosphereSection>,
+    /// A 3D run: σ-levels, mode splitting, vertical mixing (default: 2D).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub three_d: Option<ThreeDSection>,
     /// Time stepping.
     #[serde(default)]
     pub numerics: NumericsSection,
@@ -284,10 +287,11 @@ pub struct Slopes3D {
     /// the pycnocline's bottom).
     #[serde(default = "default_free_depth")]
     pub free_depth_m: f64,
-    /// Columns shallower than this are thin (m, default 0.1, the 3D model's
-    /// default): the shores, left alone.
-    #[serde(default = "default_thin_depth")]
-    pub thin_depth_m: f64,
+    /// Columns shallower than this are thin (m): the shores, left alone.
+    /// Default: `[three_d] thin_depth_m`, so the bed is smoothed for the
+    /// columns the 3D model resolves, else 0.1 (`Hydrostatic3D`'s default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thin_depth_m: Option<f64>,
     /// Raise the shore nodes of cliff elements to land (default true).
     #[serde(default = "default_true")]
     pub raise_cliffs: bool,
@@ -317,7 +321,14 @@ impl Slopes3D {
         }
     }
 
-    fn validate(&self) -> Result<(), CaseError> {
+    /// The thin depth (m), `three_d`'s by default (see `thin_depth_m`).
+    pub fn thin_depth(&self, three_d: Option<&ThreeDSection>) -> f64 {
+        self.thin_depth_m
+            .or(three_d.map(|d| d.thin_depth_m))
+            .unwrap_or_else(default_thin_depth)
+    }
+
+    fn validate(&self, thin_depth: f64) -> Result<(), CaseError> {
         let invalid = |m: String| Err(CaseError::Invalid(format!("bathymetry.slopes_3d.{m}")));
         if !(self.r_max > 0.0 && self.r_max < 1.0) {
             return invalid(format!("r_max must lie in (0, 1), not {}", self.r_max));
@@ -328,18 +339,14 @@ impl Slopes3D {
                 self.free_depth_m
             ));
         }
-        if !(positive(self.thin_depth_m) && self.thin_depth_m.is_finite()) {
-            return invalid(format!(
-                "thin_depth_m must be positive, not {}",
-                self.thin_depth_m
-            ));
+        if !(positive(thin_depth) && thin_depth.is_finite()) {
+            return invalid(format!("thin_depth_m must be positive, not {thin_depth}"));
         }
-        if self.raise_cliffs
-            && !(self.cliff_depth_m.is_finite() && self.cliff_depth_m > self.thin_depth_m)
+        if self.raise_cliffs && !(self.cliff_depth_m.is_finite() && self.cliff_depth_m > thin_depth)
         {
             return invalid(format!(
-                "cliff_depth_m must be deeper than thin_depth_m ({} m), not {}",
-                self.thin_depth_m, self.cliff_depth_m
+                "cliff_depth_m must be deeper than thin_depth_m ({thin_depth} m), not {}",
+                self.cliff_depth_m
             ));
         }
         if !self.high_water_m.is_finite() {
@@ -579,6 +586,197 @@ pub struct AtmosphereSection {
     /// The pressure gradient (default true).
     #[serde(default = "default_true")]
     pub pressure: bool,
+}
+
+/// `[three_d]`: a 3D run (`crate::physics::Hydrostatic3D` in a
+/// `crate::simulation::Simulation3D`, TODO P4): the 2D module of `[physics]`
+/// for the depth mean, with `levels` σ-layers of velocity, temperature and
+/// salinity under it, coupled by mode splitting
+/// (`crate::time::ModeSplitIntegrator`: barotropic substeps in each 3D
+/// stage). The defaults are `examples/froya_real_data.rs levels=N tide3d=1`'s.
+///
+/// - **Vertical grid:** Song & Haidvogel (1994) stretching (`theta_s`,
+///   `theta_b`, `hc_m`).
+/// - **Physics:** GLS turbulence closure (`mixing`), a linear equation of
+///   state, a log-layer bottom drag over `bottom_roughness_m` (which replaces
+///   `[physics] friction`), the shear's Smagorinsky viscosity, the pressure
+///   gradient about the initial mean profile, a Kuzmin limiter on the
+///   tracers, and the vertical advection beyond an explicit Courant number
+///   taken implicitly.
+/// - **Wetting and drying:** columns shallower than `thin_depth_m` carry no
+///   shear (`Hydrostatic3D::with_min_column_depth`).
+/// - **Start:** at rest at mean sea level. A nested boundary whose parent
+///   has profiles gives the initial T, S and shear (about a depth mean at
+///   rest) where it covers, and their stable mean profile elsewhere and
+///   below its bed; without one, `profile` gives T and S everywhere.
+/// - **Open boundaries:** the 3D fields relax across a band to the parent's
+///   columns (nesting: its `band_km` and `band_minutes`), else to the
+///   initial state at rest (`band_km`, `band_minutes` here).
+/// - **Weather:** `[atmosphere]`'s wind stress acts on the columns and its
+///   pressure on the depth mean; with `heat` and a weather file that has the
+///   heat budget, COARE 3.5 surface fluxes, shortwave absorbed as Jerlov
+///   water `jerlov`.
+///
+/// Output: snapshots (`<name>.dgsnap`, 3D) at their times exactly, and the
+/// stations at the first step on or after theirs (from the depth mean);
+/// VTK and NetCDF are 2D only for now.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreeDSection {
+    /// σ-layers (at least 2).
+    pub levels: usize,
+    /// Song–Haidvogel surface stretching (default 5).
+    #[serde(default = "default_theta_s")]
+    pub theta_s: f64,
+    /// Song–Haidvogel bottom stretching (default 0.4).
+    #[serde(default = "default_theta_b")]
+    pub theta_b: f64,
+    /// Depth of the near-surface resolution (m, default 10).
+    #[serde(default = "default_hc")]
+    pub hc_m: f64,
+    /// Columns shallower than this are thin (m, default 1).
+    #[serde(default = "default_thin_depth_3d")]
+    pub thin_depth_m: f64,
+    /// GLS closure: `"k_epsilon"` (default), `"k_omega"` or `"generic"`.
+    #[serde(default)]
+    pub mixing: Mixing3D,
+    /// Roughness length of the log-layer bottom drag (m, default 0.003).
+    #[serde(default = "default_roughness")]
+    pub bottom_roughness_m: f64,
+    /// Smagorinsky coefficient of the shear's horizontal viscosity where
+    /// `[physics]` sets no viscosity (default 0.1); with one, the shear takes
+    /// `[physics]`'s as the depth mean does.
+    #[serde(default = "default_shear_smagorinsky")]
+    pub shear_smagorinsky: f64,
+    /// Stages of the 3D step (default `"ssp_rk43"`).
+    #[serde(default)]
+    pub scheme: Integrator,
+    /// CFL number of the 3D step (default 4 for `ssp_rk43`, 2 for
+    /// `ssp_rk3`: SSP-RK(4,3)'s stages hold twice the step where a
+    /// forward-Euler bound sets it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfl: Option<f64>,
+    /// Longest 3D step (s, default 60): it bounds how far past the end the
+    /// last step reads its forcing.
+    #[serde(default = "default_dt_max_3d")]
+    pub dt_max_s: f64,
+    /// Local time stepping levels of the 3D stages (default 0: global).
+    #[serde(default)]
+    pub levels_lts: usize,
+    /// Stages of the barotropic substeps (default `"ssp_rk43"`).
+    #[serde(default)]
+    pub barotropic_scheme: Integrator,
+    /// CFL number of the barotropic substeps (default 2).
+    #[serde(default = "default_barotropic_cfl")]
+    pub barotropic_cfl: f64,
+    /// Local time stepping levels of the barotropic substeps (default 2).
+    #[serde(default = "default_barotropic_levels")]
+    pub barotropic_levels: usize,
+    /// Width of the open boundaries' band where no parent is nested (km,
+    /// default 3).
+    #[serde(default = "default_band_km")]
+    pub band_km: f64,
+    /// Its relaxation time (minutes, default 30).
+    #[serde(default = "default_band_minutes")]
+    pub band_minutes: f64,
+    /// The initial T (°C) and S at heights `z` (m, negative below mean sea
+    /// level), `[[z, T, S], ...]` from the top down, linear between them and
+    /// held beyond: where no parent covers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile: Vec<[f64; 3]>,
+    /// Surface heat and freshwater fluxes from `[atmosphere]` where its
+    /// file has the heat budget (default true).
+    #[serde(default = "default_true")]
+    pub heat: bool,
+    /// Jerlov water type of the shortwave absorption (default `"III"`,
+    /// turbid coastal water).
+    #[serde(default = "default_jerlov")]
+    pub jerlov: String,
+}
+
+/// `[three_d] mixing`: the GLS closure (Umlauf & Burchard 2003).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mixing3D {
+    /// k–ε
+    #[default]
+    KEpsilon,
+    /// k–ω
+    KOmega,
+    /// Umlauf & Burchard's generic length scale
+    Generic,
+}
+
+impl ThreeDSection {
+    /// The CFL number of the 3D step.
+    pub fn cfl(&self) -> f64 {
+        self.cfl.unwrap_or(match self.scheme {
+            Integrator::SspRk43 => 4.0,
+            Integrator::SspRk3 => 2.0,
+        })
+    }
+
+    /// T and S at height `z` from `profile`, linear between its points and
+    /// held beyond them; `None` without one.
+    pub fn profile_at(&self, z: f64) -> Option<(f64, f64)> {
+        let p = &self.profile;
+        let (first, last) = (p.first()?, p.last()?);
+        if z >= first[0] {
+            return Some((first[1], first[2]));
+        }
+        if z <= last[0] {
+            return Some((last[1], last[2]));
+        }
+        let i = p.windows(2).position(|w| z <= w[0][0] && z >= w[1][0])?;
+        let (a, b) = (p[i], p[i + 1]);
+        let w = (a[0] - z) / (a[0] - b[0]);
+        Some((a[1] + w * (b[1] - a[1]), a[2] + w * (b[2] - a[2])))
+    }
+
+    fn validate(&self) -> Result<(), CaseError> {
+        let invalid = |m: String| Err(CaseError::Invalid(format!("three_d.{m}")));
+        if self.levels < 2 {
+            return invalid(format!("levels must be at least 2, not {}", self.levels));
+        }
+        for (key, value) in [
+            ("theta_s", self.theta_s),
+            ("hc_m", self.hc_m),
+            ("thin_depth_m", self.thin_depth_m),
+            ("bottom_roughness_m", self.bottom_roughness_m),
+            ("dt_max_s", self.dt_max_s),
+            ("barotropic_cfl", self.barotropic_cfl),
+            ("cfl", self.cfl()),
+            ("band_minutes", self.band_minutes),
+        ] {
+            if !(positive(value) && value.is_finite()) {
+                return invalid(format!("{key} must be positive, not {value}"));
+            }
+        }
+        for (key, value) in [
+            ("theta_b", self.theta_b),
+            ("shear_smagorinsky", self.shear_smagorinsky),
+            ("band_km", self.band_km),
+        ] {
+            if !(non_negative(value) && value.is_finite()) {
+                return invalid(format!("{key} must be ≥ 0, not {value}"));
+            }
+        }
+        if self.theta_b > 1.0 {
+            return invalid(format!("theta_b must be at most 1, not {}", self.theta_b));
+        }
+        if self.levels_lts > 16 || self.barotropic_levels > 16 {
+            return invalid("levels_lts and barotropic_levels are at most 16".into());
+        }
+        if self.profile.windows(2).any(|w| w[0][0] <= w[1][0])
+            || self.profile.iter().flatten().any(|v| !v.is_finite())
+        {
+            return invalid("profile needs finite [z, T, S] points from the top down".into());
+        }
+        if let Err(e) = self.jerlov.parse::<crate::physics::JerlovWater>() {
+            return invalid(format!("jerlov: {e}"));
+        }
+        Ok(())
+    }
 }
 
 /// `[boundary.nesting]`: one-way nesting in a parent ocean model
@@ -1002,6 +1200,36 @@ fn default_slopes_r_max() -> f64 {
 fn default_free_depth() -> f64 {
     19.0
 }
+fn default_theta_s() -> f64 {
+    5.0
+}
+fn default_theta_b() -> f64 {
+    0.4
+}
+fn default_hc() -> f64 {
+    10.0
+}
+fn default_thin_depth_3d() -> f64 {
+    1.0 // `froya_real_data`'s TIDE_3D_THIN_DEPTH
+}
+fn default_roughness() -> f64 {
+    0.003
+}
+fn default_shear_smagorinsky() -> f64 {
+    0.1
+}
+fn default_dt_max_3d() -> f64 {
+    60.0
+}
+fn default_barotropic_cfl() -> f64 {
+    2.0
+}
+fn default_barotropic_levels() -> usize {
+    2
+}
+fn default_jerlov() -> String {
+    "III".to_string()
+}
 fn default_thin_depth() -> f64 {
     0.1 // `Hydrostatic3D::DEFAULT_MIN_COLUMN_DEPTH`
 }
@@ -1228,7 +1456,7 @@ impl Case {
             return invalid("bathymetry.wall_low_water_m must be finite".into());
         }
         if let Some(s) = &b.slopes_3d {
-            s.validate()?;
+            s.validate(s.thin_depth(self.three_d.as_ref()))?;
         }
         if let Some(a) = &self.atmosphere {
             if !self.placed() {
@@ -1486,6 +1714,53 @@ impl Case {
         {
             return invalid(format!("output.spinup_hours must be ≥ 0, not {h}"));
         }
+        if let Some(d) = &self.three_d {
+            d.validate()?;
+            if self.physics.friction.is_some() {
+                return invalid(
+                    "[three_d] has its own bottom drag (three_d.bottom_roughness_m): drop \
+                     physics.friction"
+                        .into(),
+                );
+            }
+            let nested = self
+                .boundaries
+                .iter()
+                .filter(|b| b.nesting.is_some())
+                .count();
+            if nested > 0 && nested < self.boundaries.len() {
+                return invalid(
+                    "[three_d] nests all its open boundaries in one parent or none".into(),
+                );
+            }
+            if nested > 1 {
+                return invalid("[three_d] nests in one parent: one nested [[boundary]]".into());
+            }
+            let n = &self.numerics;
+            if n.integrator != Integrator::default()
+                || n.cfl.is_some()
+                || n.dt_max_s.is_some()
+                || n.local_time_stepping_levels > 0
+            {
+                return invalid(
+                    "[numerics] steps a 2D run; a 3D run's steps are [three_d]'s (scheme, cfl, \
+                     dt_max_s, levels_lts, barotropic_*)"
+                        .into(),
+                );
+            }
+            if nested == 0 && d.profile.is_empty() {
+                return invalid(
+                    "[three_d] without a nested parent needs `profile`, the initial T and S".into(),
+                );
+            }
+            if o.vtk || o.netcdf {
+                return invalid(
+                    "[three_d] writes snapshots and stations; output.vtk and output.netcdf are \
+                     2D only for now"
+                        .into(),
+                );
+            }
+        }
         // Last, so that a build without NetCDF still checks the rest
         if self.atmosphere.is_some() && !cfg!(feature = "netcdf") {
             return invalid(
@@ -1538,6 +1813,17 @@ impl Case {
             let atmosphere = self.atmosphere.as_ref().map(|a| a.ramp_hours);
             boundaries.chain(atmosphere).fold(0.0, f64::max)
         })
+    }
+
+    /// The last time the run reads its forcing (s): the end, and for a 3D
+    /// run a third of its longest step past it (a 3D step's barotropic pass
+    /// reads `ModeSplitIntegrator::FORCING_REACH` of the step).
+    pub fn forcing_end_s(&self) -> f64 {
+        let t_end = 3600.0 * self.run.duration_hours;
+        match &self.three_d {
+            Some(d) => t_end + (crate::time::ModeSplitIntegrator::FORCING_REACH - 1.0) * d.dt_max_s,
+            None => t_end,
+        }
     }
 
     /// The run's clock, from `run.start`.

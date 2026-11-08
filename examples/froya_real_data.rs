@@ -566,6 +566,7 @@ use dgcom::time::{
 #[cfg(feature = "netcdf")]
 use dgcom::types::Depth;
 use dgcom::types::ElementIndex;
+use dgcom::vertical::MeanProfile;
 use dgcom::waves::{BoundarySpectra, PointSpectra, WindSeries};
 use dgcom::waves::{
     CoupledWaves2D, CoupledWavesStats, DEFAULT_RATE_LIMITER, GrowthLimiter, SeaStateFields,
@@ -3712,134 +3713,6 @@ fn report_stations(
     Ok(())
 }
 
-/// The domain's mean profile of T and S (°C, psu) in `z` (m), on a 1 m
-/// grid: a horizontally uniform stratification for the references of the PGF,
-/// the tracer limiter and the open faces.
-///
-/// At each height the mean of the columns that reach it, interpolated between
-/// their layer centres, then made statically stable: adjacent heights where
-/// the density decreases downwards are pooled into their weighted mean
-/// (pool-adjacent-violators on `density(T, S)`, which is linear in T and S,
-/// so a pool's density is its mean's). The columns that reach a height change
-/// with depth (below 100 m only the deep holes), and that mean alone was
-/// inverted in places: as a reference, and with `uniform` as the state, its
-/// overturning drove a bed jet of 0.26 m/s within ten minutes in a 120 m hole
-/// at Mausund (TODO P1.3). Taking every column at every height instead
-/// (extended below its bed) is stable but puts the shallow columns' bottom
-/// water in the deep holes: 10.1 °C at 100 m where the holes have 8.3 °C.
-#[derive(Clone)]
-struct MeanProfile {
-    /// Height of the lowest grid point (m)
-    z0: f64,
-    temp: Vec<f64>,
-    salt: Vec<f64>,
-}
-
-impl MeanProfile {
-    fn of(
-        state: &dgcom::solver::state::Solution3D,
-        bed: &[f64],
-        sigma: &dgcom::vertical::SigmaGrid,
-        use_column: impl Fn(usize) -> bool,
-        density: impl Fn(f64, f64) -> f64,
-    ) -> Option<Self> {
-        let nl = state.n_levels;
-        let deepest = bed.iter().copied().fold(0.0, f64::min);
-        let n = (-deepest).ceil() as usize + 1;
-        let z0 = -((n - 1) as f64);
-        let (mut sum_t, mut sum_s, mut count) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
-        for (idx, &b) in bed.iter().enumerate() {
-            if b >= 0.0 || !use_column(idx) {
-                continue;
-            }
-            // The layer centres at mean sea level, from the bed up
-            let z = |l: usize| sigma.sigma_rho()[l] * -b;
-            let (t, sal) = (
-                &state.temp[idx * nl..(idx + 1) * nl],
-                &state.salt[idx * nl..(idx + 1) * nl],
-            );
-            let mut l = 0;
-            for i in 0..n {
-                let zi = z0 + i as f64;
-                // Within the column: its bed to the surface
-                if zi < b {
-                    continue;
-                }
-                while l + 1 < nl && z(l + 1) <= zi {
-                    l += 1;
-                }
-                let (value_t, value_s) = if zi <= z(0) {
-                    (t[0], sal[0])
-                } else if l + 1 >= nl {
-                    (t[nl - 1], sal[nl - 1])
-                } else {
-                    let w = (zi - z(l)) / (z(l + 1) - z(l));
-                    (
-                        t[l] + w * (t[l + 1] - t[l]),
-                        sal[l] + w * (sal[l + 1] - sal[l]),
-                    )
-                };
-                sum_t[i] += value_t;
-                sum_s[i] += value_s;
-                count[i] += 1.0;
-            }
-        }
-        if count.iter().all(|&c| c == 0.0) {
-            return None;
-        }
-        // Pools from the surface down: (Σ T, Σ S, weight, heights)
-        let mut pools: Vec<(f64, f64, f64, usize)> = Vec::new();
-        for i in (0..n).rev() {
-            if count[i] == 0.0 {
-                // Below every column: the pool above extends
-                if let Some(last) = pools.last_mut() {
-                    last.3 += 1;
-                }
-                continue;
-            }
-            pools.push((sum_t[i], sum_s[i], count[i], 1));
-            while pools.len() >= 2 {
-                let rho = |p: &(f64, f64, f64, usize)| density(p.0 / p.2, p.1 / p.2);
-                let (lower, upper) = (pools[pools.len() - 1], pools[pools.len() - 2]);
-                if rho(&lower) >= rho(&upper) {
-                    break;
-                }
-                pools.pop();
-                let merged = pools.last_mut().expect("two pools");
-                *merged = (
-                    merged.0 + lower.0,
-                    merged.1 + lower.1,
-                    merged.2 + lower.2,
-                    merged.3 + lower.3,
-                );
-            }
-        }
-        // Back to heights, from the bottom up
-        let (mut temp, mut salt) = (Vec::with_capacity(n), Vec::with_capacity(n));
-        for &(t, s, w, len) in pools.iter().rev() {
-            temp.extend(std::iter::repeat_n(t / w, len));
-            salt.extend(std::iter::repeat_n(s / w, len));
-        }
-        // Heights above the top layer centre of every column take the top
-        let (t_top, s_top) = (*temp.last()?, *salt.last()?);
-        temp.resize(n, t_top);
-        salt.resize(n, s_top);
-        Some(Self { z0, temp, salt })
-    }
-
-    /// T and S at height `z`, linear between grid points and held beyond them.
-    fn at(&self, z: f64) -> (f64, f64) {
-        let x = (z - self.z0).clamp(0.0, (self.temp.len() - 1) as f64);
-        let i = (x.floor() as usize).min(self.temp.len().saturating_sub(2));
-        let w = (x - i as f64).clamp(0.0, 1.0);
-        let j = (i + 1).min(self.temp.len() - 1);
-        (
-            self.temp[i] + w * (self.temp[j] - self.temp[i]),
-            self.salt[i] + w * (self.salt[j] - self.salt[i]),
-        )
-    }
-}
-
 /// The tide in 3D (`levels=N tide3d=1`, TODO P1.3): see the module docs.
 /// The rivers of `rivers=` on the mesh, those whose mouth is within
 /// `river_snap_km` of it (the others are listed and left out).
@@ -3942,8 +3815,8 @@ fn tidal_run_3d<'a>(
     farm: Option<(&'a FarmCase, FarmRun)>,
 ) -> Result<Option<FarmRecord<'a>>, Box<dyn std::error::Error>> {
     use dgcom::boundary::{
-        ColumnContext3D, DeepReference, Nesting3D, NestingBand3D, OceanColumnsOptions,
-        OceanModelColumns, ParentColumn, ParentColumns3D, ReferenceColumns,
+        DeepReference, Nesting3D, NestingBand3D, OceanColumnsOptions, OceanModelColumns,
+        ParentColumns3D, ReferenceColumns, sample_columns,
     };
     // e-folding depth of the parent's bottom anomaly below its bed (m)
     const DEEP_DECAY: f64 = 10.0;
@@ -4052,43 +3925,15 @@ fn tidal_run_3d<'a>(
     let sample = |columns: &Option<Arc<dyn ParentColumns3D>>,
                   state: &mut Solution3D,
                   covered: &mut [bool]| {
-        let (mut u, mut v, mut t_col, mut s_col) =
-            (vec![0.0; nl], vec![0.0; nl], vec![0.0; nl], vec![0.0; nl]);
-        for idx in 0..ne * nn {
-            let eta = bed[idx].max(0.0);
-            state.eta.data[idx] = eta;
-            covered[idx] = false;
-            let Some(columns) = columns.as_ref().filter(|_| bed[idx] < 0.0) else {
-                continue;
-            };
-            let (k, i) = (idx / nn, idx % nn);
-            let [x, y] = domain.mesh.reference_to_physical(
-                ElementIndex::new(k),
-                domain.ops.nodes_r[i],
-                domain.ops.nodes_s[i],
-            );
-            let ctx = ColumnContext3D {
-                time: 0.0,
-                node: idx,
-                position: (x, y),
-                bed: bed[idx],
-                eta,
-            };
-            let out = ParentColumn {
-                u: &mut u,
-                v: &mut v,
-                temp: &mut t_col,
-                salt: &mut s_col,
-            };
-            if columns.column(&ctx, &sigma, out) {
-                let column = idx * nl..(idx + 1) * nl;
-                state.u[column.clone()].copy_from_slice(&u);
-                state.v[column.clone()].copy_from_slice(&v);
-                state.temp[column.clone()].copy_from_slice(&t_col);
-                state.salt[column].copy_from_slice(&s_col);
-                covered[idx] = true;
-            }
-        }
+        sample_columns(
+            columns.as_deref(),
+            &domain.mesh,
+            &domain.ops,
+            &sigma,
+            bed,
+            state,
+            covered,
+        );
     };
     sample(&columns, &mut state, &mut covered);
     let n_covered = covered.iter().filter(|&&c| c).count();
@@ -4123,36 +3968,17 @@ fn tidal_run_3d<'a>(
             mean.as_ref().map_or_else(|| summer(z), |m| m.at(z))
         }
     };
-    for idx in (0..ne * nn).filter(|&idx| !covered[idx]) {
-        let eta = state.eta.data[idx];
-        for (l, &s) in sigma.sigma_rho().iter().enumerate() {
-            let z = eta + s * (eta - bed[idx]);
-            (state.temp[idx * nl + l], state.salt[idx * nl + l]) = profile(z);
-        }
-    }
+    state.fill_tracers(&sigma, bed, |idx| !covered[idx], profile);
     // The velocity: the parent's shear about the 2D module's depth mean,
     // zero at the start (the tide ramps up from rest), where the parent
     // covers a column at least the thin depth deep; else at rest
     // (`debug_3d=still`: at rest everywhere, the parent's density field
     // adjusting without its currents)
-    let mut n_sheared = 0;
-    for idx in 0..ne * nn {
-        let column = idx * nl..(idx + 1) * nl;
-        let sheared =
-            covered[idx] && state.eta.data[idx] - bed[idx] >= opts.thin_depth() && !dbg("still");
-        for field in [&mut state.u, &mut state.v] {
-            let values = &mut field[column.clone()];
-            let mean = if sheared {
-                sigma.depth_average(values)
-            } else {
-                0.0
-            };
-            values
-                .iter_mut()
-                .for_each(|x| *x = if sheared { *x - mean } else { 0.0 });
-        }
-        n_sheared += usize::from(sheared);
-    }
+    let thin = opts.thin_depth();
+    let eta0: Vec<f64> = state.eta.data.clone();
+    let n_sheared = state.keep_shear(&sigma, |idx| {
+        covered[idx] && eta0[idx] - bed[idx] >= thin && !dbg("still")
+    });
     let largest_shear = state
         .u
         .iter()

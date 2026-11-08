@@ -114,11 +114,21 @@ fn run(file: &CaseFile) -> Result<(), String> {
     for line in describe(file, &domain) {
         println!("  {line}");
     }
-    println!(
-        "  {:?}, CFL {:.3}",
-        case.numerics.integrator,
-        case.numerics.cfl_at(case.mesh.order)
-    );
+    match &case.three_d {
+        Some(d) => println!(
+            "  3D: {} levels, {:?} at CFL {}, barotropic {:?} at CFL {}",
+            d.levels,
+            d.scheme,
+            d.cfl(),
+            d.barotropic_scheme,
+            d.barotropic_cfl
+        ),
+        None => println!(
+            "  {:?}, CFL {:.3}",
+            case.numerics.integrator,
+            case.numerics.cfl_at(case.mesh.order)
+        ),
+    }
     let done = file
         .run_on(&domain, &mut report)
         .map_err(|e| e.to_string())?;
@@ -127,6 +137,9 @@ fn run(file: &CaseFile) -> Result<(), String> {
         "done: {} steps (dt {:.3}–{:.3} s) in {:.1} s; volume {:.6e} → {:.6e} m³",
         done.n_steps, done.dt_range_s.0, done.dt_range_s.1, done.wall_time_s, v0, v1
     );
+    for line in &done.notes {
+        println!("  {line}");
+    }
     for s in &done.stations {
         let Some(g) = &s.gauge else { continue };
         println!(
