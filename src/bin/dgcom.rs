@@ -3,12 +3,16 @@
 //! ```text
 //! dgcom run   <case.toml> [--set key.path=value]...
 //! dgcom check <case.toml> [--set key.path=value]...
+//! dgcom mesh  <case.toml> [--set key.path=value]...
 //! dgcom --version
 //! ```
 //!
 //! `run` builds the case and runs it, writing to the case's output
 //! directory. `check` reads and validates the case, builds its mesh and bed,
 //! and prints the case with every default filled in, without running it.
+//! `mesh` builds the mesh and bed and writes them to the output directory's
+//! `mesh` folder (Gmsh with the boundary tags; VTK with the bed and each
+//! element's time step at rest) to inspect before a run.
 //! `--set` overrides a key of the case file, e.g. `--set numerics.cfl=0.5`.
 
 use std::path::PathBuf;
@@ -22,6 +26,7 @@ dgcom: the Discontinuous Galerkin Coastal Ocean Model
 usage:
   dgcom run   <case.toml> [--set key.path=value]...   run a case
   dgcom check <case.toml> [--set key.path=value]...   validate a case and print it resolved
+  dgcom mesh  <case.toml> [--set key.path=value]...   write the mesh and bed to inspect (Gmsh, VTK)
   dgcom --version                                     the build: version and git commit
 
 A case file is TOML (or JSON, by its .json extension); see
@@ -63,6 +68,7 @@ fn cli(args: Vec<String>) -> Result<(), String> {
     let file = CaseFile::read(&path, &overrides).map_err(|e| e.to_string())?;
     match command.as_str() {
         "check" => check(&file),
+        "mesh" => mesh(&file),
         "run" => run(&file),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     }
@@ -94,6 +100,35 @@ fn check(file: &CaseFile) -> Result<(), String> {
     }
     eprintln!("ok: output to {}", file.output_dir().display());
     print!("{}", file.case.resolved().to_toml());
+    Ok(())
+}
+
+fn mesh(file: &CaseFile) -> Result<(), String> {
+    let domain = file.build_domain().map_err(|e| e.to_string())?;
+    for line in describe(file, &domain) {
+        println!("  {line}");
+    }
+    let report = file.write_mesh(&domain).map_err(|e| e.to_string())?;
+    if let Some((lo, hi)) = report.element_dt_s {
+        println!("  element steps at rest {lo:.3} to {hi:.3} s");
+    }
+    if let Some(dt) = report.step_s {
+        println!("  the run's step at rest: {dt:.3} s");
+        // Each level's elements, by the step they take
+        let levels: Vec<String> = report
+            .elements_per_level
+            .iter()
+            .enumerate()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(l, n)| format!("{n} at {:.3} s (level {l})", dt / (1u64 << l) as f64))
+            .collect();
+        if !levels.is_empty() {
+            println!("  local time stepping: {}", levels.join(", "));
+        }
+    }
+    for path in &report.files {
+        println!("wrote {}", path.display());
+    }
     Ok(())
 }
 

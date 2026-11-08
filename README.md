@@ -11,6 +11,7 @@ A run is described by a case file: the mesh, the bed, the physics, the open boun
 ```sh
 cargo build --release --bin dgcom --no-default-features --features parallel,simd   # no native NetCDF needed
 ./target/release/dgcom check cases/tidal_channel/case.toml   # validate it, print it with every default
+./target/release/dgcom mesh  cases/tidal_channel/case.toml   # write its mesh and bed (Gmsh, VTK) to inspect
 ./target/release/dgcom run   cases/tidal_channel/case.toml   # 25 h of tide in a few seconds
 ```
 

@@ -41,7 +41,7 @@ pub mod schema;
 use std::path::{Path, PathBuf};
 
 pub use domain::{Domain, StationProbe, WaveDomain};
-pub use run::{Progress, RunReport, StationSeries};
+pub use run::{MeshReport, Progress, RunReport, StationSeries};
 pub use schema::*;
 
 /// What can go wrong with a case.

@@ -13,6 +13,8 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **`dgcom mesh case.toml` (TODO P8.1; `notes/case-files.md`)** builds a case's mesh and bed and writes them to the output directory's `mesh` folder to inspect before a run: Gmsh (`<name>.msh`, the boundary tags as physical groups) and VTK (`<name>.vtu`: the bed and the depth at rest at the nodes; each element's diameter, the 2D time step it allows at rest at the case's CFL, and with local time stepping its level). It prints the element steps, the run's first step and the elements per level; a separate wave mesh is written beside it. `io::write_vtk_fields` writes any node and element fields (`write_vtk_swe` is built on it).
+
 - **A case's output names its build and carries the viewer's metadata (TODO P8.1; `notes/case-files.md`).**
   - `dgcom::provenance` (from a new `build.rs`): the version, the git commit and whether the sources (`src`, `Cargo.toml`, `Cargo.lock`, `build.rs`) differed from it. `provenance::describe()` (`dgcom 0.1.0 (commit 45388bf468c0, modified)`) heads `case.resolved.toml` as a comment, is the snapshot's `build` key and the NetCDF file's `source`, and `dgcom --version` prints it. `froya_real_data`'s snapshots carry it too.
   - Case snapshots carry the stations (where they are sampled), the mesh's projection and the farm's cages in `froya_real_data`'s and `farm_3d`'s keys, so `dg-viz` draws the land, the station markers and the cages over a case run.

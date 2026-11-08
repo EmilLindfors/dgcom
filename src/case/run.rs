@@ -9,8 +9,11 @@ use std::fs::{self, File};
 use crate::analysis::{GaugeComparison, TimeSeries};
 use crate::waves::{CoupledWaves2D, SeaStateFields, SeaStateFrames};
 
+mod mesh;
 mod three_d;
 mod waves;
+
+pub use mesh::MeshReport;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -129,15 +132,7 @@ impl CaseFile {
             .as_ref()
             .map(|_| std::cell::RefCell::new(SeaStateFrames::default()));
 
-        // Still water at the initial level
-        let eta0 = case.initial.eta_m;
-        let mut q = SWESolution2D::new(domain.mesh.n_elements, domain.ops.n_nodes);
-        for k in ElementIndex::iter(domain.mesh.n_elements) {
-            for i in 0..domain.ops.n_nodes {
-                let h = (eta0 - domain.bathymetry.get(k, i)).max(0.0);
-                q.set_state(k, i, SWEState2D::new(h, 0.0, 0.0));
-            }
-        }
+        let mut q = still_water(case, domain);
 
         let surface: &[&str] = if waves.is_some() {
             &SeaStateFields::NAMES
@@ -678,6 +673,19 @@ fn snapshot_metadata(name: &str, domain: &Domain) -> Vec<(&'static str, String)>
         }
     }
     metadata
+}
+
+/// Still water at the case's initial level on `domain`.
+fn still_water(case: &super::Case, domain: &Domain) -> SWESolution2D {
+    let eta0 = case.initial.eta_m;
+    let mut q = SWESolution2D::new(domain.mesh.n_elements, domain.ops.n_nodes);
+    for k in ElementIndex::iter(domain.mesh.n_elements) {
+        for i in 0..domain.ops.n_nodes {
+            let h = (eta0 - domain.bathymetry.get(k, i)).max(0.0);
+            q.set_state(k, i, SWEState2D::new(h, 0.0, 0.0));
+        }
+    }
+    q
 }
 
 /// The run's writers.
