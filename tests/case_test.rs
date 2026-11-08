@@ -370,6 +370,105 @@ fn a_stratified_basin_at_rest_stays_at_rest_in_3d() {
 /// as deep as a third of its wavelength, the sea keeps its height (the
 /// largest H_s 1.000–1.015 m over the hour), the coupled run stays near
 /// rest (|ū| 2e-6 m/s), and the snapshots carry the sea state.
+/// A 3D run's stations are recorded at their times, between its steps by
+/// linear interpolation: with the fields hourly (the steps land on them)
+/// and the stations every 10 minutes, the series is the one of the run whose
+/// steps land on every 10 minutes, to the interpolation's error after the
+/// tide's ramp (2.2e-6 m in η; Δt²/8·|η''| ≈ 2.6e-6 m at 47 s), up to 2e-4 m
+/// in the ramp's transients.
+#[test]
+fn a_3d_runs_stations_are_recorded_at_their_times() {
+    // An M2 tide into a 3D channel; the fields at `field_minutes`, the
+    // stations every 10 minutes
+    let run = |field_minutes: f64| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("case.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+                [run]
+                duration_hours = 2.0
+
+                [mesh.rectangle]
+                x_m = [0.0, 10000.0]
+                y_m = [0.0, 2000.0]
+                nx = 10
+                ny = 2
+                west = "open"
+
+                [bathymetry]
+                depth_m = 20.0
+
+                [[boundary]]
+                tag = "open"
+                [boundary.tide]
+                ramp_hours = 0.5
+                constituents = [{{ name = "M2", amplitude_m = 0.5 }}]
+
+                [three_d]
+                levels = 6
+                dt_max_s = 47.0
+                profile = [[-6.0, 14.0, 32.0], [-14.0, 10.0, 34.0]]
+
+                [output]
+                directory = "out"
+                interval_minutes = {field_minutes:?}
+                station_interval_minutes = 10.0
+
+                [[output.station]]
+                name = "head"
+                x_m = 9500.0
+                y_m = 1000.0
+                "#
+            ),
+        )
+        .unwrap();
+        let report = CaseFile::read(&path, &[])
+            .unwrap()
+            .run(&mut |_| {})
+            .unwrap();
+        (report, dir)
+    };
+    let (between, _dir) = run(60.0);
+    let (landed, _dir2) = run(10.0);
+    let (a, b) = (&between.stations[0], &landed.stations[0]);
+    let times: Vec<f64> = (0..=12).map(|i| 600.0 * f64::from(i)).collect();
+    assert_eq!(a.time_s, times);
+    assert_eq!(b.time_s, times);
+    let largest = |x: &[f64], y: &[f64]| {
+        x.iter()
+            .zip(y)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0_f64, f64::max)
+    };
+    let (d_eta, d_u) = (largest(&a.eta_m, &b.eta_m), largest(&a.u_m_s, &b.u_m_s));
+    let range = a.eta_m.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+    println!(
+        "3D stations between steps against on them: |Δη| ≤ {d_eta:.1e} m, |Δu| ≤ {d_u:.1e} m/s \
+         (|η| ≤ {range:.3} m; steps {} and {})",
+        between.n_steps, landed.n_steps
+    );
+    assert!(range > 0.3, "the tide reached the head: {range}");
+    for i in 0..a.eta_m.len() {
+        println!(
+            "  {:5.0} s: Δη {:+.2e} m, Δu {:+.2e} m/s",
+            a.time_s[i],
+            a.eta_m[i] - b.eta_m[i],
+            a.u_m_s[i] - b.u_m_s[i]
+        );
+    }
+    assert!(d_eta < 1e-3 && d_u < 1e-4, "|Δη| {d_eta}, |Δu| {d_u}");
+    // On the hours both runs land, and differ by their other steps only
+    for i in [6, 12] {
+        assert!((a.eta_m[i] - b.eta_m[i]).abs() < 1e-6, "{}", a.time_s[i]);
+    }
+    // After the ramp's transients, the interpolation's error on the tide:
+    // Δt²/8·|η''| = 47²/8 · 0.48 · ω_M2² ≈ 2.6e-6 m
+    let tide = largest(&a.eta_m[5..], &b.eta_m[5..]);
+    assert!(tide < 5e-6, "|Δη| {tide} after the ramp");
+}
+
 #[test]
 fn a_swell_through_a_deep_channel_keeps_its_height() {
     let dir = tempfile::tempdir().unwrap();
