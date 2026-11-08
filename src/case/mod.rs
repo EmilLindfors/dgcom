@@ -40,7 +40,7 @@ pub mod schema;
 
 use std::path::{Path, PathBuf};
 
-pub use domain::{Domain, StationProbe, WaveDomain};
+pub use domain::{Domain, ParentWavePoints, StationProbe, WaveDomain};
 pub use run::{MeshReport, Progress, RunReport, StationSeries};
 pub use schema::*;
 

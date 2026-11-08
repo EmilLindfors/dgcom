@@ -4,8 +4,12 @@
 
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::case::schema::{WaveForce, WaveIntegration, WaveLimiter, WavesSection};
-use crate::case::{CaseError, CaseFile, WaveDomain};
+use std::path::Path;
+
+use crate::case::{CaseError, CaseFile, ParentWavePoints, WaveDomain};
+use crate::mesh::PointLocator2D;
 use crate::physics::SWEPhysics2D;
+use crate::solver::Probe2D;
 use crate::waves::{
     BoundarySpectra, CoupledWaves2D, DEFAULT_RATE_LIMITER, GrowthLimiter, SourceIntegration,
     SourceTerms, SpectralGrid, WaveForceForm, WaveModel2D,
@@ -156,5 +160,126 @@ impl CaseFile {
             to_circulation.largest_gap()
         ));
         Ok(waves)
+    }
+}
+
+/// Our waves at a parent wave model's points against the parent's own H_s
+/// there, at every exchange (the waves' own time), as
+/// `froya_real_data`'s `wave_points.txt`: H_s from the basis at the point, the
+/// peak period and the mean direction at its nearest wave node.
+pub(super) struct WavePoints<'a> {
+    parent: &'a ParentWavePoints,
+    /// Each point's probe on the waves' mesh (none outside it)
+    probes: Vec<Option<Probe2D>>,
+    /// Geographic east in the mesh axes (rad from the x axis)
+    east: f64,
+    /// The time (s) and, per point, our H_s, the parent's, our T_p and our
+    /// direction (coming from, degrees clockwise from north)
+    rows: Vec<(f64, Vec<[f64; 4]>)>,
+    spectrum: Vec<f64>,
+}
+
+impl<'a> WavePoints<'a> {
+    /// The parent's points located on `w`'s mesh, with geographic east at
+    /// `east`, and a line for the log.
+    pub(super) fn new(parent: &'a ParentWavePoints, w: &WaveDomain, east: f64) -> (Self, String) {
+        let locator = PointLocator2D::new(&w.mesh);
+        let probes: Vec<Option<Probe2D>> = parent
+            .positions
+            .iter()
+            .map(|&p| Probe2D::at(&locator, &w.ops, p))
+            .collect();
+        let inside = probes.iter().filter(|p| p.is_some()).count();
+        let outside = match probes.len() - inside {
+            0 => String::new(),
+            n => format!(" ({n} outside the waves' mesh)"),
+        };
+        let line = format!(
+            "waves: compared with the parent's H_s at {inside} of its {} points{outside}, in \
+             wave_points.csv",
+            probes.len()
+        );
+        let points = Self {
+            parent,
+            probes,
+            east,
+            rows: Vec::new(),
+            spectrum: Vec::new(),
+        };
+        (points, line)
+    }
+
+    /// Record the waves at their time `t`.
+    pub(super) fn record(&mut self, waves: &CoupledWaves2D, t: f64) {
+        let (model, state) = (waves.model(), waves.state());
+        let nn = model.ops.n_nodes;
+        self.spectrum.resize(model.grid.n_components(), 0.0);
+        let mut row = Vec::with_capacity(self.probes.len());
+        for (p, probe) in self.probes.iter().enumerate() {
+            let parent = self.parent.hs_at(p, t);
+            let Some(probe) = probe else {
+                row.push([f64::NAN, parent, f64::NAN, f64::NAN]);
+                continue;
+            };
+            let start = probe.element().as_usize() * nn;
+            let weights = probe.weights();
+            let mut hs = 0.0;
+            let mut nearest = (f64::NEG_INFINITY, None);
+            for (i, &w) in weights.iter().enumerate() {
+                model.energy_spectrum_into(state, start + i, &mut self.spectrum);
+                let params = model.grid.parameters(&self.spectrum);
+                hs += w * params.hs;
+                if w > nearest.0 {
+                    nearest = (w, Some(params));
+                }
+            }
+            let node = nearest.1.expect("an element has nodes");
+            // Travelling to `direction` (rad from the mesh's x axis) is
+            // coming from the bearing 270° − (direction − east)
+            let from = if node.hs > 0.0 {
+                (270.0 - (node.direction - self.east).to_degrees()).rem_euclid(360.0)
+            } else {
+                f64::NAN
+            };
+            row.push([hs, parent, node.tp, from]);
+        }
+        self.rows.push((t, row));
+    }
+
+    /// Bias and RMSE of our H_s against the parent's over every point and
+    /// record from `after` (s) on, and the parent's mean H_s there.
+    pub(super) fn summary(&self, after: f64) -> Option<String> {
+        let pairs: Vec<(f64, f64)> = self
+            .rows
+            .iter()
+            .filter(|(t, _)| *t >= after - 1e-6)
+            .flat_map(|(_, row)| row.iter().map(|r| (r[0], r[1])))
+            .filter(|(ours, parent)| ours.is_finite() && parent.is_finite())
+            .collect();
+        if pairs.is_empty() {
+            return None;
+        }
+        let n = pairs.len() as f64;
+        let bias = pairs.iter().map(|(a, b)| a - b).sum::<f64>() / n;
+        let rmse = (pairs.iter().map(|(a, b)| (a - b).powi(2)).sum::<f64>() / n).sqrt();
+        let mean = pairs.iter().map(|(_, b)| b).sum::<f64>() / n;
+        Some(format!(
+            "waves against the parent's H_s from hour {:.1}: parent mean {mean:.2} m, bias \
+             {bias:+.3} m, RMSE {rmse:.3} m over {} samples",
+            after / 3600.0,
+            pairs.len()
+        ))
+    }
+
+    /// The records as CSV: one row per point and time.
+    pub(super) fn write(&self, path: &Path) -> Result<(), CaseError> {
+        let mut text = String::from("point,lon,lat,time_s,hs_m,parent_hs_m,tp_s,wave_from_deg\n");
+        for (t, row) in &self.rows {
+            for (p, [hs, parent, tp, from]) in row.iter().enumerate() {
+                let [lon, lat] = self.parent.lon_lat[p];
+                text += &format!("{p},{lon},{lat},{t},{hs},{parent},{tp},{from}\n");
+            }
+        }
+        std::fs::write(path, text).map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))
     }
 }

@@ -329,7 +329,7 @@ impl CaseFile {
             let written = (|| -> Result<(), CaseError> {
                 while next_station <= t + 1e-6 {
                     if (t - next_station).abs() <= 1e-6 {
-                        output.record_samples(t, &now)?;
+                        output.record_samples(t, &now, None)?;
                     } else {
                         let (t0, before) = previous.as_ref().expect("time 0 is a station time");
                         let w = (next_station - t0) / (t - t0);
@@ -338,7 +338,7 @@ impl CaseFile {
                             .zip(&now)
                             .map(|(a, b)| interpolate(a, b, w))
                             .collect();
-                        output.record_samples(next_station, &between)?;
+                        output.record_samples(next_station, &between, None)?;
                     }
                     next_station += station_every;
                 }
