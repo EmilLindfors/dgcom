@@ -47,6 +47,9 @@ pub struct Case {
     /// Spectral waves coupled to the 2D run (default: none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waves: Option<WavesSection>,
+    /// A fish farm's net cages, dragging on the flow (default: none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub farm: Option<FarmSection>,
     /// Time stepping.
     #[serde(default)]
     pub numerics: NumericsSection,
@@ -451,6 +454,13 @@ pub struct Raster {
     /// How the raster reaches the nodes (default `"projected"`).
     #[serde(default)]
     pub sampling: Sampling,
+    /// The window `[west, south, east, north]` (degrees) the raster is cut
+    /// to before it is filled and sampled (default: a geographic mesh's
+    /// box, else the mesh's extent with a 2 % margin). The filled holes
+    /// depend on the cut (TODO P1.6), so a case reproducing a run cut to
+    /// another box states it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<[f64; 4]>,
 }
 
 /// What a raster's pixels hold.
@@ -1102,6 +1112,78 @@ impl WavesSection {
     }
 }
 
+/// `[farm]`: a fish farm's net cages (TODO F.1), laid out from a
+/// Fiskeridirektoratet site file (`io::read_farm_site_file`,
+/// `FarmSite::cage_layout`: the `cage` lines, else the frame divided into
+/// cells of `cage_spacing_m` with a cage in each) and dragging on the flow
+/// through their nets (`CageDrag2D`; needs a placed mesh): on the depth mean
+/// in 2D, on the layers the nets reach in 3D. The defaults are a 160 m ring
+/// frame's (`CageGrid::RING_160M`), `examples/froya_real_data.rs site=`'s.
+///
+/// `drag_share` scales the drag: 0 runs the same case without the cages,
+/// a small share (0.1) the example's control run, so a farm's effect is the
+/// difference between runs of one case (`--set farm.drag_share=0`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FarmSection {
+    /// The site file
+    pub site: PathBuf,
+    /// Cell size of the frame (m, default 90)
+    #[serde(default = "default_cage_spacing")]
+    pub cage_spacing_m: f64,
+    /// Cage radius unless the file gives one (m, default 25.5)
+    #[serde(default = "default_cage_radius")]
+    pub cage_radius_m: f64,
+    /// Net depth unless the file gives one (m, default 20)
+    #[serde(default = "default_net_depth")]
+    pub net_depth_m: f64,
+    /// Net solidity, the share of the net's area that is twine (default
+    /// 0.25)
+    #[serde(default = "default_solidity")]
+    pub solidity: f64,
+    /// Share of the cages' drag (default 1; 0: no cages)
+    #[serde(default = "default_drag_share")]
+    pub drag_share: f64,
+}
+
+impl FarmSection {
+    /// The site's frame and cages.
+    pub fn grid(&self) -> crate::io::CageGrid {
+        crate::io::CageGrid::new(self.cage_spacing_m, self.cage_radius_m, self.net_depth_m)
+            .with_solidity(self.solidity)
+    }
+
+    fn validate(&self, placed: bool) -> Result<(), CaseError> {
+        let invalid = |m: String| Err(CaseError::Invalid(format!("farm.{m}")));
+        if !placed {
+            return invalid(
+                "site: a site file is on the Earth, which needs a placed mesh: mesh.geographic, \
+                 or mesh.origin"
+                    .into(),
+            );
+        }
+        for (key, value) in [
+            ("cage_spacing_m", self.cage_spacing_m),
+            ("cage_radius_m", self.cage_radius_m),
+            ("net_depth_m", self.net_depth_m),
+        ] {
+            if !(positive(value) && value.is_finite()) {
+                return invalid(format!("{key} must be positive, not {value}"));
+            }
+        }
+        if !(self.solidity > 0.0 && self.solidity < 1.0) {
+            return invalid(format!(
+                "solidity must lie in (0, 1), not {}",
+                self.solidity
+            ));
+        }
+        if !(non_negative(self.drag_share) && self.drag_share.is_finite()) {
+            return invalid(format!("drag_share must be ≥ 0, not {}", self.drag_share));
+        }
+        Ok(())
+    }
+}
+
 /// `[boundary.nesting]`: one-way nesting in a parent ocean model
 /// ([`crate::boundary::OceanModelState`]). The boundary takes the parent's
 /// ζ, ū and v̄ (its tides, coastal current and wind-driven flow), interpolated
@@ -1523,6 +1605,21 @@ fn default_slopes_r_max() -> f64 {
 fn default_free_depth() -> f64 {
     19.0
 }
+fn default_cage_spacing() -> f64 {
+    crate::io::CageGrid::RING_160M.spacing
+}
+fn default_cage_radius() -> f64 {
+    crate::io::CageGrid::RING_160M.radius
+}
+fn default_net_depth() -> f64 {
+    crate::io::CageGrid::RING_160M.net_depth
+}
+fn default_solidity() -> f64 {
+    crate::io::CageGrid::RING_160M.solidity
+}
+fn default_drag_share() -> f64 {
+    1.0
+}
 fn default_wave_frequencies() -> usize {
     25
 }
@@ -1706,6 +1803,14 @@ impl Case {
                 }
             }
             (None, None, Some(r)) => {
+                if let Some([w, s, e, n]) = r.crop
+                    && !(w < e && s < n)
+                {
+                    return invalid(format!(
+                        "bathymetry.raster.crop must be [west, south, east, north], not {:?}",
+                        r.crop
+                    ));
+                }
                 if !placed {
                     return invalid(
                         "bathymetry.raster needs a placed mesh: mesh.geographic, or mesh.origin"
@@ -2053,6 +2158,9 @@ impl Case {
                         .into(),
                 );
             }
+        }
+        if let Some(f) = &self.farm {
+            f.validate(self.placed())?;
         }
         if let Some(w) = &self.waves {
             w.validate(self)?;

@@ -370,6 +370,93 @@ fn a_swell_through_a_deep_channel_keeps_its_height() {
     );
 }
 
+/// A farm in a tidal channel: three cages of 25 m radius across the middle
+/// of a placed 10 km channel, 20 m deep, with an M2 tide coming in at one
+/// end and running out through still water at the other. Their drag slows
+/// the current through the farm, and with `drag_share = 0` the run is the
+/// channel's without a farm, value for value.
+#[test]
+fn a_farms_cages_slow_the_current_through_it() {
+    use dgcom::io::{CoordinateProjection, LocalProjection};
+    let dir = tempfile::tempdir().unwrap();
+    let projection = LocalProjection::new(ORIGIN.0, ORIGIN.1);
+    let mut site = String::from("site 1 TEST\n");
+    for y in [600.0, 1000.0, 1400.0] {
+        let (lat, lon) = projection.xy_to_geo(5000.0, y);
+        site += &format!("cage {lon} {lat} 25 15\n");
+    }
+    std::fs::write(dir.path().join("site.txt"), site).unwrap();
+    let case = |farm: &str| {
+        let text = format!(
+            r#"
+            [run]
+            duration_hours = 3.0
+
+            [mesh]
+            origin = {{ lat = {}, lon = {} }}
+            [mesh.rectangle]
+            x_m = [0.0, 10000.0]
+            y_m = [0.0, 2000.0]
+            nx = 40
+            ny = 8
+            west = "open"
+            east = "tidal"
+
+            [bathymetry]
+            depth_m = 20.0
+
+            [physics]
+            friction = {{ manning = 0.025 }}
+
+            [[boundary]]
+            tag = "open"
+            [boundary.tide]
+            ramp_hours = 1.0
+            constituents = [{{ name = "M2", amplitude_m = 1.0 }}]
+
+            [[boundary]]
+            tag = "tidal"
+            still = {{}}
+
+            [output]
+            directory = "out"
+            interval_minutes = 10.0
+            snapshot = false
+
+            [[output.station]]
+            name = "farm"
+            x_m = 5000.0
+            y_m = 1000.0
+
+            {farm}
+            "#,
+            ORIGIN.0, ORIGIN.1
+        );
+        let path = dir.path().join("case.toml");
+        std::fs::write(&path, text).unwrap();
+        let file = CaseFile::read(&path, &[]).unwrap();
+        let domain = file.build_domain().unwrap();
+        let report = file.run_on(&domain, &mut |_| {}).unwrap();
+        (domain.notes, report.stations.into_iter().next().unwrap())
+    };
+    let (_, open) = case("");
+    let (_, none) = case("[farm]\nsite = \"site.txt\"\ndrag_share = 0.0");
+    let (notes, caged) = case("[farm]\nsite = \"site.txt\"");
+    assert!(notes.iter().any(|n| n.contains("3 cages")), "{notes:?}");
+    assert_eq!((&none.eta_m, &none.u_m_s), (&open.eta_m, &open.u_m_s));
+    let mean_speed = |s: &StationSeries| {
+        s.u_m_s
+            .iter()
+            .zip(&s.v_m_s)
+            .map(|(u, v)| u.hypot(*v))
+            .sum::<f64>()
+            / s.u_m_s.len() as f64
+    };
+    let (slow, fast) = (mean_speed(&caged), mean_speed(&open));
+    println!("farm: mean speed through it {slow:.4} m/s with the cages, {fast:.4} without");
+    assert!(slow < 0.95 * fast, "{slow} against {fast}");
+}
+
 /// Amplitude and phase (rad) of the M2 fit to `s` from time `from` on.
 fn m2_fit(s: &StationSeries, from: f64) -> (f64, f64) {
     let omega = 2.0 * PI / constituent_period("M2").unwrap();

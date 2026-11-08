@@ -1,0 +1,76 @@
+# The Kattholmen salmon farm (Fiskeridirektoratet site 14042) at Mausund.
+#
+# The Mausund box (22 × 19 km around the gauge) on a coastline mesh refined
+# at the farm (275 elements of 11–29 m edges within 170 m of its centre),
+# nested in NorKyst-800 with its tide corrected at Mausund (as
+# `nested.toml`), the bed a 3D model's, and the farm's cages (`[farm]`): a
+# 160 m ring frame divided into cells with a cage in each, their nets
+# dragging on the depth mean. The farm's wake and its effect on the
+# residual current are the difference between this run and the same case
+# without the cages (`--set farm.drag_share=0`), or a control at a tenth of
+# the drag (`--set farm.drag_share=0.1`) for the noise floor: see
+# `notes/farm.md`. The inputs, besides `nested.toml`'s and the Mausund box's
+# atlas (`docs/gmsh-meshes.md`, "Mausund sub-domain"), fetched once:
+#
+#   ./scripts/fiskeridir_site.sh 14042                  # → data/sites/14042.txt
+#   dgcom run cases/froya/kattholmen_farm.toml
+#
+# The mesh is `scripts/gmsh_coastline_mesh.py bbox=8.45,63.78,8.90,63.95`
+# refined round the site (`farm=lon,lat farm_size= farm_radius=`,
+# `docs/gmsh-meshes.md`).
+#
+# This case is the cages' run of `examples/froya_real_data.rs`'s Kattholmen
+# command (`site=data/sites/14042.txt`, its docs) bit for bit
+# (`notes/case-files.md`).
+
+[run]
+name = "kattholmen"
+start = "2025-06-15T00:00:00Z"
+duration_hours = 31.0
+
+[mesh]
+order = 2
+gmsh = "../../data/mausund_kattholmen.msh"
+origin = { lat = 63.865, lon = 8.675 }   # the Mausund box's centre
+
+[bathymetry.raster]
+file = "../../data/froya_topobathy.tif"
+kind = "topobathy"
+fill_zero_holes = true
+land_elevation_m = 5.0
+crop = [8.45, 63.78, 8.90, 63.95]     # the Mausund box: the filled holes depend on the cut
+
+[bathymetry.slopes_3d]
+thin_depth_m = 1.0
+
+[physics]
+coriolis = { f_plane = 1.31e-4 }
+friction = { manning = 0.025 }
+viscosity_m2_s = 0.1
+smagorinsky = 0.1
+
+[[boundary]]
+tag = "open"
+[boundary.nesting]
+file = "../../data/froya_norkyst.nc"
+atlas = "../../data/mausund_boundary_tides.txt"
+ramp_hours = 3.0
+[boundary.nesting.gauge]
+record = "../../data/tide_gauges/mausund_obs.txt"
+source = "../../data/froya_station_tides.txt"
+
+[farm]
+site = "../../data/sites/14042.txt"
+
+[numerics]
+local_time_stepping_levels = 8
+
+[output]
+interval_minutes = 60.0
+station_interval_minutes = 10.0
+
+[[output.station]]
+name = "Mausund"
+lat = 63.869331
+lon = 8.665231
+gauge = "../../data/tide_gauges/mausund_obs.txt"

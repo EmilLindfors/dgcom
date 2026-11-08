@@ -28,7 +28,7 @@ use crate::physics::{PhysicsBuilder, SWEPhysics2D, SWEPhysics2DBuilder};
 use crate::simulation::{Simulation, SimulationResult};
 use crate::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, total_mass_2d};
 use crate::source::{
-    ChezyFriction2D, CoriolisSource2D, GriddedAtmosphere2D, HorizontalViscosity2D,
+    CageDrag2D, ChezyFriction2D, CoriolisSource2D, GriddedAtmosphere2D, HorizontalViscosity2D,
     ManningFriction2D, coriolis_parameter,
 };
 use crate::tides::{canonical_name, constituent_period};
@@ -254,6 +254,10 @@ impl CaseFile {
     fn physics<BC: SWEBoundaryCondition2D>(&self, domain: &Domain, bc: BC) -> SWEPhysics2D<BC> {
         let p = &self.case.physics;
         let mut builder = self.swe_builder(domain, bc);
+        // The farm's cages on the depth mean (a 3D run's take the layers)
+        if let Some(drag) = cage_drag(domain) {
+            builder = builder.with_cage_drag(drag);
+        }
         match p.friction {
             Some(Friction::Manning(n)) => {
                 builder = builder.with_implicit_friction(ManningFriction2D::new(p.gravity, n));
@@ -479,6 +483,16 @@ fn max_hs(fields: &[&[f32]]) -> Option<f64> {
 
 /// The open boundaries of a case, one characteristic condition per tag.
 pub(super) type OpenBoundaries = Vec<(SideTag, Box<dyn SWEBoundaryCondition2D>)>;
+
+/// The farm's cages' drag on `domain`'s mesh, if any drag: none without a
+/// farm or with `drag_share = 0`.
+pub(super) fn cage_drag(domain: &Domain) -> Option<CageDrag2D> {
+    if !domain.cages.iter().any(|c| c.drag_per_length > 0.0) {
+        return None;
+    }
+    let drag = CageDrag2D::new(&domain.mesh, &domain.ops, &domain.cages);
+    (!drag.is_empty()).then_some(drag)
+}
 
 /// The walls and the open boundaries `opens`, by tag.
 pub(super) fn boundary_conditions<'a>(
