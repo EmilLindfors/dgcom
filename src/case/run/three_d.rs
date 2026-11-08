@@ -285,6 +285,9 @@ impl CaseFile {
                 .with_surface_fluxes(fluxes.clone())
                 .with_shortwave_absorption(water);
         }
+        if let Some(rivers) = &domain.rivers {
+            physics = physics.with_rivers(rivers.clone());
+        }
         // The vertical advection beyond an explicit Courant number
         // implicitly: the columns just deeper than the thin depth set the
         // step otherwise

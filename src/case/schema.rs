@@ -50,6 +50,9 @@ pub struct Case {
     /// A fish farm's net cages, dragging on the flow (default: none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub farm: Option<FarmSection>,
+    /// Rivers flowing into a 3D run (default: none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rivers: Option<RiversSection>,
     /// Time stepping.
     #[serde(default)]
     pub numerics: NumericsSection,
@@ -687,6 +690,7 @@ pub struct AtmosphereSection {
 ///   pressure on the depth mean; with `heat` and a weather file that has the
 ///   heat budget, COARE 3.5 surface fluxes, shortwave absorbed as Jerlov
 ///   water `jerlov`.
+/// - **Rivers:** `[rivers]`, volume sources with their water's T and S.
 ///
 /// Output: snapshots (`<name>.dgsnap`, 3D) at their times exactly (the steps
 /// land on them), and the stations at theirs from the depth mean, between two
@@ -1111,6 +1115,56 @@ impl WavesSection {
         }
         if case.three_d.is_some() {
             return invalid("couples to a 2D run; [three_d] has no waves yet".into());
+        }
+        Ok(())
+    }
+}
+
+/// `[rivers]`: rivers flowing into a 3D run as volume sources with their
+/// water's temperature and salinity (`crate::source::RiverSources`,
+/// `Hydrostatic3D::with_rivers`), from a river file
+/// (`crate::io::RiverForcing`: NorKyst-800's NVE rivers as
+/// `examples/norkyst_river_subset.rs` cuts them out, daily, linear in time
+/// and held beyond the file). Each river enters the element of its mouth,
+/// or the nearest boundary element from up to `snap_km` away; rivers
+/// farther off are left out and listed. The water enters the layers over
+/// `profile`. The defaults are `examples/froya_real_data.rs rivers=`'s.
+///
+/// Needs `[three_d]` (the 2D module has no rivers), a placed mesh,
+/// `run.start` and the `netcdf` feature; the file must cover the run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiversSection {
+    /// The river file
+    pub file: PathBuf,
+    /// How far a mouth may lie off the mesh (km, default 2)
+    #[serde(default = "default_river_snap_km")]
+    pub snap_km: f64,
+    /// How the water enters the layers (default `"tapered:3"`, NorKyst's
+    /// own, falling linearly to zero 3 m down): `"tapered:D"`, `"top:D"`
+    /// (the top D metres uniformly), `"fraction:F"` (the top fraction F of
+    /// the column) or `"uniform"` (the whole column)
+    #[serde(default = "default_river_profile")]
+    pub profile: String,
+}
+
+impl RiversSection {
+    fn validate(&self, case: &Case) -> Result<(), CaseError> {
+        let invalid = |m: String| Err(CaseError::Invalid(format!("[rivers]: {m}")));
+        if case.three_d.is_none() {
+            return invalid("rivers enter a 3D run: add [three_d]".into());
+        }
+        if !case.placed() {
+            return invalid("needs a placed mesh: mesh.geographic, or mesh.origin".into());
+        }
+        if case.run.start.is_none() {
+            return invalid("needs run.start, the river file's instant of time 0".into());
+        }
+        if !(non_negative(self.snap_km) && self.snap_km.is_finite()) {
+            return invalid(format!("snap_km must be ≥ 0, not {}", self.snap_km));
+        }
+        if let Err(e) = self.profile.parse::<crate::source::RiverProfile>() {
+            return invalid(format!("profile: {e}"));
         }
         Ok(())
     }
@@ -1709,6 +1763,12 @@ fn default_barotropic_levels() -> usize {
 fn default_jerlov() -> String {
     "III".to_string()
 }
+fn default_river_snap_km() -> f64 {
+    2.0
+}
+fn default_river_profile() -> String {
+    "tapered:3".to_string()
+}
 fn default_thin_depth() -> f64 {
     0.1 // `Hydrostatic3D::DEFAULT_MIN_COLUMN_DEPTH`
 }
@@ -2206,6 +2266,9 @@ impl Case {
         if let Some(f) = &self.farm {
             f.validate(self.placed())?;
         }
+        if let Some(r) = &self.rivers {
+            r.validate(self)?;
+        }
         if let Some(r) = &self.restart {
             if let Some(h) = r.interval_hours
                 && !(positive(h) && h.is_finite())
@@ -2236,6 +2299,11 @@ impl Case {
         if self.atmosphere.is_some() && !cfg!(feature = "netcdf") {
             return invalid(
                 "[atmosphere] needs dgcom built with the `netcdf` feature (on by default)".into(),
+            );
+        }
+        if self.rivers.is_some() && !cfg!(feature = "netcdf") {
+            return invalid(
+                "[rivers] needs dgcom built with the `netcdf` feature (on by default)".into(),
             );
         }
         Ok(())

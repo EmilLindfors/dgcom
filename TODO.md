@@ -9,7 +9,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Generic cases and case files (P8) — [notes/case-files.md](notes/case-files.md)
 
 - [ ] **P8.1** The output schedule is part of the run: the steps land on every output and station time, so changing an interval moves the run by round-off (1.8 mm in η over 24 h at Bodø). Either document it as a feature of the run (the intervals are inputs, now in `case.resolved.toml`) or decouple the outputs (dense output between steps).
-- [ ] **P8.1** 3D output beyond snapshots and stations in case files: VTK and NetCDF of the layers (the 3D run refuses `output.vtk` and `output.netcdf` for now), and rivers (`froya_real_data rivers=`, `RiverSources` in 3D).
+- [ ] **P8.1** 3D output beyond snapshots and stations in case files: VTK and NetCDF of the layers (the 3D run refuses `output.vtk` and `output.netcdf` for now).
 - [ ] **P8.1** A case station's waves against a wave buoy's record (H_s, T_p, direction), as the gauge scores do the level (`scripts/e39_buoy_series.py`'s series; `froya_real_data wave_stations=` prints ours only). The stations record the sea state and `wave_points.csv` compares with the parent wave model since 2026-11-08 (`notes/case-files.md`).
 - [ ] **P8.1** Restarts for a case with `[waves]`: keep the wave model's action density, its exchange and ramp state, the sea-state frames and the parent points' records, so a coupled run resumes bit for bit. Refused for now (`[restart]` since 2026-11-08, `notes/case-files.md`), as `froya_real_data` refuses `wave_coupling=` with `restart_hours=`.
 - [ ] **P8.1** `NetCDFWriter` names u, v `eastward`/`northward_sea_water_velocity`. That holds for a placed case, whose `LocalProjection` is unrotated and which writes lat/lon (2026-11-07), but not for an unplaced one, whose velocities are along x and y: name them by the axes there (with P5.2).
@@ -257,6 +257,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.6** A spatial index for point-in-polygon and GSHHS inner rings in `coastline.rs:81-95` (the land mask costs ≈ 20 s of setup at Frøya).
 - [ ] **P1.6** Count wet as h > 1 cm in the example's η statistics, so mm films don't set "η max".
 - [ ] **P1.6** Cut the atmosphere forcing's memory (≈ 210 MB at 10⁶ nodes): share stencils per element, or drop them after regridding.
+- [ ] **P1.6** A river's water lands on land nodes: `RiverSources::volume_rate` gives every node of the river's element the same ∂h/∂t, and an element snapped onto at the coast can hold a node on land. In `cases/froya/rivers_3d.toml` two elements (59, river 837 snapped 1.5 km; 1912) pond at the land elevation, so the highest wet η is 5.001 m after 1 h, against 1.81 m without rivers (`notes/case-files.md`, rivers). Place a mouth in the nearest element whose nodes are all under water, or share the rate over the element's wet nodes.
 - [ ] **P1.6** River details: river momentum `Q/(width·depth)` for jets at narrow mouths; spreading over elements within a radius if one-element plumes show.
 - [ ] **P1.6** If the wind-driven residual matters at farms: stress from the wind relative to the current, with a stability-dependent COARE drag.
 - [ ] **P1.6** Low priority (< 5 mm): the tidal-potential sign against its docs (`source/swe_2d/tidal.rs:299-305`) and the diurnal Love factor.
