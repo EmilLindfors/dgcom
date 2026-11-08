@@ -13,6 +13,10 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **A case's output names its build and carries the viewer's metadata (TODO P8.1; `notes/case-files.md`).**
+  - `dgcom::provenance` (from a new `build.rs`): the version, the git commit and whether the sources (`src`, `Cargo.toml`, `Cargo.lock`, `build.rs`) differed from it. `provenance::describe()` (`dgcom 0.1.0 (commit 45388bf468c0, modified)`) heads `case.resolved.toml` as a comment, is the snapshot's `build` key and the NetCDF file's `source`, and `dgcom --version` prints it. `froya_real_data`'s snapshots carry it too.
+  - Case snapshots carry the stations (where they are sampled), the mesh's projection and the farm's cages in `froya_real_data`'s and `farm_3d`'s keys, so `dg-viz` draws the land, the station markers and the cages over a case run.
+
 - **Fish farms in case files (TODO P8.2 stage 5; `notes/case-files.md`).**
   - `[farm]` lays a Fiskeridirektoratet site's net cages out (`FarmSite::cage_layout`, a 160 m ring frame by default: `cage_spacing_m`, `cage_radius_m`, `net_depth_m`, `solidity`) and drags them on the depth mean in 2D and on the layers their nets reach in 3D. `drag_share` scales the drag: 0 is the same case without the cages, 0.1 the example's control run.
   - `[bathymetry.raster] crop` states the window the raster is cut to (a filled topobathy bed depends on the cut, TODO P1.6), and a mesh's raster window is now its own box (the waves' mesh read the run's).

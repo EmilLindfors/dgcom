@@ -8,8 +8,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Generic cases and case files (P8) — [notes/case-files.md](notes/case-files.md)
 
-- [ ] **P8.1** Provenance in a case's output: the dgcom version and git commit (and a dirty flag) in `case.resolved.toml` and the snapshot metadata. The scored 2026-06-12 3D run's build (`6f9e558`) is not in main's history; that its numerics matched main's was luck (`notes/case-files.md`, opportunities).
-- [ ] **P8.1** Case snapshots carry `source` and `case` only; `froya_real_data`'s carry the stations and the projection (`snapshot_metadata`), which `dg-viz` uses for the land and the station markers. Write the same keys from case runs.
 - [ ] **P8.1** The output schedule is part of the run: the steps land on every output and station time, so changing an interval moves the run by round-off (1.8 mm in η over 24 h at Bodø). Either document it as a feature of the run (the intervals are inputs, now in `case.resolved.toml`) or decouple the outputs (dense output between steps).
 - [ ] **P8.1** A 3D run records its stations at the first step on or after their times (as the example does), so the series is irregular by up to a step; land the 3D steps on station times too, or interpolate between steps.
 - [ ] **P8.1** 3D output beyond snapshots and stations in case files: VTK and NetCDF of the layers (the 3D run refuses `output.vtk` and `output.netcdf` for now), and rivers (`froya_real_data rivers=`, `RiverSources` in 3D).

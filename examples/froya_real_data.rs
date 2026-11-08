@@ -3601,6 +3601,7 @@ fn snapshot_metadata(
     let mut metadata = vec![
         ("title", format!("{title}{suffix}")),
         ("source", "froya_real_data".to_string()),
+        ("build", dgcom::provenance::describe()),
     ];
     if let Some(projection) = &domain.projection {
         for s in stations {

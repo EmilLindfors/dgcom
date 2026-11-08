@@ -641,6 +641,45 @@ fn summarize(domain: &Domain, q: &SWESolution2D, t: f64, t_end: f64) -> Progress
     }
 }
 
+/// A case snapshot's header metadata: the run and the build that made it,
+/// and what the viewer draws over the fields: the stations where they are
+/// sampled, the mesh's projection (for the land around it) and the farm's
+/// cages, in `froya_real_data`'s and `farm_3d`'s keys.
+fn snapshot_metadata(name: &str, domain: &Domain) -> Vec<(&'static str, String)> {
+    let mut metadata = vec![
+        ("title", name.to_string()),
+        ("source", "dgcom".to_string()),
+        ("case", name.to_string()),
+        ("build", crate::provenance::describe()),
+    ];
+    for s in &domain.stations {
+        let [x, y] = s.probe.position();
+        metadata.push(("station", format!("{},{x:.1},{y:.1}", s.name)));
+    }
+    if let Some(projection) = &domain.projection {
+        metadata.push((
+            "projection",
+            format!("local,{},{}", projection.ref_lat(), projection.ref_lon()),
+        ));
+    }
+    for cage in &domain.cages {
+        if let crate::source::CageFootprint::Circle {
+            center: [x, y],
+            radius,
+        } = cage.footprint
+        {
+            metadata.push((
+                "cage",
+                format!(
+                    "{x},{y},{radius},{},{}",
+                    cage.net_depth, cage.drag_per_length
+                ),
+            ));
+        }
+    }
+    metadata
+}
+
 /// The run's writers.
 struct Output<'a> {
     domain: &'a Domain,
@@ -681,12 +720,15 @@ impl<'a> Output<'a> {
         let dir = file.output_dir();
         fs::create_dir_all(&dir).map_err(|e| io(&dir.display().to_string(), &e))?;
         let resolved = dir.join("case.resolved.toml");
-        fs::write(&resolved, case.resolved().to_toml())
+        let header = format!("# {}\n", crate::provenance::describe());
+        fs::write(&resolved, header + &case.resolved().to_toml())
             .map_err(|e| io(&resolved.display().to_string(), &e))?;
         let name = case.run.name.clone();
         let snapshot = if case.output.snapshot {
             let path = dir.join(format!("{name}.dgsnap"));
-            let metadata = [("source", "dgcom"), ("case", name.as_str())];
+            let metadata = snapshot_metadata(&name, domain);
+            let metadata: Vec<(&str, &str)> =
+                metadata.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let writer = match sigma {
                 Some(sigma) => SnapshotWriter::create_3d(
                     &path,
@@ -740,7 +782,7 @@ impl<'a> Output<'a> {
             }
             let mut config = NetCDFWriterConfig::new(path.display().to_string())
                 .with_title(name.clone())
-                .with_source("dgcom")
+                .with_source(crate::provenance::describe())
                 .with_velocity(true);
             if let Some(clock) = clock {
                 config = config.with_clock(*clock);
