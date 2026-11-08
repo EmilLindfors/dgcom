@@ -15,11 +15,19 @@
 //! 3. The open faces' band relaxing to the parent's columns (or the start).
 //! 4. The physics, its density, and the pressure gradient's reference
 //!    profile; the run, landing on the field outputs.
+//!
+//! A resumed run (`[restart] from`) builds all of this from the start as
+//! the run that wrote the restart did (the band's and the pressure
+//! gradient's references are of the start), then continues from the
+//! restart's state, time and mode-splitting history. Its restarts are
+//! written at field outputs, where the steps land, so that the resumed
+//! run's steps land where the uninterrupted run's do.
 
 use std::sync::Arc;
 
 use super::{
-    H_VELOCITY, Output, Progress, RunReport, boundary_conditions, score_gauges, summarize, volume,
+    H_VELOCITY, Output, Progress, RunReport, boundary_conditions, restart, score_gauges, summarize,
+    volume,
 };
 use crate::boundary::{
     DeepReference, Nesting3D, NestingBand3D, OceanColumnsOptions, OceanModelColumns,
@@ -27,6 +35,7 @@ use crate::boundary::{
 };
 use crate::case::schema::{Coriolis, Integrator, Mixing3D, ThreeDSection};
 use crate::case::{CaseError, CaseFile, Domain};
+use crate::io::Restart3D;
 use crate::physics::{
     BottomDrag3D, EquationOfState, Forcing, GlsMixing, Hydrostatic3D, ImplicitVerticalAdvection,
     JerlovWater, LinearEOS,
@@ -287,11 +296,52 @@ impl CaseFile {
             eos.compute_density(t, s, z)
         });
 
+        // A resumed run: the restart's state, time, history and records
+        let restart = match self.resume_path() {
+            Some(path) => {
+                let restart = Restart3D::read(&path)
+                    .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
+                // The domain before any output is touched (`Simulation3D::resume`
+                // checks it again)
+                let domain = crate::io::domain_fingerprint_3d(mesh, bed, &sigma);
+                if restart.domain != domain {
+                    return Err(CaseError::Invalid(format!(
+                        "cannot resume from {}: its mesh, bed or σ-grid differ",
+                        path.display()
+                    )));
+                }
+                self.check_resumed(&path, &restart.driver)?;
+                Some((path, restart))
+            }
+            None => None,
+        };
+        let t_start = restart.as_ref().map_or(0.0, |(_, r)| r.time);
+        if t_start >= t_end - 1e-6 {
+            return Err(CaseError::Invalid(format!(
+                "the restart is at {:.2} h, at or past the run's end ({} h)",
+                t_start / 3600.0,
+                case.run.duration_hours
+            )));
+        }
+        let resumed = restart.as_ref().map(|(path, r)| restart::Resumed {
+            path: path.clone(),
+            time: r.time,
+            driver: r.driver.clone(),
+        });
+        notes.extend(resumed.as_ref().map(restart::Resumed::note));
+
         // The run: the steps land on the field outputs. The stations are
         // sampled at every step and recorded at their times, between two
         // steps by linear interpolation, so their series are regular without
         // their times moving the run's steps (the 2D run lands on both)
-        let mut output = Output::create(self, domain, clock.as_ref(), Some(&sigma), &[])?;
+        let mut output = Output::create(
+            self,
+            domain,
+            clock.as_ref(),
+            Some(&sigma),
+            &[],
+            resumed.as_ref(),
+        )?;
         let field_every = 60.0 * case.output.interval_minutes;
         let station_every = 60.0 * case.output.station_interval();
         let mut q = SWESolution2D::new(ne, nn);
@@ -309,18 +359,34 @@ impl CaseFile {
             }
         };
         barotropic(&state, &mut q);
-        let volume_start = volume(domain, &q);
-        let (mut next_station, mut failure) = (0.0, None);
+        let volume_start = match &resumed {
+            Some(r) => restart::counters(&r.driver)?.1,
+            None => volume(domain, &q),
+        };
+        // The first station time after the restart's (which the stopped run
+        // recorded)
+        let mut next_station = match &resumed {
+            Some(r) => ((r.time / station_every + 1e-9).floor() + 1.0) * station_every,
+            None => 0.0,
+        };
+        let mut failure = None;
+        let mut restarts = restart::RestartSchedule::new(self, t_start);
         let mut nodes = vec![0.0; 3 * nn];
         let mut previous: Option<(f64, Vec<SWEPointSample>)> = None;
-        let mut on_step = |s: &Solution3D, t: f64| {
+        // A resumed run's first call is at the restart's time, which the
+        // stopped run wrote out: its samples are the next interpolation's
+        // start only
+        let mut at_restart = resumed.is_some();
+        let mut on_step = |s: &Solution3D, t: f64, capture: &dyn Fn() -> Restart3D| {
             if failure.is_some() {
                 return;
             }
-            let on_field = {
+            let first = std::mem::take(&mut at_restart);
+            let field_time = {
                 let n = t / field_every;
                 (n - n.round()).abs() < 1e-6 || t >= t_end - 1e-6
             };
+            let on_field = field_time && !first;
             let now: Vec<SWEPointSample> = domain
                 .stations
                 .iter()
@@ -342,9 +408,18 @@ impl CaseFile {
                     }
                     next_station += station_every;
                 }
+                // A new snapshot file starts with the restart's frame
+                if first && field_time && !output.snapshot_continued {
+                    output.write_snapshot_3d(t, s)?;
+                }
                 if on_field {
                     barotropic(s, &mut q);
                     output.write_snapshot_3d(t, s)?;
+                    if let Some(restarts) = restarts.as_mut().filter(|r| r.due(t)) {
+                        let mut restart = capture();
+                        restart.driver = output.driver_data(self, volume_start);
+                        restarts.write(t, |path| restart.write(path))?;
+                    }
                 }
                 Ok(())
             })();
@@ -365,7 +440,15 @@ impl CaseFile {
             .with_cfl(d.cfl())
             .with_dt_max(d.dt_max_s)
             .with_landing_interval(field_every);
-        let result = sim.run_with_context_callback(&mut state, 0.0, t_end, |s, t, _| on_step(s, t));
+        if let Some((path, restart)) = restart {
+            sim.resume(&restart).map_err(|e| {
+                CaseError::Invalid(format!("cannot resume from {}: {e}", path.display()))
+            })?;
+            state = restart.state;
+        }
+        let result = sim.run_with_context_callback(&mut state, t_start, t_end, |s, t, context| {
+            on_step(s, t, &|| context.restart(s, t))
+        });
         if let Some(e) = failure {
             return Err(e);
         }
@@ -377,6 +460,7 @@ impl CaseFile {
             )));
         }
         barotropic(&state, &mut q);
+        notes.extend(restarts.map(|r| r.note()));
         let mut stations = output.finish();
         if let Some(clock) = &clock {
             score_gauges(domain, &mut stations, clock, 3600.0 * case.spinup_hours());

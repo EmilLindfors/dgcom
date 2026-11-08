@@ -13,6 +13,7 @@ cargo build --release --bin dgcom --no-default-features --features parallel,simd
 ./target/release/dgcom check cases/tidal_channel/case.toml   # validate it, print it with every default
 ./target/release/dgcom mesh  cases/tidal_channel/case.toml   # write its mesh and bed (Gmsh, VTK) to inspect
 ./target/release/dgcom run   cases/tidal_channel/case.toml   # 25 h of tide in a few seconds
+# with [restart] interval_hours = H: dgcom run case.toml --resume <output>/<name>.restart
 ```
 
 The run writes to `cases/tidal_channel/output/tidal_channel/`:

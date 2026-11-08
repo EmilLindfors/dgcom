@@ -56,6 +56,9 @@ pub struct Case {
     /// What is written, and where.
     #[serde(default)]
     pub output: OutputSection,
+    /// Restart files, and resuming from one (default: neither).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<RestartSection>,
 }
 
 /// `[run]`
@@ -1506,6 +1509,46 @@ impl Default for OutputSection {
     }
 }
 
+/// `[restart]`: restart files, and a run resumed from one.
+///
+/// A restart holds the run at a time between two steps: its state (a 3D
+/// run's with the mode splitter's history, [`crate::io::Restart3D`]), the
+/// stations' records so far, the output counters, and the resolved case
+/// (`case.resolved.toml`) of the run that wrote it. A run resumed from one
+/// goes on from its time as the run that wrote it would have, bit for bit:
+/// - its case must resolve as the restart's did, but for what a resume may
+///   change anyway (`run.duration_hours`, `[output]` but its stations,
+///   `[numerics]`, the 3D time stepping, `[restart]`) and the keys it names
+///   in `changes`, so a changed option or default is not missed;
+/// - the snapshot file is continued (its frames after the restart's time are
+///   dropped), `stations.csv` and the VTK frames go on, and the NetCDF file
+///   is a new one, `<name>_from_<hours>h.nc`.
+///
+/// A run with `[waves]` has no restarts yet (the spectra are not kept).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartSection {
+    /// Write a restart every this many model hours (default: none), at the
+    /// first output time at or after each multiple (a 3D run's field
+    /// outputs, where its steps land), to `<output>/<name>.restart`, each
+    /// replacing the last in one rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_hours: Option<f64>,
+    /// Keep every restart, as `<output>/<name>_<hours>h.restart` (default
+    /// false), e.g. to branch experiments from a spun-up state.
+    #[serde(default)]
+    pub keep: bool,
+    /// Resume from this restart file (relative to the case file; `dgcom run
+    /// --resume <file>` sets it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<PathBuf>,
+    /// Keys of the case this resume changes on purpose, beyond those any
+    /// resume may change: e.g. `["farm"]` for a branch run that adds cages
+    /// to a spun-up open run. A key covers the keys under it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<String>,
+}
+
 /// `[[output.station]]`
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2163,6 +2206,20 @@ impl Case {
         if let Some(f) = &self.farm {
             f.validate(self.placed())?;
         }
+        if let Some(r) = &self.restart {
+            if let Some(h) = r.interval_hours
+                && !(positive(h) && h.is_finite())
+            {
+                return invalid(format!("restart.interval_hours must be positive, not {h}"));
+            }
+            if self.waves.is_some() && (r.interval_hours.is_some() || r.from.is_some()) {
+                return invalid(
+                    "[restart] does not keep the waves' spectra: a run with [waves] cannot \
+                     write or resume restarts yet"
+                        .into(),
+                );
+            }
+        }
         if let Some(w) = &self.waves {
             w.validate(self)?;
             if let Some(m) = &w.mesh {
@@ -2206,10 +2263,13 @@ impl Case {
     }
 
     /// This case with every default stated, as `case.resolved.toml` records
-    /// it: the CFL number computed from the order and stepper.
+    /// it: the CFL numbers computed from the order and steppers.
     pub fn resolved(&self) -> Self {
         let mut case = self.clone();
         case.numerics.cfl = Some(self.numerics.cfl_at(self.mesh.order));
+        if let Some(d) = &mut case.three_d {
+            d.cfl = Some(d.cfl());
+        }
         case
     }
 
