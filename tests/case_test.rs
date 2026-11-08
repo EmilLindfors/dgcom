@@ -70,6 +70,66 @@ fn the_example_case_runs_and_records_what_it_ran() {
     assert_eq!(header.metadata("projection"), None);
 }
 
+/// `dgcom mesh`: the example's mesh goes to Gmsh with its boundary tags
+/// and to VTK with the bed and each element's step at rest, and the step it
+/// reports is the one the run takes first, with and without local time
+/// stepping (the run starts at rest).
+#[test]
+fn the_mesh_is_written_with_the_step_the_run_takes() {
+    for levels in [0, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let overrides = [
+            "run.duration_hours=0.25".to_string(),
+            format!("numerics.local_time_stepping_levels={levels}"),
+            format!("output.directory={:?}", dir.path().display().to_string()),
+        ];
+        let file = CaseFile::read(Path::new(EXAMPLE), &overrides).unwrap();
+        let domain = file.build_domain().unwrap();
+        let report = file.write_mesh(&domain).unwrap();
+        let mesh_dir = dir.path().join("mesh");
+        assert_eq!(
+            report.files,
+            [
+                mesh_dir.join("tidal_channel.msh"),
+                mesh_dir.join("tidal_channel.vtu")
+            ]
+        );
+        let back = dgcom::mesh::read_gmsh_mesh(&report.files[0]).unwrap();
+        assert_eq!(back.n_elements, domain.mesh.n_elements);
+        let tags = |m: &dgcom::Mesh2D| {
+            let mut t: Vec<String> = m
+                .edges
+                .iter()
+                .filter_map(|e| e.boundary_tag.as_ref().map(|t| format!("{t:?}")))
+                .collect();
+            t.sort();
+            t
+        };
+        assert_eq!(tags(&back), tags(&domain.mesh));
+        let vtu = std::fs::read_to_string(&report.files[1]).unwrap();
+        for field in ["bed_m", "depth_at_rest_m", "diameter_m", "dt_s"] {
+            assert!(vtu.contains(&format!("Name=\"{field}\"")), "{field}");
+        }
+        assert_eq!(vtu.contains("Name=\"lts_level\""), levels > 0);
+        let n_levels: usize = report.elements_per_level.iter().sum();
+        assert_eq!(
+            n_levels,
+            if levels > 0 {
+                domain.mesh.n_elements
+            } else {
+                0
+            }
+        );
+
+        let step = report.step_s.unwrap();
+        let (lo, hi) = report.element_dt_s.unwrap();
+        assert!(lo <= step && lo < hi, "{lo} {step} {hi}");
+        let run = file.run_on(&domain, &mut |_| {}).unwrap();
+        // The tide ramps up from rest, so the first step is the longest
+        assert_eq!(run.dt_range_s.1, step, "levels {levels}");
+    }
+}
+
 /// Stations every 10 minutes with the fields every 30: the stations are
 /// recorded every 10 minutes, the snapshot every 30, and the run is the
 /// one that writes everything every 10 minutes, value for value (its steps

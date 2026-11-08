@@ -165,7 +165,7 @@ pub use timeseries_reader::{
     BoundaryTimeSeries, TimeSeriesFileError, TimeSeriesRecord, parse_timeseries,
     read_timeseries_file,
 };
-pub use vtk::{VtkError, write_vtk_series, write_vtk_swe};
+pub use vtk::{VtkError, write_vtk_fields, write_vtk_series, write_vtk_swe};
 #[cfg(feature = "netcdf")]
 pub use wave_spectra::WaveSpectraFile;
 pub use z_levels::{depth_average_z, s_level_weights, weighted_mean};

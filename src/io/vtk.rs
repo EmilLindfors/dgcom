@@ -328,6 +328,85 @@ impl<W: Write> VtkWriter<W> {
     }
 }
 
+/// Write fields on the mesh to a VTU file: `node_fields` at the DG nodes
+/// (`[element × node]`, as a solution's variables), `element_fields` one value
+/// per element, and the element's index as `element_id`, with `time` as the
+/// file's `TimeValue`.
+///
+/// Each element is drawn as its nodes' sub-quads (the module's
+/// documentation), so a node field shows its polynomial's detail.
+pub fn write_vtk_fields(
+    path: impl AsRef<Path>,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    node_fields: &[(&str, &[f64])],
+    element_fields: &[(&str, &[f64])],
+    time: Option<f64>,
+) -> Result<(), VtkError> {
+    let n_values = mesh.n_elements * ops.n_nodes;
+    for (name, values) in node_fields {
+        if values.len() != n_values {
+            return Err(VtkError::InvalidMesh(format!(
+                "{name}: {} values for {n_values} nodes",
+                values.len()
+            )));
+        }
+    }
+    for (name, values) in element_fields {
+        if values.len() != mesh.n_elements {
+            return Err(VtkError::InvalidMesh(format!(
+                "{name}: {} values for {} elements",
+                values.len(),
+                mesh.n_elements
+            )));
+        }
+    }
+    let vtk_mesh = build_vtk_mesh(mesh, ops);
+    let file = File::create(path)?;
+    let mut writer = VtkWriter::new(file);
+
+    writer.write_header()?;
+    writer.start_element("UnstructuredGrid", &[])?;
+    writer.start_element(
+        "Piece",
+        &[
+            ("NumberOfPoints", &vtk_mesh.points.len().to_string()),
+            ("NumberOfCells", &vtk_mesh.cells.len().to_string()),
+        ],
+    )?;
+    writer.write_points(&vtk_mesh.points)?;
+    writer.write_cells(&vtk_mesh.cells)?;
+
+    // The node fields: the VTK points are the nodes, in the same order
+    let scalars = node_fields.first().map_or("", |(name, _)| *name);
+    writer.start_element("PointData", &[("Scalars", scalars)])?;
+    for (name, values) in node_fields {
+        writer.write_data_array_f64(name, values, 1)?;
+    }
+    writer.end_element("PointData")?;
+
+    // The element fields on each of the element's sub-quads
+    writer.start_element("CellData", &[("Scalars", "element_id")])?;
+    let element_ids: Vec<i32> = vtk_mesh.element_ids.iter().map(|&id| id as i32).collect();
+    writer.write_data_array_i32("element_id", &element_ids)?;
+    let mut per_cell = Vec::with_capacity(vtk_mesh.element_ids.len());
+    for (name, values) in element_fields {
+        per_cell.clear();
+        per_cell.extend(vtk_mesh.element_ids.iter().map(|&k| values[k]));
+        writer.write_data_array_f64(name, &per_cell, 1)?;
+    }
+    writer.end_element("CellData")?;
+
+    writer.end_element("Piece")?;
+    // Time as field data (outside Piece, inside UnstructuredGrid)
+    if let Some(time) = time {
+        writer.write_field_data("TimeValue", time)?;
+    }
+    writer.end_element("UnstructuredGrid")?;
+    writer.write_footer()?;
+    Ok(())
+}
+
 /// Write SWE solution to VTK file.
 ///
 /// Outputs water depth, velocity components, velocity magnitude, and optionally
@@ -341,46 +420,14 @@ pub fn write_vtk_swe(
     time: f64,
     h_min: f64,
 ) -> Result<(), VtkError> {
-    let vtk_mesh = build_vtk_mesh(mesh, ops);
-    let file = File::create(path)?;
-    let mut writer = VtkWriter::new(file);
     let h_min = Depth::new(h_min);
-
-    let n_points = vtk_mesh.points.len();
-    let n_cells = vtk_mesh.cells.len();
-
-    writer.write_header()?;
-    writer.start_element("UnstructuredGrid", &[])?;
-    writer.start_element(
-        "Piece",
-        &[
-            ("NumberOfPoints", &n_points.to_string()),
-            ("NumberOfCells", &n_cells.to_string()),
-        ],
-    )?;
-
-    // Write geometry
-    writer.write_points(&vtk_mesh.points)?;
-    writer.write_cells(&vtk_mesh.cells)?;
-
-    // Write point data (solution fields)
-    writer.start_element("PointData", &[("Scalars", "h")])?;
-
-    // Extract solution at each point
+    let n_points = mesh.n_elements * ops.n_nodes;
     let mut h_data = Vec::with_capacity(n_points);
     let mut u_data = Vec::with_capacity(n_points);
     let mut v_data = Vec::with_capacity(n_points);
     let mut speed_data = Vec::with_capacity(n_points);
-    let mut eta_data = if bathymetry.is_some() {
-        Vec::with_capacity(n_points)
-    } else {
-        Vec::new()
-    };
-    let mut bathy_data = if bathymetry.is_some() {
-        Vec::with_capacity(n_points)
-    } else {
-        Vec::new()
-    };
+    let mut eta_data = Vec::new();
+    let mut bathy_data = Vec::new();
 
     for k in ElementIndex::iter(mesh.n_elements) {
         for i in 0..ops.n_nodes {
@@ -390,12 +437,10 @@ pub fn write_vtk_swe(
 
             let state = SWEState2D { h, hu, hv };
             let (u, v) = state.velocity(h_min);
-            let speed = state.velocity_magnitude(h_min);
-
             h_data.push(h);
             u_data.push(u);
             v_data.push(v);
-            speed_data.push(speed);
+            speed_data.push(state.velocity_magnitude(h_min));
 
             if let Some(bathy) = bathymetry {
                 let b = bathy.data[k.as_usize() * ops.n_nodes + i];
@@ -405,32 +450,17 @@ pub fn write_vtk_swe(
         }
     }
 
-    writer.write_data_array_f64("h", &h_data, 1)?;
-    writer.write_data_array_f64("u", &u_data, 1)?;
-    writer.write_data_array_f64("v", &v_data, 1)?;
-    writer.write_data_array_f64("velocity_magnitude", &speed_data, 1)?;
-
+    let mut fields: Vec<(&str, &[f64])> = vec![
+        ("h", &h_data),
+        ("u", &u_data),
+        ("v", &v_data),
+        ("velocity_magnitude", &speed_data),
+    ];
     if bathymetry.is_some() {
-        writer.write_data_array_f64("eta", &eta_data, 1)?;
-        writer.write_data_array_f64("bathymetry", &bathy_data, 1)?;
+        fields.push(("eta", &eta_data));
+        fields.push(("bathymetry", &bathy_data));
     }
-
-    writer.end_element("PointData")?;
-
-    // Write cell data
-    writer.start_element("CellData", &[("Scalars", "element_id")])?;
-    let element_ids: Vec<i32> = vtk_mesh.element_ids.iter().map(|&id| id as i32).collect();
-    writer.write_data_array_i32("element_id", &element_ids)?;
-    writer.end_element("CellData")?;
-
-    writer.end_element("Piece")?;
-
-    // Write time as field data (outside Piece, inside UnstructuredGrid)
-    writer.write_field_data("TimeValue", time)?;
-    writer.end_element("UnstructuredGrid")?;
-    writer.write_footer()?;
-
-    Ok(())
+    write_vtk_fields(path, mesh, ops, &fields, &[], Some(time))
 }
 
 /// Write VTK file with automatic frame numbering.
@@ -493,6 +523,42 @@ mod tests {
 
         // 9 subcells
         assert_eq!(vtk_mesh.cells.len(), 9);
+    }
+
+    /// Element fields go on every sub-quad of their element, and fields of
+    /// the wrong length are refused.
+    #[test]
+    fn element_fields_cover_their_elements_sub_quads() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 2.0, 0.0, 1.0, 2, 1);
+        let ops = DGOperators2D::new(2); // 4 sub-quads per element
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fields.vtu");
+        let bed = vec![-1.0; 2 * ops.n_nodes];
+        write_vtk_fields(
+            &path,
+            &mesh,
+            &ops,
+            &[("bed", &bed)],
+            &[("dt", &[3.0, 7.0])],
+            None,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let dt = text.split("Name=\"dt\"").nth(1).unwrap();
+        let values: Vec<f64> = dt
+            .split("</DataArray>")
+            .next()
+            .unwrap()
+            .split_once('>')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert_eq!(values, [3.0, 3.0, 3.0, 3.0, 7.0, 7.0, 7.0, 7.0]);
+        assert!(!text.contains("TimeValue"));
+        let short = write_vtk_fields(&path, &mesh, &ops, &[], &[("dt", &[3.0])], None);
+        assert!(matches!(short, Err(VtkError::InvalidMesh(_))));
     }
 
     #[test]
