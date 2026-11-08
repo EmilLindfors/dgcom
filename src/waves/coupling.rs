@@ -770,6 +770,51 @@ impl CoupledWaves2D {
     }
 }
 
+/// The waves' sea state at the circulation's output times, which fall
+/// between the exchanges: linear in time between the sea states at the
+/// exchanges around them ([`SeaStateFields::as_f32`], in the order of
+/// [`SeaStateFields::NAMES`]), for the surface channels of a snapshot.
+#[derive(Debug, Default)]
+pub struct SeaStateFrames {
+    before: Option<(f64, [Vec<f32>; 7])>,
+    after: Option<(f64, [Vec<f32>; 7])>,
+    /// The fields at a frame's time
+    now: [Vec<f32>; 7],
+}
+
+impl SeaStateFrames {
+    /// Whether no sea state has been pushed yet.
+    pub fn is_empty(&self) -> bool {
+        self.after.is_none()
+    }
+
+    /// The waves' sea state at their time `t`: before an exchange the first
+    /// time (the interval's start), after each exchange (its end).
+    pub fn push(&mut self, waves: &CoupledWaves2D, t: f64) {
+        self.before = self.after.take();
+        self.after = Some((t, waves.sea_state().as_f32()));
+    }
+
+    /// The fields at time `t`, linear between the last two pushed (held
+    /// beyond them); none before the first push.
+    pub fn at(&mut self, t: f64) -> Vec<&[f32]> {
+        let (Some((t1, b)), a) = (&self.after, &self.before) else {
+            return Vec::new();
+        };
+        let (t0, a) = a.as_ref().map_or((*t1, b), |(t0, a)| (*t0, a));
+        let w = if t1 > &t0 {
+            ((t - t0) / (t1 - t0)).clamp(0.0, 1.0) as f32
+        } else {
+            1.0
+        };
+        for ((out, a), b) in self.now.iter_mut().zip(a).zip(b) {
+            out.clear();
+            out.extend(a.iter().zip(b).map(|(a, b)| a + w * (b - a)));
+        }
+        self.now.iter().map(Vec::as_slice).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -102,12 +102,14 @@ fn run(file: &CaseFile) -> Result<(), String> {
     );
     let mut report = |p: &Progress| {
         println!(
-            "  {:7.2} h / {:.2} h   η {:+.3} to {:+.3} m   |u| ≤ {:.3} m/s",
+            "  {:7.2} h / {:.2} h   η {:+.3} to {:+.3} m   |u| ≤ {:.3} m/s{}",
             p.time_s / 3600.0,
             p.end_s / 3600.0,
             p.eta_range.0,
             p.eta_range.1,
-            p.max_speed
+            p.max_speed,
+            p.max_hs
+                .map_or(String::new(), |hs| format!("   H_s ≤ {hs:.2} m"))
         );
     };
     let domain = file.build_domain().map_err(|e| e.to_string())?;

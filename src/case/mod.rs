@@ -26,9 +26,11 @@
 //! - snapshot, VTK, NetCDF and station output, the stations scored
 //!   against tide gauges;
 //! - a 3D run (`[three_d]`): σ-layers under the depth mean, started from
-//!   and nested in a parent's columns or a profile.
+//!   and nested in a parent's columns or a profile;
+//! - spectral waves coupled to the 2D run (`[waves]`), on its mesh or their
+//!   own, from a JONSWAP sea or a parent wave model's spectra.
 //!
-//! Next: the waves and the farm (`notes/case-files.md`).
+//! Next: the farm (`notes/case-files.md`).
 
 mod domain;
 mod run;
@@ -36,7 +38,7 @@ pub mod schema;
 
 use std::path::{Path, PathBuf};
 
-pub use domain::{Domain, StationProbe};
+pub use domain::{Domain, StationProbe, WaveDomain};
 pub use run::{Progress, RunReport, StationSeries};
 pub use schema::*;
 
@@ -791,6 +793,70 @@ file = \"parent.nc\"
             (
                 format!("{}\n[output]\nvtk = true\n", three_d(profile)),
                 "2D only",
+            ),
+        ] {
+            let err = parse(&text).unwrap().validate().unwrap_err().to_string();
+            assert!(err.contains(says), "{says}: {err}");
+        }
+    }
+
+    #[test]
+    fn waves_take_the_examples_defaults_and_their_checks() {
+        let open = MINIMAL.replace("ny = 1", "ny = 1\n        west = \"open\"");
+        let with = |extra: &str| {
+            format!(
+                "{open}\n[[boundary]]\ntag = \"open\"\nstill = {{}}\n[output]\ninterval_minutes = \
+                 10.0\n[waves]\nexchange_minutes = 10.0\n{extra}\n"
+            )
+        };
+        let sea = "[waves.sea]\nhs_m = 1.0\ntp_s = 6.0\nfrom_deg = 270.0";
+        let case = parse(&with(sea)).unwrap();
+        case.validate().unwrap();
+        let w = case.waves.as_ref().unwrap();
+        assert_eq!((w.frequencies, w.directions), (25, 36));
+        assert!(w.implicit && w.absorbing_land && w.depth_limit);
+        assert_eq!(w.force, WaveForce::Dissipation);
+        // WAM's integration by default, SWAN's on request
+        assert_eq!(
+            w.integration(),
+            (WaveIntegration::Implicit, Some(WaveLimiter::Rate), 4, 1.0)
+        );
+        let swan = parse(&with(&format!("sources = \"swan\"\n{sea}"))).unwrap();
+        assert_eq!(
+            swan.waves.unwrap().integration(),
+            (WaveIntegration::Frozen, None, 1, 0.5)
+        );
+        for (text, says) in [
+            (with(""), "exactly one"),
+            (
+                with(&format!("{sea}\n[waves.spectra]\nfile = \"s.nc\"")),
+                "exactly one",
+            ),
+            (
+                with(sea).replace("exchange_minutes = 10.0", "exchange_minutes = 15.0"),
+                "whole multiple",
+            ),
+            (with(&format!("frequencies = 2\n{sea}")), "frequencies"),
+            (
+                with(&format!(
+                    "{sea}\n[waves.mesh]\norigin = {{ lat = 63.0, lon = 8.0 }}\ngmsh = \"w.msh\""
+                )),
+                "origin",
+            ),
+            (
+                with(&format!("{sea}\n[waves.mesh]\norder = 1")),
+                "waves.mesh",
+            ),
+            (
+                with(&format!("{sea}\n[waves.spectra]\nfile = \"s.nc\"")).replace(sea, ""),
+                "placed",
+            ),
+            (
+                format!(
+                    "{}\n[three_d]\nlevels = 4\nprofile = [[0.0, 10.0, 34.0]]\n",
+                    with(sea)
+                ),
+                "three_d",
             ),
         ] {
             let err = parse(&text).unwrap().validate().unwrap_err().to_string();

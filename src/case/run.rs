@@ -7,8 +7,10 @@
 use std::fs::{self, File};
 
 use crate::analysis::{GaugeComparison, TimeSeries};
+use crate::waves::{CoupledWaves2D, SeaStateFields, SeaStateFrames};
 
 mod three_d;
+mod waves;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +49,8 @@ pub struct Progress {
     pub eta_range: (f64, f64),
     /// Largest depth-averaged speed (m/s)
     pub max_speed: f64,
+    /// Largest significant wave height (m), with `[waves]`
+    pub max_hs: Option<f64>,
 }
 
 /// What a station recorded.
@@ -115,6 +119,15 @@ impl CaseFile {
         let opens = self.open_boundaries(domain, clock.as_ref())?;
         let wall = Reflective2D::new();
         let physics = self.physics(domain, boundary_conditions(&wall, &opens));
+        let mut notes = Vec::new();
+        let mut waves = match (&case.waves, &domain.waves) {
+            (Some(spec), Some(w)) => Some(self.coupled_waves(spec, w, &physics, &mut notes)?),
+            _ => None,
+        };
+        // The waves' sea state at the outputs, between the exchanges
+        let sea = waves
+            .as_ref()
+            .map(|_| std::cell::RefCell::new(SeaStateFrames::default()));
 
         // Still water at the initial level
         let eta0 = case.initial.eta_m;
@@ -126,7 +139,12 @@ impl CaseFile {
             }
         }
 
-        let mut output = Output::create(self, domain, clock.as_ref(), None)?;
+        let surface: &[&str] = if waves.is_some() {
+            &SeaStateFields::NAMES
+        } else {
+            &[]
+        };
+        let mut output = Output::create(self, domain, clock.as_ref(), None, surface)?;
         let volume = |q: &SWESolution2D| volume(domain, q);
         let volume_start = volume(&q);
 
@@ -136,9 +154,14 @@ impl CaseFile {
             if failure.is_some() {
                 return;
             }
-            match output.write(t, q, false) {
+            let mut frames = sea.as_ref().map(|s| s.borrow_mut());
+            let fields = frames.as_mut().map_or(Vec::new(), |f| f.at(t));
+            match output.write(t, q, false, &fields) {
                 Ok(false) => {}
-                Ok(true) => progress(&summarize(domain, q, t, t_end)),
+                Ok(true) => progress(&Progress {
+                    max_hs: max_hs(&fields),
+                    ..summarize(domain, q, t, t_end)
+                }),
                 Err(e) => {
                     failure = Some(e);
                     stop.store(true, Ordering::Relaxed);
@@ -148,6 +171,12 @@ impl CaseFile {
         let numerics = &case.numerics;
         let cfl = numerics.cfl_at(case.mesh.order);
         let stepper = numerics.integrator.standard();
+        let exchange = match (&case.waves, waves.as_mut(), sea.as_ref()) {
+            (Some(spec), Some(waves), Some(sea)) => {
+                Some((waves, 60.0 * spec.exchange_minutes, sea))
+            }
+            _ => None,
+        };
         let result = match numerics.local_time_stepping_levels {
             0 => drive(
                 Simulation::new(physics, stepper),
@@ -157,6 +186,7 @@ impl CaseFile {
                 &stop,
                 &mut q,
                 t_end,
+                exchange,
                 callback,
             ),
             levels => drive(
@@ -167,6 +197,7 @@ impl CaseFile {
                 &stop,
                 &mut q,
                 t_end,
+                exchange,
                 callback,
             ),
         };
@@ -182,7 +213,24 @@ impl CaseFile {
         }
         // The last output, unless the run ended on an output time
         if output.last_time < result.final_time - 1e-6 * interval {
-            output.write(result.final_time, &q, true)?;
+            let mut frames = sea.as_ref().map(|s| s.borrow_mut());
+            let fields = frames
+                .as_mut()
+                .map_or(Vec::new(), |f| f.at(result.final_time));
+            output.write(result.final_time, &q, true, &fields)?;
+        }
+        if let Some(waves) = &waves {
+            let stats = waves.stats();
+            notes.push(format!(
+                "waves: {} exchanges, {} wave steps (mean {:.2} s); stepping {:.1} s, exchanges \
+                 {:.1} s of the {:.1} s wall time",
+                stats.exchanges,
+                stats.wave_steps,
+                result.final_time / stats.wave_steps.max(1) as f64,
+                stats.stepping_time,
+                stats.exchange_time,
+                result.wall_time
+            ));
         }
         let mut stations = output.finish();
         if let Some(clock) = &clock {
@@ -198,7 +246,7 @@ impl CaseFile {
             wall_time_s: result.wall_time,
             volume_m3: (volume_start, volume(&q)),
             stations,
-            notes: Vec::new(),
+            notes,
         })
     }
 
@@ -379,6 +427,7 @@ fn drive<BC, I>(
     stop: &Arc<AtomicBool>,
     q: &mut SWESolution2D,
     t_end: f64,
+    exchange: Option<WaveExchange<'_>>,
     callback: impl FnMut(&SWESolution2D, f64),
 ) -> SimulationResult
 where
@@ -392,7 +441,40 @@ where
     if let Some(dt) = dt_max {
         sim = sim.with_dt_max(dt);
     }
-    sim.run_with_callback(q, 0.0, t_end, callback)
+    match exchange {
+        None => sim.run_with_callback(q, 0.0, t_end, callback),
+        // The waves exchange with the run every interval, their sea state
+        // kept at the interval's ends
+        Some((waves, every, sea)) => sim.run_with_exchange(
+            q,
+            0.0,
+            t_end,
+            every,
+            |physics, q, t, t_next| {
+                if sea.borrow().is_empty() {
+                    sea.borrow_mut().push(waves, t);
+                }
+                waves.exchange(physics, q, t, t_next);
+                sea.borrow_mut().push(waves, t_next);
+            },
+            callback,
+        ),
+    }
+}
+
+/// The coupled waves, their exchange interval (s) and their sea states.
+type WaveExchange<'a> = (
+    &'a mut CoupledWaves2D,
+    f64,
+    &'a std::cell::RefCell<SeaStateFrames>,
+);
+
+/// The largest H_s of a frame's sea-state fields (the first,
+/// `SeaStateFields::NAMES`), if it has them.
+fn max_hs(fields: &[&[f32]]) -> Option<f64> {
+    fields
+        .first()
+        .map(|hs| hs.iter().fold(0.0_f64, |m, &h| m.max(f64::from(h))))
 }
 
 /// The open boundaries of a case, one characteristic condition per tag.
@@ -541,6 +623,7 @@ fn summarize(domain: &Domain, q: &SWESolution2D, t: f64, t_end: f64) -> Progress
         end_s: t_end,
         eta_range: (lo, hi),
         max_speed: speed,
+        max_hs: None,
     }
 }
 
@@ -569,6 +652,7 @@ impl<'a> Output<'a> {
         domain: &'a Domain,
         clock: Option<&crate::time::ModelClock>,
         sigma: Option<&crate::vertical::SigmaGrid>,
+        surface: &[&str],
     ) -> Result<Self, CaseError> {
         let case = &file.case;
         let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
@@ -599,7 +683,7 @@ impl<'a> Output<'a> {
                     clock,
                     &metadata,
                 ),
-                None => SnapshotWriter::create(
+                None => SnapshotWriter::create_with(
                     &path,
                     &domain.mesh,
                     &domain.ops,
@@ -607,6 +691,10 @@ impl<'a> Output<'a> {
                     clock,
                     &metadata,
                     H_VELOCITY,
+                    crate::io::SnapshotLayout {
+                        surface,
+                        levels: None,
+                    },
                 ),
             };
             Some(writer.map_err(|e| io(&path.display().to_string(), &e))?)
@@ -703,7 +791,13 @@ impl<'a> Output<'a> {
     /// Record the stations at `t` if it is a station time, and the fields if
     /// it is a field time (both at the `last` output); whether the fields
     /// were written.
-    fn write(&mut self, t: f64, q: &SWESolution2D, last: bool) -> Result<bool, CaseError> {
+    fn write(
+        &mut self,
+        t: f64,
+        q: &SWESolution2D,
+        last: bool,
+        surface: &[&[f32]],
+    ) -> Result<bool, CaseError> {
         let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
         let domain = self.domain;
         let on = |every: f64| {
@@ -719,7 +813,7 @@ impl<'a> Output<'a> {
         }
         if let Some(snapshot) = &mut self.snapshot {
             snapshot
-                .write_state(t, q, &[])
+                .write_state(t, q, surface)
                 .map_err(|e| io("snapshot", &e))?;
         }
         if let (Some(frame), Some(dir)) = (&mut self.vtk_frames, &self.dir) {

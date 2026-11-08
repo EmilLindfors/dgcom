@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use super::schema::{
-    AtlasCorrection, AtmosphereSection, GaugeCorrection, Nesting, RasterKind, Sampling, SideTag,
-    Slopes3D,
+    AtlasCorrection, AtmosphereSection, GaugeCorrection, MeshSection, Nesting, RasterKind,
+    Sampling, SideTag, Slopes3D,
 };
 use super::{CaseError, CaseFile};
 use crate::analysis::{GaugeRecord, HarmonicAnalysis, TideGaugeStation};
@@ -34,6 +34,7 @@ use crate::physics::Coare35;
 use crate::solver::Probe2D;
 use crate::source::{GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress};
 use crate::types::ElementIndex;
+use crate::waves::{PointSpectra, WindSeries};
 
 /// Mask cells per raster pixel side of a `"bathymetry"` raster's land mask.
 const LAND_MASK_REFINEMENT: usize = 4;
@@ -69,8 +70,27 @@ pub struct Domain {
     pub fluxes_3d: Option<GriddedSurfaceFluxes>,
     /// The parent model's output, with its profiles in a 3D run
     pub parent_reader: Option<Arc<OceanModelReader>>,
+    /// `[waves]`: their mesh, bed, sea and weather
+    pub waves: Option<WaveDomain>,
     /// What was done to build it, line by line, for a log
     pub notes: Vec<String>,
+}
+
+/// The waves' mesh and inputs (`[waves]`).
+pub struct WaveDomain {
+    /// The waves' mesh: their own (`[waves.mesh]`) or the run's
+    pub mesh: Arc<Mesh2D>,
+    /// Its operators
+    pub ops: Arc<DGOperators2D>,
+    /// Its geometric factors
+    pub geom: Arc<GeometricFactors2D>,
+    /// The case's bed on it
+    pub bathymetry: Arc<Bathymetry2D>,
+    /// A parent wave model's spectra on the waves' coordinates and the run's
+    /// clock, and its wind (`[waves.spectra]`)
+    pub parent: Option<(PointSpectra, Option<WindSeries>)>,
+    /// `[atmosphere]`'s weather on the waves' nodes (its wind, not ramped)
+    pub weather: Option<GriddedAtmosphere2D>,
 }
 
 /// Where a `[[output.station]]` samples the model.
@@ -108,75 +128,8 @@ impl CaseFile {
         let case = &self.case;
         let projection = case.projection();
         let mut notes = Vec::new();
-        let grid = self.grid(projection.as_ref())?;
-        let ops = DGOperators2D::new(case.mesh.order);
-        let grid_geom = GeometricFactors2D::compute(&grid, &ops);
-
-        let b = &case.bathymetry;
-        let mut bed = if let Some(depth) = b.depth_m {
-            Bathymetry2D::from_function(&grid, &ops, &grid_geom, |_, _| -depth)
-        } else if let Some(ramp) = &b.ramp {
-            Bathymetry2D::from_function(&grid, &ops, &grid_geom, |x, y| -ramp.depth(x, y))
-        } else {
-            let projection = projection
-                .as_ref()
-                .expect("validated: a raster needs a placement");
-            let raster = self.raster(&grid, projection, &mut notes)?;
-            let sampler = raster.sampler(projection);
-            match b.raster.as_ref().expect("validated").sampling {
-                Sampling::Projected => {
-                    Bathymetry2D::project(&grid, &ops, &grid_geom, sampler, raster.pixel_size())
-                }
-                Sampling::Point => Bathymetry2D::from_function(&grid, &ops, &grid_geom, sampler),
-            }
-        };
-        if b.lower_wall_land {
-            let w = bed.lower_wall_land(&grid, &ops, &grid_geom, b.wall_low_water_m);
-            notes.push(format!(
-                "wall land lowered in {} elements: {} nodes, by up to {:.1} m, {:.4} km³ of water added",
-                w.elements,
-                w.changed,
-                w.max_change,
-                w.volume / 1e9
-            ));
-        }
-        if b.raster.is_some() {
-            let raised = bed.raise_isolated_wet_nodes(&grid, &ops, &grid_geom, 0.0);
-            notes.push(format!(
-                "{raised} isolated wet nodes raised to the lowest of their neighbours"
-            ));
-        }
-        if let Some(r_max) = b.smooth_rx0 {
-            let s = bed.smooth_rx0(&grid, &ops, &grid_geom, r_max, b.rx0_min_depth_m);
-            notes.push(format!(
-                "slope factor r_x0 {:.2} → {:.2} (nodes ≥ {} m deep): {} nodes changed by up to {:.1} m",
-                s.before, s.after, b.rx0_min_depth_m, s.changed, s.max_change
-            ));
-        }
-        if let Some(spec) = &b.slopes_3d {
-            let thin = spec.thin_depth(case.three_d.as_ref());
-            Self::bed_for_3d(spec, thin, &grid, &ops, &grid_geom, &mut bed, &mut notes);
-        }
-
-        let (mut mesh, mut bathymetry, geom) = if case.mesh.drop_land {
-            let has_water = |k: ElementIndex| bed.element(k).iter().any(|&z| z < 0.0);
-            let (mesh, kept) = grid.retain_elements(has_water, BoundaryTag::Wall);
-            if kept.is_empty() {
-                return Err(CaseError::Invalid(
-                    "no element has a node below mean sea level: the domain is all land".into(),
-                ));
-            }
-            notes.push(format!(
-                "{} of {} elements kept (a node below mean sea level)",
-                kept.len(),
-                grid.n_elements
-            ));
-            let bathymetry = bed.select_elements(&kept);
-            let geom = GeometricFactors2D::compute(&mesh, &ops);
-            (mesh, bathymetry, geom)
-        } else {
-            (grid, bed, grid_geom)
-        };
+        let (mut mesh, ops, geom, mut bathymetry) =
+            self.mesh_and_bed(&case.mesh, projection.as_ref(), &mut notes)?;
 
         // Tidal atlases: the open faces they do not cover become walls
         let mut atlases = Vec::new();
@@ -302,7 +255,7 @@ impl CaseFile {
             }
             (weather, _) => (weather, None, None),
         };
-        Ok(Domain {
+        let mut domain = Domain {
             mesh: Arc::new(mesh),
             ops: Arc::new(ops),
             geom: Arc::new(geom),
@@ -316,7 +269,86 @@ impl CaseFile {
             wind_3d,
             fluxes_3d,
             parent_reader,
+            waves: None,
             notes,
+        };
+        if case.waves.is_some() {
+            let mut notes = Vec::new();
+            domain.waves = Some(self.wave_domain(&domain, projection.as_ref(), &mut notes)?);
+            domain.notes.extend(notes);
+        }
+        Ok(domain)
+    }
+
+    /// `[waves]`: the waves' mesh (their own or the run's), the parent's
+    /// spectra, and the weather on the waves' nodes.
+    fn wave_domain(
+        &self,
+        domain: &Domain,
+        projection: Option<&LocalProjection>,
+        notes: &mut Vec<String>,
+    ) -> Result<WaveDomain, CaseError> {
+        let spec = self.case.waves.as_ref().expect("a waves case");
+        let (mesh, ops, geom, bathymetry) = match &spec.mesh {
+            Some(m) => {
+                let mut own = Vec::new();
+                let (mesh, ops, geom, bed) = self.mesh_and_bed(m, projection, &mut own)?;
+                notes.push(format!(
+                    "waves' own mesh: {} elements of order {} ({} nodes)",
+                    mesh.n_elements,
+                    ops.order,
+                    mesh.n_elements * ops.n_nodes
+                ));
+                notes.extend(own.into_iter().map(|n| format!("waves' mesh: {n}")));
+                (Arc::new(mesh), Arc::new(ops), Arc::new(geom), Arc::new(bed))
+            }
+            None => (
+                domain.mesh.clone(),
+                domain.ops.clone(),
+                domain.geom.clone(),
+                domain.bathymetry.clone(),
+            ),
+        };
+        let weather = match &domain.atmosphere {
+            Some(atmosphere) => Some(
+                atmosphere
+                    .on_mesh(&mesh, &ops)
+                    .map_err(|e| CaseError::Invalid(format!("[atmosphere] on the waves: {e}")))?,
+            ),
+            None => None,
+        };
+        let parent = match &spec.spectra {
+            Some(spectra) => {
+                let path = self.resolve(&spectra.file);
+                let projection = projection.expect("validated: placed");
+                let clock = self.case.clock()?.expect("validated: a start");
+                let (spectra, wind, line) = read_wave_spectra(&path, projection, &clock)?;
+                let t_end = 3600.0 * self.case.run.duration_hours;
+                let (first, last) = (
+                    spectra.times.first().copied().unwrap_or(0.0),
+                    spectra.times.last().copied().unwrap_or(0.0),
+                );
+                notes.push(line);
+                if first > 0.0 || last < t_end {
+                    notes.push(format!(
+                        "warning: the run (0 → {:.1} h) reaches beyond the spectra ({:.1} → \
+                         {:.1} h); the boundary is held at the ends",
+                        t_end / 3600.0,
+                        first / 3600.0,
+                        last / 3600.0
+                    ));
+                }
+                Some((spectra, wind))
+            }
+            None => None,
+        };
+        Ok(WaveDomain {
+            mesh,
+            ops,
+            geom,
+            bathymetry,
+            parent,
+            weather,
         })
     }
 
@@ -738,8 +770,91 @@ impl CaseFile {
     }
 
     /// The whole mesh, before land is dropped.
-    fn grid(&self, projection: Option<&LocalProjection>) -> Result<Mesh2D, CaseError> {
-        let m = &self.case.mesh;
+    /// The mesh `m` and the case's bed on it, the way the example builds
+    /// it (see the module docs): the whole grid, the bed on its nodes and
+    /// treated, the land dropped. For the run's mesh and the waves' own.
+    fn mesh_and_bed(
+        &self,
+        m: &MeshSection,
+        projection: Option<&LocalProjection>,
+        notes: &mut Vec<String>,
+    ) -> Result<(Mesh2D, DGOperators2D, GeometricFactors2D, Bathymetry2D), CaseError> {
+        let case = &self.case;
+        let grid = self.grid(m, projection)?;
+        let ops = DGOperators2D::new(m.order);
+        let grid_geom = GeometricFactors2D::compute(&grid, &ops);
+
+        let b = &case.bathymetry;
+        let mut bed = if let Some(depth) = b.depth_m {
+            Bathymetry2D::from_function(&grid, &ops, &grid_geom, |_, _| -depth)
+        } else if let Some(ramp) = &b.ramp {
+            Bathymetry2D::from_function(&grid, &ops, &grid_geom, |x, y| -ramp.depth(x, y))
+        } else {
+            let projection = projection.expect("validated: a raster needs a placement");
+            let raster = self.raster(&grid, projection, notes)?;
+            let sampler = raster.sampler(projection);
+            match b.raster.as_ref().expect("validated").sampling {
+                Sampling::Projected => {
+                    Bathymetry2D::project(&grid, &ops, &grid_geom, sampler, raster.pixel_size())
+                }
+                Sampling::Point => Bathymetry2D::from_function(&grid, &ops, &grid_geom, sampler),
+            }
+        };
+        if b.lower_wall_land {
+            let w = bed.lower_wall_land(&grid, &ops, &grid_geom, b.wall_low_water_m);
+            notes.push(format!(
+                "wall land lowered in {} elements: {} nodes, by up to {:.1} m, {:.4} km³ of water added",
+                w.elements,
+                w.changed,
+                w.max_change,
+                w.volume / 1e9
+            ));
+        }
+        if b.raster.is_some() {
+            let raised = bed.raise_isolated_wet_nodes(&grid, &ops, &grid_geom, 0.0);
+            notes.push(format!(
+                "{raised} isolated wet nodes raised to the lowest of their neighbours"
+            ));
+        }
+        if let Some(r_max) = b.smooth_rx0 {
+            let s = bed.smooth_rx0(&grid, &ops, &grid_geom, r_max, b.rx0_min_depth_m);
+            notes.push(format!(
+                "slope factor r_x0 {:.2} → {:.2} (nodes ≥ {} m deep): {} nodes changed by up to {:.1} m",
+                s.before, s.after, b.rx0_min_depth_m, s.changed, s.max_change
+            ));
+        }
+        if let Some(spec) = &b.slopes_3d {
+            let thin = spec.thin_depth(case.three_d.as_ref());
+            Self::bed_for_3d(spec, thin, &grid, &ops, &grid_geom, &mut bed, notes);
+        }
+
+        let (mesh, bathymetry, geom) = if m.drop_land {
+            let has_water = |k: ElementIndex| bed.element(k).iter().any(|&z| z < 0.0);
+            let (mesh, kept) = grid.retain_elements(has_water, BoundaryTag::Wall);
+            if kept.is_empty() {
+                return Err(CaseError::Invalid(
+                    "no element has a node below mean sea level: the domain is all land".into(),
+                ));
+            }
+            notes.push(format!(
+                "{} of {} elements kept (a node below mean sea level)",
+                kept.len(),
+                grid.n_elements
+            ));
+            let bathymetry = bed.select_elements(&kept);
+            let geom = GeometricFactors2D::compute(&mesh, &ops);
+            (mesh, bathymetry, geom)
+        } else {
+            (grid, bed, grid_geom)
+        };
+        Ok((mesh, ops, geom, bathymetry))
+    }
+
+    fn grid(
+        &self,
+        m: &MeshSection,
+        projection: Option<&LocalProjection>,
+    ) -> Result<Mesh2D, CaseError> {
         if let Some(r) = &m.rectangle {
             Ok(Mesh2D::uniform_rectangle_with_sides(
                 r.x_m[0],
@@ -841,6 +956,53 @@ impl CaseFile {
         ));
         Ok(raster)
     }
+}
+
+/// A parent wave model's spectra at `path` on the coordinates of
+/// `projection` and the time of `clock`, its wind, and a line for the log.
+#[cfg(feature = "netcdf")]
+fn read_wave_spectra(
+    path: &std::path::Path,
+    projection: &LocalProjection,
+    clock: &crate::time::ModelClock,
+) -> Result<(PointSpectra, Option<WindSeries>, String), CaseError> {
+    let file = crate::io::WaveSpectraFile::from_file(path)
+        .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
+    let model_time = |unix: f64| clock.model_time(unix);
+    // Geographic east in the mesh axes, at the projection's centre
+    let (ex, ey) = crate::io::east_axis(projection, projection.ref_lat(), projection.ref_lon());
+    let east = ey.atan2(ex);
+    let position = |lon: f64, lat: f64| {
+        let (x, y) = projection.geo_to_xy(lat, lon);
+        [x, y]
+    };
+    let spectra = file.point_spectra(position, model_time, east);
+    let wind = file.wind_series(&[], model_time, east);
+    let line = format!(
+        "wave spectra {}: {} points, {} → {} UTC{}",
+        path.display(),
+        file.n_points(),
+        clock.format(model_time(file.times[0])),
+        clock.format(model_time(file.times[file.times.len() - 1])),
+        file.forecast_reference_time
+            .map_or(String::new(), |t| format!(
+                " (forecast from {} UTC)",
+                clock.format(model_time(t))
+            ))
+    );
+    Ok((spectra, wind, line))
+}
+
+#[cfg(not(feature = "netcdf"))]
+fn read_wave_spectra(
+    path: &std::path::Path,
+    _projection: &LocalProjection,
+    _clock: &crate::time::ModelClock,
+) -> Result<(PointSpectra, Option<WindSeries>, String), CaseError> {
+    Err(CaseError::Invalid(format!(
+        "{}: [waves.spectra] reads NetCDF, which needs dgcom built with the `netcdf` feature",
+        path.display()
+    )))
 }
 
 /// The weather files `paths`, joined in time.
