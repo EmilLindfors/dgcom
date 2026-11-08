@@ -13,6 +13,8 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **A 3D case's stations are recorded at their times (TODO P8.1; `notes/case-files.md`)**, by linear interpolation between the two steps around each, instead of at the first step on or after it. The steps still land on the field outputs only, so the station interval does not move the run (the snapshots are unchanged), and the station series are regular for the gauge scores.
+
 - **`dgcom mesh case.toml` (TODO P8.1; `notes/case-files.md`)** builds a case's mesh and bed and writes them to the output directory's `mesh` folder to inspect before a run: Gmsh (`<name>.msh`, the boundary tags as physical groups) and VTK (`<name>.vtu`: the bed and the depth at rest at the nodes; each element's diameter, the 2D time step it allows at rest at the case's CFL, and with local time stepping its level). It prints the element steps, the run's first step and the elements per level; a separate wave mesh is written beside it. `io::write_vtk_fields` writes any node and element fields (`write_vtk_swe` is built on it).
 
 - **A case's output names its build and carries the viewer's metadata (TODO P8.1; `notes/case-files.md`).**

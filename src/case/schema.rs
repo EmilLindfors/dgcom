@@ -685,9 +685,10 @@ pub struct AtmosphereSection {
 ///   heat budget, COARE 3.5 surface fluxes, shortwave absorbed as Jerlov
 ///   water `jerlov`.
 ///
-/// Output: snapshots (`<name>.dgsnap`, 3D) at their times exactly, and the
-/// stations at the first step on or after theirs (from the depth mean);
-/// VTK and NetCDF are 2D only for now.
+/// Output: snapshots (`<name>.dgsnap`, 3D) at their times exactly (the steps
+/// land on them), and the stations at theirs from the depth mean, between two
+/// steps by linear interpolation (so the station times do not move the
+/// steps); VTK and NetCDF are 2D only for now.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreeDSection {

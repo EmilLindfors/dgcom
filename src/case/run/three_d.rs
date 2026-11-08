@@ -18,7 +18,9 @@
 
 use std::sync::Arc;
 
-use super::{Output, Progress, RunReport, boundary_conditions, score_gauges, summarize, volume};
+use super::{
+    H_VELOCITY, Output, Progress, RunReport, boundary_conditions, score_gauges, summarize, volume,
+};
 use crate::boundary::{
     DeepReference, Nesting3D, NestingBand3D, OceanColumnsOptions, OceanModelColumns,
     ParentColumns3D, ReferenceColumns, Reflective2D, sample_columns,
@@ -32,7 +34,8 @@ use crate::physics::{
 use crate::simulation::Simulation3D;
 use crate::solver::state::Solution3D;
 use crate::solver::{
-    SWESolution2D, SWEState2D, TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile,
+    Probe2D, SWEPointSample, SWESolution2D, SWEState2D, TracerLimiter3DConfig, TracerLimiterType3D,
+    TracerReferenceProfile,
 };
 use crate::source::{CoriolisSource2D, SpongeProfile, coriolis_parameter};
 use crate::time::{ModeSplitIntegrator, SspScheme};
@@ -284,8 +287,10 @@ impl CaseFile {
             eos.compute_density(t, s, z)
         });
 
-        // The run: the steps land on the field outputs; the stations are
-        // recorded at the first step on or after their times
+        // The run: the steps land on the field outputs. The stations are
+        // sampled at every step and recorded at their times, between two
+        // steps by linear interpolation, so their series are regular without
+        // their times moving the run's steps (the 2D run lands on both)
         let mut output = Output::create(self, domain, clock.as_ref(), Some(&sigma), &[])?;
         let field_every = 60.0 * case.output.interval_minutes;
         let station_every = 60.0 * case.output.station_interval();
@@ -306,6 +311,8 @@ impl CaseFile {
         barotropic(&state, &mut q);
         let volume_start = volume(domain, &q);
         let (mut next_station, mut failure) = (0.0, None);
+        let mut nodes = vec![0.0; 3 * nn];
+        let mut previous: Option<(f64, Vec<SWEPointSample>)> = None;
         let mut on_step = |s: &Solution3D, t: f64| {
             if failure.is_some() {
                 return;
@@ -314,23 +321,34 @@ impl CaseFile {
                 let n = t / field_every;
                 (n - n.round()).abs() < 1e-6 || t >= t_end - 1e-6
             };
-            let on_station = t >= next_station - 1e-6;
-            if !(on_field || on_station) {
-                return;
-            }
-            barotropic(s, &mut q);
+            let now: Vec<SWEPointSample> = domain
+                .stations
+                .iter()
+                .map(|st| sample_depth_mean(&st.probe, s, bed, &mut nodes))
+                .collect();
             let written = (|| -> Result<(), CaseError> {
-                if on_station {
-                    while next_station <= t + 1e-6 {
-                        next_station += station_every;
+                while next_station <= t + 1e-6 {
+                    if (t - next_station).abs() <= 1e-6 {
+                        output.record_samples(t, &now)?;
+                    } else {
+                        let (t0, before) = previous.as_ref().expect("time 0 is a station time");
+                        let w = (next_station - t0) / (t - t0);
+                        let between: Vec<SWEPointSample> = before
+                            .iter()
+                            .zip(&now)
+                            .map(|(a, b)| interpolate(a, b, w))
+                            .collect();
+                        output.record_samples(next_station, &between)?;
                     }
-                    output.record_stations(t, &q)?;
+                    next_station += station_every;
                 }
                 if on_field {
+                    barotropic(s, &mut q);
                     output.write_snapshot_3d(t, s)?;
                 }
                 Ok(())
             })();
+            previous = Some((t, now));
             match written {
                 Ok(()) if on_field => progress(&summarize(domain, &q, t, t_end)),
                 Ok(()) => {}
@@ -380,5 +398,57 @@ impl CaseFile {
             stations,
             notes,
         })
+    }
+}
+
+/// The depth-mean state of `s` at `probe`, as [`Probe2D::sample_swe`] reads
+/// it from the 2D state (`h = max(η − B, 0)`, `hū`, `hv̄` at the nodes) on
+/// bed `bed`: the same values at the same time. `nodes` holds the element's
+/// `3 × n_nodes` node values.
+fn sample_depth_mean(
+    probe: &Probe2D,
+    s: &Solution3D,
+    bed: &[f64],
+    nodes: &mut [f64],
+) -> SWEPointSample {
+    let nn = probe.weights().len();
+    let start = probe.element().as_usize() * nn;
+    let (h, rest) = nodes.split_at_mut(nn);
+    let (hu, hv) = rest.split_at_mut(nn);
+    for i in 0..nn {
+        let j = start + i;
+        h[i] = (s.eta.data[j] - bed[j]).max(0.0);
+        hu[i] = h[i] * s.ubar.data[j];
+        hv[i] = h[i] * s.vbar.data[j];
+    }
+    let (h, hu, hv) = (probe.evaluate(h), probe.evaluate(hu), probe.evaluate(hv));
+    let bed = probe.evaluate(&bed[start..start + nn]);
+    let (u, v) = if h > H_VELOCITY {
+        (hu / h, hv / h)
+    } else {
+        (0.0, 0.0)
+    };
+    SWEPointSample {
+        h,
+        hu,
+        hv,
+        bed,
+        eta: h + bed,
+        u,
+        v,
+    }
+}
+
+/// `a` and `b` mixed linearly, `w` of the way from `a` to `b`.
+fn interpolate(a: &SWEPointSample, b: &SWEPointSample, w: f64) -> SWEPointSample {
+    let mix = |x: f64, y: f64| x + w * (y - x);
+    SWEPointSample {
+        h: mix(a.h, b.h),
+        hu: mix(a.hu, b.hu),
+        hv: mix(a.hv, b.hv),
+        bed: mix(a.bed, b.bed),
+        eta: mix(a.eta, b.eta),
+        u: mix(a.u, b.u),
+        v: mix(a.v, b.v),
     }
 }

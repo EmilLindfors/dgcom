@@ -29,7 +29,9 @@ use crate::equations::ShallowWater2D;
 use crate::io::{SnapshotWriter, write_vtk_swe};
 use crate::physics::{PhysicsBuilder, SWEPhysics2D, SWEPhysics2DBuilder};
 use crate::simulation::{Simulation, SimulationResult};
-use crate::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, total_mass_2d};
+use crate::solver::{
+    SWEPointSample, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, total_mass_2d,
+};
 use crate::source::{
     CageDrag2D, ChezyFriction2D, CoriolisSource2D, GriddedAtmosphere2D, HorizontalViscosity2D,
     ManningFriction2D, coriolis_parameter,
@@ -831,12 +833,19 @@ impl<'a> Output<'a> {
 
     /// Record the stations at `t`.
     fn record_stations(&mut self, t: f64, q: &SWESolution2D) -> Result<(), CaseError> {
-        let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
         let domain = self.domain;
-        for (station, series) in domain.stations.iter().zip(&mut self.stations) {
-            let s = station
-                .probe
-                .sample_swe(q, Some(&domain.bathymetry), H_VELOCITY);
+        let samples: Vec<SWEPointSample> = domain
+            .stations
+            .iter()
+            .map(|s| s.probe.sample_swe(q, Some(&domain.bathymetry), H_VELOCITY))
+            .collect();
+        self.record_samples(t, &samples)
+    }
+
+    /// Record the stations' `samples` (one per station) at `t`.
+    fn record_samples(&mut self, t: f64, samples: &[SWEPointSample]) -> Result<(), CaseError> {
+        let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
+        for (s, series) in samples.iter().zip(&mut self.stations) {
             series.time_s.push(t);
             series.eta_m.push(s.eta);
             series.u_m_s.push(s.u);

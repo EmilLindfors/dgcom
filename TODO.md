@@ -9,7 +9,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Generic cases and case files (P8) — [notes/case-files.md](notes/case-files.md)
 
 - [ ] **P8.1** The output schedule is part of the run: the steps land on every output and station time, so changing an interval moves the run by round-off (1.8 mm in η over 24 h at Bodø). Either document it as a feature of the run (the intervals are inputs, now in `case.resolved.toml`) or decouple the outputs (dense output between steps).
-- [ ] **P8.1** A 3D run records its stations at the first step on or after their times (as the example does), so the series is irregular by up to a step; land the 3D steps on station times too, or interpolate between steps.
 - [ ] **P8.1** 3D output beyond snapshots and stations in case files: VTK and NetCDF of the layers (the 3D run refuses `output.vtk` and `output.netcdf` for now), and rivers (`froya_real_data rivers=`, `RiverSources` in 3D).
 - [ ] **P8.1** The waves at case stations: H_s, T_p and the mean direction at `[[output.station]]` (and against a buoy's record, as the gauge scores do the level), and at a parent wave model's points (`froya_real_data`'s `WavePoints`, `wave_stations=`). Until then the sea state is in the snapshots only.
 - [ ] **P8.1** Restarts for case runs: write the resolved case into the restart, and compare it on resume (closes P5.3's gap; the resolved case is already written next to the output).
