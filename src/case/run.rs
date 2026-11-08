@@ -5,6 +5,8 @@
 //! relaxation band is a source term after the Coriolis force, as there.
 
 use std::fs::{self, File};
+
+use crate::analysis::{GaugeComparison, TimeSeries};
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +60,8 @@ pub struct StationSeries {
     pub u_m_s: Vec<f64>,
     /// Depth-averaged velocity along y (m/s)
     pub v_m_s: Vec<f64>,
+    /// Its surface against its tide gauge after the spin-up, if it has one
+    pub gauge: Option<GaugeComparison>,
 }
 
 /// The outcome of a run.
@@ -259,13 +263,20 @@ impl CaseFile {
         if output.last_time < result.final_time - 1e-6 * interval {
             output.write(result.final_time, &q, true)?;
         }
+        let mut stations = output.finish();
+        if let Some(clock) = &clock {
+            score_gauges(domain, &mut stations, clock, 3600.0 * case.spinup_hours());
+            if stations.iter().any(|s| s.gauge.is_some()) {
+                write_gauge_scores(&self.output_dir(), &stations)?;
+            }
+        }
         Ok(RunReport {
             final_time_s: result.final_time,
             n_steps: result.n_steps,
             dt_range_s: (result.dt_min, result.dt_max),
             wall_time_s: result.wall_time,
             volume_m3: (volume_start, volume(&q)),
-            stations: output.finish(),
+            stations,
         })
     }
 
@@ -360,6 +371,81 @@ where
         sim = sim.with_dt_max(dt);
     }
     sim.run_with_callback(q, 0.0, t_end, callback)
+}
+
+/// Each station with a gauge against it, from `spinup` (s) on, on the
+/// gauge's Unix time axis.
+fn score_gauges(
+    domain: &Domain,
+    stations: &mut [StationSeries],
+    clock: &crate::time::ModelClock,
+    spinup: f64,
+) {
+    for (series, station) in stations.iter_mut().zip(&domain.stations) {
+        let Some(gauge) = &station.gauge else {
+            continue;
+        };
+        let first = series.time_s.partition_point(|&t| t < spinup - 1e-6);
+        let times: Vec<f64> = series.time_s[first..]
+            .iter()
+            .map(|&t| clock.unix(t))
+            .collect();
+        let model = TimeSeries::new(&times, &series.eta_m[first..]);
+        series.gauge = Some(GaugeComparison::compute(&model, gauge));
+    }
+}
+
+/// `gauge_skill.csv` (each gauged station against the observations and
+/// the gauge's tidal prediction) and `gauge_constituents.csv` (its reference
+/// constants against the gauge's) in `dir`.
+fn write_gauge_scores(dir: &std::path::Path, stations: &[StationSeries]) -> Result<(), CaseError> {
+    use std::fmt::Write as _;
+    let mut skill = String::from(
+        "station,reference,samples,rmse_m,centred_rmse_m,bias_m,correlation,std_model_m,std_reference_m\n",
+    );
+    let mut constants = String::from(
+        "station,constituent,model_amplitude_m,model_lag_deg,inferred,gauge_amplitude_m,gauge_lag_deg,amplitude_ratio,lag_difference_deg,abs_dz_m\n",
+    );
+    for s in stations {
+        let Some(g) = &s.gauge else { continue };
+        for (reference, score) in [
+            ("observations", &g.vs_observations),
+            ("tidal_prediction", &g.vs_prediction),
+        ] {
+            if let Ok(v) = score {
+                let _ = writeln!(
+                    skill,
+                    "{},{reference},{},{},{},{},{},{},{}",
+                    s.name, v.n, v.rmse, v.centred_rmse, v.bias, v.correlation, v.std.0, v.std.1
+                );
+            }
+        }
+        let Ok(model) = &g.model_fit else { continue };
+        for c in &g.constituents {
+            let inferred = model.get(c.name).is_some_and(|m| m.inferred);
+            let _ = writeln!(
+                constants,
+                "{},{},{},{},{inferred},{},{},{},{},{}",
+                s.name,
+                c.name,
+                c.model_amplitude,
+                c.model_phase.to_degrees(),
+                c.obs_amplitude,
+                c.obs_phase.to_degrees(),
+                c.amplitude_ratio,
+                c.phase_error_degrees(),
+                c.complex_difference()
+            );
+        }
+    }
+    for (name, text) in [
+        ("gauge_skill.csv", skill),
+        ("gauge_constituents.csv", constants),
+    ] {
+        let path = dir.join(name);
+        fs::write(&path, text).map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
+    }
+    Ok(())
 }
 
 /// A characteristic open boundary on `provider`'s external state, with

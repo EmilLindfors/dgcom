@@ -20,7 +20,7 @@ use super::schema::{
     Slopes3D,
 };
 use super::{CaseError, CaseFile};
-use crate::analysis::HarmonicAnalysis;
+use crate::analysis::{GaugeRecord, HarmonicAnalysis, TideGaugeStation};
 use crate::boundary::{
     BoundaryCoverage, GaugeAdjustment, NestingOptions, OceanModelState, ParentDatum, TidalAtlas,
 };
@@ -75,6 +75,8 @@ pub struct StationProbe {
     /// How far the point is from the station's position (m): 0 unless it
     /// was moved into open water
     pub offset_m: f64,
+    /// The tide gauge it is scored against, read and fitted
+    pub gauge: Option<GaugeRecord>,
 }
 
 impl Domain {
@@ -361,10 +363,45 @@ impl CaseFile {
                     s.name, -bed
                 ));
             }
+            let gauge = match &s.gauge {
+                Some(file) => {
+                    let path = self.resolve(file);
+                    let record = read_tide_gauge_file(&path)
+                        .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
+                    let station = record.station.clone().unwrap_or_else(|| {
+                        TideGaugeStation::new(
+                            s.name.clone(),
+                            s.lon.unwrap_or(f64::NAN),
+                            s.lat.unwrap_or(f64::NAN),
+                        )
+                    });
+                    let gauge = GaugeRecord::new(
+                        station,
+                        record.time_series.times(),
+                        record.time_series.values(),
+                    );
+                    notes.push(format!(
+                        "station {:?}: gauge record of {:.0} days, {}",
+                        s.name,
+                        gauge.days(),
+                        match &gauge.fit {
+                            Ok(fit) => format!(
+                                "{} constituents fitted (R² {:.4})",
+                                fit.constants.len(),
+                                fit.r_squared
+                            ),
+                            Err(e) => format!("no fit ({e}): skill against the observations only"),
+                        }
+                    ));
+                    Some(gauge)
+                }
+                None => None,
+            };
             stations.push(StationProbe {
                 name: s.name.clone(),
                 probe,
                 offset_m,
+                gauge,
             });
         }
         Ok(stations)

@@ -858,6 +858,10 @@ pub struct OutputSection {
     /// intervals are part of the run, to round-off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub station_interval_minutes: Option<f64>,
+    /// When the gauge scores start (hours; default: the longest ramp of the
+    /// forcing, when it is fully on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spinup_hours: Option<f64>,
     /// The whole state in the viewer's snapshot format,
     /// `<name>.dgsnap` (default true).
     #[serde(default = "default_true")]
@@ -889,6 +893,7 @@ impl Default for OutputSection {
             directory: None,
             interval_minutes: default_interval_minutes(),
             station_interval_minutes: None,
+            spinup_hours: None,
             snapshot: true,
             vtk: false,
             netcdf: false,
@@ -926,6 +931,14 @@ pub struct Station {
     /// How far a station may be moved into open water (m, default 3000).
     #[serde(default = "default_max_offset")]
     pub max_offset_m: f64,
+    /// A tide gauge's record to score the station's surface against after
+    /// `output.spinup_hours` (the format of `scripts/kartverket_gauge.sh`;
+    /// needs `run.start`): the skill against the observations and the
+    /// gauge's tidal prediction, and the reference constants against the
+    /// gauge's (`GaugeComparison`), into `gauge_skill.csv` and
+    /// `gauge_constituents.csv`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gauge: Option<PathBuf>,
 }
 
 fn default_open_water_depth() -> f64 {
@@ -1461,6 +1474,17 @@ impl Case {
                     ));
                 }
             }
+            if s.gauge.is_some() && self.run.start.is_none() {
+                return invalid(format!(
+                    "station {:?}: a gauge's record is in UTC, which needs run.start",
+                    s.name
+                ));
+            }
+        }
+        if let Some(h) = o.spinup_hours
+            && !(non_negative(h) && h.is_finite())
+        {
+            return invalid(format!("output.spinup_hours must be ≥ 0, not {h}"));
         }
         // Last, so that a build without NetCDF still checks the rest
         if self.atmosphere.is_some() && !cfg!(feature = "netcdf") {
@@ -1498,6 +1522,22 @@ impl Case {
         let mut case = self.clone();
         case.numerics.cfl = Some(self.numerics.cfl_at(self.mesh.order));
         case
+    }
+
+    /// When the gauge scores start (hours): `output.spinup_hours`, else the
+    /// longest ramp of the open boundaries and the atmosphere.
+    pub fn spinup_hours(&self) -> f64 {
+        self.output.spinup_hours.unwrap_or_else(|| {
+            let boundaries = self.boundaries.iter().filter_map(|b| {
+                b.tide
+                    .as_ref()
+                    .map(|t| t.ramp_hours)
+                    .or(b.atlas.as_ref().map(|a| a.ramp_hours))
+                    .or(b.nesting.as_ref().map(|n| n.ramp_hours))
+            });
+            let atmosphere = self.atmosphere.as_ref().map(|a| a.ramp_hours);
+            boundaries.chain(atmosphere).fold(0.0, f64::max)
+        })
     }
 
     /// The run's clock, from `run.start`.

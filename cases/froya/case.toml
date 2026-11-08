@@ -63,3 +63,4 @@ interval_minutes = 10.0
 name = "Mausund"                # Kartverket's tide gauge (MSU)
 lat = 63.869331
 lon = 8.665231
+gauge = "../../data/tide_gauges/mausund_obs.txt"   # scored after the ramp: gauge_skill.csv

@@ -8,7 +8,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Generic cases and case files (P8) — [notes/case-files.md](notes/case-files.md)
 
-- [ ] **P8.1** Score stations against a tide gauge in case files (`[[output.station]] gauge = "obs.txt"`, the example's `gauges=`): the centred RMSE, bias and correlation over a window, and the harmonic constants against the gauge's, written next to the series. The 2026-06-12 scores are computed from the case's `stations.csv` by hand until then (`notes/case-files.md`).
 - [ ] **P8.1** `dgcom mesh case.toml`: build the mesh and bed and write them (VTK, Gmsh) to inspect before a run.
 - [ ] **P8.1** Restarts for case runs: write the resolved case into the restart, and compare it on resume (closes P5.3's gap; the resolved case is already written next to the output).
 - [ ] **P8.1** `NetCDFWriter` names u, v `eastward`/`northward_sea_water_velocity`. That holds for a placed case, whose `LocalProjection` is unrotated and which writes lat/lon (2026-11-07), but not for an unplaced one, whose velocities are along x and y: name them by the axes there (with P5.2).

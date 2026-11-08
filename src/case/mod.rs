@@ -23,10 +23,10 @@
 //!   nesting in a parent ocean model (NetCDF, with the `netcdf` feature);
 //! - a weather model's wind and pressure, with the inverse-barometer level
 //!   at the open boundaries (NetCDF);
-//! - snapshot, VTK, NetCDF and station output.
+//! - snapshot, VTK, NetCDF and station output, the stations scored
+//!   against tide gauges.
 //!
-//! Next: gauge scores at the stations, and the 3D model
-//! (`notes/case-files.md`).
+//! Next: the 3D model (`notes/case-files.md`).
 
 mod domain;
 mod run;
@@ -670,6 +670,50 @@ file = \"parent.nc\"
             let err = case.validate().unwrap_err().to_string();
             assert!(err.contains("netcdf"), "{err}");
         }
+    }
+
+    #[test]
+    fn gauge_scores_start_when_the_forcing_is_fully_on() {
+        let open = MINIMAL.replace("ny = 1", "ny = 1\n        west = \"open\"");
+        let tide = |ramp: f64| {
+            format!(
+                "{open}\n[[boundary]]\ntag = \"open\"\n[boundary.tide]\nramp_hours = {ramp}\n\
+                 constituents = [{{ name = \"M2\", amplitude_m = 1.0 }}]\n\
+                 [[output.station]]\nname = \"s\"\nx_m = 500.0\ny_m = 50.0\n\
+                 gauge = \"g.txt\"\n"
+            )
+        };
+        // A gauge's record is in UTC
+        let err = parse(&tide(2.0)).unwrap().validate().unwrap_err();
+        assert!(err.to_string().contains("run.start"), "{err}");
+        let started = |text: String| {
+            text.replace(
+                "duration_hours = 1.0",
+                "duration_hours = 1.0\n        start = \"2025-06-15T00:00:00Z\"",
+            )
+        };
+        let case = parse(&started(tide(2.0))).unwrap();
+        case.validate().unwrap();
+        assert_eq!(case.spinup_hours(), 2.0, "the tide's ramp");
+        let set = parse(&started(tide(2.0)).replace(
+            "[[output.station]]",
+            "[output]\nspinup_hours = 5.0\n[[output.station]]",
+        ))
+        .unwrap();
+        assert_eq!(set.spinup_hours(), 5.0);
+        let bad = parse(&started(tide(2.0)).replace(
+            "[[output.station]]",
+            "[output]\nspinup_hours = -1.0\n[[output.station]]",
+        ))
+        .unwrap();
+        assert!(
+            bad.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("spinup_hours")
+        );
+        // Still water has no ramp
+        assert_eq!(parse(MINIMAL).unwrap().spinup_hours(), 0.0);
     }
 
     #[test]

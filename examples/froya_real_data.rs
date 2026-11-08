@@ -519,8 +519,8 @@ use std::time::Instant;
 use arguments::Arguments;
 use dgcom::analysis::{
     ADCPStation, ADCPValidationResult, AnalysisError, ConstituentComparison, CurrentTimeSeries,
-    EllipseFit, HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit,
-    StationValidationResult, TidalEllipse, TideGaugeStation, TimeSeries,
+    EllipseFit, GaugeComparison, GaugeRecord, HarmonicAnalysis, Inference, ReferenceFit,
+    TidalEllipse, TideGaugeStation, TimeSeries,
 };
 use dgcom::boundary::{
     AtlasPoint, BCContext2D, BoundaryCoverage, BoundaryLevel, BoundaryTides, CharacteristicOBC,
@@ -642,9 +642,7 @@ const STATION_MIN_DEPTH: f64 = 3.0;
 const STATION_MAX_OFFSET: f64 = 3000.0;
 /// Constituents fitted at the stations, in priority order (a short record
 /// keeps the first ones): the forcing's, without the long-period ones
-const STATION_CONSTITUENTS: [&str; 12] = [
-    "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6",
-];
+const STATION_CONSTITUENTS: [&str; 12] = HarmonicAnalysis::STATION_RECORD;
 /// Constituents fitted to a gauge's or current meter's whole record
 const GAUGE_CONSTITUENTS: [&str; 15] = HarmonicAnalysis::GAUGE_RECORD;
 
@@ -1298,14 +1296,6 @@ struct Stats {
     wet: usize,
 }
 
-/// A tide gauge's record (finite samples, Unix times) and its reference
-/// constants.
-struct Gauge {
-    station: TideGaugeStation,
-    observed: TimeSeries,
-    observed_fit: Result<ReferenceFit, AnalysisError>,
-}
-
 /// A current record (Unix times, east/north) and its tidal ellipses.
 struct CurrentRecord {
     station: ADCPStation,
@@ -1320,7 +1310,7 @@ struct Station {
     longitude: f64,
     latitude: f64,
     /// Tide gauge record (η) and current record, if any
-    gauge: Option<Gauge>,
+    gauge: Option<GaugeRecord>,
     current: Option<CurrentRecord>,
     /// The DG solution evaluated at the sampling point
     probe: Probe2D,
@@ -2042,7 +2032,7 @@ impl Domain {
         let mut add = |name: String,
                        longitude: f64,
                        latitude: f64,
-                       gauge: Option<Gauge>,
+                       gauge: Option<GaugeRecord>,
                        current: Option<CurrentRecord>,
                        record_days: f64| {
             let (x, y) = projection.geo_to_xy(latitude, longitude);
@@ -2086,15 +2076,11 @@ impl Domain {
                 println!("  Gauge {path}: no station position (skipped)");
                 continue;
             };
-            let (times, values): (Vec<f64>, Vec<f64>) = gauge
-                .time_series
-                .times()
-                .iter()
-                .copied()
-                .zip(gauge.time_series.values().iter().copied())
-                .filter(|(_, v)| v.is_finite())
-                .unzip();
-            let observed_fit = HarmonicAnalysis::fit_gauge_record(&times, &values);
+            let record = GaugeRecord::new(
+                station.clone(),
+                gauge.time_series.times(),
+                gauge.time_series.values(),
+            );
             let norkyst = atlas
                 .and_then(|a| a.nearest(station.longitude, station.latitude))
                 .filter(|&(p, d)| {
@@ -2103,17 +2089,14 @@ impl Domain {
                         && p.constituents.iter().all(|c| c.velocity.is_some())
                 });
             let name = station.name.clone();
+            let record_days = record.days();
             add(
                 name.clone(),
                 station.longitude,
                 station.latitude,
-                Some(Gauge {
-                    station,
-                    observed: TimeSeries::new(&times, &values),
-                    observed_fit,
-                }),
+                Some(record),
                 None,
-                days(&times),
+                record_days,
             );
             if let Some((p, _)) = norkyst {
                 add(
@@ -6011,20 +5994,6 @@ fn slug(name: &str) -> String {
         .collect()
 }
 
-/// Reference constants of the constituents a record resolves; the others of
-/// P1, K2, N2 and Q1 are inferred with the ratios of `reference` (a longer
-/// record at the same place) where it has them, else at equilibrium.
-fn fit_record(
-    times: &[f64],
-    values: &[f64],
-    candidates: &[&'static str],
-    reference: Option<&ReferenceFit>,
-) -> Result<ReferenceFit, AnalysisError> {
-    let inferences = Inference::EQUILIBRIUM.map(|i| i.or_from(reference));
-    HarmonicAnalysis::resolvable(candidates, record_length(times), 1.0, &inferences)
-        .fit(times, values)
-}
-
 /// Last minus first time (s); 0 for an empty record.
 fn record_length(times: &[f64]) -> f64 {
     times
@@ -6049,64 +6018,61 @@ fn fit_current_record(
         .fit_ellipses(times, u, v)
 }
 
-/// The model's reference constants at a station after spin-up (from
-/// `analysis_start`, Unix s) against the gauge's (whole record) and
-/// NorKyst's (`norkyst`, the station atlas); RMSE against the observations
-/// and the gauge's tidal prediction.
+/// The model's surface at a station after spin-up (from `analysis_start`,
+/// Unix s) against its gauge (`GaugeComparison`: the reference constants
+/// against the gauge's whole record and NorKyst's, `norkyst` from the
+/// station atlas; the skill against the observations and the gauge's tidal
+/// prediction).
 fn report_station(
     s: &Station,
-    gauge_record: &Gauge,
+    gauge: &GaugeRecord,
     analysis_start: f64,
     norkyst: Option<&AtlasPoint>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let first = s.times.partition_point(|&t| t < analysis_start);
-    let (times, eta) = (&s.times[first..], &s.eta[first..]);
-    let gauge_times = gauge_record.observed.times();
-    let gauge = gauge_record
-        .observed_fit
-        .as_ref()
-        .map_err(|e| format!("gauge fit: {e}"))?;
-    let model = fit_record(times, eta, &STATION_CONSTITUENTS, Some(gauge))?;
+    let model_series = TimeSeries::new(&s.times[first..], &s.eta[first..]);
+    let gauge_fit = gauge.fit.as_ref().map_err(|e| format!("gauge fit: {e}"))?;
+    let comparison = GaugeComparison::compute(&model_series, gauge);
+    let model = comparison.model_fit.as_ref().map_err(|e| e.to_string())?;
 
     let days = |t: &[f64]| (t[t.len() - 1] - t[0]) / 86_400.0;
     println!(
         "  Surface: model {:.1} days after spin-up (R² {:.4}), gauge {:.1} days (R² {:.4})",
-        days(times),
+        days(model_series.times()),
         model.r_squared,
-        days(gauge_times),
-        gauge.r_squared
+        gauge.days(),
+        gauge_fit.r_squared
     );
     println!(
         "  name |  model H   G    |  gauge H   G    | ratio   ΔG (°)  |ΔZ| (m) | NorKyst H   G    |ΔZ| (m)"
     );
-    let cmp = |a: &ReferenceConstant, h: f64, g: f64| {
-        ConstituentComparison::new(
-            a.name,
-            a.amplitude,
-            a.lag_deg.to_radians(),
-            h,
-            g.to_radians(),
-        )
-    };
-    let (mut rss_gauge, mut rss_norkyst) = (0.0, 0.0);
-    for c in &model.constants {
-        let Some(g) = gauge.get(c.name) else { continue };
-        let vs_gauge = cmp(c, g.amplitude, g.lag_deg);
-        rss_gauge += vs_gauge.complex_difference().powi(2);
+    let mut rss_norkyst = 0.0;
+    for (c, vs_gauge) in model
+        .constants
+        .iter()
+        .filter(|c| gauge_fit.get(c.name).is_some())
+        .zip(&comparison.constituents)
+    {
         let mut line = format!(
             "  {:4} | {:7.4} {:6.1}{} | {:7.4} {:6.1} | {:5.3} {:+7.1}   {:.4}",
             c.name,
             c.amplitude,
             c.lag_deg,
             if c.inferred { "*" } else { " " },
-            g.amplitude,
-            g.lag_deg,
+            vs_gauge.obs_amplitude,
+            vs_gauge.obs_phase.to_degrees(),
             vs_gauge.amplitude_ratio,
             vs_gauge.phase_error_degrees(),
             vs_gauge.complex_difference()
         );
         if let Some(n) = norkyst.and_then(|p| p.constituents.iter().find(|n| n.name == c.name)) {
-            let vs_norkyst = cmp(c, n.eta.0, n.eta.1);
+            let vs_norkyst = ConstituentComparison::new(
+                c.name,
+                c.amplitude,
+                c.lag_deg.to_radians(),
+                n.eta.0,
+                n.eta.1.to_radians(),
+            );
             rss_norkyst += vs_norkyst.complex_difference().powi(2);
             line += &format!(
                 "  | {:7.4} {:6.1}   {:.4}",
@@ -6120,43 +6086,27 @@ fn report_station(
     println!("  (* inferred with the gauge's ratio)");
     print!(
         "  root sum of squares of |ΔZ|: {:.4} m vs the gauge",
-        rss_gauge.sqrt()
+        comparison.rss_difference()
     );
     if norkyst.is_some() {
         print!(", {:.4} m vs NorKyst", rss_norkyst.sqrt());
     }
     println!();
 
-    // Time series after spin-up. The forcing has no mean level, so the bias
-    // is the gauge's mean over the window: see the centred RMSE
-    let model_series = TimeSeries::new(times, eta);
-    let prediction = TimeSeries::new(times, &gauge.predict(times));
-    for (what, reference) in [
-        ("observations", &gauge_record.observed),
-        ("gauge tidal prediction", &prediction),
+    // The forcing has no mean level, so the bias is the gauge's mean over
+    // the window: see the centred RMSE
+    for (what, skill) in [
+        ("observations", &comparison.vs_observations),
+        ("gauge tidal prediction", &comparison.vs_prediction),
     ] {
-        let v =
-            match StationValidationResult::compute(&gauge_record.station, &model_series, reference)
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    println!("  vs {what}: not compared ({e})");
-                    continue;
-                }
-            };
-        let centred = (v.metrics.rmse.powi(2) - v.metrics.bias.powi(2))
-            .max(0.0)
-            .sqrt();
-        println!(
-            "  vs {what}: RMSE {:.3} m (centred {centred:.3}), bias {:+.3} m, correlation {:.4}, \
-             std model {:.3} / reference {:.3} m ({} samples)",
-            v.metrics.rmse,
-            v.metrics.bias,
-            v.metrics.correlation,
-            v.model_std,
-            v.obs_std,
-            v.metrics.n_points
-        );
+        match skill {
+            Ok(v) => println!(
+                "  vs {what}: RMSE {:.3} m (centred {:.3}), bias {:+.3} m, correlation {:.4}, \
+                 std model {:.3} / reference {:.3} m ({} samples)",
+                v.rmse, v.centred_rmse, v.bias, v.correlation, v.std.0, v.std.1, v.n
+            ),
+            Err(e) => println!("  vs {what}: not compared ({e})"),
+        }
     }
     Ok(())
 }
@@ -6366,7 +6316,7 @@ struct AtlasReference<'a> {
 impl<'a> AtlasReference<'a> {
     fn new(stations: &'a [Station], station_atlas: Option<&'a TidalAtlas>) -> Option<Self> {
         stations.iter().find_map(|s| {
-            let fit = s.gauge.as_ref()?.observed_fit.as_ref().ok()?;
+            let fit = s.gauge.as_ref()?.fit.as_ref().ok()?;
             let norkyst = station_atlas
                 .and_then(|a| a.nearest(s.longitude, s.latitude))
                 .filter(|&(_, d)| d <= STATION_MAX_OFFSET);

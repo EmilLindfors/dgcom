@@ -70,3 +70,4 @@ station_interval_minutes = 10.0   # the example's `station_minutes=10`: the step
 name = "Mausund"
 lat = 63.869331
 lon = 8.665231
+gauge = "../../data/tide_gauges/mausund_obs_202606.txt"   # scored after the ramp: gauge_skill.csv
