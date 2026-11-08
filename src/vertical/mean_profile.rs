@@ -166,22 +166,23 @@ mod tests {
         (state, bed, sigma)
     }
 
-    /// A stable linear stratification is its own mean, between the layer
-    /// centres, and held beyond them.
+    /// A stable linear stratification is its own mean wherever every column
+    /// that reaches a height has layer centres around it (between −1 and
+    /// −9 m both columns, between −10 and −19 m the deep one); each column
+    /// holds its end layers' values beyond them, and the profile is held
+    /// above the surface and below the deepest bed.
     #[test]
     fn a_stable_linear_profile_is_its_own_mean() {
         let (state, bed, sigma) = columns(|z| 10.0 + 0.1 * z, |z| 33.0 - 0.05 * z);
         let density = |t: f64, s: f64| 1025.0 - 0.2 * (t - 10.0) + 0.8 * (s - 35.0);
         let mean = MeanProfile::of(&state, &bed, &sigma, |_| true, density).unwrap();
-        for z in [-0.5, -3.0, -9.5, -12.0, -19.0] {
+        for z in [-2.0, -3.5, -6.0, -12.0, -15.5] {
             let (t, s) = mean.at(z);
             assert!((t - (10.0 + 0.1 * z)).abs() < 1e-12, "T at {z}: {t}");
             assert!((s - (33.0 - 0.05 * z)).abs() < 1e-12, "S at {z}: {s}");
         }
-        // Above the top layer centre (−0.5 m in the 10 m column) and below
-        // the deepest (−19 m): held
-        assert_eq!(mean.at(0.0).0, mean.at(-0.5).0);
-        assert_eq!(mean.at(-30.0).0, mean.at(-20.0).0);
+        assert_eq!(mean.at(1.0), mean.at(0.0));
+        assert_eq!(mean.at(-30.0), mean.at(-20.0));
     }
 
     /// An inverted profile (denser on top) is pooled into one stable layer

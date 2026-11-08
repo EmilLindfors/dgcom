@@ -173,6 +173,120 @@ fn a_station_is_scored_against_its_gauge() {
     assert_eq!(constants.lines().count(), 1 + names.len(), "{constants}");
 }
 
+/// A 3D channel 10 km long, stratified by a `[three_d] profile` (a 4 °C
+/// pycnocline at 10 m), at rest for two hours: its bed from `depths` (m,
+/// mouth and head), its west end open to still water or closed. The largest
+/// depth-mean speed and surface over the outputs, the run, and its output
+/// directory.
+fn stratified_channel(
+    depths: [f64; 2],
+    open: bool,
+) -> (f64, f64, dgcom::case::RunReport, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("case.toml");
+    let (west, boundary) = if open {
+        (
+            "west = \"open\"",
+            "[[boundary]]\ntag = \"open\"\nstill = {}",
+        )
+    } else {
+        ("", "")
+    };
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+            [run]
+            duration_hours = 2.0
+
+            [mesh.rectangle]
+            x_m = [0.0, 10000.0]
+            y_m = [0.0, 2000.0]
+            nx = 10
+            ny = 2
+            {west}
+
+            [bathymetry.ramp]
+            from_m = [0.0, 1000.0]
+            to_m = [10000.0, 1000.0]
+            depth_m = {depths:?}
+
+            [physics]
+            coriolis = {{ latitude = 63.5 }}
+
+            {boundary}
+
+            [three_d]
+            levels = 8
+            profile = [[-6.0, 14.0, 32.0], [-14.0, 10.0, 34.0]]
+
+            [output]
+            directory = "out"
+            interval_minutes = 30.0
+
+            [[output.station]]
+            name = "head"
+            x_m = 9500.0
+            y_m = 1000.0
+            "#
+        ),
+    )
+    .unwrap();
+    let file = CaseFile::read(&path, &[]).unwrap();
+    let (mut speed, mut eta) = (0.0_f64, 0.0_f64);
+    let report = file
+        .run(&mut |p| {
+            speed = speed.max(p.max_speed);
+            eta = eta.max(p.eta_range.0.abs()).max(p.eta_range.1.abs());
+        })
+        .unwrap();
+    (speed, eta, report, dir)
+}
+
+/// A stratified 3D basin at rest stays at rest: closed and 20 m deep, to
+/// round-off, and the run writes its 3D snapshots and the station. Over a
+/// slope (30 to 10 m) with its mouth open to still water the depth mean
+/// drifts at under 1 μm/s in two hours (2e-7 m/s measured; closed, as
+/// much: not the band). The drift comes with the mixing: the flat basin
+/// mixes too and stays at rest, while over the slope the stratification
+/// diffuses differently in columns of different depth. That is a real
+/// horizontal density gradient (the diffusion-driven slope flow of Phillips
+/// 1970 and Wunsch 1970), and the profile's departure from the pressure
+/// gradient's reference brings back part of its σ error; this bounds both.
+#[test]
+fn a_stratified_basin_at_rest_stays_at_rest_in_3d() {
+    let (speed, eta, report, dir) = stratified_channel([20.0, 20.0], false);
+    println!(
+        "3D basin at rest, closed and flat, 2 h: |ū| ≤ {speed:.1e} m/s, |η| ≤ {eta:.1e} m in {} steps; {:?}",
+        report.n_steps, report.notes
+    );
+    assert!(speed < 1e-12 && eta < 1e-12, "|ū| {speed}, |η| {eta}");
+    assert!(report.notes.iter().any(|n| n.contains("three_d.profile")));
+    let head = &report.stations[0];
+    assert_eq!(head.time_s, vec![0.0, 1800.0, 3600.0, 5400.0, 7200.0]);
+    assert!(head.eta_m.iter().all(|e| e.abs() < 1e-12));
+    let mut snapshot =
+        dgcom::io::SnapshotReader::open(dir.path().join("out").join("case.dgsnap")).unwrap();
+    assert_eq!(snapshot.header().n_levels(), 8, "a 3D snapshot");
+    assert_eq!(
+        snapshot.times().unwrap(),
+        vec![0.0, 1800.0, 3600.0, 5400.0, 7200.0]
+    );
+
+    let (speed, eta, report, _dir) = stratified_channel([30.0, 10.0], true);
+    println!(
+        "3D channel at rest over a slope, open, 2 h: |ū| ≤ {speed:.1e} m/s, |η| ≤ {eta:.1e} m; {:?}",
+        report.notes
+    );
+    assert!(speed < 1e-6 && eta < 1e-5, "|ū| {speed}, |η| {eta}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("relaxed to the stratification at rest"))
+    );
+}
+
 /// Amplitude and phase (rad) of the M2 fit to `s` from time `from` on.
 fn m2_fit(s: &StationSeries, from: f64) -> (f64, f64) {
     let omega = 2.0 * PI / constituent_period("M2").unwrap();

@@ -30,8 +30,9 @@ use crate::io::{
 };
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, PointLocator2D, read_gmsh_mesh};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::physics::Coare35;
 use crate::solver::Probe2D;
-use crate::source::GriddedAtmosphere2D;
+use crate::source::{GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress};
 use crate::types::ElementIndex;
 
 /// Mask cells per raster pixel side of a `"bathymetry"` raster's land mask.
@@ -59,8 +60,15 @@ pub struct Domain {
     pub parents: Vec<(SideTag, OceanModelState)>,
     /// Where each `[[output.station]]` samples the model
     pub stations: Vec<StationProbe>,
-    /// `[atmosphere]`'s weather on the mesh, if any
+    /// `[atmosphere]`'s weather on the mesh, if any: in a 3D run its
+    /// pressure only (the depth mean's), the wind in `wind_3d`
     pub atmosphere: Option<GriddedAtmosphere2D>,
+    /// In a 3D run, the weather's wind stress on the columns
+    pub wind_3d: Option<GriddedWindStress>,
+    /// In a 3D run with `heat`, the weather's heat and freshwater fluxes
+    pub fluxes_3d: Option<GriddedSurfaceFluxes>,
+    /// The parent model's output, with its profiles in a 3D run
+    pub parent_reader: Option<Arc<OceanModelReader>>,
     /// What was done to build it, line by line, for a log
     pub notes: Vec<String>,
 }
@@ -146,7 +154,8 @@ impl CaseFile {
             ));
         }
         if let Some(spec) = &b.slopes_3d {
-            Self::bed_for_3d(spec, &grid, &ops, &grid_geom, &mut bed, &mut notes);
+            let thin = spec.thin_depth(case.three_d.as_ref());
+            Self::bed_for_3d(spec, thin, &grid, &ops, &grid_geom, &mut bed, &mut notes);
         }
 
         let (mut mesh, mut bathymetry, geom) = if case.mesh.drop_land {
@@ -221,10 +230,11 @@ impl CaseFile {
         // Parent models: the open faces they have no water at become walls,
         // and the bed is blended to theirs across the band
         let mut parents = Vec::new();
+        let mut parent_reader = None;
         for b in &case.boundaries {
             let Some(spec) = &b.nesting else { continue };
             let projection = projection.as_ref().expect("validated: placed");
-            let parent = self.nest(
+            let (parent, reader) = self.nest(
                 b.tag,
                 spec,
                 &mut mesh,
@@ -235,6 +245,7 @@ impl CaseFile {
                 &mut notes,
             )?;
             parents.push((b.tag, parent));
+            parent_reader = Some(reader);
         }
 
         let open_tags = open_tags(&mesh)?;
@@ -260,6 +271,37 @@ impl CaseFile {
             Some(spec) => Some(self.atmosphere(spec, &mesh, &ops, projection, &mut notes)?),
             None => None,
         };
+        // A 3D run: the wind on the columns, the pressure on the depth mean,
+        // and the heat budget's fluxes if the weather has it
+        let (atmosphere, wind_3d, fluxes_3d) = match (atmosphere, &case.three_d) {
+            (Some(weather), Some(d)) => {
+                let (pressure, wind) = weather.split_for_3d();
+                let fluxes = if d.heat && pressure.reader().has_heat_budget() {
+                    let (_, lat_min, _, lat_max) = pressure.reader().grid().bbox();
+                    let bulk = Coare35::at_latitude(0.5 * (lat_min + lat_max));
+                    notes.push(format!(
+                        "surface heat and freshwater: COARE 3.5 on the weather, shortwave into \
+                         Jerlov {} water",
+                        d.jerlov
+                    ));
+                    Some(
+                        pressure
+                            .surface_fluxes(bulk)
+                            .map_err(|e| CaseError::Invalid(format!("[atmosphere]: {e}")))?,
+                    )
+                } else {
+                    if d.heat {
+                        notes.push(
+                            "surface heat and freshwater: none (the weather has no heat budget)"
+                                .into(),
+                        );
+                    }
+                    None
+                };
+                (Some(pressure), Some(wind), fluxes)
+            }
+            (weather, _) => (weather, None, None),
+        };
         Ok(Domain {
             mesh: Arc::new(mesh),
             ops: Arc::new(ops),
@@ -271,6 +313,9 @@ impl CaseFile {
             parents,
             stations,
             atmosphere,
+            wind_3d,
+            fluxes_3d,
+            parent_reader,
             notes,
         })
     }
@@ -303,7 +348,7 @@ impl CaseFile {
             atmosphere = atmosphere.without_pressure();
         }
         atmosphere
-            .check_time_coverage(0.0, 3600.0 * case.run.duration_hours)
+            .check_time_coverage(0.0, case.forcing_end_s())
             .map_err(invalid)?;
         Ok(atmosphere)
     }
@@ -412,13 +457,13 @@ impl CaseFile {
     /// leaves isolated after each (`froya_real_data slopes3d=on`'s order).
     fn bed_for_3d(
         spec: &Slopes3D,
+        thin: f64,
         grid: &Mesh2D,
         ops: &DGOperators2D,
         geom: &GeometricFactors2D,
         bed: &mut Bathymetry2D,
         notes: &mut Vec<String>,
     ) {
-        let thin = spec.thin_depth_m;
         let s = bed.smooth_element_slopes(grid, ops, geom, spec.bound(), thin);
         notes.push(format!(
             "smoothed for 3D (within an element r_x0 ≤ {} below {} m, columns ≥ {thin} m, \
@@ -480,9 +525,9 @@ impl CaseFile {
         bathymetry: &mut Bathymetry2D,
         projection: &LocalProjection,
         notes: &mut Vec<String>,
-    ) -> Result<OceanModelState, CaseError> {
+    ) -> Result<(OceanModelState, Arc<OceanModelReader>), CaseError> {
         let path = self.resolve(&spec.file);
-        let reader = Arc::new(read_parent(&path)?);
+        let reader = Arc::new(read_parent(&path, self.case.three_d.is_some())?);
         notes.push(format!("parent {}: {}", path.display(), reader.summary()));
         let invalid =
             |e: &dyn std::fmt::Display| CaseError::Invalid(format!("{}: {e}", path.display()));
@@ -535,9 +580,16 @@ impl CaseFile {
             .case
             .clock()?
             .expect("validated: nesting needs a start");
-        let parent =
-            OceanModelState::new(reader, mesh, ops, projection, boundary_tag, clock, &options)
-                .map_err(|e| invalid(&e))?;
+        let parent = OceanModelState::new(
+            reader.clone(),
+            mesh,
+            ops,
+            projection,
+            boundary_tag,
+            clock,
+            &options,
+        )
+        .map_err(|e| invalid(&e))?;
         notes.push(format!(
             "parent ζ shifted by {:+.3} m to mean sea level ({datum_source}); {} boundary nodes \
              ({} snapped to a wet parent point), {} nodes in a {} km band",
@@ -614,11 +666,22 @@ impl CaseFile {
             }
             _ => parent,
         };
-        let t_end = 3600.0 * self.case.run.duration_hours;
-        parent
-            .check_time_coverage(0.0, t_end)
-            .map_err(|e| invalid(&e))?;
-        Ok(parent)
+        let (t_end, t_forcing) = (
+            3600.0 * self.case.run.duration_hours,
+            self.case.forcing_end_s(),
+        );
+        parent.check_time_coverage(0.0, t_forcing).map_err(|e| {
+            if t_forcing > t_end {
+                invalid(&format!(
+                    "{e}: a 3D run reads its forcing up to {:.0} s past its end (a third of \
+                     three_d.dt_max_s); cut the parent an hour longer or end the run earlier",
+                    t_forcing - t_end
+                ))
+            } else {
+                invalid(&e)
+            }
+        })?;
+        Ok((parent, reader))
     }
 
     /// Correct `atlas` at the gauge of `spec`; what changed.
@@ -797,14 +860,19 @@ fn read_weather(_paths: &[std::path::PathBuf]) -> Result<AtmosphereReader, CaseE
     ))
 }
 
-/// The parent model's output at `path`.
+/// The parent model's output at `path`, with its profiles for a 3D run.
 #[cfg(feature = "netcdf")]
-fn read_parent(path: &std::path::Path) -> Result<OceanModelReader, CaseError> {
-    OceanModelReader::from_file(path).map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))
+fn read_parent(path: &std::path::Path, profiles: bool) -> Result<OceanModelReader, CaseError> {
+    if profiles {
+        OceanModelReader::from_file_with_profiles(path)
+    } else {
+        OceanModelReader::from_file(path)
+    }
+    .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))
 }
 
 #[cfg(not(feature = "netcdf"))]
-fn read_parent(path: &std::path::Path) -> Result<OceanModelReader, CaseError> {
+fn read_parent(path: &std::path::Path, _profiles: bool) -> Result<OceanModelReader, CaseError> {
     Err(CaseError::Invalid(format!(
         "{}: boundary.nesting reads NetCDF, which needs dgcom built with the `netcdf` feature \
          (on by default)",

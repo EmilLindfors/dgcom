@@ -7,6 +7,8 @@
 use std::fs::{self, File};
 
 use crate::analysis::{GaugeComparison, TimeSeries};
+
+mod three_d;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +22,7 @@ use crate::boundary::{
 };
 use crate::equations::ShallowWater2D;
 use crate::io::{SnapshotWriter, write_vtk_swe};
-use crate::physics::{PhysicsBuilder, SWEPhysics2D};
+use crate::physics::{PhysicsBuilder, SWEPhysics2D, SWEPhysics2DBuilder};
 use crate::simulation::{Simulation, SimulationResult};
 use crate::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, total_mass_2d};
 use crate::source::{
@@ -79,6 +81,9 @@ pub struct RunReport {
     pub volume_m3: (f64, f64),
     /// The stations' records
     pub stations: Vec<StationSeries>,
+    /// What the run set up and did beyond the domain's notes, line by line
+    /// (a 3D run's start and open faces)
+    pub notes: Vec<String>,
 }
 
 impl CaseFile {
@@ -94,6 +99,9 @@ impl CaseFile {
         domain: &Domain,
         progress: &mut dyn FnMut(&Progress),
     ) -> Result<RunReport, CaseError> {
+        if self.case.three_d.is_some() {
+            return self.run_3d(domain, progress);
+        }
         let case = &self.case;
         let clock = case.clock()?;
         let t_end = 3600.0 * case.run.duration_hours;
@@ -104,96 +112,9 @@ impl CaseFile {
                 .interval_minutes
                 .min(case.output.station_interval());
 
-        // Open boundaries: one characteristic condition per tag
-        let weather_level = domain
-            .atmosphere
-            .as_ref()
-            .filter(|_| case.atmosphere.as_ref().is_some_and(|a| a.pressure));
-        let opens: Vec<(SideTag, Box<dyn SWEBoundaryCondition2D>)> = case
-            .boundaries
-            .iter()
-            .map(|b| -> Result<_, CaseError> {
-                // The weather's inverse-barometer level, the fraction this
-                // boundary adds
-                let level = weather_level.map(|a| (a, b.inverse_barometer_fraction()));
-                let bc: Box<dyn SWEBoundaryCondition2D> = match (&b.still, &b.tide, &b.atlas) {
-                    _ if b.nesting.is_some() => {
-                        let parent = domain
-                            .parents
-                            .iter()
-                            .find_map(|(tag, parent)| (*tag == b.tag).then_some(parent))
-                            .expect("read with the domain");
-                        open_boundary(parent.clone(), b.velocity, level)
-                    }
-                    (Some(still), _, _) => {
-                        open_boundary(StillWater::at(still.eta_m), b.velocity, level)
-                    }
-                    (None, Some(tide), _) => {
-                        let constituents = tide
-                            .constituents
-                            .iter()
-                            .map(|c| {
-                                let name = canonical_name(&c.name).expect("validated");
-                                let period = constituent_period(name).expect("validated");
-                                // η = A cos(ωt − G)
-                                TidalConstituent::new(
-                                    name,
-                                    c.amplitude_m,
-                                    period,
-                                    -c.phase_deg.to_radians(),
-                                )
-                            })
-                            .collect();
-                        let mut harmonic = HarmonicTide::new(constituents)
-                            .with_mean_elevation(tide.mean_m)
-                            .with_ramp_up(3600.0 * tide.ramp_hours);
-                        if let Some(clock) = &clock {
-                            harmonic = harmonic.with_nodal_corrections(clock);
-                        }
-                        open_boundary(harmonic, b.velocity, level)
-                    }
-                    (None, None, Some(spec)) => {
-                        let atlas = domain
-                            .atlases
-                            .iter()
-                            .find_map(|(tag, atlas)| (*tag == b.tag).then_some(atlas))
-                            .expect("read with the domain");
-                        let clock = clock.as_ref().expect("validated: an atlas needs a start");
-                        let projection = domain.projection.as_ref().expect("validated: placed");
-                        let mut tides = atlas
-                            .boundary_tides(
-                                &domain.mesh,
-                                &domain.ops,
-                                projection,
-                                b.tag.boundary_tag(),
-                                clock,
-                                spec.coverage_m,
-                            )
-                            .map_err(|e| {
-                                CaseError::Invalid(format!("{}: {e}", spec.file.display()))
-                            })?
-                            .with_ramp_up(3600.0 * spec.ramp_hours);
-                        if let Some(ratio) = spec.transport_scaling {
-                            tides = tides.with_transport_scaling(ratio);
-                        }
-                        open_boundary(tides, b.velocity, level)
-                    }
-                    (None, None, None) => unreachable!("validated"),
-                };
-                Ok((b.tag, bc))
-            })
-            .collect::<Result<_, _>>()?;
+        let opens = self.open_boundaries(domain, clock.as_ref())?;
         let wall = Reflective2D::new();
-        let mut bc = MultiBoundaryCondition2D::new(&wall);
-        for (tag, open) in &opens {
-            bc = match tag {
-                SideTag::Open => bc.with_open(open.as_ref()),
-                SideTag::Tidal => bc.with_tidal(open.as_ref()),
-                SideTag::River => bc.with_river(open.as_ref()),
-                SideTag::Wall => unreachable!("validated"),
-            };
-        }
-        let physics = self.physics(domain, bc);
+        let physics = self.physics(domain, boundary_conditions(&wall, &opens));
 
         // Still water at the initial level
         let eta0 = case.initial.eta_m;
@@ -205,7 +126,7 @@ impl CaseFile {
             }
         }
 
-        let mut output = Output::create(self, domain, clock.as_ref())?;
+        let mut output = Output::create(self, domain, clock.as_ref(), None)?;
         let volume = |q: &SWESolution2D| volume(domain, q);
         let volume_start = volume(&q);
 
@@ -277,11 +198,121 @@ impl CaseFile {
             wall_time_s: result.wall_time,
             volume_m3: (volume_start, volume(&q)),
             stations,
+            notes: Vec::new(),
         })
     }
 
     /// The 2D physics of the case on `domain` with boundary conditions `bc`.
     fn physics<BC: SWEBoundaryCondition2D>(&self, domain: &Domain, bc: BC) -> SWEPhysics2D<BC> {
+        let p = &self.case.physics;
+        let mut builder = self.swe_builder(domain, bc);
+        match p.friction {
+            Some(Friction::Manning(n)) => {
+                builder = builder.with_implicit_friction(ManningFriction2D::new(p.gravity, n));
+            }
+            Some(Friction::DragCoefficient(c_d)) => {
+                builder = builder.with_implicit_friction(ChezyFriction2D::new(c_d));
+            }
+            None => {}
+        }
+        builder.build()
+    }
+
+    /// The case's open boundaries, one characteristic condition per tag.
+    pub(super) fn open_boundaries(
+        &self,
+        domain: &Domain,
+        clock: Option<&crate::time::ModelClock>,
+    ) -> Result<OpenBoundaries, CaseError> {
+        let case = &self.case;
+        // Open boundaries: one characteristic condition per tag
+        let weather_level = domain
+            .atmosphere
+            .as_ref()
+            .filter(|_| case.atmosphere.as_ref().is_some_and(|a| a.pressure));
+        case.boundaries
+            .iter()
+            .map(|b| -> Result<_, CaseError> {
+                // The weather's inverse-barometer level, the fraction this
+                // boundary adds
+                let level = weather_level.map(|a| (a, b.inverse_barometer_fraction()));
+                let bc: Box<dyn SWEBoundaryCondition2D> = match (&b.still, &b.tide, &b.atlas) {
+                    _ if b.nesting.is_some() => {
+                        let parent = domain
+                            .parents
+                            .iter()
+                            .find_map(|(tag, parent)| (*tag == b.tag).then_some(parent))
+                            .expect("read with the domain");
+                        open_boundary(parent.clone(), b.velocity, level)
+                    }
+                    (Some(still), _, _) => {
+                        open_boundary(StillWater::at(still.eta_m), b.velocity, level)
+                    }
+                    (None, Some(tide), _) => {
+                        let constituents = tide
+                            .constituents
+                            .iter()
+                            .map(|c| {
+                                let name = canonical_name(&c.name).expect("validated");
+                                let period = constituent_period(name).expect("validated");
+                                // η = A cos(ωt − G)
+                                TidalConstituent::new(
+                                    name,
+                                    c.amplitude_m,
+                                    period,
+                                    -c.phase_deg.to_radians(),
+                                )
+                            })
+                            .collect();
+                        let mut harmonic = HarmonicTide::new(constituents)
+                            .with_mean_elevation(tide.mean_m)
+                            .with_ramp_up(3600.0 * tide.ramp_hours);
+                        if let Some(clock) = clock {
+                            harmonic = harmonic.with_nodal_corrections(clock);
+                        }
+                        open_boundary(harmonic, b.velocity, level)
+                    }
+                    (None, None, Some(spec)) => {
+                        let atlas = domain
+                            .atlases
+                            .iter()
+                            .find_map(|(tag, atlas)| (*tag == b.tag).then_some(atlas))
+                            .expect("read with the domain");
+                        let clock = clock.expect("validated: an atlas needs a start");
+                        let projection = domain.projection.as_ref().expect("validated: placed");
+                        let mut tides = atlas
+                            .boundary_tides(
+                                &domain.mesh,
+                                &domain.ops,
+                                projection,
+                                b.tag.boundary_tag(),
+                                clock,
+                                spec.coverage_m,
+                            )
+                            .map_err(|e| {
+                                CaseError::Invalid(format!("{}: {e}", spec.file.display()))
+                            })?
+                            .with_ramp_up(3600.0 * spec.ramp_hours);
+                        if let Some(ratio) = spec.transport_scaling {
+                            tides = tides.with_transport_scaling(ratio);
+                        }
+                        open_boundary(tides, b.velocity, level)
+                    }
+                    (None, None, None) => unreachable!("validated"),
+                };
+                Ok((b.tag, bc))
+            })
+            .collect()
+    }
+
+    /// The 2D module of the case on `domain` with boundary conditions `bc`,
+    /// without its bed friction: the 2D run adds it, and a 3D run's bottom
+    /// drag replaces it.
+    pub(super) fn swe_builder<BC: SWEBoundaryCondition2D>(
+        &self,
+        domain: &Domain,
+        bc: BC,
+    ) -> SWEPhysics2DBuilder<BC> {
         let p = &self.case.physics;
         let mut builder = PhysicsBuilder::swe_2d(
             domain.mesh.clone(),
@@ -328,21 +359,12 @@ impl CaseFile {
         if let Some(atmosphere) = &domain.atmosphere {
             builder = builder.with_source(atmosphere.clone());
         }
-        match p.friction {
-            Some(Friction::Manning(n)) => {
-                builder = builder.with_implicit_friction(ManningFriction2D::new(p.gravity, n));
-            }
-            Some(Friction::DragCoefficient(c_d)) => {
-                builder = builder.with_implicit_friction(ChezyFriction2D::new(c_d));
-            }
-            None => {}
-        }
         if p.viscosity_m2_s > 0.0 || p.smagorinsky > 0.0 {
             builder = builder.with_viscosity(
                 HorizontalViscosity2D::smagorinsky(p.smagorinsky).with_background(p.viscosity_m2_s),
             );
         }
-        builder.build()
+        builder
     }
 }
 
@@ -371,6 +393,26 @@ where
         sim = sim.with_dt_max(dt);
     }
     sim.run_with_callback(q, 0.0, t_end, callback)
+}
+
+/// The open boundaries of a case, one characteristic condition per tag.
+pub(super) type OpenBoundaries = Vec<(SideTag, Box<dyn SWEBoundaryCondition2D>)>;
+
+/// The walls and the open boundaries `opens`, by tag.
+pub(super) fn boundary_conditions<'a>(
+    wall: &'a Reflective2D,
+    opens: &'a [(SideTag, Box<dyn SWEBoundaryCondition2D>)],
+) -> MultiBoundaryCondition2D<'a> {
+    let mut bc = MultiBoundaryCondition2D::new(wall);
+    for (tag, open) in opens {
+        bc = match tag {
+            SideTag::Open => bc.with_open(open.as_ref()),
+            SideTag::Tidal => bc.with_tidal(open.as_ref()),
+            SideTag::River => bc.with_river(open.as_ref()),
+            SideTag::Wall => unreachable!("validated"),
+        };
+    }
+    bc
 }
 
 /// Each station with a gauge against it, from `spinup` (s) on, on the
@@ -520,10 +562,13 @@ struct Output<'a> {
 }
 
 impl<'a> Output<'a> {
+    /// The writers of `file`'s run on `domain`; with `sigma`, of a 3D run
+    /// (its snapshots 3D).
     fn create(
         file: &CaseFile,
         domain: &'a Domain,
         clock: Option<&crate::time::ModelClock>,
+        sigma: Option<&crate::vertical::SigmaGrid>,
     ) -> Result<Self, CaseError> {
         let case = &file.case;
         let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
@@ -543,18 +588,28 @@ impl<'a> Output<'a> {
         let name = case.run.name.clone();
         let snapshot = if case.output.snapshot {
             let path = dir.join(format!("{name}.dgsnap"));
-            Some(
-                SnapshotWriter::create(
+            let metadata = [("source", "dgcom"), ("case", name.as_str())];
+            let writer = match sigma {
+                Some(sigma) => SnapshotWriter::create_3d(
+                    &path,
+                    &domain.mesh,
+                    &domain.ops,
+                    &domain.bathymetry.data,
+                    sigma,
+                    clock,
+                    &metadata,
+                ),
+                None => SnapshotWriter::create(
                     &path,
                     &domain.mesh,
                     &domain.ops,
                     &domain.bathymetry.data,
                     clock,
-                    &[("source", "dgcom"), ("case", &name)],
+                    &metadata,
                     H_VELOCITY,
-                )
-                .map_err(|e| io(&path.display().to_string(), &e))?,
-            )
+                ),
+            };
+            Some(writer.map_err(|e| io(&path.display().to_string(), &e))?)
         } else {
             None
         };
@@ -707,6 +762,21 @@ impl<'a> Output<'a> {
                 .map_err(|e| io("NetCDF", &e))?;
         }
         Ok(true)
+    }
+
+    /// A 3D run's snapshot at `t`, if snapshots are written.
+    fn write_snapshot_3d(
+        &mut self,
+        t: f64,
+        state: &crate::solver::state::Solution3D,
+    ) -> Result<(), CaseError> {
+        self.last_time = t;
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot
+                .write_solution_3d(t, state)
+                .map_err(|e| CaseError::Io(format!("snapshot: {e}")))?;
+        }
+        Ok(())
     }
 
     /// The stations' records; the writers flush every frame as it is written.
