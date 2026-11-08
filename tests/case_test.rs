@@ -48,9 +48,26 @@ fn the_example_case_runs_and_records_what_it_ran() {
         Case::parse(&resolved, false, &[]).unwrap(),
         file.case.resolved()
     );
+    // It names the build that ran it, as the snapshot does
+    let build = dgcom::provenance::describe();
+    assert_eq!(resolved.lines().next(), Some(format!("# {build}").as_str()));
     let csv = std::fs::read_to_string(dir.path().join("stations.csv")).unwrap();
     assert_eq!(csv.lines().count(), 1 + 3 * 5);
-    assert!(dir.path().join("tidal_channel.dgsnap").exists());
+    let snapshot =
+        dgcom::io::SnapshotReader::open(dir.path().join("tidal_channel.dgsnap")).unwrap();
+    let header = snapshot.header();
+    assert_eq!(header.metadata("build"), Some(build.as_str()));
+    assert_eq!(header.metadata("title"), Some("tidal_channel"));
+    // Its stations where they are sampled, for the viewer; unplaced, no projection
+    let stations: Vec<&str> = header
+        .metadata
+        .iter()
+        .filter(|(k, _)| k == "station")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(stations.len(), 3, "{stations:?}");
+    assert!(stations[0].starts_with(&format!("{},", report.stations[0].name)));
+    assert_eq!(header.metadata("projection"), None);
 }
 
 /// Stations every 10 minutes with the fields every 30: the stations are
@@ -421,7 +438,6 @@ fn a_farms_cages_slow_the_current_through_it() {
             [output]
             directory = "out"
             interval_minutes = 10.0
-            snapshot = false
 
             [[output.station]]
             name = "farm"
@@ -443,6 +459,29 @@ fn a_farms_cages_slow_the_current_through_it() {
     let (_, none) = case("[farm]\nsite = \"site.txt\"\ndrag_share = 0.0");
     let (notes, caged) = case("[farm]\nsite = \"site.txt\"");
     assert!(notes.iter().any(|n| n.contains("3 cages")), "{notes:?}");
+    // The snapshot carries the cages, the station and the projection for the viewer
+    let snapshot =
+        dgcom::io::SnapshotReader::open(dir.path().join("out").join("case.dgsnap")).unwrap();
+    let header = snapshot.header();
+    let cages: Vec<Vec<f64>> = header
+        .metadata
+        .iter()
+        .filter(|(k, _)| k == "cage")
+        .map(|(_, v)| v.split(',').map(|c| c.parse().unwrap()).collect())
+        .collect();
+    assert_eq!(cages.len(), 3);
+    for (cage, y) in cages.iter().zip([600.0, 1000.0, 1400.0]) {
+        assert!(
+            (cage[0] - 5000.0).abs() < 1.0 && (cage[1] - y).abs() < 1.0,
+            "{cage:?}"
+        );
+        assert_eq!(cage[2], 25.0);
+    }
+    assert_eq!(header.metadata("station"), Some("farm,5000.0,1000.0"));
+    assert_eq!(
+        header.metadata("projection"),
+        Some(format!("local,{},{}", ORIGIN.0, ORIGIN.1).as_str())
+    );
     assert_eq!((&none.eta_m, &none.u_m_s), (&open.eta_m, &open.u_m_s));
     let mean_speed = |s: &StationSeries| {
         s.u_m_s

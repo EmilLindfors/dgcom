@@ -3,6 +3,7 @@
 //! ```text
 //! dgcom run   <case.toml> [--set key.path=value]...
 //! dgcom check <case.toml> [--set key.path=value]...
+//! dgcom --version
 //! ```
 //!
 //! `run` builds the case and runs it, writing to the case's output
@@ -21,6 +22,7 @@ dgcom: the Discontinuous Galerkin Coastal Ocean Model
 usage:
   dgcom run   <case.toml> [--set key.path=value]...   run a case
   dgcom check <case.toml> [--set key.path=value]...   validate a case and print it resolved
+  dgcom --version                                     the build: version and git commit
 
 A case file is TOML (or JSON, by its .json extension); see
 cases/tidal_channel/case.toml and the `dgcom::case` documentation.";
@@ -40,6 +42,10 @@ fn cli(args: Vec<String>) -> Result<(), String> {
     let command = args.next().ok_or(USAGE)?;
     if matches!(command.as_str(), "-h" | "--help" | "help") {
         println!("{USAGE}");
+        return Ok(());
+    }
+    if matches!(command.as_str(), "-V" | "--version" | "version") {
+        println!("{}", dgcom::provenance::describe());
         return Ok(());
     }
     let mut path = None;
@@ -93,6 +99,7 @@ fn check(file: &CaseFile) -> Result<(), String> {
 
 fn run(file: &CaseFile) -> Result<(), String> {
     let case = &file.case;
+    println!("{}", dgcom::provenance::describe());
     println!(
         "dgcom: {} for {} h, output every {} min to {}",
         case.run.name,
