@@ -220,6 +220,36 @@ impl HarmonicAnalysis {
             .fit(times, values)
     }
 
+    /// Constituents fitted to a model's record at a station, in priority
+    /// order: [`Self::GAUGE_RECORD`]'s tides, without the long-period
+    /// constituents a run of days cannot hold.
+    pub const STATION_RECORD: [&'static str; 12] = [
+        "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6",
+    ];
+
+    /// The reference constants of a record shorter than `reference`'s (Unix
+    /// times; e.g. a model run against its gauge's whole record): the
+    /// `candidates` the record resolves (Rayleigh criterion 1), the others
+    /// of P1, K2, N2 and Q1 inferred with `reference`'s ratios and lag
+    /// offsets where it has both constituents, else at equilibrium. A short
+    /// record resolves few candidates, and their constants carry the
+    /// unresolved constituents of their band: a day's M2 holds S2
+    /// (`notes/validation.md`, the 2026-06-12 Mausund outcome), which only a
+    /// fortnight separates.
+    pub fn fit_with_reference(
+        candidates: &[&'static str],
+        times: &[f64],
+        values: &[f64],
+        reference: Option<&ReferenceFit>,
+    ) -> Result<ReferenceFit, AnalysisError> {
+        let length = times
+            .first()
+            .zip(times.last())
+            .map_or(0.0, |(t0, t1)| t1 - t0);
+        let inferences = Inference::EQUILIBRIUM.map(|i| i.or_from(reference));
+        Self::resolvable(candidates, length, 1.0, &inferences).fit(times, values)
+    }
+
     /// Fit `names`, inferring nothing.
     pub fn new(names: &[&'static str]) -> Self {
         Self {

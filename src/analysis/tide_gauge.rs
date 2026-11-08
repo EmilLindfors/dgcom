@@ -220,6 +220,153 @@ fn paired_by_time(model: &TimeSeries, obs: &TimeSeries) -> (Vec<f64>, Vec<f64>) 
         .unzip()
 }
 
+/// A tide gauge's record: its finite samples (Unix times) and their
+/// reference constants over the whole record.
+#[derive(Clone, Debug)]
+pub struct GaugeRecord {
+    /// The gauge
+    pub station: TideGaugeStation,
+    /// The finite samples
+    pub observed: TimeSeries,
+    /// [`HarmonicAnalysis::fit_gauge_record`] of them
+    pub fit: Result<ReferenceFit, AnalysisError>,
+}
+
+impl GaugeRecord {
+    /// `station`'s samples `(times[i], values[i])` (Unix times), the
+    /// non-finite ones (gaps) left out, and their whole-record fit.
+    pub fn new(station: TideGaugeStation, times: &[f64], values: &[f64]) -> Self {
+        let (times, values): (Vec<f64>, Vec<f64>) = times
+            .iter()
+            .zip(values)
+            .filter(|(_, v)| v.is_finite())
+            .map(|(&t, &v)| (t, v))
+            .unzip();
+        let fit = HarmonicAnalysis::fit_gauge_record(&times, &values);
+        Self {
+            observed: TimeSeries::new(&times, &values).with_name(station.name.clone()),
+            station,
+            fit,
+        }
+    }
+
+    /// Length of the record (days).
+    pub fn days(&self) -> f64 {
+        let t = self.observed.times();
+        t.first()
+            .zip(t.last())
+            .map_or(0.0, |(t0, t1)| (t1 - t0) / 86_400.0)
+    }
+}
+
+/// The skill of a series against a reference over their paired samples
+/// ([`StationValidationResult::compute`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SkillScore {
+    /// Paired samples
+    pub n: usize,
+    /// Root-mean-square difference (m)
+    pub rmse: f64,
+    /// Root-mean-square difference about the mean difference (m): the
+    /// error with the bias, often the datum's, taken out
+    pub centred_rmse: f64,
+    /// Mean difference, series minus reference (m)
+    pub bias: f64,
+    /// Pearson correlation
+    pub correlation: f64,
+    /// Standard deviations of the series and of the reference (m)
+    pub std: (f64, f64),
+}
+
+impl SkillScore {
+    fn of(result: &StationValidationResult) -> Self {
+        let m = &result.metrics;
+        Self {
+            n: m.n_points,
+            rmse: m.rmse,
+            centred_rmse: (m.rmse.powi(2) - m.bias.powi(2)).max(0.0).sqrt(),
+            bias: m.bias,
+            correlation: m.correlation,
+            std: (result.model_std, result.obs_std),
+        }
+    }
+}
+
+/// A model's surface at a tide gauge against the gauge's record: the skill
+/// against the observations and against the gauge's own tidal prediction
+/// (its whole-record fit, which takes the weather out), and the reference
+/// constants constituent by constituent.
+#[derive(Clone, Debug)]
+pub struct GaugeComparison {
+    /// The model's reference constants
+    /// ([`HarmonicAnalysis::fit_with_reference`] of
+    /// [`HarmonicAnalysis::STATION_RECORD`] with the gauge's ratios). A
+    /// record too short for any is an error, and the rest stands.
+    pub model_fit: Result<ReferenceFit, AnalysisError>,
+    /// Model against gauge for each constituent of the model's fit that the
+    /// gauge's has, in the model's order
+    pub constituents: Vec<ConstituentComparison>,
+    /// Against the observations
+    pub vs_observations: Result<SkillScore, AnalysisError>,
+    /// Against the gauge's tidal prediction at the model's times
+    pub vs_prediction: Result<SkillScore, AnalysisError>,
+}
+
+impl GaugeComparison {
+    /// Compare `model` (the surface at the gauge, Unix times, the spin-up
+    /// already cut) with `gauge`.
+    pub fn compute(model: &TimeSeries, gauge: &GaugeRecord) -> Self {
+        let gauge_fit = gauge.fit.as_ref().ok();
+        let model_fit = HarmonicAnalysis::fit_with_reference(
+            &HarmonicAnalysis::STATION_RECORD,
+            model.times(),
+            model.values(),
+            gauge_fit,
+        );
+        let constituents = match (&model_fit, gauge_fit) {
+            (Ok(m), Some(g)) => m
+                .constants
+                .iter()
+                .filter_map(|c| {
+                    let o = g.get(c.name)?;
+                    Some(ConstituentComparison::new(
+                        c.name,
+                        c.amplitude,
+                        c.lag_deg.to_radians(),
+                        o.amplitude,
+                        o.lag_deg.to_radians(),
+                    ))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let skill = |reference: &TimeSeries| {
+            StationValidationResult::compute(&gauge.station, model, reference)
+                .map(|r| SkillScore::of(&r))
+        };
+        let vs_prediction = match &gauge.fit {
+            Ok(fit) => skill(&TimeSeries::new(model.times(), &fit.predict(model.times()))),
+            Err(e) => Err(e.clone()),
+        };
+        Self {
+            model_fit,
+            constituents,
+            vs_observations: skill(&gauge.observed),
+            vs_prediction,
+        }
+    }
+
+    /// Root sum of squares of the constituents' complex differences |ΔZ|
+    /// (m).
+    pub fn rss_difference(&self) -> f64 {
+        self.constituents
+            .iter()
+            .map(|c| c.complex_difference().powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+}
+
 /// Validation result for a single tide gauge station.
 #[derive(Clone, Debug)]
 pub struct StationValidationResult {
@@ -902,5 +1049,106 @@ mod tests {
         assert!(summary.contains("Test"));
         assert!(summary.contains("RMSE"));
         assert!(summary.contains("Skill Score"));
+    }
+
+    /// The tide of `constants` (name, amplitude, Greenwich lag in degrees)
+    /// about `mean` at `times` (Unix s), as a fit predicts it.
+    fn tide(mean: f64, constants: &[(&'static str, f64, f64)], times: &[f64]) -> Vec<f64> {
+        let fit = ReferenceFit {
+            mean,
+            constants: constants
+                .iter()
+                .map(
+                    |&(name, amplitude, lag_deg)| crate::analysis::ReferenceConstant {
+                        name,
+                        amplitude,
+                        lag_deg,
+                        inferred: false,
+                    },
+                )
+                .collect(),
+            r_squared: 1.0,
+            residual_rms: 0.0,
+        };
+        fit.predict(times)
+    }
+
+    /// A gauge of M2 and K1 (with P1 at equilibrium) for 60 days, with a
+    /// gap; a 3-day model with 1.2
+    /// times its M2, 2.5 times its K1 and 5 cm above it. The comparison
+    /// finds those ratios with no phase error, and scores the model
+    /// against the gauge's prediction over every model sample.
+    #[test]
+    fn a_comparison_finds_the_models_constants_against_the_gauges() {
+        let t0 = 1_749_945_600.0;
+        let gauge_times: Vec<f64> = (0..60 * 24).map(|h| t0 + 3600.0 * f64::from(h)).collect();
+        // P1 at its equilibrium ratio to K1, as the fit infers it
+        let p1 = crate::analysis::Inference::P1_FROM_K1.amplitude_ratio;
+        let mut gauge_values = tide(
+            0.0,
+            &[
+                ("M2", 1.0, 60.0),
+                ("K1", 0.2, 200.0),
+                ("P1", 0.2 * p1, 200.0),
+            ],
+            &gauge_times,
+        );
+        gauge_values[100] = f64::NAN;
+        let gauge = GaugeRecord::new(
+            TideGaugeStation::new("Test", 8.0, 63.0),
+            &gauge_times,
+            &gauge_values,
+        );
+        assert_eq!(gauge.observed.len(), 60 * 24 - 1, "the gap is left out");
+        let fit = gauge.fit.as_ref().unwrap();
+        assert!(
+            (fit.get("M2").unwrap().amplitude - 1.0).abs() < 1e-6,
+            "{:?}",
+            fit.constants
+        );
+
+        let start = t0 + 20.0 * 86_400.0;
+        let model_times: Vec<f64> = (0..3 * 24 * 6)
+            .map(|i| start + 600.0 * f64::from(i))
+            .collect();
+        let model_values = tide(
+            0.05,
+            &[
+                ("M2", 1.2, 60.0),
+                ("K1", 0.5, 200.0),
+                ("P1", 0.5 * p1, 200.0),
+            ],
+            &model_times,
+        );
+        let comparison =
+            GaugeComparison::compute(&TimeSeries::new(&model_times, &model_values), &gauge);
+        for (name, ratio) in [("M2", 1.2), ("K1", 2.5)] {
+            let c = comparison
+                .constituents
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap();
+            assert!(
+                (c.amplitude_ratio - ratio).abs() < 1e-6,
+                "{name}: {}",
+                c.amplitude_ratio
+            );
+            assert!(
+                c.phase_error_degrees().abs() < 1e-4,
+                "{name}: {}",
+                c.phase_error_degrees()
+            );
+        }
+        let prediction = comparison.vs_prediction.as_ref().unwrap();
+        assert_eq!(prediction.n, model_times.len());
+        // The offset, and the 3-day mean of the larger tide
+        assert!((prediction.bias - 0.05).abs() < 0.01, "{}", prediction.bias);
+        let observed = comparison.vs_observations.as_ref().unwrap();
+        assert_eq!(
+            observed.n,
+            3 * 24,
+            "the hourly samples within the model's span, 0 to 71 h"
+        );
+        assert!(comparison.rss_difference() > 0.2);
     }
 }

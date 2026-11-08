@@ -127,5 +127,40 @@ fn run(file: &CaseFile) -> Result<(), String> {
         "done: {} steps (dt {:.3}–{:.3} s) in {:.1} s; volume {:.6e} → {:.6e} m³",
         done.n_steps, done.dt_range_s.0, done.dt_range_s.1, done.wall_time_s, v0, v1
     );
+    for s in &done.stations {
+        let Some(g) = &s.gauge else { continue };
+        println!(
+            "gauge {} after {} h (gauge_skill.csv, gauge_constituents.csv):",
+            s.name,
+            case.spinup_hours()
+        );
+        for (what, score) in [
+            ("observations", &g.vs_observations),
+            ("tidal prediction", &g.vs_prediction),
+        ] {
+            match score {
+                Ok(v) => println!(
+                    "  vs {what}: centred RMSE {:.1} cm, bias {:+.1} cm, correlation {:.4} ({} samples)",
+                    100.0 * v.centred_rmse,
+                    100.0 * v.bias,
+                    v.correlation,
+                    v.n
+                ),
+                Err(e) => println!("  vs {what}: not compared ({e})"),
+            }
+        }
+        match &g.model_fit {
+            Ok(_) => println!(
+                "  reference constants: root sum of squares of |ΔZ| {:.1} cm over {}",
+                100.0 * g.rss_difference(),
+                g.constituents
+                    .iter()
+                    .map(|c| c.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(e) => println!("  reference constants: not fitted ({e})"),
+        }
+    }
     Ok(())
 }

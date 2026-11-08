@@ -100,6 +100,79 @@ fn stations_can_be_recorded_more_often_than_the_fields() {
     assert!(err.contains("whole multiple"), "{err}");
 }
 
+/// A station is scored against its gauge after the spin-up (by default the
+/// tide's 2 h ramp): here a gauge that read the station's own surface 10 cm
+/// high through the run, and a pure M2 for a month on either side. The
+/// skill against it is a bias of −10 cm with nothing else, over the hourly
+/// samples from 2 h to the end (14 h), and both score files are written.
+#[test]
+fn a_station_is_scored_against_its_gauge() {
+    let hours = 14.0;
+    let dir = tempfile::tempdir().unwrap();
+    let plain = example(dir.path(), hours).run(&mut |_| {}).unwrap();
+    let mouth = &plain.stations[0];
+
+    // 2025-06-15T00:00:00Z, the example's run.start
+    let start_unix = 1_749_945_600.0;
+    let mut record = String::from(
+        "# station: mouth\n# longitude: 8.5\n# latitude: 63.5\n# columns: time(s) water_level(m)\n",
+    );
+    for h in -720..=744 {
+        let t = 3600.0 * f64::from(h);
+        let level = match mouth.time_s.iter().position(|&s| (s - t).abs() < 1e-6) {
+            Some(i) => mouth.eta_m[i] + 0.1,
+            None => 0.8 * (2.0 * std::f64::consts::PI * t / (12.420_601 * 3600.0)).cos(),
+        };
+        record += &format!("{} {level}\n", start_unix + t);
+    }
+    let gauge = dir.path().join("gauge.txt");
+    std::fs::write(&gauge, record).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = CaseFile::read(
+        Path::new(EXAMPLE),
+        &[
+            format!("run.duration_hours={hours}"),
+            format!("output.directory={:?}", dir.path().display().to_string()),
+            format!("output.station.0.gauge={:?}", gauge.display().to_string()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(file.case.spinup_hours(), 2.0);
+    let report = file.run(&mut |_| {}).unwrap();
+    // The gauge changes nothing in the run
+    assert_eq!(report.stations[0].eta_m, mouth.eta_m);
+    let g = report.stations[0].gauge.as_ref().unwrap();
+    let v = g.vs_observations.as_ref().unwrap();
+    println!(
+        "mouth vs its gauge: bias {:+.4} m, centred {:.1e} m, r {:.6}, {} samples; vs prediction {:?}",
+        v.bias,
+        v.centred_rmse,
+        v.correlation,
+        v.n,
+        g.vs_prediction.as_ref().map(|p| p.centred_rmse)
+    );
+    assert_eq!(v.n, 13, "hours 2 to 14");
+    assert!((v.bias + 0.1).abs() < 1e-9 && v.centred_rmse < 1e-9);
+    assert!((v.correlation - 1.0).abs() < 1e-9);
+    assert!(g.vs_prediction.is_ok());
+    assert!(report.stations[1].gauge.is_none());
+    let names: Vec<_> = g.constituents.iter().map(|c| c.name).collect();
+    assert!(names.contains(&"M2"), "{names:?}");
+
+    let skill = std::fs::read_to_string(dir.path().join("gauge_skill.csv")).unwrap();
+    assert_eq!(skill.lines().count(), 3, "{skill}");
+    assert!(
+        skill
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("mouth,observations,13,")
+    );
+    let constants = std::fs::read_to_string(dir.path().join("gauge_constituents.csv")).unwrap();
+    assert_eq!(constants.lines().count(), 1 + names.len(), "{constants}");
+}
+
 /// Amplitude and phase (rad) of the M2 fit to `s` from time `from` on.
 fn m2_fit(s: &StationSeries, from: f64) -> (f64, f64) {
     let omega = 2.0 * PI / constituent_period("M2").unwrap();

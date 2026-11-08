@@ -56,3 +56,4 @@ interval_minutes = 10.0
 name = "Bodø"                   # Kartverket's tide gauge (BOO)
 lat = 67.288
 lon = 14.391
+gauge = "../../data/tide_gauges/bodo_obs.txt"   # scored after the ramp: gauge_skill.csv

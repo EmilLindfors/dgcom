@@ -13,6 +13,11 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Gauge scores in case files and the library (TODO P8.1; `notes/case-files.md`).**
+  - `[[output.station]] gauge = "obs.txt"` scores a station's surface against a tide gauge's record after `[output] spinup_hours` (default: the longest ramp of the forcing): the skill against the observations and against the gauge's own tidal prediction (RMSE, centred RMSE, bias, correlation, spreads), and the reference constants against the gauge's, into `gauge_skill.csv` and `gauge_constituents.csv`, in `RunReport` and in `dgcom run`'s log.
+  - The library holds the example's scoring now: `GaugeRecord` (a gauge's finite samples and whole-record fit), `GaugeComparison` and `SkillScore` (`analysis`), `HarmonicAnalysis::fit_with_reference` and `HarmonicAnalysis::STATION_RECORD`. `froya_real_data`'s station report is built on them and prints the same numbers. A run too short for any constituent keeps its skill scores.
+  - `cases/{bodo,froya}/scored_2026-06-12.toml` write their scores themselves (2.96 and 4.25 cm), and the other Frøya and Bodø cases name their gauges.
+
 - **Weather in case files (TODO P8.1, P8.2; `notes/case-files.md`).**
   - `[atmosphere]` forces a case with a weather model's 10 m wind and sea-level pressure (`files`, MET Nordic, MEPS, AROME-Arctic or ERA5 NetCDF; `GriddedAtmosphere2D`), ramped up over `ramp_hours`, with `wind` and `pressure` switches.
   - The open boundaries add the inverse-barometer level: `[[boundary]] inverse_barometer`, a fraction (0–2) that defaults to 1 for still water, tides and atlases and to 0 for nesting (the example's `ib=`).

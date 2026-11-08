@@ -68,8 +68,9 @@ pub use metrics::{
 };
 pub use stability::{StabilityMonitor, StabilityStatus, StabilityThresholds, StabilityWarning};
 pub use tide_gauge::{
-    ModelExtractor, PrecomputedExtractor, StationValidationResult, TideGaugeStation,
-    ValidationSummary, norwegian_stations, validate_stations,
+    GaugeComparison, GaugeRecord, ModelExtractor, PrecomputedExtractor, SkillScore,
+    StationValidationResult, TideGaugeStation, ValidationSummary, norwegian_stations,
+    validate_stations,
 };
 
 use std::f64::consts::PI;
