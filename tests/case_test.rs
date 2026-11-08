@@ -364,12 +364,6 @@ fn a_stratified_basin_at_rest_stays_at_rest_in_3d() {
     );
 }
 
-/// A swell through the open end of a deep channel, coupled to the run: a
-/// JONSWAP sea of 1 m, 8 s from the west fills the 30 m channel at the
-/// start and comes in through the boundary. Without wind, in water about
-/// as deep as a third of its wavelength, the sea keeps its height (the
-/// largest H_s 1.000–1.015 m over the hour), the coupled run stays near
-/// rest (|ū| 2e-6 m/s), and the snapshots carry the sea state.
 /// A 3D run's stations are recorded at their times, between its steps by
 /// linear interpolation: with the fields hourly (the steps land on them)
 /// and the stations every 10 minutes, the series is the one of the run whose
@@ -469,6 +463,12 @@ fn a_3d_runs_stations_are_recorded_at_their_times() {
     assert!(tide < 5e-6, "|Δη| {tide} after the ramp");
 }
 
+/// A swell through the open end of a deep channel, coupled to the run: a
+/// JONSWAP sea of 1 m, 8 s from the west fills the 30 m channel at the
+/// start and comes in through the boundary. Without wind, in water about
+/// as deep as a third of its wavelength, the sea keeps its height (the
+/// largest H_s 1.000–1.015 m over the hour), the coupled run stays near
+/// rest (|ū| 2e-6 m/s), and the snapshots carry the sea state.
 #[test]
 fn a_swell_through_a_deep_channel_keeps_its_height() {
     let dir = tempfile::tempdir().unwrap();
