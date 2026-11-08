@@ -71,6 +71,16 @@ pub struct StationSeries {
     pub u_m_s: Vec<f64>,
     /// Depth-averaged velocity along y (m/s)
     pub v_m_s: Vec<f64>,
+    /// With `[waves]`, the sea state at the station at the same times
+    /// (empty without waves): the significant wave height (m), the peak
+    /// period (s) and the mean direction the waves come from (degrees
+    /// clockwise from north; from the mesh's y axis on an unplaced mesh)
+    pub hs_m: Vec<f64>,
+    /// The peak period (s), 0 without waves there
+    pub tp_s: Vec<f64>,
+    /// The mean direction the waves come from (degrees clockwise from north),
+    /// NaN without waves there
+    pub wave_from_deg: Vec<f64>,
     /// Its surface against its tide gauge after the spin-up, if it has one
     pub gauge: Option<GaugeComparison>,
 }
@@ -168,10 +178,22 @@ impl CaseFile {
         let numerics = &case.numerics;
         let cfl = numerics.cfl_at(case.mesh.order);
         let stepper = numerics.integrator.standard();
+        // The waves against a parent wave model's own H_s at its points
+        let points = match (&domain.waves, waves.is_some()) {
+            (Some(w), true) => w.parent_points.as_ref().map(|parent| {
+                let (points, line) = waves::WavePoints::new(parent, w, wave_east(domain));
+                notes.push(line);
+                std::cell::RefCell::new(points)
+            }),
+            _ => None,
+        };
         let exchange = match (&case.waves, waves.as_mut(), sea.as_ref()) {
-            (Some(spec), Some(waves), Some(sea)) => {
-                Some((waves, 60.0 * spec.exchange_minutes, sea))
-            }
+            (Some(spec), Some(waves), Some(sea)) => Some(WaveExchange {
+                waves,
+                every: 60.0 * spec.exchange_minutes,
+                sea,
+                points: points.as_ref(),
+            }),
             _ => None,
         };
         let result = match numerics.local_time_stepping_levels {
@@ -228,6 +250,11 @@ impl CaseFile {
                 stats.exchange_time,
                 result.wall_time
             ));
+        }
+        if let Some(points) = &points {
+            let points = points.borrow();
+            points.write(&self.output_dir().join("wave_points.csv"))?;
+            notes.extend(points.summary(3600.0 * case.spinup_hours()));
         }
         let mut stations = output.finish();
         if let Some(clock) = &clock {
@@ -428,7 +455,7 @@ fn drive<BC, I>(
     stop: &Arc<AtomicBool>,
     q: &mut SWESolution2D,
     t_end: f64,
-    exchange: Option<WaveExchange<'_>>,
+    exchange: Option<WaveExchange<'_, '_>>,
     callback: impl FnMut(&SWESolution2D, f64),
 ) -> SimulationResult
 where
@@ -446,29 +473,51 @@ where
         None => sim.run_with_callback(q, 0.0, t_end, callback),
         // The waves exchange with the run every interval, their sea state
         // kept at the interval's ends
-        Some((waves, every, sea)) => sim.run_with_exchange(
+        Some(WaveExchange {
+            waves,
+            every,
+            sea,
+            points,
+        }) => sim.run_with_exchange(
             q,
             0.0,
             t_end,
             every,
             |physics, q, t, t_next| {
-                if sea.borrow().is_empty() {
+                let record = |waves: &CoupledWaves2D, t: f64| {
                     sea.borrow_mut().push(waves, t);
+                    if let Some(points) = points {
+                        points.borrow_mut().record(waves, t);
+                    }
+                };
+                if sea.borrow().is_empty() {
+                    record(waves, t);
                 }
                 waves.exchange(physics, q, t, t_next);
-                sea.borrow_mut().push(waves, t_next);
+                record(waves, t_next);
             },
             callback,
         ),
     }
 }
 
-/// The coupled waves, their exchange interval (s) and their sea states.
-type WaveExchange<'a> = (
-    &'a mut CoupledWaves2D,
-    f64,
-    &'a std::cell::RefCell<SeaStateFrames>,
-);
+/// The coupled waves, their exchange interval (s), their sea states and the
+/// parent's points they are compared at.
+struct WaveExchange<'a, 'p> {
+    waves: &'a mut CoupledWaves2D,
+    every: f64,
+    sea: &'a std::cell::RefCell<SeaStateFrames>,
+    points: Option<&'a std::cell::RefCell<waves::WavePoints<'p>>>,
+}
+
+/// Geographic east in `domain`'s mesh axes (rad from the x axis): at the
+/// projection's centre, the x axis on an unplaced mesh.
+fn wave_east(domain: &Domain) -> f64 {
+    domain.projection.as_ref().map_or(0.0, |p| {
+        let (ex, ey) = crate::io::east_axis(p, p.ref_lat(), p.ref_lon());
+        ey.atan2(ex)
+    })
+}
 
 /// The largest H_s of a frame's sea-state fields (the first,
 /// `SeaStateFields::NAMES`), if it has them.
@@ -677,6 +726,33 @@ fn snapshot_metadata(name: &str, domain: &Domain) -> Vec<(&'static str, String)>
     metadata
 }
 
+/// The sea state at `probe` from the `surface` fields
+/// (`SeaStateFields::NAMES`: H_s, T_p, the direction's x and y, …): H_s, T_p
+/// and the direction the waves come from (degrees clockwise from north, with
+/// geographic east at `east` rad from the mesh's x axis; NaN without waves).
+fn sea_state_at(probe: &crate::solver::Probe2D, surface: &[&[f32]], east: f64) -> [f64; 3] {
+    let nn = probe.weights().len();
+    let start = probe.element().as_usize() * nn;
+    let at = |field: &[f32]| -> f64 {
+        probe
+            .weights()
+            .iter()
+            .zip(&field[start..start + nn])
+            .map(|(w, &v)| w * f64::from(v))
+            .sum()
+    };
+    let (hs, tp) = (at(surface[0]), at(surface[1]));
+    let (dx, dy) = (at(surface[2]), at(surface[3]));
+    // Travelling to `to` (rad from the mesh's x axis) is coming from the
+    // bearing 270° − (to − east)
+    let from = if dx.hypot(dy) > 1e-12 {
+        (270.0 - (dy.atan2(dx) - east).to_degrees()).rem_euclid(360.0)
+    } else {
+        f64::NAN
+    };
+    [hs, tp, from]
+}
+
 /// Still water at the case's initial level on `domain`.
 fn still_water(case: &super::Case, domain: &Domain) -> SWESolution2D {
     let eta0 = case.initial.eta_m;
@@ -701,6 +777,9 @@ struct Output<'a> {
     netcdf: Option<crate::io::NetCDFWriter>,
     stations: Vec<StationSeries>,
     csv: Option<BufWriter<File>>,
+    /// With waves: geographic east in the mesh axes (rad from the x axis),
+    /// for the stations' wave directions
+    wave_east: Option<f64>,
     last_time: f64,
     /// Time between field outputs and between station records (s)
     field_every: f64,
@@ -811,10 +890,16 @@ impl<'a> Output<'a> {
             let mut csv = BufWriter::new(
                 File::create(&path).map_err(|e| io(&path.display().to_string(), &e))?,
             );
-            writeln!(csv, "station,time_s,eta_m,u_m_s,v_m_s,depth_m")
+            let waves = if surface.is_empty() {
+                ""
+            } else {
+                ",hs_m,tp_s,wave_from_deg"
+            };
+            writeln!(csv, "station,time_s,eta_m,u_m_s,v_m_s,depth_m{waves}")
                 .map_err(|e| io("stations.csv", &e))?;
             Some(csv)
         };
+        let wave_east = (!surface.is_empty()).then(|| wave_east(domain));
         Ok(Self {
             domain,
             name,
@@ -825,34 +910,68 @@ impl<'a> Output<'a> {
             netcdf,
             stations,
             csv,
+            wave_east,
             last_time: f64::NEG_INFINITY,
             field_every: 60.0 * case.output.interval_minutes,
             station_every: 60.0 * case.output.station_interval(),
         })
     }
 
-    /// Record the stations at `t`.
-    fn record_stations(&mut self, t: f64, q: &SWESolution2D) -> Result<(), CaseError> {
+    /// Record the stations at `t`, with the sea state of the `surface`
+    /// fields (`SeaStateFields::NAMES`) if the run has waves.
+    fn record_stations(
+        &mut self,
+        t: f64,
+        q: &SWESolution2D,
+        surface: &[&[f32]],
+    ) -> Result<(), CaseError> {
         let domain = self.domain;
         let samples: Vec<SWEPointSample> = domain
             .stations
             .iter()
             .map(|s| s.probe.sample_swe(q, Some(&domain.bathymetry), H_VELOCITY))
             .collect();
-        self.record_samples(t, &samples)
+        let sea: Option<Vec<[f64; 3]>> =
+            self.wave_east.filter(|_| surface.len() >= 4).map(|east| {
+                domain
+                    .stations
+                    .iter()
+                    .map(|s| sea_state_at(&s.probe, surface, east))
+                    .collect()
+            });
+        self.record_samples(t, &samples, sea.as_deref())
     }
 
-    /// Record the stations' `samples` (one per station) at `t`.
-    fn record_samples(&mut self, t: f64, samples: &[SWEPointSample]) -> Result<(), CaseError> {
+    /// Record the stations' `samples` (one per station) at `t`, with their
+    /// sea states (H_s, T_p, from) if the run has waves.
+    fn record_samples(
+        &mut self,
+        t: f64,
+        samples: &[SWEPointSample],
+        sea: Option<&[[f64; 3]]>,
+    ) -> Result<(), CaseError> {
         let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
-        for (s, series) in samples.iter().zip(&mut self.stations) {
+        for (j, (s, series)) in samples.iter().zip(&mut self.stations).enumerate() {
             series.time_s.push(t);
             series.eta_m.push(s.eta);
             series.u_m_s.push(s.u);
             series.v_m_s.push(s.v);
+            let waves = match sea.map(|sea| sea[j]) {
+                Some([hs, tp, from]) => {
+                    series.hs_m.push(hs);
+                    series.tp_s.push(tp);
+                    series.wave_from_deg.push(from);
+                    format!(",{hs},{tp},{from}")
+                }
+                None => String::new(),
+            };
             if let Some(csv) = &mut self.csv {
-                writeln!(csv, "{},{t},{},{},{},{}", series.name, s.eta, s.u, s.v, s.h)
-                    .map_err(|e| io("stations.csv", &e))?;
+                writeln!(
+                    csv,
+                    "{},{t},{},{},{},{}{waves}",
+                    series.name, s.eta, s.u, s.v, s.h
+                )
+                .map_err(|e| io("stations.csv", &e))?;
             }
         }
         if let Some(csv) = &mut self.csv {
@@ -879,7 +998,7 @@ impl<'a> Output<'a> {
         };
         self.last_time = t;
         if on(self.station_every) {
-            self.record_stations(t, q)?;
+            self.record_stations(t, q, surface)?;
         }
         if !on(self.field_every) {
             return Ok(false);

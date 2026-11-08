@@ -463,12 +463,36 @@ fn a_3d_runs_stations_are_recorded_at_their_times() {
     assert!(tide < 5e-6, "|Δη| {tide} after the ramp");
 }
 
+/// A parent wave model's H_s at its points is linear in time between its
+/// records and held beyond them.
+#[test]
+fn a_parent_wave_models_hs_is_linear_in_time() {
+    let parent = dgcom::case::ParentWavePoints {
+        lon_lat: vec![[8.0, 63.0], [8.1, 63.0]],
+        positions: vec![[0.0, 0.0], [1000.0, 0.0]],
+        times: vec![0.0, 3600.0, 7200.0],
+        // [time][point]
+        hs: vec![1.0, 2.0, 3.0, 2.0, 1.0, 4.0],
+    };
+    assert_eq!(parent.hs_at(0, -100.0), 1.0);
+    assert_eq!(parent.hs_at(0, 1800.0), 2.0);
+    assert_eq!(parent.hs_at(1, 1800.0), 2.0);
+    assert_eq!(parent.hs_at(1, 5400.0), 3.0);
+    assert_eq!(parent.hs_at(0, 9000.0), 1.0);
+}
+
 /// A swell through the open end of a deep channel, coupled to the run: a
-/// JONSWAP sea of 1 m, 8 s from the west fills the 30 m channel at the
-/// start and comes in through the boundary. Without wind, in water about
-/// as deep as a third of its wavelength, the sea keeps its height (the
-/// largest H_s 1.000–1.015 m over the hour), the coupled run stays near
-/// rest (|ū| 2e-6 m/s), and the snapshots carry the sea state.
+/// JONSWAP sea of 1 m, 8 s from the west fills the 30 m channel, 6 km long
+/// and 10 km wide, at the start and comes in through the boundary. Without
+/// wind, in water about as deep as a third of its wavelength, the sea keeps
+/// its height: a station mid-channel reads H_s 0.98 m after the hour, T_p
+/// 7.9 s, from 270°. The coupled run stays near rest, and the snapshots
+/// carry the sea state.
+///
+/// The channel is wide because its side walls take the waves that run into
+/// them, as a coast does: 2 km wide, the spread sea fell to 0.68 m mid-way
+/// and 0.66 m at the head (2026-11-08), while the largest H_s, at the
+/// boundary, stayed 1.0 m.
 #[test]
 fn a_swell_through_a_deep_channel_keeps_its_height() {
     let dir = tempfile::tempdir().unwrap();
@@ -483,9 +507,9 @@ fn a_swell_through_a_deep_channel_keeps_its_height() {
         order = 1
         [mesh.rectangle]
         x_m = [0.0, 6000.0]
-        y_m = [0.0, 2000.0]
+        y_m = [-4000.0, 6000.0]
         nx = 12
-        ny = 4
+        ny = 20
         west = "open"
 
         [bathymetry]
@@ -510,6 +534,11 @@ fn a_swell_through_a_deep_channel_keeps_its_height() {
         [output]
         directory = "out"
         interval_minutes = 10.0
+
+        [[output.station]]
+        name = "mid"
+        x_m = 3000.0
+        y_m = 1000.0
         "#,
     )
     .unwrap();
@@ -544,6 +573,32 @@ fn a_swell_through_a_deep_channel_keeps_its_height() {
         "{largest} against {}",
         hs[6]
     );
+
+    // The station's sea state, in its series and its CSV
+    let mid = &report.stations[0];
+    println!(
+        "mid: H_s {:?} m, T_p {:?} s, from {:?}°",
+        mid.hs_m, mid.tp_s, mid.wave_from_deg
+    );
+    assert_eq!(mid.hs_m.len(), 7);
+    assert!(
+        mid.hs_m.iter().all(|h| (0.97..=1.01).contains(h)),
+        "{:?}",
+        mid.hs_m
+    );
+    assert!(
+        mid.tp_s.iter().all(|t| (t - 8.0).abs() < 0.2),
+        "{:?}",
+        mid.tp_s
+    );
+    assert!(
+        mid.wave_from_deg.iter().all(|d| (d - 270.0).abs() < 0.5),
+        "{:?}",
+        mid.wave_from_deg
+    );
+    let csv = std::fs::read_to_string(dir.path().join("out").join("stations.csv")).unwrap();
+    assert!(csv.starts_with("station,time_s,eta_m,u_m_s,v_m_s,depth_m,hs_m,tp_s,wave_from_deg\n"));
+    assert_eq!(csv.lines().nth(1).unwrap().split(',').count(), 9);
 }
 
 /// A farm in a tidal channel: three cages of 25 m radius across the middle

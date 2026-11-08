@@ -93,8 +93,39 @@ pub struct WaveDomain {
     /// A parent wave model's spectra on the waves' coordinates and the run's
     /// clock, and its wind (`[waves.spectra]`)
     pub parent: Option<(PointSpectra, Option<WindSeries>)>,
+    /// The parent's own H_s at its points, to compare the waves with, if its
+    /// file has it
+    pub parent_points: Option<ParentWavePoints>,
     /// `[atmosphere]`'s weather on the waves' nodes (its wind, not ramped)
     pub weather: Option<GriddedAtmosphere2D>,
+}
+
+/// A parent wave model's points and its own significant wave height there.
+#[derive(Clone, Debug)]
+pub struct ParentWavePoints {
+    /// Each point's longitude and latitude (degrees)
+    pub lon_lat: Vec<[f64; 2]>,
+    /// Their positions in the mesh's coordinates (m)
+    pub positions: Vec<[f64; 2]>,
+    /// Times (s of model time), ascending
+    pub times: Vec<f64>,
+    /// H_s (m), `[time][point]`
+    pub hs: Vec<f64>,
+}
+
+impl ParentWavePoints {
+    /// The parent's H_s at point `p` at time `t`, linear in time (held
+    /// beyond its times).
+    pub fn hs_at(&self, p: usize, t: f64) -> f64 {
+        let (np, times) = (self.positions.len(), &self.times);
+        if times.len() == 1 {
+            return self.hs[p];
+        }
+        let upper = times.partition_point(|&x| x <= t).clamp(1, times.len() - 1);
+        let (a, b) = (upper - 1, upper);
+        let w = ((t - times[a]) / (times[b] - times[a])).clamp(0.0, 1.0);
+        (1.0 - w) * self.hs[a * np + p] + w * self.hs[b * np + p]
+    }
 }
 
 /// Where a `[[output.station]]` samples the model.
@@ -386,12 +417,14 @@ impl CaseFile {
             ),
             None => None,
         };
+        let mut parent_points = None;
         let parent = match &spec.spectra {
             Some(spectra) => {
                 let path = self.resolve(&spectra.file);
                 let projection = projection.expect("validated: placed");
                 let clock = self.case.clock()?.expect("validated: a start");
-                let (spectra, wind, line) = read_wave_spectra(&path, projection, &clock)?;
+                let (spectra, wind, points, line) = read_wave_spectra(&path, projection, &clock)?;
+                parent_points = points;
                 let t_end = 3600.0 * self.case.run.duration_hours;
                 let (first, last) = (
                     spectra.times.first().copied().unwrap_or(0.0),
@@ -417,6 +450,7 @@ impl CaseFile {
             geom,
             bathymetry,
             parent,
+            parent_points,
             weather,
         })
     }
@@ -1031,14 +1065,24 @@ impl CaseFile {
     }
 }
 
+/// What [`read_wave_spectra`] reads: the spectra, the wind, the parent's own
+/// H_s at its points and a line for the log.
+type WaveSpectraRead = (
+    PointSpectra,
+    Option<WindSeries>,
+    Option<ParentWavePoints>,
+    String,
+);
+
 /// A parent wave model's spectra at `path` on the coordinates of
-/// `projection` and the time of `clock`, its wind, and a line for the log.
+/// `projection` and the time of `clock`, its wind, its own H_s at its points
+/// (if the file has it) and a line for the log.
 #[cfg(feature = "netcdf")]
 fn read_wave_spectra(
     path: &std::path::Path,
     projection: &LocalProjection,
     clock: &crate::time::ModelClock,
-) -> Result<(PointSpectra, Option<WindSeries>, String), CaseError> {
+) -> Result<WaveSpectraRead, CaseError> {
     let file = crate::io::WaveSpectraFile::from_file(path)
         .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
     let model_time = |unix: f64| clock.model_time(unix);
@@ -1051,6 +1095,17 @@ fn read_wave_spectra(
     };
     let spectra = file.point_spectra(position, model_time, east);
     let wind = file.wind_series(&[], model_time, east);
+    let points = file.hs.as_ref().map(|hs| ParentWavePoints {
+        lon_lat: file
+            .longitude
+            .iter()
+            .zip(&file.latitude)
+            .map(|(&lon, &lat)| [lon, lat])
+            .collect(),
+        positions: spectra.positions.clone(),
+        times: spectra.times.clone(),
+        hs: hs.clone(),
+    });
     let line = format!(
         "wave spectra {}: {} points, {} → {} UTC{}",
         path.display(),
@@ -1063,7 +1118,7 @@ fn read_wave_spectra(
                 clock.format(model_time(t))
             ))
     );
-    Ok((spectra, wind, line))
+    Ok((spectra, wind, points, line))
 }
 
 #[cfg(not(feature = "netcdf"))]
@@ -1071,7 +1126,7 @@ fn read_wave_spectra(
     path: &std::path::Path,
     _projection: &LocalProjection,
     _clock: &crate::time::ModelClock,
-) -> Result<(PointSpectra, Option<WindSeries>, String), CaseError> {
+) -> Result<WaveSpectraRead, CaseError> {
     Err(CaseError::Invalid(format!(
         "{}: [waves.spectra] reads NetCDF, which needs dgcom built with the `netcdf` feature",
         path.display()
