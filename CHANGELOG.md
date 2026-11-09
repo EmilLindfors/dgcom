@@ -11,7 +11,18 @@ All notable changes to this project should be documented in this file.
   - "roms-rs" read as a port of ROMS, which this model is not.
   - Restart, snapshot and particle files keep their format, so files written before the rename still load.
 
+### Added
+
+- **Coastline meshes refined at river mouths (TODO P1.6; `docs/gmsh-meshes.md`).** `scripts/gmsh_coastline_mesh.py rivers=<file> [river_size=50] [river_radius=1000] [river_min_water=2·river_size]` refines the mesh around each river mouth inside the box. It uses a Gmsh `Ball` field, which works for mouths on land. Near the mouths it keeps estuaries open by using the smaller `river_min_water`, and it resamples the coastline at the local size.
+  - **Frøya** (`cases/froya/rivers_coast_3d.toml`, new): the farthest a river moves to its element is 195 m, against 1,376 m on the 500 m grid of `rivers_3d.toml`. The mesh has 25,383 quads against 12,490, and costs 2.9× per model hour in 3D.
+  - **Logs:** the river log names the river that moved farthest.
+
 ### Fixed
+
+- **Rivers are left out only beyond a boundary nested in a parent (TODO P1.6; `notes/inputs-forcing.md`).** Earlier, any open boundary counted, but only a parent model brings a river's water in through a boundary. Beyond a tide-only or radiation boundary, a mouth now moves to the nearest element under water, as beyond a wall.
+  - **Inputs:** `RiverSources::new`/`on_mesh` take the parent's boundary tags. A case passes those of its `[boundary.nesting]` sections, and `froya_real_data` passes `open` with `norkyst=`.
+  - **Rule:** a mouth outside the mesh is left out if it lies beyond the line of the nearest nested face. Before, the test was whether the nearest boundary face was open. On the Frøya coastline mesh a coastal wall lies nearer to rivers 836 and 837, south of the box, than the open faces do, so they were snapped 1.7–1.9 km in. Now all three Frøya meshes leave out the same four rivers.
+  - **Renamed:** `RiverError::BeyondOpenBoundary` is now `BeyondParentBoundary`.
 
 - **Rivers beyond an open boundary are left out (TODO P1.6; `notes/inputs-forcing.md`).** A river whose mouth is outside the mesh and nearest an open boundary (open, tidal or river faces) is now left out and listed (`RiverError::BeyondOpenBoundary`). Its mouth lies outside the domain, and the water entering through the boundary already brings it in: a parent model has its own rivers.
   - **Why:** at Frøya, the three largest placed rivers (837, 844, 836: 0.9, 0.8 and 0.55 m³/s) lie 1.5–1.9 km south of the box. They were snapped in across the open boundary into the 3 km nesting band, where the parent's T and S already carry their water and relax theirs away.

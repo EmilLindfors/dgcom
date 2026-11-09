@@ -251,8 +251,9 @@
 //! their water's temperature and salinity (`RiverForcing`,
 //! `Hydrostatic3D::with_rivers`), each in the element of its mouth or, for a
 //! mouth on the coast or on land, the nearest element under water from up to
-//! `river_snap_km` away (rivers farther off, and mouths beyond an open
-//! boundary, which the parent's water carries in, are listed and left out), entering over `river_profile=`: `tapered:D` (the default, D = 3:
+//! `river_snap_km` away (rivers farther off, and with `norkyst=` mouths beyond
+//! the open boundary, which NorKyst's water carries in, are listed and left
+//! out), entering over `river_profile=`: `tapered:D` (the default, D = 3:
 //! the top D metres, per metre falling linearly to zero at D, as NorKyst's
 //! rivers enter), `top:D` (the top D metres, uniformly) or `fraction:F` (the
 //! top fraction F of the column). The stations, the progress
@@ -3709,18 +3710,26 @@ fn rivers_3d(
         .iter()
         .map(|r| r.discharge.mean_over(0.0, t_end))
         .sum();
+    // Nested in NorKyst, the open faces take its water, which carries the
+    // rivers beyond them in
+    let parent_tags = if opts.norkyst.is_some() {
+        vec![BoundaryTag::Open]
+    } else {
+        Vec::new()
+    };
     let (sources, skipped) = RiverSources::on_mesh(
         rivers,
         &domain.mesh,
         &domain.geom,
         &domain.bathymetry,
         1000.0 * opts.river_snap_km,
+        &parent_tags,
     );
     let mean = |i: usize| sources.river(i).discharge.mean_over(0.0, t_end);
     let total: f64 = (0..sources.len()).map(mean).sum();
     println!(
         "  Rivers: {} of {} from {} ({total:.1} of {offered:.1} m³/s over the run), entering \
-         over {:?}; {} left out (beyond an open boundary, or more than {} km from the mesh's \
+         over {:?}; {} left out (beyond a nested boundary, or more than {} km from the mesh's \
          water)",
         sources.len(),
         forcing.len(),
@@ -3739,6 +3748,18 @@ fn rivers_3d(
             sources.element(i).as_usize(),
             sources.depth_range(i).0,
             sources.depth_range(i).1,
+            sources.snap_distance(i)
+        );
+    }
+    let farthest = (0..sources.len()).max_by(|&a, &b| {
+        sources
+            .snap_distance(a)
+            .total_cmp(&sources.snap_distance(b))
+    });
+    if let Some(i) = farthest {
+        println!(
+            "    farthest moved: river {}, {:.0} m",
+            sources.river(i).name,
             sources.snap_distance(i)
         );
     }

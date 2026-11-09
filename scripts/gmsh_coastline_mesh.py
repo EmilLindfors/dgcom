@@ -3,6 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "gmsh>=4.11",
+#     "netCDF4",
 #     "numpy",
 #     "scipy",
 #     "rasterio",
@@ -27,7 +28,17 @@ examples/froya_real_data.rs (`mesh=`).
    boundary segment is much shorter than the elements next to it.
 4. Gmsh meshes the water with a size field growing from `coast` (m) at the
    coastline to `far` (m) `dist` metres offshore, optionally refined to
-   `farm_size` within `farm_radius` of `farm=lon,lat`. Recombination and
+   `farm_size` within `farm_radius` of `farm=lon,lat`, and to `river_size`
+   within `river_radius` of the river mouths of `rivers=<file>` (a river
+   file as `examples/norkyst_river_subset.rs` writes it, `river_lon`,
+   `river_lat`; the mouths inside the box). A river enters an element whose
+   nodes are all under water (`source::river`), so on a coarse coast its
+   mouth moves to the nearest such element, a kilometre or more away; at
+   `river_size` it moves less than an element. Near the mouths the water
+   narrower than `river_min_water` (default 2·`river_size`) is kept, not
+   `min_water` (estuaries and fjord heads stay open), and the coastline is
+   resampled at the local size. The size grows away from a mouth as fast as
+   from the coast (`(far − coast)/dist`). Recombination and
    subdivision give an all-quad mesh (sizes here are after subdivision).
    Recombination only pairs triangles into quads of quality at least
    `recombine_quality` (0.3); the other triangles become three quads each on
@@ -46,7 +57,8 @@ Usage:
     uv run scripts/gmsh_coastline_mesh.py [dem=data/froya_topobathy.tif] \\
         [bbox=8.0,63.6,9.2,64.0] [coast=200] [far=1500] [dist=6000] \\
         [min_land=2·coast] [min_water=2·coast] [min_island=40000] [farm=lon,lat] [farm_size=50] \\
-        [farm_radius=1000] [recombine_quality=0.3] [smooth=5] [out=data/froya_coast.msh]
+        [farm_radius=1000] [rivers=data/froya_rivers.nc] [river_size=50] [river_radius=1000] \\
+        [river_min_water=2·river_size] [recombine_quality=0.3] [smooth=5] [out=data/froya_coast.msh]
 """
 
 import math
@@ -93,9 +105,48 @@ def land_polygons(dem, bbox, project):
 
 
 def resample(line, spacing):
-    """Points along `line` about `spacing` apart, keeping both ends."""
-    n = max(1, round(line.length / spacing))
-    return [line.interpolate(i / n, normalized=True).coords[0] for i in range(n + 1)]
+    """Points along `line` about `spacing` apart, keeping both ends.
+    `spacing` is a number, or a `Spacing` of the position: the points are
+    then equally spaced in `∫ ds / spacing`."""
+    if not isinstance(spacing, Spacing):
+        n = max(1, round(line.length / spacing))
+        return [line.interpolate(i / n, normalized=True).coords[0] for i in range(n + 1)]
+    # The spacing along the line, sampled at a quarter of its finest
+    m = max(2, int(np.ceil(line.length / (0.25 * spacing.finest))) + 1)
+    s = np.linspace(0.0, line.length, m)
+    h = spacing(shapely.get_coordinates(shapely.line_interpolate_point(line, s)))
+    count = np.concatenate([[0.0], np.cumsum(0.5 * (1 / h[1:] + 1 / h[:-1]) * np.diff(s))])
+    n = max(1, round(count[-1]))
+    at = np.interp(np.linspace(0.0, count[-1], n + 1), count, s)
+    at[0], at[-1] = 0.0, line.length
+    return [tuple(c) for c in shapely.get_coordinates(shapely.line_interpolate_point(line, at))]
+
+
+class Spacing:
+    """A coastline spacing varying with the position: `base` (m), or less
+    near the points `centres`, `size(r)` at `r` metres from one."""
+
+    def __init__(self, base, centres, size, finest):
+        self.base, self.centres, self.size, self.finest = base, np.asarray(centres), size, finest
+
+    def __call__(self, xy):
+        r = np.hypot(xy[:, None, 0] - self.centres[None, :, 0], xy[:, None, 1] - self.centres[None, :, 1])
+        return np.minimum(self.base, self.size(r.min(axis=1)))
+
+
+def river_mouths(path, bbox, project):
+    """The mouths (x, y) in metres of the river file's rivers inside `bbox`."""
+    import netCDF4
+
+    with netCDF4.Dataset(path) as d:
+        lon, lat = d.variables["river_lon"][:], d.variables["river_lat"][:]
+    inside = [
+        (float(x), float(y))
+        for x, y in zip(lon, lat)
+        if bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]
+    ]
+    print(f"rivers: {len(inside)} of {len(lon)} mouths of {path} inside the box")
+    return [project(x, y) for x, y in inside]
 
 
 def main(opts):
@@ -112,18 +163,28 @@ def main(opts):
     x1, y1 = project(bbox[2], bbox[3])
     domain = box(x0, y0, x1, y1)
 
+    mouths = river_mouths(opts["rivers"], bbox, project) if "rivers" in opts else []
+    river_size = float(opts.get("river_size", 50))
+    river_radius = float(opts.get("river_radius", 1000))
+    river_min_water = float(opts.get("river_min_water", 2 * river_size))
+    near_mouths = unary_union([shapely.Point(m).buffer(river_radius) for m in mouths])
+
     land = land_polygons(opts.get("dem", "data/froya_topobathy.tif"), bbox, project)
     # Land narrower than min_land: removed (erode, then dilate the land)
     r = 0.5 * min_land
     land = land.buffer(-r, quad_segs=2).buffer(r, quad_segs=2)
     # Water narrower than min_water: filled (erode, then dilate the water),
-    # which also joins islands that (nearly) touch
-    sea = domain.difference(land)
-    r = 0.5 * min_water
-    sea = sea.buffer(-r, quad_segs=2).buffer(r, quad_segs=2).intersection(domain)
+    # which also joins islands that (nearly) touch; near the river mouths
+    # only water narrower than river_min_water
+    water = domain.difference(land)
+    opened = lambda w, width: w.buffer(-0.5 * width, quad_segs=2).buffer(0.5 * width, quad_segs=2)
+    sea = opened(water, min_water)
+    if mouths:
+        sea = sea.union(opened(water, river_min_water).intersection(near_mouths))
+    sea = sea.intersection(domain)
     sea = max(getattr(sea, "geoms", [sea]), key=lambda p: p.area)
     sea = Polygon(sea.exterior, [h for h in sea.interiors if Polygon(h).area >= min_island])
-    sea = sea.simplify(0.1 * coast, preserve_topology=True)
+    sea = sea.simplify(0.1 * min(coast, river_size if mouths else coast), preserve_topology=True)
     rings = [LineString(sea.exterior.coords)] + [LineString(h.coords) for h in sea.interiors]
     gap = min(
         (rings[i].distance(rings[j]) for i in range(len(rings)) for j in range(i + 1, len(rings))),
@@ -155,7 +216,25 @@ def main(opts):
     # Coastline segments of the element size before subdivision (one
     # element each; features narrower than it were removed above)
     mesher = opts.get("mesher", "subdivide")
-    spacing = 2.0 * coast if mesher == "subdivide" else coast
+    scale = 2.0 if mesher == "subdivide" else 1.0
+    # A mouth's size grows as fast as the coast's away from the coast
+    river_reach = (far - river_size) * dist / (far - coast)
+
+    def river_ball(r):
+        """The size (before scaling) `r` metres from a mouth (Gmsh's Ball
+        field below)."""
+        grown = river_size + (far - river_size) * (r - river_radius) / river_reach
+        return np.where(r <= river_radius, river_size, np.minimum(far, grown))
+
+    if mouths:
+        spacing = Spacing(
+            scale * coast,
+            mouths,
+            lambda r: scale * river_ball(r),
+            scale * min(coast, river_size),
+        )
+    else:
+        spacing = scale * coast
 
     def ring_loop(ring):
         """Curve loop of a ring. Edges along one side of the box are "open",
@@ -207,7 +286,6 @@ def main(opts):
     # - qs: quasi-structured quads (Gmsh algorithm 11) at the final size;
     #   more than 20 min on the Frøya coastline
     subdivide = mesher == "subdivide"
-    scale = 2.0 if subdivide else 1.0
     field = gmsh.model.mesh.field
     distance = field.add("Distance")
     field.setNumbers(distance, "CurvesList", coast_lines)
@@ -233,6 +311,16 @@ def main(opts):
         field.setNumber(farm_threshold, "DistMin", float(opts.get("farm_radius", 1000)))
         field.setNumber(farm_threshold, "DistMax", dist)
         fields.append(farm_threshold)
+    for mx, my in mouths:
+        # river_ball: the river's size within river_radius, then growing
+        ball = field.add("Ball")
+        field.setNumber(ball, "XCenter", mx)
+        field.setNumber(ball, "YCenter", my)
+        field.setNumber(ball, "Radius", river_radius)
+        field.setNumber(ball, "Thickness", river_reach)
+        field.setNumber(ball, "VIn", scale * river_size)
+        field.setNumber(ball, "VOut", scale * far)
+        fields.append(ball)
     minimum = field.add("Min")
     field.setNumbers(minimum, "FieldsList", fields)
     field.setAsBackgroundMesh(minimum)

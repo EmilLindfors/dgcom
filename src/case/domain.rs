@@ -367,18 +367,28 @@ impl CaseFile {
             .iter()
             .map(|r| r.discharge.mean_over(0.0, t_end))
             .sum();
+        // The faces nested in a parent, whose water carries the rivers
+        // beyond them in
+        let parent_tags: Vec<_> = self
+            .case
+            .boundaries
+            .iter()
+            .filter(|b| b.nesting.is_some())
+            .map(|b| b.tag.boundary_tag())
+            .collect();
         let (sources, skipped) = RiverSources::on_mesh(
             rivers,
             &domain.mesh,
             &domain.geom,
             &domain.bathymetry,
             1000.0 * spec.snap_km,
+            &parent_tags,
         );
         let mean = |i: usize| sources.river(i).discharge.mean_over(0.0, t_end);
         let total: f64 = (0..sources.len()).map(mean).sum();
         notes.push(format!(
             "rivers: {} of {} from {} ({total:.1} of {offered:.1} m³/s over the run), entering \
-             over {}; {} left out (beyond an open boundary, or more than {} km from the mesh's \
+             over {}; {} left out (beyond a nested boundary, or more than {} km from the mesh's \
              water)",
             sources.len(),
             forcing.len(),
@@ -397,6 +407,18 @@ impl CaseFile {
                 sources.element(i).as_usize(),
                 sources.depth_range(i).0,
                 sources.depth_range(i).1,
+                sources.snap_distance(i)
+            ));
+        }
+        let farthest = (0..sources.len()).max_by(|&a, &b| {
+            sources
+                .snap_distance(a)
+                .total_cmp(&sources.snap_distance(b))
+        });
+        if let Some(i) = farthest {
+            notes.push(format!(
+                "  farthest moved: river {}, {:.0} m",
+                sources.river(i).name,
                 sources.snap_distance(i)
             ));
         }
