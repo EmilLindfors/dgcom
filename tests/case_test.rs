@@ -2141,3 +2141,88 @@ fn a_wind_sets_the_channel_up_against_its_head() {
         "{setup} against {theory}"
     );
 }
+
+/// `[rivers]`: a river of 10 m³/s into a closed 3D basin adds its volume,
+/// 10 m³/s × 1 h, to round-off (3e-11 of it); a second, 5 km off the basin,
+/// is left out (more than `snap_km` from the mesh) and listed.
+#[cfg(feature = "netcdf")]
+#[test]
+fn a_rivers_water_fills_a_closed_3d_basin() {
+    use dgcom::io::{CoordinateProjection, LocalProjection, RiverForcing, RiverMouth};
+    let dir = tempfile::tempdir().unwrap();
+    let projection = LocalProjection::new(ORIGIN.0, ORIGIN.1);
+    let mouth = |id: i64, x: f64, y: f64| {
+        let (lat, lon) = projection.xy_to_geo(x, y);
+        RiverMouth { id, lon, lat }
+    };
+    // Constant over two days around the run
+    let day = 86_400.0;
+    RiverForcing::new(
+        vec![mouth(1, 230.0, 170.0), mouth(2, 6000.0, 0.0)],
+        vec![START_UNIX - day, START_UNIX + day],
+        vec![10.0, 3.0, 10.0, 3.0],
+        vec![5.0, 5.0, 5.0, 5.0],
+        vec![0.0, 0.0, 0.0, 0.0],
+    )
+    .unwrap()
+    .write(dir.path().join("rivers.nc"))
+    .unwrap();
+    let path = dir.path().join("case.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+            [run]
+            duration_hours = 1.0
+            start = "2025-06-15T00:00:00Z"
+
+            [mesh]
+            origin = {{ lat = {}, lon = {} }}
+            [mesh.rectangle]
+            x_m = [-1000.0, 1000.0]
+            y_m = [-1000.0, 1000.0]
+            nx = 4
+            ny = 4
+
+            [bathymetry]
+            depth_m = 20.0
+
+            [three_d]
+            levels = 6
+            profile = [[-6.0, 14.0, 32.0], [-14.0, 10.0, 34.0]]
+
+            [rivers]
+            file = "rivers.nc"
+
+            [output]
+            directory = "out"
+            interval_minutes = 30.0
+            "#,
+            ORIGIN.0, ORIGIN.1
+        ),
+    )
+    .unwrap();
+    let report = CaseFile::read(&path, &[])
+        .unwrap()
+        .run(&mut |_| {})
+        .unwrap();
+    let (start, end) = report.volume_m3;
+    let gained = end - start;
+    println!(
+        "a river into a closed basin, 1 h: {gained:.6} m³ gained of 36000 in {} steps; {:?}",
+        report.n_steps, report.notes
+    );
+    assert!((gained - 36_000.0).abs() < 1e-9 * 36_000.0, "{gained} m³");
+    let file = CaseFile::read(&path, &[]).unwrap();
+    let domain = file.build_domain().unwrap();
+    assert_eq!(domain.rivers.as_ref().map(|r| r.len()), Some(1));
+    assert!(
+        domain
+            .notes
+            .iter()
+            .any(|n| n.starts_with("rivers: 1 of 2") && n.contains("1 more than 2 km")),
+        "{:?}",
+        domain.notes
+    );
+    assert!(domain.notes.iter().any(|n| n.contains("left out: river 2")));
+}

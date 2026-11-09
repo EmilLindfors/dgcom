@@ -26,7 +26,7 @@
 //! - snapshot, VTK, NetCDF and station output, the stations scored
 //!   against tide gauges;
 //! - a 3D run (`[three_d]`): σ-layers under the depth mean, started from
-//!   and nested in a parent's columns or a profile;
+//!   and nested in a parent's columns or a profile, with rivers (`[rivers]`);
 //! - spectral waves coupled to the 2D run (`[waves]`), on its mesh or their
 //!   own, from a JONSWAP sea or a parent wave model's spectra;
 //! - a fish farm's net cages dragging on the flow (`[farm]`);
@@ -797,6 +797,48 @@ file = \"parent.nc\"
             (
                 format!("{}\n[output]\nvtk = true\n", three_d(profile)),
                 "2D only",
+            ),
+        ] {
+            let err = parse(&text).unwrap().validate().unwrap_err().to_string();
+            assert!(err.contains(says), "{says}: {err}");
+        }
+    }
+
+    #[test]
+    fn rivers_take_the_examples_defaults_and_need_a_placed_3d_run() {
+        let profile = "profile = [[0.0, 12.0, 32.0], [-20.0, 8.0, 34.0]]";
+        let unplaced = MINIMAL.replace(
+            "duration_hours = 1.0",
+            "duration_hours = 1.0\n        start = \"2025-06-15T00:00:00Z\"",
+        );
+        let placed = unplaced.replace(
+            "[mesh.rectangle]",
+            "[mesh]\n        origin = { lat = 63.9, lon = 8.6 }\n        [mesh.rectangle]",
+        );
+        let with = |base: &str, rivers: &str| {
+            format!(
+                "{base}\n[three_d]\nlevels = 10\n{profile}\n[rivers]\nfile = \"rivers.nc\"\n\
+                 {rivers}\n"
+            )
+        };
+        let case = parse(&with(&placed, "")).unwrap();
+        let r = case.rivers.as_ref().unwrap();
+        assert_eq!((r.snap_km, r.profile.as_str()), (2.0, "tapered:3"));
+        if cfg!(feature = "netcdf") {
+            case.validate().unwrap();
+        }
+        for (text, says) in [
+            (with(&placed, "snap_km = -1.0"), "snap_km"),
+            (with(&placed, "profile = \"bottom:3\""), "profile"),
+            (with(&placed, "profile = \"fraction:2\""), "profile"),
+            (with(&unplaced, ""), "placed mesh"),
+            (
+                with(&placed.replace("start = ", "# start = "), ""),
+                "run.start",
+            ),
+            (
+                with(&placed, "").replace(&format!("[three_d]\nlevels = 10\n{profile}\n"), ""),
+                "[three_d]",
             ),
         ] {
             let err = parse(&text).unwrap().validate().unwrap_err().to_string();

@@ -1001,21 +1001,11 @@ impl Options {
                 .collect(),
             rivers: args.get("rivers").map(PathBuf::from),
             river_snap_km: get("river_snap_km", 2.0)?,
-            river_profile: {
-                use dgcom::source::RiverProfile;
-                let text = args
-                    .get("river_profile")
-                    .map_or("tapered:3", String::as_str);
-                let bad = || format!("bad river_profile={text}: tapered:D, top:D or fraction:F");
-                let (kind, value) = text.split_once(':').ok_or_else(bad)?;
-                let value: f64 = value.parse().map_err(|_| bad())?;
-                match kind {
-                    "tapered" => RiverProfile::TaperedTopMetres(value),
-                    "top" => RiverProfile::TopMetres(value),
-                    "fraction" => RiverProfile::TopFraction(value),
-                    _ => return Err(bad()),
-                }
-            },
+            river_profile: args
+                .get("river_profile")
+                .map_or("tapered:3", String::as_str)
+                .parse()
+                .map_err(|e| format!("river_profile=: {e}"))?,
             wave_grid: {
                 let text = args.get("wave_grid").map_or("25,36", String::as_str);
                 let parts: Vec<usize> = text

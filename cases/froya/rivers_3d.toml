@@ -1,0 +1,73 @@
+# Frøya–Smøla–Hitra in 3D with its rivers, nested in NorKyst-800.
+#
+# `nested.toml` in 3D (`[three_d]`, 20 σ-layers started from NorKyst-800's
+# own columns) with the rivers that NorKyst-800 itself takes: NVE's daily
+# discharge, temperature and salinity at the river mouths (`[rivers]`). Each
+# river enters the element of its mouth, or the nearest boundary element
+# from up to 2 km off; its water enters the top 3 m, tapering to zero as
+# NorKyst's `river_Vshape` does. The parent must hold its profiles and reach
+# a third of the longest 3D step past the run's end; the river file must
+# cover the run. The inputs, besides `nested.toml`'s atlas and gauge:
+#
+#   cargo run --release --example norkyst_nesting_subset -- \
+#       bbox=8.0,63.6,9.2,64.0 start=2025-06-15 hours=72 wind=1 profiles=1 \
+#       out=data/froya_norkyst_3d.nc
+#   cargo run --release --example norkyst_river_subset -- \
+#       bbox=8.0,63.6,9.2,64.0 start=2025-06-15 days=3 out=data/froya_rivers.nc
+#   dgcom run cases/froya/rivers_3d.toml
+#
+# This case reproduces `examples/froya_real_data.rs
+# norkyst=data/froya_norkyst_3d.nc levels=20 tide3d=1
+# rivers=data/froya_rivers.nc` bit for bit (`notes/case-files.md`).
+
+[run]
+name = "froya_rivers_3d"
+start = "2025-06-15T00:00:00Z"
+duration_hours = 12.42          # one M2 period
+
+[mesh]
+order = 2
+
+[mesh.geographic]
+bbox = [8.0, 63.6, 9.2, 64.0]   # west, south, east, north
+nx = 120
+ny = 90
+
+[bathymetry.raster]
+file = "../../data/froya_topobathy.tif"
+kind = "topobathy"
+fill_zero_holes = true
+land_elevation_m = 5.0
+
+[physics]
+coriolis = { f_plane = 1.31e-4 }      # the bed friction is [three_d]'s drag
+
+[[boundary]]
+tag = "open"
+[boundary.nesting]
+file = "../../data/froya_norkyst_3d.nc"
+atlas = "../../data/froya_boundary_tides.txt"   # NorKyst's own month-long fit
+band_km = 3.0
+band_minutes = 30.0
+ramp_hours = 1.0
+[boundary.nesting.gauge]
+record = "../../data/tide_gauges/mausund_obs.txt"
+source = "../../data/froya_station_tides.txt"
+
+[three_d]
+levels = 20
+
+[rivers]
+file = "../../data/froya_rivers.nc"   # NorKyst-800's NVE rivers, daily
+snap_km = 2.0
+profile = "tapered:3"
+
+[output]
+interval_minutes = 60.0
+station_interval_minutes = 10.0
+
+[[output.station]]
+name = "Mausund"
+lat = 63.869331
+lon = 8.665231
+gauge = "../../data/tide_gauges/mausund_obs.txt"   # scored after the ramp: gauge_skill.csv

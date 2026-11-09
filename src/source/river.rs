@@ -210,6 +210,43 @@ impl RiverProfile {
     }
 }
 
+/// A profile from its text: `uniform` ([`RiverProfile::DepthUniform`]),
+/// `fraction:F`, `top:D` or `tapered:D` (D in metres), as case files and
+/// `froya_real_data river_profile=` give it.
+impl std::str::FromStr for RiverProfile {
+    type Err = RiverError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let bad = || {
+            RiverError::Profile(format!(
+                "{text:?} is not uniform, fraction:F, top:D or tapered:D"
+            ))
+        };
+        if text == "uniform" {
+            return Ok(Self::DepthUniform);
+        }
+        let (kind, value) = text.split_once(':').ok_or_else(bad)?;
+        let value: f64 = value.parse().map_err(|_| bad())?;
+        let profile = match kind {
+            "fraction" => Self::TopFraction(value),
+            "top" => Self::TopMetres(value),
+            "tapered" => Self::TaperedTopMetres(value),
+            _ => return Err(bad()),
+        };
+        // The values' ranges, as `weights` checks them
+        let fits = match profile {
+            Self::TopFraction(f) => f > 0.0 && f <= 1.0,
+            _ => value.is_finite() && value > 0.0,
+        };
+        match fits {
+            true => Ok(profile),
+            false => Err(RiverError::Profile(format!(
+                "{text:?}: a fraction in (0, 1], a depth positive"
+            ))),
+        }
+    }
+}
+
 /// A river mouth.
 #[derive(Clone, Debug, PartialEq)]
 pub struct River {
@@ -712,6 +749,32 @@ mod tests {
     use crate::operators::DGOperators2D;
     use crate::solver::SWESolution2D;
     use crate::vertical::UniformStretching;
+
+    #[test]
+    fn a_profile_reads_from_its_text() {
+        let parse = |text: &str| text.parse::<RiverProfile>();
+        assert_eq!(parse("uniform").unwrap(), RiverProfile::DepthUniform);
+        assert_eq!(
+            parse("fraction:0.2").unwrap(),
+            RiverProfile::TopFraction(0.2)
+        );
+        assert_eq!(parse("top:5").unwrap(), RiverProfile::TopMetres(5.0));
+        assert_eq!(
+            parse("tapered:3").unwrap(),
+            RiverProfile::TaperedTopMetres(3.0)
+        );
+        for bad in [
+            "",
+            "tapered",
+            "tapered:x",
+            "bottom:3",
+            "fraction:1.5",
+            "top:0",
+            "top:-2",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} parsed");
+        }
+    }
 
     fn mesh() -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 400.0, 0.0, 200.0, 4, 2);

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use super::schema::{
     AtlasCorrection, AtmosphereSection, FarmSection, GaugeCorrection, MeshSection, Nesting,
-    RasterKind, Sampling, SideTag, Slopes3D,
+    RasterKind, RiversSection, Sampling, SideTag, Slopes3D,
 };
 use super::{CaseError, CaseFile};
 use crate::analysis::{GaugeRecord, HarmonicAnalysis, TideGaugeStation};
@@ -33,7 +33,7 @@ use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, PointLocator2D, read_gmsh_m
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::Coare35;
 use crate::solver::Probe2D;
-use crate::source::{CageFootprint, NetCage};
+use crate::source::{CageFootprint, NetCage, RiverSources};
 use crate::source::{GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress};
 use crate::types::ElementIndex;
 use crate::waves::{PointSpectra, WindSeries};
@@ -76,6 +76,8 @@ pub struct Domain {
     pub waves: Option<WaveDomain>,
     /// `[farm]`: the cages, their drag scaled by `drag_share`
     pub cages: Vec<NetCage>,
+    /// `[rivers]`: the rivers placed on the mesh
+    pub rivers: Option<RiverSources>,
     /// What was done to build it, line by line, for a log
     pub notes: Vec<String>,
 }
@@ -306,6 +308,7 @@ impl CaseFile {
             parent_reader,
             waves: None,
             cages: Vec::new(),
+            rivers: None,
             notes,
         };
         if let Some(farm) = &case.farm {
@@ -319,7 +322,82 @@ impl CaseFile {
             domain.waves = Some(self.wave_domain(&domain, projection.as_ref(), &mut notes)?);
             domain.notes.extend(notes);
         }
+        if let Some(spec) = &case.rivers {
+            let projection = projection.as_ref().expect("validated: placed");
+            let mut notes = Vec::new();
+            domain.rivers = Some(self.rivers(spec, &domain, projection, &mut notes)?);
+            domain.notes.extend(notes);
+        }
         Ok(domain)
+    }
+
+    /// `[rivers]`: the file's rivers on the mesh, those whose mouth is
+    /// within `snap_km` of it (the others listed and left out), as
+    /// `froya_real_data rivers=` places them.
+    fn rivers(
+        &self,
+        spec: &RiversSection,
+        domain: &Domain,
+        projection: &LocalProjection,
+        notes: &mut Vec<String>,
+    ) -> Result<RiverSources, CaseError> {
+        let path = self.resolve(&spec.file);
+        let forcing = read_rivers(&path)?;
+        let clock = self.case.clock()?.expect("validated: a start");
+        // Daily values: the run must lie within the file's days
+        let t_end = 3600.0 * self.case.run.duration_hours;
+        let (first, last) = forcing.time_range();
+        if clock.unix(0.0) < first || clock.unix(t_end) > last {
+            return Err(CaseError::Invalid(format!(
+                "{}: the rivers run from {} to {}, the run from {} to {} \
+                 (`norkyst_river_subset start= days=`)",
+                path.display(),
+                clock.format(clock.model_time(first)),
+                clock.format(clock.model_time(last)),
+                clock.format(0.0),
+                clock.format(t_end)
+            )));
+        }
+        let profile: crate::source::RiverProfile = spec.profile.parse().expect("validated");
+        let rivers = forcing
+            .rivers(projection, &clock, &profile)
+            .map_err(|e| CaseError::Invalid(format!("{}: {e}", path.display())))?;
+        let (sources, skipped) =
+            RiverSources::on_mesh(rivers, &domain.mesh, &domain.geom, 1000.0 * spec.snap_km);
+        // Over the run, hourly
+        let hours = (t_end / 3600.0).ceil().max(1.0) as usize;
+        let mean = |i: usize| {
+            (0..=hours)
+                .map(|h| sources.discharge(i, (h as f64 * 3600.0).min(t_end)))
+                .sum::<f64>()
+                / (hours + 1) as f64
+        };
+        let total: f64 = (0..sources.len()).map(mean).sum();
+        notes.push(format!(
+            "rivers: {} of {} from {} ({total:.1} m³/s over the run), entering over {}; {} more \
+             than {} km from the mesh left out",
+            sources.len(),
+            forcing.len(),
+            path.display(),
+            spec.profile,
+            skipped.len(),
+            spec.snap_km
+        ));
+        let mut order: Vec<usize> = (0..sources.len()).collect();
+        order.sort_by(|&a, &b| mean(b).total_cmp(&mean(a)));
+        for &i in order.iter().take(5) {
+            notes.push(format!(
+                "  river {}: {:.1} m³/s into element {} (snapped {:.0} m)",
+                sources.river(i).name,
+                mean(i),
+                sources.element(i).as_usize(),
+                sources.snap_distance(i)
+            ));
+        }
+        for error in skipped.iter().take(5) {
+            notes.push(format!("  left out: {error}"));
+        }
+        Ok(sources)
     }
 
     /// `[farm]`: the site's cages, their drag scaled by `drag_share`.
@@ -1129,6 +1207,22 @@ fn read_wave_spectra(
 ) -> Result<WaveSpectraRead, CaseError> {
     Err(CaseError::Invalid(format!(
         "{}: [waves.spectra] reads NetCDF, which needs dgcom built with the `netcdf` feature",
+        path.display()
+    )))
+}
+
+/// The river file at `path`.
+#[cfg(feature = "netcdf")]
+fn read_rivers(path: &std::path::Path) -> Result<crate::io::RiverForcing, CaseError> {
+    crate::io::RiverForcing::from_file(path)
+        .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))
+}
+
+#[cfg(not(feature = "netcdf"))]
+fn read_rivers(path: &std::path::Path) -> Result<crate::io::RiverForcing, CaseError> {
+    Err(CaseError::Invalid(format!(
+        "{}: [rivers] reads NetCDF, which needs dgcom built with the `netcdf` feature (on by \
+         default)",
         path.display()
     )))
 }
