@@ -162,6 +162,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **F.3** Offline connectivity from `.dgsnap`/`.dgpart` (needs each particle's source cage and interpolation between frames), or record online.
 - [ ] **F.3** Save the solver state on live saves, not the viewer's f32 snapshot; add S to the viewer's `Layers`.
 - [ ] **F.3** The photo view's wind (short waves, whitecaps) from the run's weather: the 10 m wind as two more surface fields of the snapshot (`met=` runs), in place of `--wind`; ride the waves on the top σ-layer's current in 3D.
+- [ ] **F.3** A vertical section through a river mouth in the viewer: S over distance and depth along a line between two pins (`notes/viz.md`, river water).
 - [ ] **F.3** Builders in `viz/` for other live scenarios (nested runs, the Mausund sub-domain).
 - [ ] **F.3** Cut terrain patches out of coarser patches too, so overlapping patches work; a world-space label per farm site.
 - [ ] **F.3** The photo view costs ≈ 15 ms a frame over the chart view (21.6 against 5.4 ms at 4000 × 2250 on an RTX 4060 Laptop, `dg-viz --frame-times`): bake the waves into a tiled height/slope texture once per frame if a slower GPU or more waves need it. Make the wave-group noise periodic over the hourly `misc.z` wrap.
@@ -257,6 +258,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.6** A spatial index for point-in-polygon and GSHHS inner rings in `coastline.rs:81-95` (the land mask costs ≈ 20 s of setup at Frøya).
 - [ ] **P1.6** Count wet as h > 1 cm in the example's η statistics, so mm films don't set "η max".
 - [ ] **P1.6** Cut the atmosphere forcing's memory (≈ 210 MB at 10⁶ nodes): share stencils per element, or drop them after regridding.
+- [ ] **P1.6** The refined Frøya mesh blows up in 3D at a fixed step sequence. `cases/froya/rivers_coast_3d.toml --set run.duration_hours=6 --set output.interval_minutes=15 --set output.station_interval_minutes=5` stops at t = 555.2 s every time, with η not finite in all 23,821 elements in the one step while u, v, T and S stay finite. It does so without `[rivers]` too. The plain coastline mesh, a 0.2 h run (its steps land on 720 s, not 900 s) and 10-minute output all run cleanly. A NaN that reaches every element's η in one step is a global barotropic quantity, not a CFL blow-up; find it (the blow-up message now names the field and its elements: `simulation_3d.rs`, `non_finite_field`).
 - [ ] **P1.6** River mouths for fine meshes: NorKyst's mouths sit on its 800 m grid (Frøya's river 848 34.5 m up a hill, 250 m from the DEM's water), so on a 50 m mesh refined at them (`gmsh_coastline_mesh.py rivers=`) a river still moves up to 195 m. Read NVE's own outlet coordinates for the rivers, and locate the refined Frøya mesh's |u| max of 1.97 m/s (1.24 without; `notes/inputs-forcing.md`, rivers).
 - [ ] **P1.6** River details: river momentum `Q/(width·depth)` for jets at narrow mouths; spreading over elements within a radius if one-element plumes show.
 - [ ] **P1.6** If the wind-driven residual matters at farms: stress from the wind relative to the current, with a stability-dependent COARE drag.

@@ -13,6 +13,13 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **River water mixing into the sea, in the viewer (`notes/viz.md`).**
+  - **Colouring:** `dg-viz --colour salinity|temperature` (C, and the Colour menu) colours a 3D run's water by the salinity or temperature of the layer shown, or its depth mean. The maps are cmocean's haline and thermal. The scale follows the wet nodes' range in half units, or `--range LO,HI` fixes it.
+  - **Rivers:** a case's snapshot file lists its rivers (`river=name,x,y`, the largest first). The viewer marks where each one's water enters, and the number keys frame them from 2 km above.
+  - **Example:** `cases/froya/rivers_coast_3d.toml`'s river 853 shows a plume of about 32.5 against 33–34 within the first hour.
+  - **`--screenshot` of a large replay** saves the frame. It used to save a black window, or fail with "sending on a closed channel".
+  - **Blow-up message:** a 3D blow-up now names the field and how many elements it reached, and where the first is.
+
 - **Coastline meshes refined at river mouths (TODO P1.6; `docs/gmsh-meshes.md`).** `scripts/gmsh_coastline_mesh.py rivers=<file> [river_size=50] [river_radius=1000] [river_min_water=2·river_size]` refines the mesh around each river mouth inside the box. It uses a Gmsh `Ball` field, which works for mouths on land. Near the mouths it keeps estuaries open by using the smaller `river_min_water`, and it resamples the coastline at the local size.
   - **Frøya** (`cases/froya/rivers_coast_3d.toml`, new): the farthest a river moves to its element is 195 m, against 1,376 m on the 500 m grid of `rivers_3d.toml`. The mesh has 25,383 quads against 12,490, and costs 2.9× per model hour in 3D.
   - **Logs:** the river log names the river that moved farthest.
