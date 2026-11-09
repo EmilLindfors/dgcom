@@ -1,10 +1,12 @@
 //! Rivers as volume sources in the 2D model (TODO P1.6/P5.1).
 //!
 //! The production path, `Simulation` + `SSPRK3` + `SWEPhysics2D`, in a closed
-//! basin with a dry beach: one river into open water, one onto the dry beach
-//! (river databases put mouths on the coastline, often above the water). The
-//! basin's volume must grow by exactly `∫ Q dt`; SSP-RK3 integrates a
-//! discharge linear in time exactly.
+//! basin with a dry beach: one river into open water, one with its mouth on
+//! the dry beach (river databases put mouths on the coastline, often above
+//! the water), which enters the nearest water. The basin's volume must grow
+//! by exactly `∫ Q dt`; SSP-RK3 integrates a discharge linear in time
+//! exactly. The beach stays dry: the water enters the sea, not the land
+//! (TODO P1.6).
 
 use std::sync::Arc;
 
@@ -43,7 +45,7 @@ fn rivers_add_exactly_their_discharge_to_the_volume() {
     let added = 12.5 * t_end + 3.0 * t_end;
 
     for formulation in [SWEFormulation2D::Standard, SWEFormulation2D::WetDry] {
-        let sources = RiverSources::new(rivers.clone(), &mesh, &geom, 0.0).unwrap();
+        let sources = RiverSources::new(rivers.clone(), &mesh, &geom, &bathymetry, SNAP).unwrap();
         let builder = PhysicsBuilder::swe_2d(
             mesh.clone(),
             ops.clone(),
@@ -95,11 +97,55 @@ fn rivers_add_exactly_their_discharge_to_the_volume() {
         assert!(lowest >= 0.0, "{formulation:?}: negative depth {lowest:e}");
         assert_eq!(sim.physics().negative_depth_clips(), 0, "{formulation:?}");
 
-        // The beach river wetted its dry element
-        let k = RiverSources::new(rivers.clone(), &mesh, &geom, 0.0)
-            .unwrap()
-            .element(1);
-        let wet: f64 = (0..ops.n_nodes).map(|i| q.get_state(k, i).h).sum();
-        assert!(wet > 0.0, "{formulation:?}: the beach river left no water");
+        // The beach river's water went into the sea: the beach, 0.6 m and
+        // more above it, stayed dry (the river in its mouth's beach element,
+        // the rate shared evenly, left 7.0 mm on it). Only where the
+        // formulation keeps a shore at rest: `Standard` leaks 5.8 mm onto the
+        // beach in these 600 s with no rivers at all (it is to be retired,
+        // TODO P1.2)
+        if formulation != SWEFormulation2D::WetDry {
+            continue;
+        }
+        let mut beach = 0.0_f64;
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                if bathymetry.get(k, i) > 0.5 {
+                    beach = beach.max(q.get_state(k, i).h);
+                }
+            }
+        }
+        assert!(
+            beach < WetDryConfig::DEFAULT_H_DRY,
+            "{formulation:?}: {beach} m of water on the beach"
+        );
+    }
+}
+
+/// How far the beach river's mouth may move: from 1900 m to the element of
+/// 1200–1400 m, the nearest under water (the shore is at 1429 m, in the
+/// element of 1400–1600 m).
+const SNAP: f64 = 500.0;
+
+/// A mouth on the beach enters the nearest element under water, shared by
+/// depth.
+#[test]
+fn a_mouth_on_the_beach_enters_the_nearest_water() {
+    let mesh = Mesh2D::uniform_rectangle(0.0, LENGTH, 0.0, 400.0, 10, 2);
+    let ops = DGOperators2D::new(2);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
+    let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+    let beach = vec![River::new("beach", [1900.0, 250.0], 3.0)];
+    assert!(RiverSources::new(beach.clone(), &mesh, &geom, &bathymetry, SNAP - 1.0).is_err());
+    let sources = RiverSources::new(beach, &mesh, &geom, &bathymetry, SNAP).unwrap();
+    let k = sources.element(0);
+    let locator = dgcom::mesh::PointLocator2D::new(&mesh);
+    assert_eq!(k, locator.locate([1300.0, 250.0]).unwrap().element);
+    assert!((sources.snap_distance(0) - SNAP).abs() < 1e-9);
+    for i in 0..ops.n_nodes {
+        let (b, s) = (bathymetry.get(k, i), sources.share(0)[i]);
+        assert!(b < 0.0 && s > 0.0, "{s} at the bed {b} m");
+        let dilution = s / -b;
+        let first = sources.share(0)[0] / -bathymetry.get(k, 0);
+        assert!((dilution - first).abs() < 1e-14 * first);
     }
 }

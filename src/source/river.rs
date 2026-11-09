@@ -1,21 +1,31 @@
 //! Rivers as volume sources.
 //!
-//! A river adds water: its discharge `Q(t)` (m³/s) enters the element that
-//! holds its mouth, spread uniformly over the element,
+//! A river adds water: its discharge `Q(t)` (m³/s) enters an element under
+//! water (every node below the still water, `B < 0`), shared over the
+//! element's nodes in proportion to their still-water depth `d = −B`,
 //!
 //! ```text
-//!     ∂h/∂t = … + Q(t)/A_k    at every node of element k,
+//!     ∂h/∂t = … + Q(t)·d_j / ∫_k d dA    at node j of element k.
 //! ```
 //!
-//! with `A_k` the element's area. A constant nodal rate is a constant
-//! polynomial, whose integral over the element is `Q` exactly: the volume of
-//! the domain grows by `∫ Q dt` to round-off. The water enters with no
-//! momentum of its own (`hu`, `hv` are untouched, so the river dilutes the
-//! local velocity), as ROMS's `LwSrc` point sources do.
+//! Its integral over the element is `Q` exactly (in the quadrature the volume
+//! is measured with), so the volume of the domain grows by `∫ Q dt` to
+//! round-off. The dilution rate `s/d` is the same at every node,
+//! `Q/∫_k d dA`: the river freshens the element's water evenly, and a shallow
+//! node (one the low tide may dry) takes little of it. The shares use the
+//! still water, not the moving surface, so that the barotropic steps and the
+//! 3D layers of a mode-split step add the same water at the same nodes. The
+//! water enters with no momentum of its own (`hu`, `hv` are untouched, so the
+//! river dilutes the local velocity), as ROMS's `LwSrc` point sources do.
 //!
-//! The mouth is the river's position. A position outside the mesh (river
-//! databases put mouths on the coastline, often a little inland of a water-only
-//! mesh) snaps to the nearest boundary element within a given distance.
+//! The mouth is the river's position. River databases put mouths on the
+//! coastline, often a little inland of a mesh's water: a mouth outside the
+//! mesh, or in an element on the coast (one with a node on land), moves to
+//! the nearest element under water within a given distance, as FVCOM's and
+//! SCHISM's sources must sit in the water. In a coastal element the water
+//! would stand on the land nodes at the land's height (TODO P1.6: η of 5 m
+//! on the 5 m land of the Frøya mesh, with the rate shared evenly), or crowd
+//! into the element's sliver of water and spill up the beach.
 //!
 //! # 2D
 //!
@@ -321,19 +331,22 @@ pub enum RiverError {
         /// Smallest discharge (m³/s)
         discharge: f64,
     },
-    /// A mouth too far from the mesh.
+    /// Levels set over another bed than the rivers were placed on.
+    #[error("rivers: {0}")]
+    OtherBed(String),
+    /// A mouth too far from the mesh's water.
     #[error(
-        "river {name}: the mouth at ({x:.0}, {y:.0}) m is {distance:.0} m from the mesh, \
-         more than {max_snap:.0} m"
+        "river {name}: the mouth at ({x:.0}, {y:.0}) m is {distance:.0} m from the mesh's \
+         water, more than {max_snap:.0} m"
     )]
-    OutsideMesh {
+    FarFromWater {
         /// River name
         name: String,
         /// Mouth position (m)
         x: f64,
         /// Mouth position (m)
         y: f64,
-        /// Distance to the nearest boundary element (m)
+        /// Distance to the nearest element under water (m)
         distance: f64,
         /// Allowed snapping distance (m)
         max_snap: f64,
@@ -347,50 +360,57 @@ pub struct RiverSources {
     rivers: Vec<River>,
     /// Element of every river.
     elements: Vec<ElementIndex>,
-    /// `1/A_k` of every river's element (1/m²).
-    inv_area: Vec<f64>,
-    /// Distance the mouth was moved onto the mesh (0 inside it).
+    /// Distance the mouth was moved to the mesh's water (0 if it is in it).
     snapped: Vec<f64>,
     /// Compressed rows: the rivers of element `k` are
     /// `by_element[offsets[k]..offsets[k + 1]]`.
     offsets: Vec<usize>,
     by_element: Vec<usize>,
+    /// Still-water depth `d = max(−B, 0)` at every node of each river's
+    /// element, `[river][node]` (m).
+    depth: Vec<f64>,
+    /// Share of each river's discharge at every node of its element,
+    /// `d_j / ∫_k d dA`, `[river][node]` (1/m²).
+    share: Vec<f64>,
+    n_nodes: usize,
     /// Weights of the levels of a 3D model at every node of the river's
     /// element, `[river][node][level]` (empty until [`Self::set_levels`]).
     shape: Vec<f64>,
-    n_nodes: usize,
     n_levels: usize,
 }
 
 impl RiverSources {
-    /// Place `rivers` on `mesh`: each in the element holding its mouth, or,
-    /// for a mouth outside the mesh, the nearest boundary element if it is
-    /// within `max_snap` (m).
+    /// Place `rivers` on `mesh` over its still-water bed `bathymetry` (the
+    /// model's own): each in the element holding its mouth if that element
+    /// is under water, or else in the nearest element under water if it is
+    /// within `max_snap` (m) of the mouth.
     pub fn new(
         rivers: Vec<River>,
         mesh: &Mesh2D,
         geom: &GeometricFactors2D,
+        bathymetry: &Bathymetry2D,
         max_snap: f64,
     ) -> Result<Self, RiverError> {
-        let placer = Placer::new(mesh);
+        let placer = Placer::new(mesh, bathymetry);
         let placed = rivers
             .iter()
             .map(|river| placer.place(river, max_snap))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::placed(rivers, placed, mesh, geom))
+        Ok(Self::placed(rivers, placed, mesh, geom, bathymetry))
     }
 
     /// [`Self::new`] for the rivers that can be placed, with the errors of
-    /// those that cannot (a mouth beyond `max_snap`, a negative discharge):
-    /// for rivers selected by a box around a mesh, some of which flow into
-    /// water the mesh does not reach.
+    /// those that cannot (a mouth beyond `max_snap` of the water, a negative
+    /// discharge): for rivers selected by a box around a mesh, some of which
+    /// flow into water the mesh does not reach.
     pub fn on_mesh(
         rivers: Vec<River>,
         mesh: &Mesh2D,
         geom: &GeometricFactors2D,
+        bathymetry: &Bathymetry2D,
         max_snap: f64,
     ) -> (Self, Vec<RiverError>) {
-        let placer = Placer::new(mesh);
+        let placer = Placer::new(mesh, bathymetry);
         let (mut kept, mut placed, mut errors) = (Vec::new(), Vec::new(), Vec::new());
         for river in rivers {
             match placer.place(&river, max_snap) {
@@ -401,22 +421,37 @@ impl RiverSources {
                 Err(e) => errors.push(e),
             }
         }
-        (Self::placed(kept, placed, mesh, geom), errors)
+        (Self::placed(kept, placed, mesh, geom, bathymetry), errors)
     }
 
     /// The rivers in their elements, `placed[i]` = (element, snap
-    /// distance).
+    /// distance), each element under water.
     fn placed(
         rivers: Vec<River>,
         placed: Vec<(ElementIndex, f64)>,
         mesh: &Mesh2D,
         geom: &GeometricFactors2D,
+        bathymetry: &Bathymetry2D,
     ) -> Self {
+        let nn = bathymetry.n_nodes;
+        assert_eq!(
+            geom.n_nodes, nn,
+            "the bathymetry's nodes are not the geometry's"
+        );
         let (elements, snapped): (Vec<ElementIndex>, Vec<f64>) = placed.into_iter().unzip();
-        let inv_area = elements
-            .iter()
-            .map(|k| 1.0 / geom.area[k.as_usize()])
-            .collect();
+        let mut depth = Vec::with_capacity(elements.len() * nn);
+        let mut share = Vec::with_capacity(elements.len() * nn);
+        for &k in &elements {
+            let d: Vec<f64> = bathymetry
+                .element(k)
+                .iter()
+                .map(|&b| (-b).max(0.0))
+                .collect();
+            // Positive: the placer only takes elements under water
+            let volume = geom.integrate_element(k.as_usize(), &d);
+            share.extend(d.iter().map(|d| d / volume));
+            depth.extend(d);
+        }
         let mut offsets = vec![0; mesh.n_elements + 1];
         for k in &elements {
             offsets[k.as_usize() + 1] += 1;
@@ -433,12 +468,13 @@ impl RiverSources {
         Self {
             rivers,
             elements,
-            inv_area,
             snapped,
             offsets,
             by_element,
+            depth,
+            share,
+            n_nodes: nn,
             shape: Vec::new(),
-            n_nodes: 0,
             n_levels: 0,
         }
     }
@@ -463,12 +499,25 @@ impl RiverSources {
         self.elements[i]
     }
 
-    /// `1/A_k` of river `i`'s element (1/m²).
-    pub fn inv_area(&self, i: usize) -> f64 {
-        self.inv_area[i]
+    /// River `i`'s share of its discharge at every node of its element,
+    /// `d_j / ∫_k d dA` (1/m²; zero on land, integrating to one over the
+    /// element).
+    pub fn share(&self, i: usize) -> &[f64] {
+        &self.share[i * self.n_nodes..(i + 1) * self.n_nodes]
     }
 
-    /// How far river `i`'s mouth was moved onto the mesh (m; 0 inside it).
+    /// The still-water depths of river `i`'s element, shallowest and
+    /// deepest node (m, both positive), for logs: a shallow mouth shows.
+    pub fn depth_range(&self, i: usize) -> (f64, f64) {
+        self.depth[i * self.n_nodes..(i + 1) * self.n_nodes]
+            .iter()
+            .fold((f64::INFINITY, 0.0_f64), |(lo, hi), &d| {
+                (lo.min(d), hi.max(d))
+            })
+    }
+
+    /// How far river `i`'s mouth was moved to the mesh's water (m; 0 if it
+    /// is in it).
     pub fn snap_distance(&self, i: usize) -> f64 {
         self.snapped[i]
     }
@@ -488,33 +537,53 @@ impl RiverSources {
         (0..self.len()).map(|i| self.discharge(i, t)).sum()
     }
 
-    /// The rate of the depth `∂h/∂t` (m/s) the rivers add at every node of
-    /// element `k` at time `t`.
-    pub fn volume_rate(&self, k: usize, t: f64) -> f64 {
-        self.in_element(k)
-            .iter()
-            .map(|&i| self.discharge(i, t) * self.inv_area[i])
-            .sum()
+    /// Add the rate of the depth `∂h/∂t` (m/s) the rivers bring at time `t`
+    /// to `h`, the nodes of element `k`.
+    pub fn add_volume_rates(&self, k: usize, t: f64, h: &mut [f64]) {
+        for &i in self.in_element(k) {
+            let q = self.discharge(i, t);
+            for (h, s) in h.iter_mut().zip(self.share(i)) {
+                *h += q * s;
+            }
+        }
     }
 
     /// Resolve the rivers' vertical profiles on the levels of `sigma` at
-    /// every node of their elements, over the still-water depth `−B` of
-    /// `bathymetry` (for a 3D model; see [`RiverProfile`]).
+    /// every node of their elements, over the still-water depth (for a 3D
+    /// model; see [`RiverProfile`]). `bathymetry` is the model's, which must
+    /// be the one the rivers were placed on (their shares are its depths).
     pub fn set_levels(
         &mut self,
         sigma: &SigmaGrid,
         bathymetry: &Bathymetry2D,
     ) -> Result<(), RiverError> {
-        let nn = bathymetry.n_nodes;
+        let nn = self.n_nodes;
+        if bathymetry.n_nodes != nn {
+            return Err(RiverError::OtherBed(format!(
+                "{} nodes per element, the rivers were placed on {nn}",
+                bathymetry.n_nodes
+            )));
+        }
         let mut shape = Vec::with_capacity(self.len() * nn * sigma.n_levels());
-        for (river, k) in self.rivers.iter().zip(&self.elements) {
-            for i in 0..nn {
-                let depth = -bathymetry.data[k.as_usize() * nn + i];
-                shape.extend(river.profile.weights(sigma, depth)?);
+        for (i, (river, &k)) in self.rivers.iter().zip(&self.elements).enumerate() {
+            let depth = &self.depth[i * nn..(i + 1) * nn];
+            let same = bathymetry
+                .element(k)
+                .iter()
+                .zip(depth)
+                .all(|(&b, &d)| (-b).max(0.0) == d);
+            if !same {
+                return Err(RiverError::OtherBed(format!(
+                    "river {}: the bed of element {} is not the one it was placed on",
+                    river.name,
+                    k.as_usize()
+                )));
+            }
+            for &d in depth {
+                shape.extend(river.profile.weights(sigma, d)?);
             }
         }
         self.shape = shape;
-        self.n_nodes = nn;
         self.n_levels = sigma.n_levels();
         Ok(())
     }
@@ -540,23 +609,51 @@ impl RiverSources {
 struct Placer<'m> {
     mesh: &'m Mesh2D,
     locator: PointLocator2D<'m>,
-    boundary_elements: Vec<ElementIndex>,
+    /// Whether each element is under water at rest (every node `B < 0`).
+    wet: Vec<bool>,
+    /// The elements under water, with their bounding boxes
+    /// `[x_min, y_min, x_max, y_max]`.
+    water: Vec<(ElementIndex, [f64; 4])>,
 }
 
 impl<'m> Placer<'m> {
-    fn new(mesh: &'m Mesh2D) -> Self {
+    fn new(mesh: &'m Mesh2D, bathymetry: &Bathymetry2D) -> Self {
+        let wet: Vec<bool> = (0..mesh.n_elements)
+            .map(|k| {
+                bathymetry
+                    .element(ElementIndex::new(k))
+                    .iter()
+                    .all(|&b| b < 0.0)
+            })
+            .collect();
+        let water = (0..mesh.n_elements)
+            .filter(|&k| wet[k])
+            .map(|k| {
+                let k = ElementIndex::new(k);
+                let corners = mesh.element_vertices(k);
+                let bounds = corners.iter().fold(
+                    [
+                        f64::INFINITY,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        f64::NEG_INFINITY,
+                    ],
+                    |[x0, y0, x1, y1], &[x, y]| [x0.min(x), y0.min(y), x1.max(x), y1.max(y)],
+                );
+                (k, bounds)
+            })
+            .collect();
         Self {
             mesh,
             locator: PointLocator2D::new(mesh),
-            boundary_elements: (0..mesh.n_elements)
-                .map(ElementIndex::new)
-                .filter(|&k| (0..4).any(|f| mesh.is_boundary_face(k, f)))
-                .collect(),
+            wet,
+            water,
         }
     }
 
-    /// The element holding `river`'s mouth, or the nearest boundary element
-    /// within `max_snap`, with the distance the mouth moves.
+    /// The element holding `river`'s mouth if it is under water, or else
+    /// the nearest element under water within `max_snap`, with the distance the
+    /// mouth moves.
     fn place(&self, river: &River, max_snap: f64) -> Result<(ElementIndex, f64), RiverError> {
         let low = river.discharge.min();
         if low < 0.0 {
@@ -566,25 +663,35 @@ impl<'m> Placer<'m> {
             });
         }
         let p = river.position;
-        if let Some(point) = self.locator.locate(p) {
+        if let Some(point) = self.locator.locate(p)
+            && self.wet[point.element.as_usize()]
+        {
             return Ok((point.element, 0.0));
         }
-        let (distance, k) = self
-            .boundary_elements
-            .iter()
-            .map(|&k| (distance_to_quad(&self.mesh.element_vertices(k), p), k))
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .unwrap_or((f64::INFINITY, ElementIndex::new(0)));
-        if !distance.is_finite() || distance > max_snap {
-            return Err(RiverError::OutsideMesh {
+        // The bounding box is never farther than the element: skip the
+        // elements whose box is beyond the nearest so far
+        let (mut distance, mut nearest) = (f64::INFINITY, None);
+        for &(k, [x0, y0, x1, y1]) in &self.water {
+            let dx = (x0 - p[0]).max(p[0] - x1).max(0.0);
+            let dy = (y0 - p[1]).max(p[1] - y1).max(0.0);
+            if dx.hypot(dy) >= distance {
+                continue;
+            }
+            let d = distance_to_quad(&self.mesh.element_vertices(k), p);
+            if d < distance {
+                (distance, nearest) = (d, Some(k));
+            }
+        }
+        match nearest {
+            Some(k) if distance <= max_snap => Ok((k, distance)),
+            _ => Err(RiverError::FarFromWater {
                 name: river.name.clone(),
                 x: p[0],
                 y: p[1],
                 distance,
                 max_snap,
-            });
+            }),
         }
-        Ok((k, distance))
     }
 }
 
@@ -621,12 +728,7 @@ impl SourceTerm2D for RiverSources {
         _hu: &mut [f64],
         _hv: &mut [f64],
     ) {
-        let k = element.element.as_usize();
-        if self.in_element(k).is_empty() {
-            return;
-        }
-        let rate = self.volume_rate(k, element.time);
-        h.iter_mut().for_each(|h| *h += rate);
+        self.add_volume_rates(element.element.as_usize(), element.time, h);
     }
 
     fn name(&self) -> &'static str {
@@ -638,11 +740,7 @@ impl SourceTerm2D for RiverSources {
     }
 
     fn add_mass_element(&self, element: &ElementSources<'_>, h: &mut [f64]) {
-        let k = element.element.as_usize();
-        if !self.in_element(k).is_empty() {
-            let rate = self.volume_rate(k, element.time);
-            h.iter_mut().for_each(|h| *h += rate);
-        }
+        self.add_volume_rates(element.element.as_usize(), element.time, h);
     }
 }
 
@@ -658,21 +756,21 @@ pub struct RiverInflow<'a> {
 }
 
 impl RiverInflow<'_> {
-    /// The rate of the depth (m/s) the rivers add at every node of element `k`
-    /// over the step.
-    pub fn volume_rate(&self, k: usize) -> f64 {
+    /// The rate of the depth (m/s) the rivers add at node `node` of element
+    /// `k` over the step.
+    pub fn volume_rate(&self, k: usize, node: usize) -> f64 {
         self.rivers
             .in_element(k)
             .iter()
-            .map(|&i| self.discharge[i] * self.rivers.inv_area[i])
+            .map(|&i| self.discharge[i] * self.rivers.share(i)[node])
             .sum()
     }
 
-    /// Add the layer volume sources `s_l = Σ w_l Q̄/A_k` (m/s) at node
-    /// `node` of element `k` to `out` (one per level, bed first).
+    /// Add the layer volume sources `s_l = Σ w_l Q̄ d_j/∫_k d dA` (m/s) at
+    /// node `node` (`j`) of element `k` to `out` (one per level, bed first).
     pub fn add_layer_rates(&self, k: usize, node: usize, out: &mut [f64]) {
         for &i in self.rivers.in_element(k) {
-            let rate = self.discharge[i] * self.rivers.inv_area[i];
+            let rate = self.discharge[i] * self.rivers.share(i)[node];
             for (o, &w) in out.iter_mut().zip(self.rivers.level_weights(i, node)) {
                 *o += w * rate;
             }
@@ -695,10 +793,11 @@ impl RiverInflow<'_> {
             if !elements.contains(k) {
                 continue;
             }
-            let rate = self.discharge[i] * self.rivers.inv_area[i];
+            let (q, share) = (self.discharge[i], self.rivers.share(i));
             let c = concentration(self.rivers.river(i), k);
             let columns = rhs[k * n_nodes * nl..(k + 1) * n_nodes * nl].chunks_exact_mut(nl);
             for (node, column) in columns.enumerate() {
+                let rate = q * share[node];
                 for (r, &w) in column.iter_mut().zip(self.rivers.level_weights(i, node)) {
                     *r += w * rate * c;
                 }
@@ -725,7 +824,7 @@ impl RiverInflow<'_> {
             if !elements.contains(k) {
                 continue;
             }
-            let rate = self.discharge[i] * self.rivers.inv_area[i];
+            let (q, share) = (self.discharge[i], self.rivers.share(i));
             let columns = k * n_nodes * nw..(k + 1) * n_nodes * nw;
             for (node, (r, phi)) in rhs[columns.clone()]
                 .chunks_exact_mut(nw)
@@ -733,6 +832,7 @@ impl RiverInflow<'_> {
                 .enumerate()
             {
                 let weights = self.rivers.level_weights(i, node);
+                let rate = q * share[node];
                 for j in 0..nw {
                     let below = if j > 0 { weights[j - 1] } else { 0.0 };
                     let above = weights.get(j).copied().unwrap_or(0.0);
@@ -776,11 +876,12 @@ mod tests {
         }
     }
 
-    fn mesh() -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
+    fn mesh() -> (Mesh2D, DGOperators2D, GeometricFactors2D, Bathymetry2D) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 400.0, 0.0, 200.0, 4, 2);
         let ops = DGOperators2D::new(2);
         let geom = GeometricFactors2D::compute(&mesh, &ops);
-        (mesh, ops, geom)
+        let bed = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -10.0);
+        (mesh, ops, geom, bed)
     }
 
     #[test]
@@ -899,14 +1000,14 @@ mod tests {
 
     #[test]
     fn rivers_are_placed_in_their_elements_or_snapped_onto_the_mesh() {
-        let (mesh, _, geom) = mesh();
+        let (mesh, _, geom, bed) = mesh();
         let rivers = vec![
             River::new("inside", [150.0, 50.0], 10.0),
             River::new("same element", [160.0, 60.0], 5.0),
             // 30 m north of the top boundary, above element (3, 1)
             River::new("outside", [350.0, 230.0], 1.0),
         ];
-        let sources = RiverSources::new(rivers, &mesh, &geom, 50.0).unwrap();
+        let sources = RiverSources::new(rivers, &mesh, &geom, &bed, 50.0).unwrap();
         let locator = PointLocator2D::new(&mesh);
         let inside = locator.locate([150.0, 50.0]).unwrap().element;
         let corner = locator.locate([350.0, 190.0]).unwrap().element;
@@ -921,17 +1022,22 @@ mod tests {
             .all(|k| sources.in_element(k).is_empty());
         assert!(empty);
         // Element area 100 m × 100 m
-        assert!((sources.volume_rate(inside.as_usize(), 0.0) - 15.0 / 1e4).abs() < 1e-15);
+        let mut rate = vec![0.0; sources.share(0).len()];
+        sources.add_volume_rates(inside.as_usize(), 0.0, &mut rate);
+        assert!(
+            rate.iter().all(|r| (r - 15.0 / 1e4).abs() < 1e-15),
+            "{rate:?}"
+        );
         assert!((sources.total_discharge(0.0) - 16.0).abs() < 1e-12);
 
         let far = vec![River::new("far", [350.0, 300.0], 1.0)];
         assert!(matches!(
-            RiverSources::new(far, &mesh, &geom, 50.0),
-            Err(RiverError::OutsideMesh { .. })
+            RiverSources::new(far, &mesh, &geom, &bed, 50.0),
+            Err(RiverError::FarFromWater { .. })
         ));
         let negative = vec![River::new("dry", [10.0, 10.0], -1.0)];
         assert!(matches!(
-            RiverSources::new(negative, &mesh, &geom, 50.0),
+            RiverSources::new(negative, &mesh, &geom, &bed, 50.0),
             Err(RiverError::NegativeDischarge { .. })
         ));
 
@@ -942,7 +1048,7 @@ mod tests {
             River::new("dry", [10.0, 10.0], -1.0),
             River::new("outside", [350.0, 230.0], 1.0),
         ];
-        let (sources, errors) = RiverSources::on_mesh(rivers, &mesh, &geom, 50.0);
+        let (sources, errors) = RiverSources::on_mesh(rivers, &mesh, &geom, &bed, 50.0);
         assert_eq!(sources.len(), 2);
         assert_eq!(sources.river(0).name, "inside");
         assert_eq!(sources.element(0), inside);
@@ -952,7 +1058,7 @@ mod tests {
         assert!(matches!(
             errors.as_slice(),
             [
-                RiverError::OutsideMesh { .. },
+                RiverError::FarFromWater { .. },
                 RiverError::NegativeDischarge { .. }
             ]
         ));
@@ -962,10 +1068,10 @@ mod tests {
     /// nothing else.
     #[test]
     fn the_source_integrates_to_the_discharge() {
-        let (mesh, ops, geom) = mesh();
+        let (mesh, ops, geom, bed) = mesh();
         let discharge = RiverSeries::new(vec![0.0, 100.0], vec![4.0, 8.0]).unwrap();
         let rivers = vec![River::new("r", [250.0, 150.0], 0.0).with_discharge(discharge)];
-        let sources = RiverSources::new(rivers, &mesh, &geom, 0.0).unwrap();
+        let sources = RiverSources::new(rivers, &mesh, &geom, &bed, 0.0).unwrap();
         let solution = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
         let nn = ops.n_nodes;
         let mut total = 0.0;
@@ -986,5 +1092,82 @@ mod tests {
             total += geom.integrate_element(k, &h);
         }
         assert!((total - 5.0).abs() < 1e-12, "∫ ∂h/∂t = {total}");
+    }
+
+    /// A river enters an element under water, never one on the coast
+    /// (TODO P1.6: the Frøya rivers ponded on the land's 5 m), shared by
+    /// depth; a mouth on the coast, on land or off the mesh moves to the
+    /// nearest element under water.
+    #[test]
+    fn a_rivers_water_enters_the_water_not_the_land() {
+        let (mesh, ops, geom, _) = mesh();
+        // The coast at x = 250 m, across the elements of 200–300 m; land
+        // beyond, up to 15 m high at 400 m; 5–15 m deep in 100–200 m
+        let bed = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| (x - 250.0) / 10.0);
+        let locator = PointLocator2D::new(&mesh);
+        let at = |x: f64| locator.locate([x, 50.0]).unwrap().element;
+        let rivers = vec![
+            River::new("sea", [150.0, 50.0], 4.0),
+            // In the coastal element, 20 m from the water
+            River::new("coast", [220.0, 50.0], 2.0),
+            // On land, 150 m from the water
+            River::new("inland", [350.0, 50.0], 1.0),
+        ];
+        let sources = RiverSources::new(rivers.clone(), &mesh, &geom, &bed, 150.0).unwrap();
+        for (i, distance) in [0.0, 20.0, 150.0].into_iter().enumerate() {
+            assert_eq!(sources.element(i), at(150.0), "{}", rivers[i].name);
+            assert!((sources.snap_distance(i) - distance).abs() < 1e-9);
+        }
+        let too_far = RiverSources::new(rivers, &mesh, &geom, &bed, 149.0);
+        assert!(
+            matches!(too_far, Err(RiverError::FarFromWater { distance, .. })
+            if (distance - 150.0).abs() < 1e-9)
+        );
+
+        // Shared by depth: the same dilution rate at every node, the share
+        // integrating to one
+        let k = at(150.0);
+        let share = sources.share(0);
+        assert!((geom.integrate_element(k.as_usize(), share) - 1.0).abs() < 1e-15);
+        let dilution: Vec<f64> = bed
+            .element(k)
+            .iter()
+            .zip(share)
+            .map(|(&b, &s)| s / -b)
+            .collect();
+        let (lo, hi) = dilution
+            .iter()
+            .fold((f64::INFINITY, 0.0_f64), |(lo, hi), &r| {
+                (lo.min(r), hi.max(r))
+            });
+        assert!(hi - lo < 1e-14 * hi, "{dilution:?}");
+        // The 15 m deep side takes three times the 5 m side's
+        let (deep, shallow) = (share[0], share[ops.n_nodes - 1]);
+        assert!(deep > 2.9 * shallow, "{share:?}");
+
+        // All 7 m³/s into the element, nothing on the coast
+        let mut rate = vec![0.0; ops.n_nodes];
+        sources.add_volume_rates(k.as_usize(), 0.0, &mut rate);
+        assert!((geom.integrate_element(k.as_usize(), &rate) - 7.0).abs() < 1e-12);
+        let mut coast = vec![0.0; ops.n_nodes];
+        sources.add_volume_rates(at(220.0).as_usize(), 0.0, &mut coast);
+        assert!(coast.iter().all(|&r| r == 0.0));
+
+        // Off the mesh, 50 m from its (dry) edge but 250 m from its water
+        let off = vec![River::new("off", [450.0, 50.0], 1.0)];
+        assert!(RiverSources::new(off.clone(), &mesh, &geom, &bed, 249.0).is_err());
+        let off = RiverSources::new(off, &mesh, &geom, &bed, 250.0).unwrap();
+        assert_eq!(off.element(0), k);
+
+        // The levels are laid over the bed the rivers were placed on
+        let sigma = SigmaGrid::new(4, UniformStretching);
+        let mut placed = sources.clone();
+        placed.set_levels(&sigma, &bed).unwrap();
+        let flat = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -10.0);
+        let mut other = sources;
+        assert!(matches!(
+            other.set_levels(&sigma, &flat),
+            Err(RiverError::OtherBed(_))
+        ));
     }
 }

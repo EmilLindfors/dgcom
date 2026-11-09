@@ -332,7 +332,7 @@ impl CaseFile {
     }
 
     /// `[rivers]`: the file's rivers on the mesh, those whose mouth is
-    /// within `snap_km` of it (the others listed and left out), as
+    /// within `snap_km` of its water (the others listed and left out), as
     /// `froya_real_data rivers=` places them.
     fn rivers(
         &self,
@@ -362,8 +362,13 @@ impl CaseFile {
         let rivers = forcing
             .rivers(projection, &clock, &profile)
             .map_err(|e| CaseError::Invalid(format!("{}: {e}", path.display())))?;
-        let (sources, skipped) =
-            RiverSources::on_mesh(rivers, &domain.mesh, &domain.geom, 1000.0 * spec.snap_km);
+        let (sources, skipped) = RiverSources::on_mesh(
+            rivers,
+            &domain.mesh,
+            &domain.geom,
+            &domain.bathymetry,
+            1000.0 * spec.snap_km,
+        );
         // Over the run, hourly
         let hours = (t_end / 3600.0).ceil().max(1.0) as usize;
         let mean = |i: usize| {
@@ -375,7 +380,7 @@ impl CaseFile {
         let total: f64 = (0..sources.len()).map(mean).sum();
         notes.push(format!(
             "rivers: {} of {} from {} ({total:.1} m³/s over the run), entering over {}; {} more \
-             than {} km from the mesh left out",
+             than {} km from the mesh's water left out",
             sources.len(),
             forcing.len(),
             path.display(),
@@ -387,10 +392,12 @@ impl CaseFile {
         order.sort_by(|&a, &b| mean(b).total_cmp(&mean(a)));
         for &i in order.iter().take(5) {
             notes.push(format!(
-                "  river {}: {:.1} m³/s into element {} (snapped {:.0} m)",
+                "  river {}: {:.1} m³/s into element {} ({:.1}–{:.1} m deep; snapped {:.0} m)",
                 sources.river(i).name,
                 mean(i),
                 sources.element(i).as_usize(),
+                sources.depth_range(i).0,
+                sources.depth_range(i).1,
                 sources.snap_distance(i)
             ));
         }

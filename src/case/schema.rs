@@ -1125,10 +1125,11 @@ impl WavesSection {
 /// `Hydrostatic3D::with_rivers`), from a river file
 /// (`crate::io::RiverForcing`: NorKyst-800's NVE rivers as
 /// `examples/norkyst_river_subset.rs` cuts them out, daily, linear in time
-/// and held beyond the file). Each river enters the element of its mouth,
-/// or the nearest boundary element from up to `snap_km` away; rivers
-/// farther off are left out and listed. The water enters the layers over
-/// `profile`. The defaults are `examples/froya_real_data.rs rivers=`'s.
+/// and held beyond the file). Each river enters the element of its mouth
+/// if it is under water, or else the nearest element under water from up to
+/// `snap_km` away (a mouth on the coast or on land never pours onto the
+/// land); rivers farther off are left out and listed. The water enters the
+/// element's nodes by their depth, and the layers over `profile`. The defaults are `examples/froya_real_data.rs rivers=`'s.
 ///
 /// Needs `[three_d]` (the 2D module has no rivers), a placed mesh,
 /// `run.start` and the `netcdf` feature; the file must cover the run.
@@ -1137,7 +1138,7 @@ impl WavesSection {
 pub struct RiversSection {
     /// The river file
     pub file: PathBuf,
-    /// How far a mouth may lie off the mesh (km, default 2)
+    /// How far a mouth may move to the mesh's water (km, default 2)
     #[serde(default = "default_river_snap_km")]
     pub snap_km: f64,
     /// How the water enters the layers (default `"tapered:3"`, NorKyst's

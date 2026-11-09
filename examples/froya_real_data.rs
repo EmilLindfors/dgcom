@@ -249,9 +249,9 @@
 //! Christensen et al. 2026). `rivers=<file>` (from `norkyst_river_subset`:
 //! NorKyst-800's NVE rivers, daily) adds the rivers as volume sources with
 //! their water's temperature and salinity (`RiverForcing`,
-//! `Hydrostatic3D::with_rivers`), each in the element of its mouth or snapped
-//! onto the mesh from up to `river_snap_km` away (rivers farther off are listed
-//! and left out), entering over `river_profile=`: `tapered:D` (the default, D = 3:
+//! `Hydrostatic3D::with_rivers`), each in the element of its mouth or, for a
+//! mouth on the coast or on land, the nearest element under water from up to
+//! `river_snap_km` away (rivers farther off are listed and left out), entering over `river_profile=`: `tapered:D` (the default, D = 3:
 //! the top D metres, per metre falling linearly to zero at D, as NorKyst's
 //! rivers enter), `top:D` (the top D metres, uniformly) or `fraction:F` (the
 //! top fraction F of the column). The stations, the progress
@@ -871,7 +871,7 @@ struct Options {
     /// beyond those a resume may change anyway (`RESUME_MAY_CHANGE`)
     resume_changes: Vec<String>,
     /// Rivers of the 3D tide (`rivers=<file>`, from `norkyst_river_subset`),
-    /// snapped onto the mesh from up to `river_snap_km` away, entering over
+    /// moved to the mesh's water from up to `river_snap_km` away, entering over
     /// `river_profile=` (`tapered:3`, `top:D`, `fraction:F`)
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     rivers: Option<PathBuf>,
@@ -3707,6 +3707,7 @@ fn rivers_3d(
         rivers,
         &domain.mesh,
         &domain.geom,
+        &domain.bathymetry,
         1000.0 * opts.river_snap_km,
     );
     // Over the run, hourly
@@ -3720,7 +3721,7 @@ fn rivers_3d(
     let total: f64 = (0..sources.len()).map(mean).sum();
     println!(
         "  Rivers: {} of {} from {} ({total:.1} m³/s over the run), entering over {:?}; {} \
-         more than {} km from the mesh left out",
+         more than {} km from the mesh's water left out",
         sources.len(),
         forcing.len(),
         path.display(),
@@ -3732,10 +3733,12 @@ fn rivers_3d(
     order.sort_by(|&a, &b| mean(b).total_cmp(&mean(a)));
     for &i in order.iter().take(5) {
         println!(
-            "    river {}: {:.1} m³/s into element {} (snapped {:.0} m)",
+            "    river {}: {:.1} m³/s into element {} ({:.1}–{:.1} m deep; snapped {:.0} m)",
             sources.river(i).name,
             mean(i),
             sources.element(i).as_usize(),
+            sources.depth_range(i).0,
+            sources.depth_range(i).1,
             sources.snap_distance(i)
         );
     }

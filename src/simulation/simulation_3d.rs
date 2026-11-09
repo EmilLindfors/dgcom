@@ -1361,7 +1361,8 @@ mod tests {
 
         /// [`Self::physics`] with `rivers`.
         fn physics_with_rivers(&self, rivers: Vec<River>) -> Physics {
-            let sources = RiverSources::new(rivers, &self.mesh, &self.geom, 0.0).unwrap();
+            let sources =
+                RiverSources::new(rivers, &self.mesh, &self.geom, &self.bathymetry, 0.0).unwrap();
             self.physics().with_rivers(sources)
         }
 
@@ -7506,7 +7507,7 @@ mod tests {
         let river = River::new("head", [0.5 * length / nx as f64, 0.5 * width], discharge)
             .with_temperature(RiverSeries::constant(eos.t0))
             .with_profile(RiverProfile::TopFraction(0.3));
-        let rivers = RiverSources::new(vec![river], &mesh, &geom, 0.0).unwrap();
+        let rivers = RiverSources::new(vec![river], &mesh, &geom, &bathymetry, 0.0).unwrap();
         let sea = Arc::new(Sea {
             temp: eos.t0,
             salt: s_sea,

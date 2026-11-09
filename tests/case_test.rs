@@ -2144,7 +2144,7 @@ fn a_wind_sets_the_channel_up_against_its_head() {
 
 /// `[rivers]`: a river of 10 m³/s into a closed 3D basin adds its volume,
 /// 10 m³/s × 1 h, to round-off (3e-11 of it); a second, 5 km off the basin,
-/// is left out (more than `snap_km` from the mesh) and listed.
+/// is left out (more than `snap_km` from the mesh's water) and listed.
 #[cfg(feature = "netcdf")]
 #[test]
 fn a_rivers_water_fills_a_closed_3d_basin() {
