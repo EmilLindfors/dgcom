@@ -1128,8 +1128,11 @@ impl WavesSection {
 /// and held beyond the file). Each river enters the element of its mouth
 /// if it is under water, or else the nearest element under water from up to
 /// `snap_km` away (a mouth on the coast or on land never pours onto the
-/// land); rivers farther off are left out and listed. The water enters the
-/// element's nodes by their depth, and the layers over `profile`. The defaults are `examples/froya_real_data.rs rivers=`'s.
+/// land); rivers farther off are left out and listed, as are mouths
+/// beyond an open boundary (outside the domain: the parent's water, which
+/// has its own rivers, carries them in). The water enters the element's
+/// nodes by their depth, and the layers over `profile`. The defaults are
+/// `examples/froya_real_data.rs rivers=`'s.
 ///
 /// Needs `[three_d]` (the 2D module has no rivers), a placed mesh,
 /// `run.start` and the `netcdf` feature; the file must cover the run.

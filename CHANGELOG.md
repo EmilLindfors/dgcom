@@ -13,6 +13,11 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **Rivers beyond an open boundary are left out (TODO P1.6; `notes/inputs-forcing.md`).** A river whose mouth is outside the mesh and nearest an open boundary (open, tidal or river faces) is now left out and listed (`RiverError::BeyondOpenBoundary`). Its mouth lies outside the domain, and the water entering through the boundary already brings it in: a parent model has its own rivers.
+  - **Why:** at Frøya, the three largest placed rivers (837, 844, 836: 0.9, 0.8 and 0.55 m³/s) lie 1.5–1.9 km south of the box. They were snapped in across the open boundary into the 3 km nesting band, where the parent's T and S already carry their water and relax theirs away.
+  - **Logs:** the case and the example now give the placed discharge against the file's, over the run: "9 of 13 … (0.9 of 2.1 m³/s over the run); 4 left out".
+  - **`RiverSeries::mean_over(t0, t1)`:** the exact mean of the piecewise-linear series. The logs used to sample it hourly.
+
 - **River water no longer stands on land (TODO P1.6; `notes/inputs-forcing.md`).** A river's element had every node raised at the same rate, land nodes too, so on the Frøya mesh river water stood at the 5 m land elevation (the highest η after 1 h: 5.001 m, against 1.807 m without rivers).
   - **Placement:** a river enters an element whose nodes are all under water at rest. A mouth on the coast, on land or off the mesh moves to the nearest such element within the snapping distance, as FVCOM's and SCHISM's sources must sit in the water.
   - **Shares:** the discharge is shared over the element's nodes by still-water depth, `Q·d_j/∫_k d dA`. The volume still grows by exactly `∫Q dt`, the dilution rate is the same at every node, and a shallow node takes little. The barotropic steps, Ω, the tracers and the turbulence sources use the same shares.

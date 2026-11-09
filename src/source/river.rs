@@ -22,7 +22,11 @@
 //! coastline, often a little inland of a mesh's water: a mouth outside the
 //! mesh, or in an element on the coast (one with a node on land), moves to
 //! the nearest element under water within a given distance, as FVCOM's and
-//! SCHISM's sources must sit in the water. In a coastal element the water
+//! SCHISM's sources must sit in the water. A mouth outside the mesh whose
+//! nearest boundary is open is left out: it lies outside the domain, and the
+//! water that enters through the boundary (a parent model's, which has its
+//! own rivers) carries it in; placed inside, its water would enter twice, or
+//! be relaxed away in a nesting band. In a coastal element the water
 //! would stand on the land nodes at the land's height (TODO P1.6: η of 5 m
 //! on the 5 m land of the Frøya mesh, with the rate shared evenly), or crowd
 //! into the element's sliver of water and spill up the beach.
@@ -122,6 +126,26 @@ impl RiverSeries {
     /// The smallest value.
     pub fn min(&self) -> f64 {
         self.values.iter().copied().fold(f64::INFINITY, f64::min)
+    }
+
+    /// The mean over `[t0, t1]`, exactly (the trapezoid rule between the
+    /// series' times, where it is linear); the value at `t0` if `t1 ≤ t0`.
+    pub fn mean_over(&self, t0: f64, t1: f64) -> f64 {
+        if t1 <= t0 {
+            return self.at(t0);
+        }
+        let inside = self.times.iter().copied().filter(|&t| t > t0 && t < t1);
+        let mut points = std::iter::once(t0).chain(inside).chain(std::iter::once(t1));
+        let mut last = points.next().map(|t| (t, self.at(t)));
+        let mut integral = 0.0;
+        for t in points {
+            let v = self.at(t);
+            if let Some((s, u)) = last {
+                integral += 0.5 * (t - s) * (u + v);
+            }
+            last = Some((t, v));
+        }
+        integral / (t1 - t0)
     }
 }
 
@@ -350,6 +374,22 @@ pub enum RiverError {
         distance: f64,
         /// Allowed snapping distance (m)
         max_snap: f64,
+    },
+    /// A mouth beyond an open boundary: outside the domain, where the water
+    /// that enters through the boundary (a parent model's) carries it.
+    #[error(
+        "river {name}: the mouth at ({x:.0}, {y:.0}) m lies {distance:.0} m beyond an open \
+         boundary, whose water carries it in"
+    )]
+    BeyondOpenBoundary {
+        /// River name
+        name: String,
+        /// Mouth position (m)
+        x: f64,
+        /// Mouth position (m)
+        y: f64,
+        /// Distance to the open boundary (m)
+        distance: f64,
     },
 }
 
@@ -614,6 +654,9 @@ struct Placer<'m> {
     /// The elements under water, with their bounding boxes
     /// `[x_min, y_min, x_max, y_max]`.
     water: Vec<(ElementIndex, [f64; 4])>,
+    /// The boundary faces, as their end points and whether they are open
+    /// (open, tidal or river faces: [`crate::mesh::BoundaryTag::is_open`]).
+    boundary: Vec<([f64; 2], [f64; 2], bool)>,
 }
 
 impl<'m> Placer<'m> {
@@ -643,17 +686,27 @@ impl<'m> Placer<'m> {
                 (k, bounds)
             })
             .collect();
+        let mut boundary = Vec::new();
+        for k in ElementIndex::iter(mesh.n_elements) {
+            let corners = mesh.element_vertices(k);
+            for face in (0..4).filter(|&f| mesh.is_boundary_face(k, f)) {
+                let open = mesh.boundary_tag(k, face).is_some_and(|tag| tag.is_open());
+                boundary.push((corners[face], corners[(face + 1) % 4], open));
+            }
+        }
         Self {
             mesh,
             locator: PointLocator2D::new(mesh),
             wet,
             water,
+            boundary,
         }
     }
 
     /// The element holding `river`'s mouth if it is under water, or else
-    /// the nearest element under water within `max_snap`, with the distance the
-    /// mouth moves.
+    /// the nearest element under water within `max_snap`, with the distance
+    /// the mouth moves. A mouth outside the mesh whose nearest boundary is
+    /// open lies outside the domain: the water entering there carries it.
     fn place(&self, river: &River, max_snap: f64) -> Result<(ElementIndex, f64), RiverError> {
         let low = river.discharge.min();
         if low < 0.0 {
@@ -663,10 +716,27 @@ impl<'m> Placer<'m> {
             });
         }
         let p = river.position;
-        if let Some(point) = self.locator.locate(p)
-            && self.wet[point.element.as_usize()]
-        {
-            return Ok((point.element, 0.0));
+        match self.locator.locate(p) {
+            Some(point) if self.wet[point.element.as_usize()] => {
+                return Ok((point.element, 0.0));
+            }
+            Some(_) => {}
+            None => {
+                let (distance, open) = self
+                    .boundary
+                    .iter()
+                    .map(|&(a, b, open)| (distance_to_segment(a, b, p), open))
+                    .min_by(|x, y| x.0.total_cmp(&y.0))
+                    .unwrap_or((f64::INFINITY, false));
+                if open {
+                    return Err(RiverError::BeyondOpenBoundary {
+                        name: river.name.clone(),
+                        x: p[0],
+                        y: p[1],
+                        distance,
+                    });
+                }
+            }
         }
         // The bounding box is never farther than the element: skip the
         // elements whose box is beyond the nearest so far
@@ -699,18 +769,20 @@ impl<'m> Placer<'m> {
 /// (counter-clockwise), for a point outside it.
 fn distance_to_quad(vertices: &[[f64; 2]; 4], p: [f64; 2]) -> f64 {
     (0..4)
-        .map(|e| {
-            let (a, b) = (vertices[e], vertices[(e + 1) % 4]);
-            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-            let length2 = dx * dx + dy * dy;
-            let t = if length2 > 0.0 {
-                (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / length2).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
-        })
+        .map(|e| distance_to_segment(vertices[e], vertices[(e + 1) % 4], p))
         .fold(f64::INFINITY, f64::min)
+}
+
+/// Distance from `p` to the segment from `a` to `b`.
+fn distance_to_segment(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> f64 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let length2 = dx * dx + dy * dy;
+    let t = if length2 > 0.0 {
+        (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / length2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
 }
 
 impl SourceTerm2D for RiverSources {
@@ -1169,5 +1241,61 @@ mod tests {
             other.set_levels(&sigma, &flat),
             Err(RiverError::OtherBed(_))
         ));
+    }
+
+    /// A mouth beyond an open boundary lies outside the domain, where the
+    /// water entering through the boundary (a parent model's) carries it:
+    /// left out, not snapped in. One beyond a wall still snaps.
+    #[test]
+    fn a_mouth_beyond_an_open_boundary_is_left_out() {
+        use crate::mesh::BoundaryTag::{Open, Wall};
+        // Open to the east, walls on the other sides
+        let mesh = Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            400.0,
+            0.0,
+            200.0,
+            4,
+            2,
+            [Wall, Open, Wall, Wall],
+        );
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let bed = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -10.0);
+        let rivers = vec![
+            // 50 m east of the open side
+            River::new("east", [450.0, 50.0], 1.0),
+            // 30 m north of the wall, 60 m from the open side
+            River::new("north", [340.0, 230.0], 2.0),
+            River::new("inside", [390.0, 50.0], 3.0),
+        ];
+        let (sources, errors) = RiverSources::on_mesh(rivers, &mesh, &geom, &bed, 100.0);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources.river(0).name, "north");
+        assert!((sources.snap_distance(0) - 30.0).abs() < 1e-9);
+        assert_eq!(sources.river(1).name, "inside");
+        assert!(matches!(
+            errors.as_slice(),
+            [RiverError::BeyondOpenBoundary { name, distance, .. }]
+                if name == "east" && (distance - 50.0).abs() < 1e-9
+        ));
+        // However close: the parent carries it
+        let near = vec![River::new("near", [400.5, 50.0], 1.0)];
+        assert!(matches!(
+            RiverSources::new(near, &mesh, &geom, &bed, 1e4),
+            Err(RiverError::BeyondOpenBoundary { .. })
+        ));
+    }
+
+    #[test]
+    fn a_series_mean_is_exact_between_its_times() {
+        let s = RiverSeries::new(vec![0.0, 10.0, 30.0], vec![1.0, 3.0, 2.0]).unwrap();
+        // ∫_0^30 = 20 + 50 = 70
+        assert!((s.mean_over(0.0, 30.0) - 70.0 / 30.0).abs() < 1e-15);
+        // Held beyond its ends: ∫_-10^40 = 10 + 70 + 20
+        assert!((s.mean_over(-10.0, 40.0) - 100.0 / 50.0).abs() < 1e-15);
+        // Within one piece: the mean of its ends
+        assert!((s.mean_over(2.0, 6.0) - s.at(4.0)).abs() < 1e-15);
+        assert_eq!(s.mean_over(5.0, 5.0), s.at(5.0));
     }
 }
