@@ -865,7 +865,7 @@ fn build_mesh(raw: RawMesh) -> Result<Mesh2D> {
                     element_tag(faces[2].element)
                 ),
                 QuadMeshError::Overlap { vertices, faces } => format!(
-                    "elements {} and {} overlap: they traverse their shared edge {} in the                      same direction",
+                    "elements {} and {} overlap: they traverse their shared edge {} in the same direction",
                     element_tag(faces[0].element),
                     element_tag(faces[1].element),
                     segment(vertices)
@@ -896,7 +896,7 @@ fn build_mesh(raw: RawMesh) -> Result<Mesh2D> {
         };
         let Some(e) = edge else {
             return Err(GmshError::InvalidMesh(format!(
-                "line element {element} (nodes {} and {}) is not an edge of the                  quadrilateral mesh",
+                "line element {element} (nodes {} and {}) is not an edge of the quadrilateral mesh",
                 tags[0], tags[1]
             )));
         };

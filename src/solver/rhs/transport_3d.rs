@@ -3747,7 +3747,7 @@ mod tests {
             let limited = error(LimitedAkima);
             assert!(
                 akima * 200.0 < upwind && tvd * 20.0 < upwind && limited < 1.01 * akima,
-                "smooth profile: upwind {upwind:.3e}, Akima {akima:.3e}, TVD {tvd:.3e},                  limited Akima {limited:.3e}"
+                "smooth profile: upwind {upwind:.3e}, Akima {akima:.3e}, TVD {tvd:.3e}, limited Akima {limited:.3e}"
             );
         }
     }

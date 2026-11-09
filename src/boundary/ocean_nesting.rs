@@ -113,7 +113,9 @@ pub enum NestingError {
     NoSurface,
     /// The parent record is too short for [`ParentDatum::RecordMean`].
     #[error(
-        "the parent record is {days:.1} days, too short to take its own mean as the datum (at          least {min} days, or a surge in it comes off too): give ParentDatum::Shift, e.g. minus          TidalAtlas::mean_level of an atlas fitted to the parent over a month around the run",
+        "the parent record is {days:.1} days, too short to take its own mean as the datum (at \
+         least {min} days, or a surge in it comes off too): give ParentDatum::Shift, e.g. minus \
+         TidalAtlas::mean_level of an atlas fitted to the parent over a month around the run",
         min = ParentDatum::MIN_RECORD_DAYS
     )]
     ShortDatumRecord {

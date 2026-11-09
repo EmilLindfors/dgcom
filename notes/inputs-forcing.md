@@ -88,7 +88,7 @@
     - **1 h in 3D** (20 levels, `cases/froya/rivers_coast_3d.toml`):
       - **Refined:** 23,821 elements in water, 718 steps in 1,337 s; η max 2.165 m, |u| max 1.97 m/s.
       - **Unrefined:** 12,101 elements, 486 steps in 456 s; η max 2.176 m, |u| max 1.24 m/s.
-      - **Not yet located:** the larger |u| on the refined mesh. Narrow sounds opened by `river_min_water` would be the first place to look.
+      - **Located (2026-11-09):** the larger |u| was the cliffs' σ-level currents, below; with `[bathymetry.slopes_3d]` the case has the 3D bed.
     - **Remaining:**
       - NVE's own outlet coordinates would beat NorKyst's 800 m-grid positions on a 50 m mesh.
       - The refined elements are shallow (843's 0.6–4.6 m), so they dry at low water. Their shares of the river are small, by depth.
@@ -103,6 +103,21 @@
     - **Frøya** (`rivers_coast_3d.toml`): 853 moves 332 m to the shore (2.4–17.9 m deep), 851 26 m, 843 46 m, 849 74 m and 850 129 m; the farthest is 846 at 359 m.
     - **Gate:** `a_river_enters_where_it_meets_the_water_from_its_land`. The mouth sits 150 m out in an open-sided basin with its land cell behind the coast. It enters the shore column, 50 m from the mouth; within 40 m it falls back to its own element, as without a land cell.
     - **Still open:** NVE's own outlet coordinates. NorKyst's file has no names or NVE numbers to match them by.
+  - [x] The refined Frøya mesh's 3D blow-ups were its bed (2026-11-09, `fix/river-cases-3d-bed`). `rivers_coast_3d.toml` stopped at 555 s, 744 s or 5.12 h depending on the output intervals, and the viewer's run fell back to `three_d.cfl = 2`.
+    - **The trace** (each step's dt, n_bt, the bound and the element setting it, and the binding column of the suspect elements; a temporary `DGCOM_TRACE_AFTER` build):
+      - **"555 s" was no global failure.** At t = 555.17 s the run was taking steps of ≈ 1e-11 s with |u| ≈ 1e11 m/s in element 22853, for millions of steps, until a NaN reached η everywhere. The TODO's "η in every element in one step" was the end of that, not its start.
+      - **The growth began at rest.** Elements 22853 and 14975, at (18.4, −19.4) km, grew from 0.03 m/s to 3–8 m/s by 400 s and 21 m/s at 422 s, at a node 1.2–1.3 m deep. The step followed their speed, jumping between 1.3 and 9.9 s.
+      - **Both are cliffs.** 14975 is 44–50 m across with nodes from 0 to 75.6 m deep; 22853 is 28 m across with nodes from 1.24 to 81.2 m deep. Its r_x0 is ≈ 0.97 against ROMS's ≲ 0.2. The 200 m coastline mesh averaged these slopes away; the 50 m refinement resolves them.
+      - **Ruled out on the way:** the barotropic filter (`BarotropicFilter::new` is finite, sums to one and has its centroid at `n_bt` for every `n_bt` from 4 to 20,000) and a sliver step at a landing time (`Simulation3D` makes the steps up to a landing equal).
+    - **The cause:** `rivers_3d.toml` and `rivers_coast_3d.toml` (#211, #223) left out `[bathymetry.slopes_3d]`, the 3D bed every other 3D raster case has. The same failure was found before (the coastline mesh at `cfl_3d=1.5` blew up in a cliff element, 1.2 m beside 82 m; `CHANGELOG.md`) and led to `slopes3d=on`, but nothing in the case path said so.
+    - **The fix:** both cases take `[bathymetry.slopes_3d]` (defaults). The same 600 s: max |u| 21.0 → 0.44 m/s, 89 → 62 steps (mean 6.7 → 9.7 s). The bed moves a lot: 9,193 elements over the bound (the largest 339 m too deep), nodes changed by up to 245 m, cliff shores raised in 1,830 elements (14.4 km² of water at mean sea level), 380 ponds filled. Rivers 851 and 850 now enter 17–23 m and 41–55 m deep water (the cliff shores they entered are land).
+    - **The guard:** every 3D case run reports its bed against `slopes_3d`'s bound ("3D bed: N elements over the σ-levels' slope bound … the largest X m too deep, at (x, y) km", or "every element within"), and warns when the bed is over it without `[bathymetry.slopes_3d]` (`CaseDomain::report_3d_slopes`, gate `a_3d_run_on_a_steep_bed_is_warned_of_its_slopes`).
+      - **Why not r_x0:** plain r_x0 cannot tell the two beds apart. It is 0.97 untreated (1.1 m beside 83.6 m) and 0.90 treated (1.0 m beside 19.0 m, above the free depth, which `slopes_3d` leaves to the σ-levels by design). The element bound is what was calibrated against growth (`ElementSlopeBound::for_pycnocline`).
+    - **Judged at the default `cfl_3d = 4`** in the three configurations that failed, each runs to its end with no negative-depth clip:
+      - **6 h, output every 15 min, stations every 5 min** (stopped at 555 s): 2,903 steps of 2.17–10.03 s, |u| ≤ 2.14 m/s.
+      - **4.5 h, output every 10 min** (the viewer's run, stopped at 744 s): 2,358 steps of 2.09–10.0 s, |u| ≤ 2.21 m/s.
+      - **6 h, output every 10 min, stations every 5 min** (stopped at 5.12 h): 3,049 steps, |u| ≤ 2.21 m/s.
+      - **The 2.2 m/s peak is the tide, not a cliff:** the untreated bed at `three_d.cfl = 2` reached the same 2.20 m/s over 4.5 h, in 4,387 steps of 1.40–5.22 s. The treated bed takes the default CFL in about half the steps.
   - [ ] A river spreads over one element. On a farm mesh of tens of metres a large river (Orkla, ~70 m³/s) into one small element is a strong local source (the 3D gate's 20 m³/s into 6250 m² raises that element by ≈ 3 mm/s): spread it over the elements within a radius, weighted by area, if mouths on fine meshes show jets or plumes one element wide.
   - [ ] River momentum: the water enters at rest (dilutes the local velocity). A discharge direction and speed (`Q/(width·depth)`) as a momentum source matter for jets at narrow mouths.
   - [x] A fixed-depth profile (the top `d` metres, whatever the local depth) for rivers into deep fjords; `TopFraction` is a σ-fraction, so in 400 m of water its top 20 % is 80 m. NorKyst's rivers enter over the top ≈ 3 m, the weight per metre falling about linearly to zero there (measured 2026-10-21, P5.1 in `operational.md`). Done 2026-10-21, PR #165: `RiverProfile::TopMetres(d)` and `TaperedTopMetres(d)` (NorKyst's; `River::new`'s default is now `TaperedTopMetres(3.0)`, was `TopFraction(0.2)`).

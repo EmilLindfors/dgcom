@@ -342,7 +342,7 @@ where
                     t,
                     n_steps,
                     format!(
-                        "{} is not finite at t = {t:.1} s in {} of {} elements, the first                          element {} at ({x:.0}, {y:.0}) m: the state has blown up",
+                        "{} is not finite at t = {t:.1} s in {} of {} elements, the first element {} at ({x:.0}, {y:.0}) m: the state has blown up",
                         bad.field, bad.elements, state.n_elements, bad.first
                     ),
                 );
@@ -4206,7 +4206,7 @@ mod tests {
             }
         }
         println!(
-            "VISCOSITY ν = {nu}: {n} unknowns, largest real part {best:.3e} /s              (e-folding {:.1} min), imaginary {:.3e}",
+            "VISCOSITY ν = {nu}: {n} unknowns, largest real part {best:.3e} /s (e-folding {:.1} min), imaginary {:.3e}",
             1.0 / best / 60.0,
             values[at].im
         );

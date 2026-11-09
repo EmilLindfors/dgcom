@@ -30,6 +30,13 @@ kind = "topobathy"
 fill_zero_holes = true
 land_elevation_m = 5.0
 
+# The bed σ-levels need: within an element r_x0 ≤ 0.15 below the summer
+# pycnocline, cliff shores raised to land, tidal ponds filled. Without it
+# the refined mesh resolves cliffs (a 1.2 m node beside 75–80 m ones,
+# r_x0 ≈ 0.97) whose σ-level currents reached 21 m/s within 400 s and blew
+# the run up (TODO P1.6, 2026-11-09).
+[bathymetry.slopes_3d]
+
 [physics]
 coriolis = { f_plane = 1.31e-4 }      # the bed friction is [three_d]'s drag
 

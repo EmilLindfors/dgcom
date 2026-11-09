@@ -11,6 +11,14 @@ All notable changes to this project should be documented in this file.
   - "roms-rs" read as a port of ROMS, which this model is not.
   - Restart, snapshot and particle files keep their format, so files written before the rename still load.
 
+### Fixed
+
+- **The Frøya river cases' 3D blow-ups were their bed (TODO P1.6; `notes/inputs-forcing.md`).** `cases/froya/rivers_coast_3d.toml` stopped at 555 s, 744 s or 5.12 h depending on its output intervals.
+  - **Cause:** its 50 m mesh resolves underwater cliffs (a 1.2 m node beside 75–80 m ones, r_x0 ≈ 0.97) and the case left out `[bathymetry.slopes_3d]`. σ-level currents grew there from rest to 21 m/s within 400 s. The "555 s" failure was millions of 1e-11 s steps at 1e11 m/s in that element, not a global one.
+  - **Fix:** `rivers_coast_3d.toml` and `rivers_3d.toml` take `[bathymetry.slopes_3d]`. Over the same 600 s the largest |u| is 0.44 m/s instead of 21, in 62 steps instead of 89. At the default `cfl_3d = 4` all three failing configurations now run to their end (6 h, 4.5 h, 6 h; |u| ≤ 2.2 m/s, the same peak as the untreated bed at CFL 2), the 4.5 h one in 2,358 steps instead of 4,387 at CFL 2.
+  - **Guard:** a 3D case run reports how many elements of its bed are over `slopes_3d`'s slope bound (r_x0 ≤ 0.15 within an element below the pycnocline), and warns when that is not zero without `[bathymetry.slopes_3d]`. Plain r_x0 would not have told the beds apart (0.97 untreated, 0.90 treated). New `Slopes3D: Default`, `ElementSlopeBound::tolerance`.
+  - **Messages:** nine strings had lost a line continuation and carried a run of spaces: the 3D blow-up message, the gmsh mesh errors, the parent-datum error, and some test and example output.
+
 ### Added
 
 - **Rivers from a parent model enter from land (TODO P1.6; `notes/inputs-forcing.md`).** NorKyst-800 puts a river on a face of its 800 m grid. On a finer mesh that face can be open water, hundreds of metres off the shore the river reaches: river 853's water entered in the middle of its bay.

@@ -6217,7 +6217,7 @@ fn correct_parent_tides(
                     .all(|c| c.eta.0 < 1e-3)
             }) {
                 println!(
-                    "  The atlas has K2 and P1 at the equilibrium ratios, so theory adds the                      minor semidiurnals only (build it with `norkyst_boundary_tides ratios=`)"
+                    "  The atlas has K2 and P1 at the equilibrium ratios, so theory adds the minor semidiurnals only (build it with `norkyst_boundary_tides ratios=`)"
                 );
             }
             theory
