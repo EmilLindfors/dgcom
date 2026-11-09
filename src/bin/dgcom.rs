@@ -1,7 +1,7 @@
 //! `dgcom`: run a case file.
 //!
 //! ```text
-//! dgcom run   <case.toml> [--set key.path=value]...
+//! dgcom run   <case.toml> [--set key.path=value]... [--resume <restart>]
 //! dgcom check <case.toml> [--set key.path=value]...
 //! dgcom mesh  <case.toml> [--set key.path=value]...
 //! dgcom --version
@@ -14,6 +14,8 @@
 //! `mesh` folder (Gmsh with the boundary tags; VTK with the bed and each
 //! element's time step at rest) to inspect before a run.
 //! `--set` overrides a key of the case file, e.g. `--set numerics.cfl=0.5`.
+//! `--resume` continues a run from one of its restarts (`[restart]`): it
+//! sets `restart.from` to the file, relative to the working directory.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -25,6 +27,7 @@ dgcom: the Discontinuous Galerkin Coastal Ocean Model
 
 usage:
   dgcom run   <case.toml> [--set key.path=value]...   run a case
+              [--resume <restart>]                  ... from one of its restarts
   dgcom check <case.toml> [--set key.path=value]...   validate a case and print it resolved
   dgcom mesh  <case.toml> [--set key.path=value]...   write the mesh and bed to inspect (Gmsh, VTK)
   dgcom --version                                     the build: version and git commit
@@ -59,6 +62,14 @@ fn cli(args: Vec<String>) -> Result<(), String> {
         match arg.as_str() {
             "--set" => overrides.push(args.next().ok_or("--set needs key.path=value")?),
             s if s.starts_with("--set=") => overrides.push(s["--set=".len()..].to_string()),
+            "--resume" => {
+                let file = args.next().ok_or("--resume needs a restart file")?;
+                // From the working directory, not the case file's
+                let file =
+                    std::path::absolute(&file).map_err(|e| format!("--resume {file}: {e}"))?;
+                let file = toml::Value::String(file.display().to_string());
+                overrides.push(format!("restart.from={file}"));
+            }
             s if s.starts_with('-') => return Err(format!("unknown option {s}\n\n{USAGE}")),
             _ if path.is_none() => path = Some(PathBuf::from(arg)),
             _ => return Err(format!("unexpected argument {arg}\n\n{USAGE}")),

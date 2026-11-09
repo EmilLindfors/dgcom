@@ -10,6 +10,7 @@ use crate::analysis::{GaugeComparison, TimeSeries};
 use crate::waves::{CoupledWaves2D, SeaStateFields, SeaStateFrames};
 
 mod mesh;
+mod restart;
 mod three_d;
 mod waves;
 
@@ -26,7 +27,7 @@ use crate::boundary::{
     MultiBoundaryCondition2D, Reflective2D, SWEBoundaryCondition2D, StillWater, TidalConstituent,
 };
 use crate::equations::ShallowWater2D;
-use crate::io::{SnapshotWriter, write_vtk_swe};
+use crate::io::{Restart2D, SnapshotWriter, write_vtk_swe};
 use crate::physics::{PhysicsBuilder, SWEPhysics2D, SWEPhysics2DBuilder};
 use crate::simulation::{Simulation, SimulationResult};
 use crate::solver::{
@@ -71,6 +72,8 @@ pub struct StationSeries {
     pub u_m_s: Vec<f64>,
     /// Depth-averaged velocity along y (m/s)
     pub v_m_s: Vec<f64>,
+    /// Water depth (m)
+    pub depth_m: Vec<f64>,
     /// With `[waves]`, the sea state at the station at the same times
     /// (empty without waves): the significant wave height (m), the peak
     /// period (s) and the mean direction the waves come from (degrees
@@ -135,6 +138,48 @@ impl CaseFile {
         let wall = Reflective2D::new();
         let physics = self.physics(domain, boundary_conditions(&wall, &opens));
         let mut notes = Vec::new();
+        // A resumed run: the restart's state, time and records
+        let resumed = match self.resume_path() {
+            Some(path) => {
+                let restart = Restart2D::read(&path)
+                    .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
+                physics.check_restart(&restart).map_err(|e| {
+                    CaseError::Invalid(format!("cannot resume from {}: {e}", path.display()))
+                })?;
+                self.check_resumed(&path, &restart.driver)?;
+                let resumed = restart::Resumed {
+                    path,
+                    time: restart.time,
+                    driver: restart.driver,
+                };
+                notes.push(resumed.note());
+                Some((restart.state, resumed))
+            }
+            None => None,
+        };
+        let (mut q, resumed) = match resumed {
+            Some((state, resumed)) => (state, Some(resumed)),
+            None => (still_water(case, domain), None),
+        };
+        let t_start = resumed.as_ref().map_or(0.0, |r| r.time);
+        if t_start >= t_end - 1e-6 {
+            return Err(CaseError::Invalid(format!(
+                "the restart is at {:.2} h, at or past the run's end ({} h)",
+                t_start / 3600.0,
+                case.run.duration_hours
+            )));
+        }
+        // The callbacks fall on the restart's time plus multiples of the
+        // interval, and the outputs on multiples of theirs
+        let n = t_start / interval;
+        if (n - n.round()).abs() > 1e-6 {
+            return Err(CaseError::Invalid(format!(
+                "the restart is at {t_start} s, not a multiple of this run's {} min output \
+                 interval",
+                interval / 60.0
+            )));
+        }
+        let fingerprint = physics.domain_fingerprint();
         let mut waves = match (&case.waves, &domain.waves) {
             (Some(spec), Some(w)) => Some(self.coupled_waves(spec, w, &physics, &mut notes)?),
             _ => None,
@@ -144,26 +189,58 @@ impl CaseFile {
             .as_ref()
             .map(|_| std::cell::RefCell::new(SeaStateFrames::default()));
 
-        let mut q = still_water(case, domain);
-
         let surface: &[&str] = if waves.is_some() {
             &SeaStateFields::NAMES
         } else {
             &[]
         };
-        let mut output = Output::create(self, domain, clock.as_ref(), None, surface)?;
+        let mut output = Output::create(
+            self,
+            domain,
+            clock.as_ref(),
+            None,
+            surface,
+            resumed.as_ref(),
+        )?;
         let volume = |q: &SWESolution2D| volume(domain, q);
-        let volume_start = volume(&q);
+        let volume_start = match &resumed {
+            Some(r) => restart::counters(&r.driver)?.1,
+            None => volume(&q),
+        };
 
         let stop = Arc::new(AtomicBool::new(false));
         let mut failure = None;
+        let mut restarts = restart::RestartSchedule::new(self, t_start);
+        // A resumed run's first callback is at the restart's time, which the
+        // stopped run wrote out: only the files that start with this run
+        // take it
+        let mut at_restart = resumed.is_some();
         let callback = |q: &SWESolution2D, t: f64| {
             if failure.is_some() {
                 return;
             }
             let mut frames = sea.as_ref().map(|s| s.borrow_mut());
             let fields = frames.as_mut().map_or(Vec::new(), |f| f.at(t));
-            match output.write(t, q, false, &fields) {
+            if std::mem::take(&mut at_restart) {
+                if let Err(e) = output.write_at_restart(t, q, &fields) {
+                    failure = Some(e);
+                    stop.store(true, Ordering::Relaxed);
+                }
+                return;
+            }
+            let mut written = output.write(t, q, false, &fields);
+            if let (Ok(_), Some(restarts)) = (&written, restarts.as_mut().filter(|r| r.due(t))) {
+                let restart = Restart2D {
+                    time: t,
+                    domain: fingerprint,
+                    state: q.clone(),
+                    driver: output.driver_data(self, volume_start),
+                };
+                if let Err(e) = restarts.write(t, |path| restart.write(path)) {
+                    written = Err(e);
+                }
+            }
+            match written {
                 Ok(false) => {}
                 Ok(true) => progress(&Progress {
                     max_hs: max_hs(&fields),
@@ -204,7 +281,7 @@ impl CaseFile {
                 numerics.dt_max_s,
                 &stop,
                 &mut q,
-                t_end,
+                (t_start, t_end),
                 exchange,
                 callback,
             ),
@@ -215,7 +292,7 @@ impl CaseFile {
                 numerics.dt_max_s,
                 &stop,
                 &mut q,
-                t_end,
+                (t_start, t_end),
                 exchange,
                 callback,
             ),
@@ -256,6 +333,7 @@ impl CaseFile {
             points.write(&self.output_dir().join("wave_points.csv"))?;
             notes.extend(points.summary(3600.0 * case.spinup_hours()));
         }
+        notes.extend(restarts.map(|r| r.note()));
         let mut stations = output.finish();
         if let Some(clock) = &clock {
             score_gauges(domain, &mut stations, clock, 3600.0 * case.spinup_hours());
@@ -444,8 +522,8 @@ impl CaseFile {
     }
 }
 
-/// Run `sim` from 0 to `t_end`, calling `callback` every `interval` (and at
-/// the start and the end).
+/// Run `sim` over `(t_start, t_end)`, calling `callback` every `interval`
+/// (and at the start and the end).
 #[allow(clippy::too_many_arguments)]
 fn drive<BC, I>(
     sim: Simulation<SWESolution2D, SWEPhysics2D<BC>, I>,
@@ -454,7 +532,7 @@ fn drive<BC, I>(
     dt_max: Option<f64>,
     stop: &Arc<AtomicBool>,
     q: &mut SWESolution2D,
-    t_end: f64,
+    (t_start, t_end): (f64, f64),
     exchange: Option<WaveExchange<'_, '_>>,
     callback: impl FnMut(&SWESolution2D, f64),
 ) -> SimulationResult
@@ -470,7 +548,7 @@ where
         sim = sim.with_dt_max(dt);
     }
     match exchange {
-        None => sim.run_with_callback(q, 0.0, t_end, callback),
+        None => sim.run_with_callback(q, t_start, t_end, callback),
         // The waves exchange with the run every interval, their sea state
         // kept at the interval's ends
         Some(WaveExchange {
@@ -480,7 +558,7 @@ where
             points,
         }) => sim.run_with_exchange(
             q,
-            0.0,
+            t_start,
             t_end,
             every,
             |physics, q, t, t_next| {
@@ -772,6 +850,8 @@ struct Output<'a> {
     name: String,
     dir: Option<std::path::PathBuf>,
     snapshot: Option<SnapshotWriter>,
+    /// A resumed run's snapshot file is the stopped run's, continued
+    snapshot_continued: bool,
     vtk_frames: Option<usize>,
     #[cfg(feature = "netcdf")]
     netcdf: Option<crate::io::NetCDFWriter>,
@@ -788,17 +868,19 @@ struct Output<'a> {
 
 impl<'a> Output<'a> {
     /// The writers of `file`'s run on `domain`; with `sigma`, of a 3D run
-    /// (its snapshots 3D).
+    /// (its snapshots 3D); `resumed`, continuing the outputs of the run that
+    /// wrote that restart.
     fn create(
         file: &CaseFile,
         domain: &'a Domain,
         clock: Option<&crate::time::ModelClock>,
         sigma: Option<&crate::vertical::SigmaGrid>,
         surface: &[&str],
+        resumed: Option<&restart::Resumed>,
     ) -> Result<Self, CaseError> {
         let case = &file.case;
         let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
-        let stations: Vec<StationSeries> = domain
+        let mut stations: Vec<StationSeries> = domain
             .stations
             .iter()
             .map(|s| StationSeries {
@@ -806,6 +888,13 @@ impl<'a> Output<'a> {
                 ..Default::default()
             })
             .collect();
+        let vtk_done = match resumed {
+            Some(r) => {
+                restart::restore_stations(&mut stations, &r.driver)?;
+                restart::counters(&r.driver)?.0
+            }
+            None => 0,
+        };
         let dir = file.output_dir();
         fs::create_dir_all(&dir).map_err(|e| io(&dir.display().to_string(), &e))?;
         let resolved = dir.join("case.resolved.toml");
@@ -813,13 +902,19 @@ impl<'a> Output<'a> {
         fs::write(&resolved, header + &case.resolved().to_toml())
             .map_err(|e| io(&resolved.display().to_string(), &e))?;
         let name = case.run.name.clone();
+        let mut snapshot_continued = false;
         let snapshot = if case.output.snapshot {
             let path = dir.join(format!("{name}.dgsnap"));
             let metadata = snapshot_metadata(&name, domain);
             let metadata: Vec<(&str, &str)> =
                 metadata.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            let writer = match sigma {
-                Some(sigma) => SnapshotWriter::create_3d(
+            // A resumed run continues the file, without the frames the
+            // stopped run wrote after its restart
+            let continued = resumed.filter(|_| path.exists());
+            snapshot_continued = continued.is_some();
+            let writer = match (continued, sigma) {
+                (Some(r), _) => SnapshotWriter::append(&path, r.time, H_VELOCITY),
+                (None, Some(sigma)) => SnapshotWriter::create_3d(
                     &path,
                     &domain.mesh,
                     &domain.ops,
@@ -828,7 +923,7 @@ impl<'a> Output<'a> {
                     clock,
                     &metadata,
                 ),
-                None => SnapshotWriter::create_with(
+                (None, None) => SnapshotWriter::create_with(
                     &path,
                     &domain.mesh,
                     &domain.ops,
@@ -849,7 +944,7 @@ impl<'a> Output<'a> {
         let vtk_frames = if case.output.vtk {
             let vtk = dir.join("vtk");
             fs::create_dir_all(&vtk).map_err(|e| io(&vtk.display().to_string(), &e))?;
-            Some(0)
+            Some(vtk_done)
         } else {
             None
         };
@@ -858,7 +953,11 @@ impl<'a> Output<'a> {
             use crate::io::{
                 CoordinateProjection, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig,
             };
-            let path = dir.join(format!("{name}.nc"));
+            // A resumed run's in a file of its own
+            let path = dir.join(match resumed {
+                Some(r) => format!("{name}_from_{:.2}h.nc", r.time / 3600.0),
+                None => format!("{name}.nc"),
+            });
             let positions = domain.node_positions();
             let (x, y): (Vec<f64>, Vec<f64>) = positions.iter().map(|&[x, y]| (x, y)).unzip();
             let mut mesh_info = NetCDFMeshInfo::from_xy(x, y);
@@ -897,6 +996,21 @@ impl<'a> Output<'a> {
             };
             writeln!(csv, "station,time_s,eta_m,u_m_s,v_m_s,depth_m{waves}")
                 .map_err(|e| io("stations.csv", &e))?;
+            // A resumed run's records so far, as they were written
+            let n = stations.first().map_or(0, |s| s.time_s.len());
+            for i in 0..n {
+                for s in &stations {
+                    let sea = [&s.hs_m, &s.tp_s, &s.wave_from_deg].map(|x| x.get(i));
+                    let mut row = format!(
+                        "{},{},{},{},{},{}",
+                        s.name, s.time_s[i], s.eta_m[i], s.u_m_s[i], s.v_m_s[i], s.depth_m[i]
+                    );
+                    if let [Some(hs), Some(tp), Some(from)] = sea {
+                        row += &format!(",{hs},{tp},{from}");
+                    }
+                    writeln!(csv, "{row}").map_err(|e| io("stations.csv", &e))?;
+                }
+            }
             Some(csv)
         };
         let wave_east = (!surface.is_empty()).then(|| wave_east(domain));
@@ -905,13 +1019,14 @@ impl<'a> Output<'a> {
             name,
             dir: Some(dir),
             snapshot,
+            snapshot_continued,
             vtk_frames,
             #[cfg(feature = "netcdf")]
             netcdf,
             stations,
             csv,
             wave_east,
-            last_time: f64::NEG_INFINITY,
+            last_time: resumed.map_or(f64::NEG_INFINITY, |r| r.time),
             field_every: 60.0 * case.output.interval_minutes,
             station_every: 60.0 * case.output.station_interval(),
         })
@@ -956,6 +1071,7 @@ impl<'a> Output<'a> {
             series.eta_m.push(s.eta);
             series.u_m_s.push(s.u);
             series.v_m_s.push(s.v);
+            series.depth_m.push(s.h);
             let waves = match sea.map(|sea| sea[j]) {
                 Some([hs, tp, from]) => {
                     series.hs_m.push(hs);
@@ -990,8 +1106,6 @@ impl<'a> Output<'a> {
         last: bool,
         surface: &[&[f32]],
     ) -> Result<bool, CaseError> {
-        let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
-        let domain = self.domain;
         let on = |every: f64| {
             let n = t / every;
             last || (n - n.round()).abs() < 1e-6
@@ -1003,12 +1117,47 @@ impl<'a> Output<'a> {
         if !on(self.field_every) {
             return Ok(false);
         }
-        if let Some(snapshot) = &mut self.snapshot {
+        self.write_fields(t, q, surface, true)?;
+        Ok(true)
+    }
+
+    /// A resumed run's fields at the restart's time `t`, if it is a field
+    /// time, into the files that start there: the NetCDF file and a new
+    /// snapshot file (the stopped run's files have them).
+    fn write_at_restart(
+        &mut self,
+        t: f64,
+        q: &SWESolution2D,
+        surface: &[&[f32]],
+    ) -> Result<(), CaseError> {
+        let n = t / self.field_every;
+        if (n - n.round()).abs() < 1e-6 {
+            self.write_fields(t, q, surface, false)?;
+        }
+        Ok(())
+    }
+
+    /// The fields at `t`: to every writer, or (`all` false, at a resumed
+    /// run's start) only to the files that start with the resumed run.
+    fn write_fields(
+        &mut self,
+        t: f64,
+        q: &SWESolution2D,
+        surface: &[&[f32]],
+        all: bool,
+    ) -> Result<(), CaseError> {
+        let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
+        let domain = self.domain;
+        if let Some(snapshot) = self
+            .snapshot
+            .as_mut()
+            .filter(|_| all || !self.snapshot_continued)
+        {
             snapshot
                 .write_state(t, q, surface)
                 .map_err(|e| io("snapshot", &e))?;
         }
-        if let (Some(frame), Some(dir)) = (&mut self.vtk_frames, &self.dir) {
+        if let (Some(frame), Some(dir), true) = (&mut self.vtk_frames, &self.dir, all) {
             let path = dir
                 .join("vtk")
                 .join(format!("{}_{:04}.vtu", self.name, frame));
@@ -1047,7 +1196,7 @@ impl<'a> Output<'a> {
                 .write_timestep(t, &h, &eta, Some(&u), Some(&v))
                 .map_err(|e| io("NetCDF", &e))?;
         }
-        Ok(true)
+        Ok(())
     }
 
     /// A 3D run's snapshot at `t`, if snapshots are written.
@@ -1063,6 +1212,17 @@ impl<'a> Output<'a> {
                 .map_err(|e| CaseError::Io(format!("snapshot: {e}")))?;
         }
         Ok(())
+    }
+
+    /// A restart's driver data: the case, the stations' records so far and
+    /// the counters, with `volume_start` the run's volume at time 0.
+    fn driver_data(&self, file: &CaseFile, volume_start: f64) -> crate::io::DriverData {
+        restart::driver_data(
+            file,
+            &self.stations,
+            self.vtk_frames.unwrap_or(0),
+            volume_start,
+        )
     }
 
     /// The stations' records; the writers flush every frame as it is written.

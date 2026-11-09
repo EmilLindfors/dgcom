@@ -70,6 +70,237 @@ fn the_example_case_runs_and_records_what_it_ran() {
     assert_eq!(header.metadata("projection"), None);
 }
 
+/// Every file in `dir` (recursively), by its path under `dir`, with its bytes.
+fn files_in(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let name = path.strip_prefix(dir).unwrap().display().to_string();
+                files.insert(name, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
+}
+
+/// The records of `a` and `b` equal bit for bit.
+fn assert_same_records(a: &[StationSeries], b: &[StationSeries]) {
+    assert_eq!(a.len(), b.len());
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for (a, b) in a.iter().zip(b) {
+        assert_eq!(a.name, b.name);
+        for (field, x, y) in [
+            ("time", &a.time_s, &b.time_s),
+            ("eta", &a.eta_m, &b.eta_m),
+            ("u", &a.u_m_s, &b.u_m_s),
+            ("v", &a.v_m_s, &b.v_m_s),
+            ("depth", &a.depth_m, &b.depth_m),
+        ] {
+            assert_eq!(bits(x), bits(y), "{} {field}", a.name);
+        }
+    }
+}
+
+/// `[restart]`: the example with local time stepping, stopped at 1.25 h
+/// after its restart at 1 h and resumed from it, ends as the uninterrupted
+/// run does, bit for bit: the stations' records and `stations.csv`, the
+/// snapshot file (the stopped run's frames after 1 h dropped and the file
+/// continued) and the VTK frames. A resume whose case differs is refused,
+/// naming the key, unless `restart.changes` names it; an option given at
+/// its default is no change.
+#[test]
+fn a_resumed_case_run_ends_bit_for_bit_where_the_uninterrupted_one_does() {
+    let case = |dir: &Path, hours: f64, extra: &[&str]| {
+        let mut overrides = vec![
+            format!("run.duration_hours={hours}"),
+            format!("output.directory={:?}", dir.display().to_string()),
+            "output.interval_minutes=15.0".to_string(),
+            "output.station_interval_minutes=5.0".to_string(),
+            "output.vtk=true".to_string(),
+            "numerics.local_time_stepping_levels=2".to_string(),
+            "restart.interval_hours=0.5".to_string(),
+        ];
+        overrides.extend(extra.iter().map(|s| s.to_string()));
+        CaseFile::read(Path::new(EXAMPLE), &overrides).unwrap()
+    };
+    let whole = tempfile::tempdir().unwrap();
+    let uninterrupted = case(whole.path(), 2.0, &[]).run(&mut |_| {}).unwrap();
+    assert!(
+        uninterrupted
+            .notes
+            .iter()
+            .any(|n| n.starts_with("restarts every 0.5 h: 4 written")),
+        "{:?}",
+        uninterrupted.notes
+    );
+
+    // Stopped at 1.25 h: its last restart is at 1 h. A copy for the branch
+    // below (the resumed run replaces the file with its own)
+    let stopped = tempfile::tempdir().unwrap();
+    case(stopped.path(), 1.25, &[]).run(&mut |_| {}).unwrap();
+    let restart = stopped.path().join("tidal_channel.restart");
+    let from = format!("restart.from={:?}", restart.display().to_string());
+    let kept = tempfile::tempdir().unwrap();
+    let at_1h = kept.path().join("at_1h.restart");
+    std::fs::copy(&restart, &at_1h).unwrap();
+
+    // Another viscosity is refused, by name
+    let err = case(stopped.path(), 2.0, &[&from, "physics.viscosity_m2_s=1.0"])
+        .run(&mut |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("physics.viscosity_m2_s = 1.0 (the restart's run: 0.0)"),
+        "{err}"
+    );
+
+    // Resumed in place, with the viscosity given at its default
+    let resumed = case(stopped.path(), 2.0, &[&from, "physics.viscosity_m2_s=0.0"])
+        .run(&mut |_| {})
+        .unwrap();
+    assert!(
+        resumed.notes[0].starts_with("resumed from ") && resumed.notes[0].contains("at 1.00 h"),
+        "{:?}",
+        resumed.notes
+    );
+    assert_same_records(&uninterrupted.stations, &resumed.stations);
+    assert_eq!(
+        uninterrupted.volume_m3.0.to_bits(),
+        resumed.volume_m3.0.to_bits()
+    );
+    assert_eq!(
+        uninterrupted.volume_m3.1.to_bits(),
+        resumed.volume_m3.1.to_bits()
+    );
+    let (a, b) = (files_in(whole.path()), files_in(stopped.path()));
+    let outputs = |files: &std::collections::BTreeMap<String, Vec<u8>>| {
+        files
+            .keys()
+            .filter(|k| !k.ends_with(".restart") && !k.ends_with(".toml"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(outputs(&a), outputs(&b));
+    // 9 VTK frames at 0, 15, …, 120 minutes, a snapshot file, stations.csv
+    assert_eq!(outputs(&a).len(), 11, "{:?}", outputs(&a));
+    for name in outputs(&a) {
+        assert!(a[&name] == b[&name], "{name} differs");
+    }
+
+    // A branch run that changes the viscosity on purpose, into another
+    // directory: its snapshot starts at the restart
+    let branch = tempfile::tempdir().unwrap();
+    let changed = case(
+        branch.path(),
+        1.5,
+        &[
+            &format!("restart.from={:?}", at_1h.display().to_string()),
+            "physics.viscosity_m2_s=1.0",
+            "restart.changes=[\"physics.viscosity_m2_s\"]",
+        ],
+    )
+    .run(&mut |_| {})
+    .unwrap();
+    assert_eq!(changed.stations[0].time_s.first(), Some(&0.0));
+    assert_eq!(changed.stations[0].time_s.len(), 19);
+    let mut snapshot =
+        dgcom::io::SnapshotReader::open(branch.path().join("tidal_channel.dgsnap")).unwrap();
+    assert_eq!(snapshot.times().unwrap(), vec![3600.0, 4500.0, 5400.0]);
+}
+
+/// `[restart]` in 3D: a channel's M2 tide, stopped at 36 minutes after its
+/// restart at the 30-minute field output and resumed from it, ends as the
+/// uninterrupted run does, bit for bit: its stations (interpolated between
+/// steps across the restart) and its snapshot file. The restarts fall on the
+/// first field output at or after each quarter hour (20, 30, 50 and 60
+/// minutes), where the steps land.
+#[test]
+fn a_resumed_3d_case_run_ends_bit_for_bit_where_the_uninterrupted_one_does() {
+    let case = |dir: &Path, minutes: f64, extra: &[&str]| {
+        let path = dir.join("case.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+                [run]
+                name = "channel"
+                duration_hours = {:?}
+
+                [mesh.rectangle]
+                x_m = [0.0, 10000.0]
+                y_m = [0.0, 2000.0]
+                nx = 10
+                ny = 2
+                west = "open"
+
+                [bathymetry]
+                depth_m = 20.0
+
+                [[boundary]]
+                tag = "open"
+                [boundary.tide]
+                ramp_hours = 0.25
+                constituents = [{{ name = "M2", amplitude_m = 0.5 }}]
+
+                [three_d]
+                levels = 6
+                dt_max_s = 47.0
+                profile = [[-6.0, 14.0, 32.0], [-14.0, 10.0, 34.0]]
+
+                [output]
+                directory = "out"
+                interval_minutes = 10.0
+                station_interval_minutes = 5.0
+
+                [[output.station]]
+                name = "head"
+                x_m = 9500.0
+                y_m = 1000.0
+
+                [restart]
+                interval_hours = 0.25
+                "#,
+                minutes / 60.0
+            ),
+        )
+        .unwrap();
+        CaseFile::read(
+            &path,
+            &extra.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let whole = tempfile::tempdir().unwrap();
+    let uninterrupted = case(whole.path(), 60.0, &[]).run(&mut |_| {}).unwrap();
+    assert!(
+        uninterrupted
+            .notes
+            .iter()
+            .any(|n| n.starts_with("restarts every 0.25 h: 4 written, the last at 1.00 h")),
+        "{:?}",
+        uninterrupted.notes
+    );
+    let stopped = tempfile::tempdir().unwrap();
+    case(stopped.path(), 36.0, &[]).run(&mut |_| {}).unwrap();
+    let restart = stopped.path().join("out").join("channel.restart");
+    assert_eq!(dgcom::io::Restart3D::read(&restart).unwrap().time, 1800.0);
+    let from = format!("restart.from={:?}", restart.display().to_string());
+    let resumed = case(stopped.path(), 60.0, &[&from])
+        .run(&mut |_| {})
+        .unwrap();
+    assert_eq!(uninterrupted.stations[0].time_s.len(), 13);
+    assert_same_records(&uninterrupted.stations, &resumed.stations);
+    for name in ["channel.dgsnap", "stations.csv"] {
+        let read = |dir: &Path| std::fs::read(dir.join("out").join(name)).unwrap();
+        assert!(read(whole.path()) == read(stopped.path()), "{name} differs");
+    }
+}
+
 /// `dgcom mesh`: the example's mesh goes to Gmsh with its boundary tags
 /// and to VTK with the bed and each element's step at rest, and the step it
 /// reports is the one the run takes first, with and without local time

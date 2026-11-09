@@ -29,7 +29,9 @@
 //!   and nested in a parent's columns or a profile;
 //! - spectral waves coupled to the 2D run (`[waves]`), on its mesh or their
 //!   own, from a JONSWAP sea or a parent wave model's spectra;
-//! - a fish farm's net cages dragging on the flow (`[farm]`).
+//! - a fish farm's net cages dragging on the flow (`[farm]`);
+//! - restarts, and runs resumed from them bit for bit (`[restart]`), the
+//!   resumed case checked against the restart's.
 //!
 //! Next: the farm's analysis and particles (TODO F.1, F.2), and retiring
 //! `froya_real_data`'s moved modes (`notes/case-files.md`).

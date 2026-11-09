@@ -57,8 +57,9 @@
 //! `vbar`, `u`, `v`, `w`, `temp`, `salt`, `rho`, `eddy_viscosity`,
 //! `eddy_diffusivity`, `tke`, `gls`), `slow_forcing.t`, `slow_forcing.next_t`
 //! and `slow_forcing.<j>.h|hu|hv` (newest first), `vertical_reference.temp`
-//! and `.salt` if any. Of both: `extra.<name>`, and `metadata` last (text,
-//! `key=value` lines). `write` writes a temporary file beside the target and
+//! and `.salt` if any. Of both: `extra.<name>`, `text.<name>` (text, e.g. a
+//! case run's resolved case file), and `metadata` last (text, `key=value`
+//! lines). `write` writes a temporary file beside the target and
 //! renames it over the target, so an interrupted write leaves the previous
 //! restart.
 
@@ -104,12 +105,15 @@ pub enum RestartError {
 }
 
 /// What the driver of a run keeps in its restart, carried along unread:
-/// `key=value` metadata (e.g. the command line) and named `f64` arrays (e.g.
+/// `key=value` metadata (e.g. the command line), named texts of any length
+/// (e.g. a case run's resolved case file) and named `f64` arrays (e.g.
 /// station records, output counters).
 #[derive(Clone, Debug, Default)]
 pub struct DriverData {
     /// The `key=value` pairs (no newlines; no `=` in keys).
     pub metadata: Vec<(String, String)>,
+    /// The named texts.
+    pub text: Vec<(String, String)>,
     /// The named arrays.
     pub extra: Vec<(String, Vec<f64>)>,
 }
@@ -120,6 +124,14 @@ impl DriverData {
         self.metadata
             .iter()
             .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The text `name`, if any.
+    pub fn text(&self, name: &str) -> Option<&str> {
+        self.text
+            .iter()
+            .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
     }
 
@@ -148,6 +160,15 @@ impl DriverData {
         match self.metadata.iter_mut().find(|(k, _)| k == key) {
             Some((_, v)) => *v = value,
             None => self.metadata.push((key.to_string(), value)),
+        }
+    }
+
+    /// Add (or replace) the text `name`.
+    pub fn set_text(&mut self, name: &str, value: impl Into<String>) {
+        let value = value.into();
+        match self.text.iter_mut().find(|(n, _)| n == name) {
+            Some((_, v)) => *v = value,
+            None => self.text.push((name.to_string(), value)),
         }
     }
 
@@ -404,7 +425,8 @@ fn write_body<'a, W: Write>(
         .map(|(k, v)| format!("{k}={v}\n"))
         .collect();
 
-    out.write_all(&(sections.len() as u64 + 1).to_le_bytes())?;
+    let n_sections = sections.len() + driver.text.len() + 1;
+    out.write_all(&(n_sections as u64).to_le_bytes())?;
     for (name, values) in sections {
         write_name(out, &name, KIND_VALUES, values.len())?;
         let mut bytes = Vec::with_capacity(8 * CHUNK.min(values.len()));
@@ -415,6 +437,10 @@ fn write_body<'a, W: Write>(
             }
             out.write_all(&bytes)?;
         }
+    }
+    for (name, text) in &driver.text {
+        write_name(out, &format!("text.{name}"), KIND_TEXT, text.len())?;
+        out.write_all(text.as_bytes())?;
     }
     write_name(out, "metadata", KIND_TEXT, metadata.len())?;
     out.write_all(metadata.as_bytes())
@@ -427,6 +453,7 @@ struct RawRestart {
     values: HashMap<String, Vec<f64>>,
     order: Vec<String>,
     metadata: Vec<(String, String)>,
+    text: Vec<(String, String)>,
 }
 
 impl RawRestart {
@@ -459,6 +486,7 @@ impl RawRestart {
             .ok_or_else(|| RestartError::Format("an unknown section".into()))?;
         Ok(DriverData {
             metadata: self.metadata,
+            text: self.text,
             extra,
         })
     }
@@ -542,6 +570,7 @@ fn read_body<R: Read>(
     let mut values: HashMap<String, Vec<f64>> = HashMap::new();
     let mut order = Vec::new();
     let mut metadata = Vec::new();
+    let mut texts = Vec::new();
     for _ in 0..n_sections {
         let mut name_len = [0; 4];
         input.read_exact(&mut name_len)?;
@@ -572,19 +601,24 @@ fn read_body<R: Read>(
                 order.push(name.clone());
                 values.insert(name, data);
             }
-            KIND_TEXT if name == "metadata" => {
+            KIND_TEXT if name == "metadata" || name.starts_with("text.") => {
                 if len > input.remaining {
-                    return Err(format("metadata past the end of the file".into()));
+                    return Err(format(format!("section {name} past the end of the file")));
                 }
                 let mut text = vec![0; len as usize];
                 input.read_exact(&mut text)?;
-                let text =
-                    String::from_utf8(text).map_err(|_| format("metadata not UTF-8".into()))?;
-                for line in text.lines().filter(|l| !l.is_empty()) {
-                    let (k, v) = line
-                        .split_once('=')
-                        .ok_or_else(|| format(format!("metadata line without '=': {line}")))?;
-                    metadata.push((k.to_string(), v.to_string()));
+                let text = String::from_utf8(text)
+                    .map_err(|_| format(format!("section {name} not UTF-8")))?;
+                match name.strip_prefix("text.") {
+                    Some(name) => texts.push((name.to_string(), text)),
+                    None => {
+                        for line in text.lines().filter(|l| !l.is_empty()) {
+                            let (k, v) = line.split_once('=').ok_or_else(|| {
+                                format(format!("metadata line without '=': {line}"))
+                            })?;
+                            metadata.push((k.to_string(), v.to_string()));
+                        }
+                    }
                 }
             }
             other => return Err(format(format!("section {name} of unknown kind {other}"))),
@@ -600,6 +634,7 @@ fn read_body<R: Read>(
         values,
         order,
         metadata,
+        text: texts,
     })
 }
 
@@ -742,6 +777,7 @@ mod tests {
     fn driver() -> DriverData {
         let mut driver = DriverData::default();
         driver.set_metadata("command", "froya_real_data levels=20 tide3d=1");
+        driver.set_text("case", "[run]\nname = \"x = 1\"\n\n# ø, 東\n");
         driver.set_extra("station.0.eta", vec![0.1, f64::NAN, -0.3]);
         driver
     }
@@ -801,6 +837,7 @@ mod tests {
 
     fn assert_same_driver(a: &DriverData, b: &DriverData) {
         assert_eq!(a.metadata, b.metadata);
+        assert_eq!(a.text, b.text);
         assert_eq!(a.extra.len(), b.extra.len());
         for ((na, va), (nb, vb)) in a.extra.iter().zip(&b.extra) {
             assert_eq!(na, nb);
