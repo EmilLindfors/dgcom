@@ -19,6 +19,14 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P8.3** Read ROMS inputs: the grid file (`h`, `mask_rho`, lon/lat) as bed and mask; the tidal forcing file (`tide_Eamp`/`Ephase`/`Cmax`/…, from TPXO/FES) as a `TidalAtlas`; boundary and climatology files (`zeta_west`, …) as a parent.
 - [ ] **P8.4** `docs/coming-from-roms.md`: map `ocean.in` keywords to case keys, and list what has no equivalent yet. Pair it with ROMS output names (P5.2).
 - [ ] **P8.5** A test case ROMS users know (an estuary or tidal channel) run from a case file and compared against ROMS; the README quickstart runs `cases/tidal_channel` (2026-11-07), which is checked against linear theory, not ROMS.
+- [ ] **P8.6** A second coast, Chiloé (Chile; tracking #220): the inner sea's tide on GEBCO with a TPXO/FES atlas (`cases/chiloe/case.toml`), scored at SHOA's gauges, M2's growth from Melinka to Puerto Montt the key test (#213).
+- [ ] **P8.7** Nest in IFOP's MOSA (CHONOS, ROMS/CROCO 1 km): read it, find out whether it carries the tide, score it, `cases/chiloe/nested.toml` (#214).
+- [ ] **P8.8** Nesting with the parent's residual and an atlas tide: `parent − parent's tide + target tide`, today's corrections the special case `parent = "atlas"` (#215; `notes/boundaries-nesting.md`).
+- [ ] **P8.9** Chilean weather (MOSA-WRF names), rivers (FLOW, DGA), gauges (SHOA via IOC/UHSLC) and farm sites (Subpesca) as inputs (#216).
+- [ ] **P8.10** One table of variable roles for the gridded readers, CF `standard_name` first, with case overrides, instead of the name lists in `io/netcdf_read.rs` (#217; tracking #221).
+- [ ] **P8.11** Providers at the edges: canonical input formats in `docs/inputs.md`, fetchers under `scripts/sources/<provider>/`, `norkyst_boundary_tides` → `parent_boundary_tides`, `io::norkyst_parquet` (no callers) deleted (#218).
+- [ ] **P8.12** Retire the `norwegian_*` presets and `norwegian_stations` from the core, and derive the tide-range keys (`high_water_m`, `pond_low_water_m`, `wall_low_water_m`, `land_elevation_m`) from the case's tide instead of Mausund's (#219).
+- [ ] **P8.1** The case logs print a southern placement as "placed about -42.7500°N -73.4500°E": print hemispheres (42.75°S 73.45°W), and log the Coriolis f₀ (and β) a case runs with, so a sign error shows (`notes/case-files.md`, Chiloé).
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
