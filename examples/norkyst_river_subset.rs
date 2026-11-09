@@ -7,7 +7,9 @@
 //! (`froya_real_data rivers=<file>`):
 //!
 //! - the mouths are the midpoints of the coastal faces the rivers enter
-//!   NorKyst through (`roms_source_position`), from the grid's ρ-points;
+//!   NorKyst through (`roms_source`), from the grid's ρ-points, with the
+//!   land cell each river flows from (`river_inland_lon`, `river_inland_lat`),
+//!   which a finer mesh follows to its own shore;
 //! - the discharge (m³/s) and the river water's temperature and salinity
 //!   (NorKyst's levels weighted by the river's `river_Vshape`) at the days
 //!   covering `start` to `start + days`.

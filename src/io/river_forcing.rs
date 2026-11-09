@@ -27,8 +27,13 @@
 //! - 1, the v-face between ρ(ξ, η−1) and ρ(ξ, η);
 //! - 2 (`LwSrc`), at ρ(ξ, η) itself.
 //!
-//! A child mesh resolves the coast differently, so the mouth is snapped to
-//! the mesh by [`crate::source::RiverSources`].
+//! The river comes from the face's other cell, the land cell: the one the
+//! transport flows from (positive along +ξ or +η, so from ρ(ξ−1, η) or
+//! ρ(ξ, η−1); negative, from ρ(ξ, η)). Its ρ-point is the mouth's *inland*
+//! point. A child mesh resolves the coast differently: the parent's face
+//! can lie in the child's open water, hundreds of metres off the shore the
+//! river reaches, so [`crate::source::RiverSources`] follows the line from
+//! the inland point through the face to where the child's water begins.
 //!
 //! # Temperature and salinity
 //!
@@ -57,10 +62,14 @@ pub struct RiverMouth {
     pub lon: f64,
     /// Latitude of the mouth (degrees north).
     pub lat: f64,
+    /// `(lon, lat)` of the land side: the ρ-point of the cell the river flows
+    /// from through the mouth's face (see the module docs); `None` for a
+    /// vertical source, or a file without it.
+    pub inland: Option<(f64, f64)>,
 }
 
 /// The ρ-points of a ROMS grid, or of a window of it, to place point
-/// sources with [`roms_source_position`]: `lon` and `lat` row-major
+/// sources with [`roms_source`]: `lon` and `lat` row-major
 /// `[η][ξ]`, `n_eta × n_xi`, the first point at ROMS indices
 /// `(xi0, eta0)`.
 #[derive(Clone, Copy, Debug)]
@@ -91,16 +100,43 @@ impl RomsRhoPoints<'_> {
     }
 }
 
-/// `(lon, lat)` of a ROMS point source at indices `(xi, eta)` of kind
-/// `direction` (`river_direction`; see the module docs), or `None` if its
-/// cells are not in `points`. An unknown direction or a non-integer index
-/// is an error.
-pub fn roms_source_position(
+/// Where a ROMS point source lies ([`roms_source`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RomsSource {
+    /// `(lon, lat)` of the face's midpoint, or of the ρ-point of a vertical
+    /// source.
+    pub position: (f64, f64),
+    /// `(lon, lat)` of a face's two cells' ρ-points, the lower index first
+    /// (the one a positive transport flows from); `None` for a vertical
+    /// source.
+    pub cells: Option<[(f64, f64); 2]>,
+}
+
+impl RomsSource {
+    /// The land side of a face source whose transport has the sign of
+    /// `transport`: the cell it flows from (`None` for a vertical source or
+    /// no transport).
+    pub fn inland(&self, transport: f64) -> Option<(f64, f64)> {
+        let [lower, upper] = self.cells?;
+        if transport > 0.0 {
+            Some(lower)
+        } else if transport < 0.0 {
+            Some(upper)
+        } else {
+            None
+        }
+    }
+}
+
+/// A ROMS point source at indices `(xi, eta)` of kind `direction`
+/// (`river_direction`; see the module docs), or `None` if its cells are not
+/// in `points`. An unknown direction or a non-integer index is an error.
+pub fn roms_source(
     points: &RomsRhoPoints,
     xi: f64,
     eta: f64,
     direction: f64,
-) -> Result<Option<(f64, f64)>, String> {
+) -> Result<Option<RomsSource>, String> {
     let index = |v: f64| {
         (v.fract() == 0.0 && v >= 0.0)
             .then_some(v as i64)
@@ -117,10 +153,14 @@ pub fn roms_source_position(
         return Ok(None);
     };
     Ok(match neighbour {
-        None => Some(cell),
-        Some((i, j)) => points
-            .at(i, j)
-            .map(|(lon, lat)| (0.5 * (cell.0 + lon), 0.5 * (cell.1 + lat))),
+        None => Some(RomsSource {
+            position: cell,
+            cells: None,
+        }),
+        Some((i, j)) => points.at(i, j).map(|other| RomsSource {
+            position: (0.5 * (cell.0 + other.0), 0.5 * (cell.1 + other.1)),
+            cells: Some([other, cell]),
+        }),
     })
 }
 
@@ -265,9 +305,9 @@ impl RiverForcing {
         self.select(|m| bbox.contains(m.lat, m.lon))
     }
 
-    /// The rivers on a model's plane (`projection`) and clock: positions in
-    /// metres, the series in model seconds (constant beyond the file's
-    /// times), entering over `profile`. Named by their ids (errors say `river <id>`).
+    /// The rivers on a model's plane (`projection`) and clock: positions (and
+    /// inland points) in metres, the series in model seconds (constant beyond
+    /// the file's times), entering over `profile`. Named by their ids (errors say `river <id>`).
     pub fn rivers(
         &self,
         projection: &(impl CoordinateProjection + ?Sized),
@@ -288,7 +328,12 @@ impl RiverForcing {
             .enumerate()
             .map(|(i, mouth)| {
                 let (x, y) = projection.geo_to_xy(mouth.lat, mouth.lon);
+                let inland = mouth.inland.map(|(lon, lat)| {
+                    let (x, y) = projection.geo_to_xy(lat, lon);
+                    [x, y]
+                });
                 Ok(River::new(mouth.id.to_string(), [x, y], 0.0)
+                    .with_inland(inland)
                     .with_discharge(series(&self.discharge, i)?)
                     .with_temperature(series(&self.temperature, i)?)
                     .with_salinity(series(&self.salinity, i)?)
@@ -304,7 +349,7 @@ mod netcdf_file {
 
     use netcdf::Extent;
 
-    use super::{RiverForcing, RiverMouth, RomsRhoPoints, roms_source_position};
+    use super::{RiverForcing, RiverMouth, RomsRhoPoints, RomsSource, roms_source};
     use crate::io::GeoBoundingBox;
     use crate::io::netcdf_io::NetCDFError;
     use crate::io::netcdf_read::{read_time_named, read_values};
@@ -375,6 +420,20 @@ mod netcdf_file {
                 .ok_or_else(missing)
                 .and_then(|v| read_values(&v, vec![]))?;
             let ids = ids(&file, lon.len())?;
+            // The land sides, if the file has them (NaN for none)
+            let inland = match (
+                file.variable("river_inland_lon"),
+                file.variable("river_inland_lat"),
+            ) {
+                (Some(x), Some(y)) => {
+                    let (x, y) = (read_values(&x, vec![])?, read_values(&y, vec![])?);
+                    x.into_iter()
+                        .zip(y)
+                        .map(|(x, y)| (x.is_finite() && y.is_finite()).then_some((x, y)))
+                        .collect()
+                }
+                _ => vec![None; lon.len()],
+            };
             let rivers: Vec<(usize, RiverMouth)> = (0..lon.len())
                 .map(|i| {
                     (
@@ -383,11 +442,12 @@ mod netcdf_file {
                             id: ids[i],
                             lon: lon[i],
                             lat: lat[i],
+                            inland: inland[i],
                         },
                     )
                 })
                 .collect();
-            read_series(&file, rivers, None)
+            read_series(&file, rivers, None, None)
         }
 
         /// The rivers of a ROMS river file on the grid whose ρ-points are
@@ -410,29 +470,33 @@ mod netcdf_file {
                 None => vec![2.0; xi.len()],
             };
             let ids = ids(&file, xi.len())?;
-            let mut rivers = Vec::new();
+            let (mut rivers, mut sources) = (Vec::new(), Vec::new());
             for i in 0..xi.len() {
-                let position = roms_source_position(grid, xi[i], eta[i], direction[i])
+                let source = roms_source(grid, xi[i], eta[i], direction[i])
                     .map_err(|e| invalid(format!("river {}: {e}", ids[i])))?;
-                if let Some((lon, lat)) = position
-                    && bbox.is_none_or(|b| b.contains(lat, lon))
+                if let Some(source) = source
+                    && bbox.is_none_or(|b| b.contains(source.position.1, source.position.0))
                 {
+                    let (lon, lat) = source.position;
                     rivers.push((
                         i,
                         RiverMouth {
                             id: ids[i],
                             lon,
                             lat,
+                            inland: None,
                         },
                     ));
+                    sources.push(source);
                 }
             }
-            read_series(&file, rivers, window)
+            read_series(&file, rivers, Some(&sources), window)
         }
 
         /// Write the rivers as a river file that [`Self::from_file`] reads:
         /// dimensions `river`, `river_time`; `river` (the ids), `river_lon`,
-        /// `river_lat`, `river_time` (seconds since 1970), and
+        /// `river_lat`, `river_inland_lon`, `river_inland_lat` (NaN where
+        /// unknown), `river_time` (seconds since 1970), and
         /// `river_transport`, `river_temp`, `river_salt` as `[time][river]`.
         pub fn write(&self, path: impl AsRef<Path>) -> Result<(), NetCDFError> {
             let mut file = netcdf::create(path.as_ref())?;
@@ -442,6 +506,13 @@ mod netcdf_file {
             let ids: Vec<f64> = self.mouths.iter().map(|m| m.id as f64).collect();
             let lon: Vec<f64> = self.mouths.iter().map(|m| m.lon).collect();
             let lat: Vec<f64> = self.mouths.iter().map(|m| m.lat).collect();
+            let inland = |f: fn((f64, f64)) -> f64| -> Vec<f64> {
+                self.mouths
+                    .iter()
+                    .map(|m| m.inland.map_or(f64::NAN, f))
+                    .collect()
+            };
+            let (inland_lon, inland_lat) = (inland(|p| p.0), inland(|p| p.1));
             for (name, long_name, units, values) in [
                 (
                     "river",
@@ -460,6 +531,18 @@ mod netcdf_file {
                     "latitude of the river mouth",
                     "degrees_north",
                     &lat,
+                ),
+                (
+                    "river_inland_lon",
+                    "longitude of the land cell the river flows from (NaN: unknown)",
+                    "degrees_east",
+                    &inland_lon,
+                ),
+                (
+                    "river_inland_lat",
+                    "latitude of the land cell the river flows from (NaN: unknown)",
+                    "degrees_north",
+                    &inland_lat,
                 ),
             ] {
                 let mut var = file.add_variable::<f64>(name, &["river"])?;
@@ -496,10 +579,12 @@ mod netcdf_file {
     }
 
     /// The series of `rivers` (file index, mouth; indices ascending) at the
-    /// times covering `window`.
+    /// times covering `window`, with their land sides from the transport's
+    /// sign across their `sources`' faces, if given.
     fn read_series(
         file: &netcdf::File,
         rivers: Vec<(usize, RiverMouth)>,
+        sources: Option<&[RomsSource]>,
         window: Option<(f64, f64)>,
     ) -> Result<RiverForcing, NetCDFError> {
         let (all_times, _) = read_time_named(file, &["river_time"])?;
@@ -544,6 +629,7 @@ mod netcdf_file {
             vec![slice(n0, nt), slice(r0, nr)],
         )?;
         let transport = pick(&transport, nr);
+        let mut inland: Vec<Option<(f64, f64)>> = rivers.iter().map(|r| r.1.inland).collect();
         for (k, id) in ids.iter().enumerate() {
             let q = (0..nt).map(|n| transport[n * nk + k]);
             let (lo, hi) = q.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), q| {
@@ -553,6 +639,9 @@ mod netcdf_file {
                 return Err(invalid(format!(
                     "river {id}: the transport changes sign ({lo} to {hi} m³/s)"
                 )));
+            }
+            if let Some(sources) = sources {
+                inland[k] = sources[k].inland(lo + hi);
             }
         }
         let discharge: Vec<f64> = transport.iter().map(|q| q.abs()).collect();
@@ -606,7 +695,11 @@ mod netcdf_file {
         let temperature = tracer("river_temp")?;
         let salinity = tracer("river_salt")?;
         RiverForcing::new(
-            rivers.into_iter().map(|r| r.1).collect(),
+            rivers
+                .into_iter()
+                .zip(inland)
+                .map(|(r, inland)| RiverMouth { inland, ..r.1 })
+                .collect(),
             time,
             discharge,
             temperature,
@@ -645,7 +738,8 @@ mod tests {
             xi0: 10,
             eta0: 20,
         };
-        let at = |xi, eta, dir| roms_source_position(&points, xi, eta, dir).unwrap();
+        let source = |xi, eta, dir| roms_source(&points, xi, eta, dir).unwrap();
+        let at = |xi, eta, dir| source(xi, eta, dir).map(|s| s.position);
         let close = |a: Option<(f64, f64)>, b: (f64, f64)| {
             let a = a.expect("inside the window");
             assert!(
@@ -663,8 +757,16 @@ mod tests {
         assert_eq!(at(10.0, 21.0, 0.0), None);
         assert_eq!(at(12.0, 20.0, 1.0), None);
         assert_eq!(at(9.0, 21.0, 2.0), None);
-        assert!(roms_source_position(&points, 12.5, 21.0, 0.0).is_err());
-        assert!(roms_source_position(&points, 12.0, 21.0, 3.0).is_err());
+        assert!(roms_source(&points, 12.5, 21.0, 0.0).is_err());
+        assert!(roms_source(&points, 12.0, 21.0, 3.0).is_err());
+        // The land side: the cell the transport flows from, the lower index for
+        // a positive transport
+        let u_face = source(12.0, 21.0, 0.0).unwrap();
+        assert_eq!(u_face.cells, Some([(0.11, 60.21), (0.12, 60.21)]));
+        assert_eq!(u_face.inland(3.0), Some((0.11, 60.21)));
+        assert_eq!(u_face.inland(-3.0), Some((0.12, 60.21)));
+        assert_eq!(u_face.inland(0.0), None);
+        assert_eq!(source(12.0, 21.0, 2.0).unwrap().inland(3.0), None);
     }
 
     fn forcing() -> RiverForcing {
@@ -673,11 +775,13 @@ mod tests {
                 id: 7,
                 lon: 8.5,
                 lat: 63.7,
+                inland: Some((8.49, 63.7)),
             },
             RiverMouth {
                 id: 9,
                 lon: 9.5,
                 lat: 63.9,
+                inland: None,
             },
         ];
         // Two days, [time][river]
@@ -705,6 +809,10 @@ mod tests {
         assert_eq!(rivers[0].name, "7");
         assert!(rivers[0].position[0].abs() < 1e-9 && rivers[0].position[1].abs() < 1e-9);
         assert!(rivers[1].position[0] > 40e3 && rivers[1].position[1] > 20e3);
+        // The land behind the mouth on the plane: 0.01° west, ≈ 490 m
+        let inland = rivers[0].inland.expect("river 7's land side");
+        assert!(inland[0] < -480.0 && inland[0] > -500.0 && inland[1].abs() < 1.0);
+        assert_eq!(rivers[1].inland, None);
         // A quarter of the way from day 1 to day 2 at t = 0
         assert!((rivers[1].discharge.at(0.0) - 150.0).abs() < 1e-9);
         assert!((rivers[0].temperature.at(18.0 * 3600.0) - 6.0).abs() < 1e-9);
@@ -798,8 +906,12 @@ mod tests {
         );
         let m = &forcing.mouths()[0];
         assert!((m.lon - 0.115).abs() < 1e-12 && (m.lat - 60.21).abs() < 1e-12);
+        // River 11 flows along +ξ: from ρ(11, 21)
+        assert_eq!(m.inland, Some((0.11, 60.21)));
         let m = &forcing.mouths()[1];
         assert!((m.lon - 0.12).abs() < 1e-12 && (m.lat - 60.205).abs() < 1e-12);
+        // River 12 flows along −η: from ρ(12, 21)
+        assert_eq!(m.inland, Some((0.12, 60.21)));
         // The discharge into the sea whatever the face's direction
         assert_eq!(forcing.discharge(0, 0), 20.0);
         assert_eq!(forcing.discharge(2, 1), 5.0);
@@ -863,6 +975,7 @@ mod tests {
             id: 1,
             lon: 8.0,
             lat: 63.0,
+            inland: None,
         };
         let make = |q: f64, t: f64| {
             RiverForcing::new(vec![mouth.clone()], vec![0.0], vec![q], vec![t], vec![0.0])
