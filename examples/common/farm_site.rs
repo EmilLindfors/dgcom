@@ -421,7 +421,7 @@ impl FarmCase {
         );
         let depths: Vec<String> = self.depths.iter().map(|d| format!("{d:.0}")).collect();
         println!(
-            "  Farm: bed at the cage centres {} m below mean sea level; {} elements over the farm,              edges {:.0}–{:.0} m; sampled every {} m over ±{} m",
+            "  Farm: bed at the cage centres {} m below mean sea level; {} elements over the farm, edges {:.0}–{:.0} m; sampled every {} m over ±{} m",
             depths.join(", "),
             self.elements.0,
             self.elements.1,

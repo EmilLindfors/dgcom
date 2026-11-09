@@ -359,6 +359,13 @@ impl ElementSlopeBound {
         self.free_depth.max(self.ratio() * shallow)
     }
 
+    /// The excess (m) up to which an element counts as within the bound:
+    /// round-off of [`Bathymetry2D::smooth_element_slopes`], which smooths
+    /// to within it.
+    pub fn tolerance(&self) -> f64 {
+        1e-6 * self.free_depth
+    }
+
     /// How much deeper than allowed `deep` is beside `shallow` (m, zero
     /// when within the bound).
     pub fn excess(&self, shallow: f64, deep: f64) -> f64 {
@@ -1090,7 +1097,7 @@ impl Bathymetry2D {
         let ordered = |depth: &[f64], [a, b]: [usize; 2]| {
             if depth[a] >= depth[b] { (a, b) } else { (b, a) }
         };
-        let tolerance = 1e-6 * bound.free_depth;
+        let tolerance = bound.tolerance();
         // Elements over the bound (beyond round-off) and the largest excess
         let survey = |depth: &[f64]| {
             graph

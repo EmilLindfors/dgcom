@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use super::schema::{
-    AtlasCorrection, AtmosphereSection, FarmSection, GaugeCorrection, MeshSection, Nesting,
-    RasterKind, RiversSection, Sampling, SideTag, Slopes3D,
+    AtlasCorrection, AtmosphereSection, BathymetrySection, FarmSection, GaugeCorrection,
+    MeshSection, Nesting, RasterKind, RiversSection, Sampling, SideTag, Slopes3D,
 };
 use super::{CaseError, CaseFile};
 use crate::analysis::{GaugeRecord, HarmonicAnalysis, TideGaugeStation};
@@ -693,6 +693,66 @@ impl CaseFile {
         Ok(stations)
     }
 
+    /// A 3D run's bed against the slope bound of `[bathymetry.slopes_3d]`
+    /// (its own, or the defaults' when it is left out): how many elements
+    /// let a σ-level cross the pycnocline between two of their resolved
+    /// nodes (at least `thin` deep), and the largest of them. σ-levels
+    /// across such slopes drive spurious currents (the hydrostatic
+    /// inconsistency of the pressure gradient, Beckmann & Haidvogel 1993;
+    /// ROMS reports r_x0 for every grid). Plain r_x0 does not tell a treated
+    /// bed from one that blows up: the refined Frøya mesh has r_x0 0.97 (a
+    /// 1.1 m node beside an 83.6 m one) untreated and 0.90 (1.0 m beside
+    /// 19.0 m, above the free depth) treated. Untreated, its 9193 elements
+    /// over the bound grew σ-level currents of 21 m/s within 400 s and blew
+    /// up at `cfl_3d = 4` (TODO P1.6, 2026-11-09). A bed over the bound
+    /// without `[bathymetry.slopes_3d]` is warned about.
+    fn report_3d_slopes(
+        b: &BathymetrySection,
+        thin: f64,
+        grid: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        bed: &Bathymetry2D,
+        notes: &mut Vec<String>,
+    ) {
+        let spec = b.slopes_3d.clone().unwrap_or_default();
+        let bound = spec.bound();
+        let excess = bed.element_slope_excess(grid, ops, geom, bound, thin);
+        let over = excess.iter().filter(|&&e| e > bound.tolerance()).count();
+        let (worst, largest) =
+            excess.iter().enumerate().fold(
+                (0, 0.0),
+                |(k, m), (j, &e)| if e > m { (j, e) } else { (k, m) },
+            );
+        let rule = format!(
+            "r_x0 ≤ {} within an element below {} m, nodes ≥ {thin} m deep",
+            bound.r_max, bound.free_depth
+        );
+        if over == 0 {
+            notes.push(format!(
+                "3D bed: every element within the σ-levels' slope bound ({rule})"
+            ));
+            return;
+        }
+        let corners = grid.element_vertices(ElementIndex::new(worst));
+        let [x, y] = corners
+            .iter()
+            .fold([0.0, 0.0], |c, v| [c[0] + 0.25 * v[0], c[1] + 0.25 * v[1]]);
+        notes.push(format!(
+            "3D bed: {over} elements over the σ-levels' slope bound ({rule}), the largest \
+             {largest:.1} m too deep, at ({:.1}, {:.1}) km",
+            x / 1e3,
+            y / 1e3
+        ));
+        if b.slopes_3d.is_none() {
+            notes.push(
+                "warning: σ-levels across these slopes drive spurious currents that can blow \
+                 the run up; [bathymetry.slopes_3d] smooths the bed for 3D"
+                    .into(),
+            );
+        }
+    }
+
     /// `[bathymetry.slopes_3d]`: smooth the element slopes, then raise the
     /// cliff shores and fill the tidal ponds, raising the wet nodes either
     /// leaves isolated after each (`froya_real_data slopes3d=on`'s order).
@@ -1035,6 +1095,17 @@ impl CaseFile {
         if let Some(spec) = &b.slopes_3d {
             let thin = spec.thin_depth(case.three_d.as_ref());
             Self::bed_for_3d(spec, thin, &grid, &ops, &grid_geom, &mut bed, notes);
+        }
+        if let Some(three_d) = &case.three_d {
+            Self::report_3d_slopes(
+                b,
+                three_d.thin_depth_m,
+                &grid,
+                &ops,
+                &grid_geom,
+                &bed,
+                notes,
+            );
         }
 
         let (mesh, bathymetry, geom) = if m.drop_land {

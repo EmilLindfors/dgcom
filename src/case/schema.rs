@@ -379,6 +379,22 @@ pub struct Slopes3D {
     pub high_water_m: f64,
 }
 
+/// `[bathymetry.slopes_3d]` with every key left out.
+impl Default for Slopes3D {
+    fn default() -> Self {
+        Self {
+            r_max: default_slopes_r_max(),
+            free_depth_m: default_free_depth(),
+            thin_depth_m: None,
+            raise_cliffs: true,
+            cliff_depth_m: default_cliff_depth(),
+            fill_ponds: true,
+            pond_low_water_m: default_pond_low_water(),
+            high_water_m: default_high_water(),
+        }
+    }
+}
+
 impl Slopes3D {
     /// The library's bound.
     pub fn bound(&self) -> crate::mesh::ElementSlopeBound {
