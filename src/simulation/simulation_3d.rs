@@ -329,11 +329,22 @@ where
             self.physics.relax_vertical_reference(state, dt);
             // A blown-up step leaves NaN or infinities, which every later
             // step would carry on to `t_end` (the step's bound skips NaN)
-            if let Some(field) = non_finite_field(state) {
+            if let Some(bad) = non_finite_field(state) {
+                // Where: the elements it has reached, and the first of them
+                let corners = self
+                    .physics
+                    .mesh
+                    .element_vertices(crate::types::ElementIndex::new(bad.first));
+                let [x, y] = corners
+                    .iter()
+                    .fold([0.0, 0.0], |c, v| [c[0] + 0.25 * v[0], c[1] + 0.25 * v[1]]);
                 return SimulationResult::failure(
                     t,
                     n_steps,
-                    format!("{field} is not finite at t = {t:.1} s: the state has blown up"),
+                    format!(
+                        "{} is not finite at t = {t:.1} s in {} of {} elements, the first                          element {} at ({x:.0}, {y:.0}) m: the state has blown up",
+                        bad.field, bad.elements, state.n_elements, bad.first
+                    ),
                 );
             }
 
@@ -372,20 +383,47 @@ where
     }
 }
 
-/// The first of `state`'s prognostic fields (η, u, v, T, S) with a value
-/// that is not finite, if any.
-fn non_finite_field(state: &Solution3D) -> Option<&'static str> {
-    let fields: [(&'static str, &[f64]); 5] = [
-        ("η", &state.eta.data),
-        ("u", &state.u),
-        ("v", &state.v),
-        ("T", &state.temp),
-        ("S", &state.salt),
+/// A prognostic field with values that are not finite, and where.
+struct NonFinite {
+    field: &'static str,
+    /// The first element with one
+    first: usize,
+    /// Elements with one
+    elements: usize,
+}
+
+/// The prognostic field (η, u, v, T, S) with values that are not finite in
+/// the fewest elements, the nearest to where the blow-up began (a value that
+/// every element uses, as the barotropic step, spreads it everywhere in a
+/// step), if any.
+fn non_finite_field(state: &Solution3D) -> Option<NonFinite> {
+    let layer = state.n_nodes * state.n_levels;
+    let fields: [(&'static str, &[f64], usize); 5] = [
+        ("η", &state.eta.data, state.n_nodes),
+        ("u", &state.u, layer),
+        ("v", &state.v, layer),
+        ("T", &state.temp, layer),
+        ("S", &state.salt, layer),
     ];
     fields
         .into_iter()
-        .find(|(_, values)| !values.iter().all(|x| x.is_finite()))
-        .map(|(name, _)| name)
+        .filter_map(|(field, values, per_element)| {
+            if values.iter().all(|x| x.is_finite()) {
+                return None;
+            }
+            let bad: Vec<usize> = values
+                .chunks(per_element.max(1))
+                .enumerate()
+                .filter(|(_, c)| !c.iter().all(|x| x.is_finite()))
+                .map(|(k, _)| k)
+                .collect();
+            Some(NonFinite {
+                field,
+                first: bad[0],
+                elements: bad.len(),
+            })
+        })
+        .min_by_key(|bad| bad.elements)
 }
 
 /// What a callback of [`Simulation3D::run_with_context_callback`] sees

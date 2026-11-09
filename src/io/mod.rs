@@ -152,7 +152,7 @@ pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmP
 pub use restart::{
     DriverData, Restart2D, Restart3D, RestartError, domain_fingerprint_2d, domain_fingerprint_3d,
 };
-pub use river_forcing::{RiverForcing, RiverMouth, RomsRhoPoints, roms_source_position};
+pub use river_forcing::{RiverForcing, RiverMouth, RomsRhoPoints, RomsSource, roms_source};
 pub use snapshot::{
     SOLUTION_3D_FIELDS, SnapshotError, SnapshotFrame, SnapshotHeader, SnapshotLayout,
     SnapshotLevels, SnapshotReader, SnapshotWriter,

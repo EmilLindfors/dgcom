@@ -92,6 +92,17 @@
     - **Remaining:**
       - NVE's own outlet coordinates would beat NorKyst's 800 m-grid positions on a 50 m mesh.
       - The refined elements are shallow (843's 0.6–4.6 m), so they dry at low water. Their shares of the river are small, by depth.
+  - [x] Rivers from a parent enter from land (2026-11-09, `feat/viz-river-mixing`). In the viewer, river 853's plume started in the middle of its bay (asked about that day).
+    - **Why:** NorKyst's mouth is a face of its 800 m grid, the parent's coastline. On the 50 m refined mesh the face is open water about 330 m off the shore.
+    - **The land side:** `RiverForcing` keeps each face's land cell, the ρ-point the transport flows from (positive transport along +ξ/+η: the lower index). `norkyst_river_subset` writes it as `river_inland_lon/lat`. The refetched `data/froya_rivers.nc` is otherwise identical to the old one. The land cells lie ≈ 400 m from the faces, at 8.6–8.9°E.
+    - **Dead end:** following the line from the land cell through the face to the first water.
+      - 853 moved 386 m, into 6–18 m of water, because NorKyst's land cell there is water: the bay goes on past it.
+      - 851 moved 406 m into 70–80 m of open sea, where NorKyst's 800 m mask counts sea as land.
+      - The parent's land mask is too coarse to follow.
+    - **The rule:** a river with a land cell enters at the *shore element* nearest the segment from its face to that cell. A shore element is under water at every node and has a neighbour that is not, or a wall face; an open boundary is not a shore. The element must lie within `max_snap` of the face, or the old rule applies. Rivers without a land cell, such as idealised point sources, keep their element.
+    - **Frøya** (`rivers_coast_3d.toml`): 853 moves 332 m to the shore (2.4–17.9 m deep), 851 26 m, 843 46 m, 849 74 m and 850 129 m; the farthest is 846 at 359 m.
+    - **Gate:** `a_river_enters_where_it_meets_the_water_from_its_land`. The mouth sits 150 m out in an open-sided basin with its land cell behind the coast. It enters the shore column, 50 m from the mouth; within 40 m it falls back to its own element, as without a land cell.
+    - **Still open:** NVE's own outlet coordinates. NorKyst's file has no names or NVE numbers to match them by.
   - [ ] A river spreads over one element. On a farm mesh of tens of metres a large river (Orkla, ~70 m³/s) into one small element is a strong local source (the 3D gate's 20 m³/s into 6250 m² raises that element by ≈ 3 mm/s): spread it over the elements within a radius, weighted by area, if mouths on fine meshes show jets or plumes one element wide.
   - [ ] River momentum: the water enters at rest (dilutes the local velocity). A discharge direction and speed (`Q/(width·depth)`) as a momentum source matter for jets at narrow mouths.
   - [x] A fixed-depth profile (the top `d` metres, whatever the local depth) for rivers into deep fjords; `TopFraction` is a σ-fraction, so in 400 m of water its top 20 % is 80 m. NorKyst's rivers enter over the top ≈ 3 m, the weight per metre falling about linearly to zero there (measured 2026-10-21, P5.1 in `operational.md`). Done 2026-10-21, PR #165: `RiverProfile::TopMetres(d)` and `TaperedTopMetres(d)` (NorKyst's; `River::new`'s default is now `TaperedTopMetres(3.0)`, was `TopFraction(0.2)`).

@@ -2153,7 +2153,12 @@ fn a_rivers_water_fills_a_closed_3d_basin() {
     let projection = LocalProjection::new(ORIGIN.0, ORIGIN.1);
     let mouth = |id: i64, x: f64, y: f64| {
         let (lat, lon) = projection.xy_to_geo(x, y);
-        RiverMouth { id, lon, lat }
+        RiverMouth {
+            id,
+            lon,
+            lat,
+            inland: None,
+        }
     };
     // Constant over two days around the run
     let day = 86_400.0;

@@ -16,7 +16,9 @@
 //! stratified farm channel of `examples/farm_3d.rs` or the farm fjord in 3D: there
 //! the water shows the depth-mean current or any σ-layer's ([`layers`]), a sheet
 //! at the strongest stratification of every column shows the pycnocline, halocline or thermocline ([`stratification`]), and lice larvae, faeces
-//! and feed are tracked in 3D ([`cloud_3d`]).
+//! and feed are tracked in 3D ([`cloud_3d`]). A 3D run's water can be coloured by
+//! the salinity or temperature of any layer, and a case's rivers are marked where
+//! their water enters ([`rivers`]): a river's fresh water mixing into the sea.
 //!
 //! ```bash
 //! cd viz && cargo run --release -- [options]
@@ -104,9 +106,13 @@
 //! - `--vz Z` vertical exaggeration [3]; `--scale-max V` fix the top of the starting
 //!   colouring's scale (m/s for the speed, m for η's half-width and H_s, s for T_p)
 //!   instead of letting it follow the field in round steps
-//! - `--colour speed|elevation|hs|tp|dissipation` what the water's colour shows at the
-//!   start (C cycles it; the last three are a run's waves: a snapshot file of a
-//!   coupled wave run, `froya_real_data wave_coupling=`) [speed]
+//! - `--colour speed|elevation|hs|tp|dissipation|salinity|temperature` what the
+//!   water's colour shows at the start (C cycles it; hs, tp and dissipation are a
+//!   run's waves: a snapshot file of a coupled wave run, `froya_real_data
+//!   wave_coupling=`; salinity and temperature a 3D run's, of the shown layer or the
+//!   depth mean: a river's fresh water mixing into the sea) [speed]. `--range LO,HI`
+//!   fix both ends of a starting salinity's or temperature's scale instead of
+//!   letting them follow the field's range
 //! - `--water-alpha A` opacity of the translucent water, 0.05–0.95 [0.4]; lower shows
 //!   more of the bed (its depth scale is in the legend), higher more of the colouring
 //! - `--ramp S` seconds over which the tide ramps up from rest; 0 switches it on at
@@ -166,6 +172,7 @@ mod playback;
 mod plot;
 mod record;
 mod replay;
+mod rivers;
 mod scenario;
 mod screen;
 mod script;
@@ -185,7 +192,7 @@ use std::sync::Mutex;
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use dgcom::mesh::PointLocator2D;
 use dgcom::time::ModelClock;
 
@@ -234,6 +241,7 @@ struct Args {
     rate: Option<f64>,
     vz: f32,
     scale_max: Option<f32>,
+    range: Option<[f32; 2]>,
     colour: ColourBy,
     water_alpha: f32,
     drag: bool,
@@ -288,6 +296,7 @@ impl Args {
             rate: None,
             vz: 3.0,
             scale_max: None,
+            range: None,
             colour: ColourBy::Speed,
             water_alpha: WaterOpacity::default().0,
             drag: true,
@@ -352,11 +361,21 @@ impl Args {
                 "--colour" | "--color" => {
                     args.colour = ColourBy::parse(&value).ok_or_else(|| {
                         format!(
-                            "--colour takes speed, elevation, hs, tp or dissipation, not {value}"
+                            "--colour takes speed, elevation, hs, tp, dissipation, salinity                              or temperature, not {value}"
                         )
                     })?;
                 }
                 "--scale-max" => args.scale_max = Some(num(&flag, &value)?),
+                "--range" => {
+                    let ends: Vec<f32> = value
+                        .split(',')
+                        .map(|v| num(&flag, v.trim()))
+                        .collect::<Result<_, _>>()?;
+                    match ends.as_slice() {
+                        &[lo, hi] if lo < hi => args.range = Some([lo, hi]),
+                        _ => return Err(format!("--range takes LO,HI with LO < HI, not {value}")),
+                    }
+                }
                 "--water-alpha" => {
                     args.water_alpha = num(&flag, &value)?;
                     if !(0.0..=1.0).contains(&args.water_alpha) {
@@ -451,10 +470,7 @@ impl Args {
                 "--size" => {
                     let bad = || format!("--size takes WxH in pixels, not {value}");
                     let (w, h) = value.split_once('x').ok_or_else(bad)?;
-                    args.size = (
-                        w.parse().map_err(|_| bad())?,
-                        h.parse().map_err(|_| bad())?,
-                    );
+                    args.size = (w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?);
                 }
                 _ => {
                     return Err(format!(
@@ -488,12 +504,17 @@ fn fail(code: u8, message: impl Into<String>) -> Failed {
     }
 }
 
-/// `--screenshot`: the frame to save, and how many frames since the shown time reached it.
+/// `--screenshot`: the frame to save, how many frames since the shown time reached it,
+/// and whether the file is written.
 #[derive(Resource)]
 struct Capture {
     path: Option<String>,
     at: f64,
     frames: Option<u32>,
+    /// When the shown time reached `at`
+    reached: Option<std::time::Instant>,
+    requested: bool,
+    saved: bool,
 }
 
 /// `X,Y,HEIGHT,BEARING,TILT` (X, Y in km of mesh coordinates) as a photographer's view.
@@ -557,6 +578,7 @@ pub struct Run {
     frame: Frame,
     nodes: Nodes,
     cages: CageLayout,
+    river_marks: rivers::RiverMarks,
     arrows: Arrows,
     views: Views,
     start: OrbitCamera,
@@ -737,6 +759,17 @@ impl Run {
                 })
                 .collect(),
         );
+        // Where the run's rivers enter
+        let river_marks = rivers::RiverMarks(
+            scenario
+                .rivers
+                .iter()
+                .map(|(_, at)| rivers::RiverMark {
+                    at: *at,
+                    probe: Probe::at(&locator, &scenario, *at),
+                })
+                .collect(),
+        );
         // The land and sea around a domain on a real coast
         let terrain_paths: Option<Vec<PathBuf>> = match args.terrain.as_deref() {
             Some("none") => None,
@@ -805,12 +838,24 @@ impl Run {
             pitch: close_up.pitch,
             distance: close_up.distance,
         };
-        // The run's stations and the `--place`s as the scenario frames its point of
-        // interest, the sites as the farm close-up
+        // A river mouth from 2 km, looking steeply down on its plume
+        let river_framing = scenario::CloseUp {
+            distance: 2000.0,
+            pitch: 1.1,
+            ..place_framing
+        };
+        // The run's stations, its rivers and the `--place`s as the scenario frames
+        // its point of interest, the sites as the farm close-up
         let places = scenario
             .places
             .iter()
             .map(|(name, at)| (name.clone(), framed(*at, &place_framing)))
+            .chain(
+                scenario
+                    .rivers
+                    .iter()
+                    .map(|(name, at)| (name.clone(), framed(*at, &river_framing))),
+            )
             .chain(
                 site_places
                     .iter()
@@ -868,6 +913,7 @@ impl Run {
                     .iter()
                     .map(|&s| s as f32)
                     .collect(),
+                d_sigma: three_d.sigma.d_sigma().iter().map(|&s| s as f32).collect(),
                 depth: farm.map_or(0.0, |p| -p.eval(&bed)),
             }
         });
@@ -965,6 +1011,7 @@ impl Run {
             frame,
             nodes,
             cages,
+            river_marks,
             arrows,
             views,
             start,
@@ -992,6 +1039,7 @@ impl Run {
             frame,
             nodes,
             cages,
+            river_marks,
             arrows,
             views,
             start,
@@ -1137,6 +1185,7 @@ impl Run {
         world.insert_resource(frame);
         world.insert_resource(nodes);
         world.insert_resource(cages);
+        world.insert_resource(river_marks);
         world.insert_resource(arrows);
         world.insert_resource(actions::Actions::new(&views));
         world.insert_resource(args.show);
@@ -1144,9 +1193,10 @@ impl Run {
         world.insert_resource(Field::default());
         world.insert_resource(shown);
         world.insert_resource(periodic);
-        world.insert_resource(Colouring::new(args.scale_max, args.colour));
-        // The waves' maps read on opaque water, not mixed with the bed's colours
-        world.insert_resource(if args.colour.is_waves() {
+        world.insert_resource(Colouring::new(args.scale_max, args.range, args.colour));
+        // The maps of a field of their own read on opaque water, not mixed with the
+        // bed's colours
+        world.insert_resource(if args.colour.is_map() {
             surface::SurfaceStyle::Opaque
         } else {
             surface::SurfaceStyle::Translucent
@@ -1176,6 +1226,9 @@ impl Run {
             path: args.screenshot,
             at: args.at.unwrap_or(t_end),
             frames: None,
+            reached: None,
+            requested: false,
+            saved: false,
         });
         if let Some(dir) = &args.record {
             std::fs::create_dir_all(dir)
@@ -1196,7 +1249,12 @@ impl Run {
                     }
                 }
             };
-            world.insert_resource(record::Recording::new(dir.clone(), args.fps, drive, args.ui));
+            world.insert_resource(record::Recording::new(
+                dir.clone(),
+                args.fps,
+                drive,
+                args.ui,
+            ));
         }
         world.insert_resource(FrameTimes {
             wanted: args.frame_times.unwrap_or(0),
@@ -1343,7 +1401,11 @@ fn main() -> AppExit {
         PhotoPlugin,
         LayersPlugin,
     ))
-    .add_plugins((StratificationPlugin, record::RecordPlugin))
+    .add_plugins((
+        StratificationPlugin,
+        record::RecordPlugin,
+        rivers::RiversPlugin,
+    ))
     .run_resource::<RunArgs>()
     .run_resource::<Frame>()
     .run_resource::<Nodes>()
@@ -1498,7 +1560,13 @@ fn capture(
     let Some(path) = capture.path.clone() else {
         return;
     };
-    match capture.frames.as_mut() {
+    let saved = capture.saved;
+    // The render pipelines compile in the background: a replay, which starts at
+    // once, reaches its time before they are ready and would be saved black
+    let settled = capture
+        .reached
+        .is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(5));
+    match capture.frames {
         None => {
             let ended = !matches!(playback.solver, SolverState::Running)
                 && !playback.growing()
@@ -1506,17 +1574,29 @@ fn capture(
             if field.t.is_some_and(|t| t >= capture.at) || (field.t.is_some() && ended) {
                 playback.paused = true;
                 capture.frames = Some(0);
+                capture.reached = Some(std::time::Instant::now());
             }
         }
         Some(n) => {
-            *n += 1;
-            // A few frames for the meshes to reach the GPU, then some for the file to be written.
-            if *n == 10 {
+            let n = n + 1;
+            capture.frames = Some(n);
+            // A few frames and seconds for the meshes and the pipelines to reach the
+            // GPU, then until the file is written: a large mesh's frame can take
+            // longer to read back than a fixed count of frames allowed ("sending on
+            // a closed channel")
+            if n >= 10 && settled && !capture.requested {
+                capture.requested = true;
                 commands
                     .spawn(Screenshot::primary_window())
-                    .observe(save_to_disk(path));
-            } else if *n == 40 {
+                    .observe(save_to_disk(path))
+                    .observe(|_: On<ScreenshotCaptured>, mut capture: ResMut<Capture>| {
+                        capture.saved = true;
+                    });
+            } else if saved {
                 exit.write(AppExit::Success);
+            } else if n == 3000 {
+                eprintln!("--screenshot: no frame came back from the GPU in 3000 frames");
+                exit.write(AppExit::from_code(1));
             }
         }
     }

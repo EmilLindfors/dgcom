@@ -27,7 +27,7 @@ use crate::photo::Photo;
 use crate::playback::Playback;
 use crate::screen::{RunResources, Viewing};
 use crate::stratification::{SheetShows, Stratification};
-use crate::surface::{ColourBy, Colouring, SurfaceStyle, WaterOpacity};
+use crate::surface::{COLOURINGS, ColourBy, Colouring, SurfaceStyle, WaterOpacity};
 use crate::terrain::Terrain;
 use crate::trace::Trace;
 
@@ -188,15 +188,6 @@ const DIGITS: [KeyCode; 9] = [
     KeyCode::Digit9,
 ];
 const DIGIT_NAMES: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
-
-/// The colourings, in the order C steps through them.
-pub const COLOURINGS: [ColourBy; 5] = [
-    ColourBy::Speed,
-    ColourBy::Elevation,
-    ColourBy::WaveHeight,
-    ColourBy::WavePeriod,
-    ColourBy::WaveDissipation,
-];
 
 /// The viewer's actions (see the module docs), with the run's named places.
 #[derive(Resource)]
@@ -470,6 +461,8 @@ pub fn colouring_name(by: ColourBy) -> &'static str {
         ColourBy::WaveHeight => "Wave height H_s",
         ColourBy::WavePeriod => "Peak period T_p",
         ColourBy::WaveDissipation => "Wave energy lost (whitecapping, breaking)",
+        ColourBy::Salinity => "Salinity",
+        ColourBy::Temperature => "Temperature",
     }
 }
 
@@ -525,7 +518,7 @@ impl Context<'_> {
     /// Whether the run has `action` now.
     pub fn applies(&self, action: Action) -> bool {
         match action {
-            Action::Colour(by) => !by.is_waves() || self.field.waves.is_some(),
+            Action::Colour(by) => by.shows_in(&self.field),
             Action::LayerUp | Action::LayerDown => self.levels.is_some(),
             Action::Sheet => self.sheet.is_some(),
             Action::Contours => self.contours.is_some(),
@@ -739,7 +732,7 @@ mod tests {
         world.insert_resource(ButtonInput::<LogicalKey>::default());
         world.insert_resource(Actions::new(&views(1)));
         world.insert_resource(Playback::new(60.0, 60.0, 1 << 20));
-        world.insert_resource(Colouring::new(None, ColourBy::Speed));
+        world.insert_resource(Colouring::new(None, None, ColourBy::Speed));
         world.insert_resource(SurfaceStyle::Translucent);
         world.insert_resource(WaterOpacity::default());
         world.insert_resource(Field::default());

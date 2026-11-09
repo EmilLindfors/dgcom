@@ -5,8 +5,8 @@
 //! derivative matrices that give the exact gradient of a nodal field (for the surface
 //! normals). [`Field`] is η, u and v at [`crate::playback::Playback::t`], linear in
 //! time between the two snapshots around it; in a 3D run (u, v) is the depth mean or
-//! the σ-layer [`ShownLayer`] picks, and in a run with waves the sea state too (the
-//! direction as its vector). A [`Probe`] evaluates a nodal field at a point by
+//! the σ-layer [`ShownLayer`] picks, as are the salinity and the temperature, and in
+//! a run with waves the sea state too (the direction as its vector). A [`Probe`] evaluates a nodal field at a point by
 //! the element's own polynomial (`dgcom::solver::Probe2D`'s weights).
 //!
 //! World frame: Bevy is +Y up, so mesh (x, y, z) goes to (x − x₀, z·vz, −(y − y₀)), the
@@ -18,6 +18,7 @@ use dgcom::operators::DGOperators2D;
 use dgcom::solver::Probe2D;
 use dgcom::types::ElementIndex;
 
+use crate::layers::Levels;
 use crate::playback::Playback;
 use crate::scenario::Scenario;
 use crate::solver::Waves;
@@ -131,7 +132,7 @@ impl Nodes {
     }
 }
 
-/// Which current a 3D run's water and arrows show.
+/// Which current, salinity and temperature a 3D run's water and arrows show.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ShownLayer {
     #[default]
@@ -140,19 +141,29 @@ pub enum ShownLayer {
     Level(usize),
 }
 
-/// η, u and v at the shown time, and the sea state of a run with waves.
+/// η, u and v at the shown time, the salinity and temperature of a 3D run, and the
+/// sea state of a run with waves.
 #[derive(Resource, Default)]
 pub struct Field {
     pub eta: Vec<f32>,
     pub u: Vec<f32>,
     pub v: Vec<f32>,
+    /// Salinity and temperature (°C) of the shown layer, or their depth means
+    /// (`Σ Δσ_l C_l`); empty in 2D, and the salinity in a run without it
+    pub salt: Vec<f32>,
+    pub temp: Vec<f32>,
     pub waves: Option<Waves>,
     /// Model time of the field (s); `None` before the first snapshot
     pub t: Option<f64>,
 }
 
 /// Interpolates the snapshots around the shown time.
-pub fn interpolate(playback: Res<Playback>, shown: Res<ShownLayer>, mut field: ResMut<Field>) {
+pub fn interpolate(
+    playback: Res<Playback>,
+    shown: Res<ShownLayer>,
+    levels: Option<Res<Levels>>,
+    mut field: ResMut<Field>,
+) {
     if !(playback.changed || shown.is_changed()) {
         return;
     }
@@ -185,6 +196,34 @@ pub fn interpolate(playback: Res<Playback>, shown: Res<ShownLayer>, mut field: R
             lerp(&mut field.u, &a.u, &b.u);
             lerp(&mut field.v, &a.v, &b.v);
         }
+    }
+    let Field { salt, temp, .. } = &mut *field;
+    salt.clear();
+    temp.clear();
+    if let (Some(la), Some(lb)) = (&a.layers, &b.layers) {
+        let nl = la.n_levels;
+        // The shown layer's value, or the depth mean Σ Δσ_l C_l
+        let weights: Vec<f32> = match (*shown, &levels) {
+            (ShownLayer::Level(l), _) => (0..nl).map(|k| f32::from(k == l.min(nl - 1))).collect(),
+            (ShownLayer::DepthMean, Some(levels)) if levels.d_sigma.len() == nl => {
+                levels.d_sigma.clone()
+            }
+            _ => vec![1.0 / nl as f32; nl],
+        };
+        let mix = |out: &mut Vec<f32>, x: &[f32], y: &[f32]| {
+            if x.len() != y.len() || x.is_empty() {
+                return;
+            }
+            out.extend(x.chunks_exact(nl).zip(y.chunks_exact(nl)).map(|(cx, cy)| {
+                cx.iter()
+                    .zip(cy)
+                    .zip(&weights)
+                    .map(|((x, y), k)| k * (x + w * (y - x)))
+                    .sum::<f32>()
+            }));
+        };
+        mix(salt, &la.salt, &lb.salt);
+        mix(temp, &la.temp, &lb.temp);
     }
     match (&a.waves, &b.waves) {
         (Some(wa), Some(wb)) => {

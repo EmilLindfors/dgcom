@@ -131,6 +131,10 @@ pub struct Scenario {
     /// Named points the number keys frame as the close-up does (m, mesh
     /// coordinates): the stations of a run, the farm sites, `--place`s
     pub places: Vec<(String, [f64; 2])>,
+    /// Where a run's rivers enter (m, mesh coordinates), by name: a case's
+    /// snapshot file lists them, the largest first ([`crate::rivers`] marks them;
+    /// the number keys frame them after the stations, looking down on the mouth)
+    pub rivers: Vec<(String, [f64; 2])>,
     pub forcing: Forcing,
     /// The 3D model, for a scenario run in 3D
     pub three_d: Option<ThreeD>,
@@ -162,6 +166,7 @@ impl Scenario {
             ],
             farm: FARM,
             places: Vec::new(),
+            rivers: Vec::new(),
             close_up: CloseUp {
                 distance: 420.0,
                 yaw: 0.7,
@@ -293,6 +298,7 @@ impl Scenario {
             projection: None,
             farm: FARM,
             places: Vec::new(),
+            rivers: Vec::new(),
             // Low, from the second cage's side
             close_up: CloseUp {
                 distance: 800.0,
@@ -395,6 +401,7 @@ impl Scenario {
             cages: Vec::new(),
             farm: [x, y],
             places: vec![("Mausund".into(), [x, y])],
+            rivers: Vec::new(),
             close_up: CloseUp {
                 distance: 6_000.0,
                 yaw: 0.7,
@@ -452,17 +459,20 @@ impl Scenario {
             .metadata("title")
             .unwrap_or("Snapshot file")
             .to_string();
-        // Every station, by its name
-        let places = header
-            .metadata
-            .iter()
-            .filter(|(k, _)| k == "station")
-            .filter_map(|(_, v)| {
-                let at = point(v)?;
-                let name = v.rsplitn(3, ',').nth(2)?.trim();
-                Some((name.to_string(), at))
-            })
-            .collect();
+        // Every station and every river (where its water enters), by name
+        let named = |key: &str| -> Vec<(String, [f64; 2])> {
+            header
+                .metadata
+                .iter()
+                .filter(|(k, _)| k == key)
+                .filter_map(|(_, v)| {
+                    let at = point(v)?;
+                    let name = v.rsplitn(3, ',').nth(2)?.trim();
+                    Some((name.to_string(), at))
+                })
+                .collect()
+        };
+        let (places, rivers) = (named("station"), named("river"));
         let numbers = |s: &str| -> Option<Vec<f64>> {
             s.split(',').map(|c| c.trim().parse::<f64>().ok()).collect()
         };
@@ -518,6 +528,7 @@ impl Scenario {
             cages,
             farm,
             places,
+            rivers,
             close_up: CloseUp {
                 distance: (extent / 10.0) as f32,
                 yaw,
