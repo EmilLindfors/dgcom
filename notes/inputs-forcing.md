@@ -64,6 +64,34 @@
       - 9 of 13 rivers are placed, 0.9 of the file's 2.1 m³/s (run means, now exact: `RiverSeries::mean_over`). The four outside the box are listed as beyond the open boundary.
       - η max 1.807 m. The case equals `froya_real_data rivers=` bit for bit (7 frames).
       - Inside, the snaps are 843 1162 m, 851 616 m, 849 499 m and 850 212 m: the 500 m geographic grid's coastal elements all touch land. That is the mesh-refinement item in `TODO.md`.
+  - [x] Only a parent's boundary takes rivers in (2026-11-09, `feat/mesh-river-mouths`).
+    - **Why:** #211 left out any mouth outside the mesh whose nearest boundary face was open. Beyond a tide-only or radiation boundary, though, nothing brings the river in.
+    - **Inputs:** `RiverSources::new`/`on_mesh` now take the parent's boundary tags. A case gives those of its `[boundary.nesting]` sections, and `froya_real_data` gives `open` with `norkyst=`.
+    - **Test:** a mouth outside the mesh is left out if it lies on the far side of the nearest nested face's line from that face's element. The old test, "the nearest face is open", depended on where the coast runs. On the plain Frøya coastline mesh a coastal wall is nearer than the open faces to rivers 836 and 837, south of the box, so they were snapped 1.7–1.9 km in. Now the geographic grid, the coastline mesh and the refined mesh all leave out the same four (836, 837, 844, 845).
+    - **Gate:** `a_mouth_beyond_a_parents_boundary_is_left_out`:
+      - beyond the nested face, 0.5 m out with a 10 km snap allowed: left out;
+      - with no parent: snapped in;
+      - beyond the line of a nested south side, though as near the east wall: left out;
+      - short of that line, beside the east wall: snapped in.
+  - [x] Meshes refined at the mouths (2026-11-09, `feat/mesh-river-mouths`): `scripts/gmsh_coastline_mesh.py rivers=<file>` (`docs/gmsh-meshes.md`).
+    - **Why:** measured against the DEM, the nine Frøya mouths inside the box all lie within 250 m of its water. On the 500 m `[mesh.geographic]` grid they still moved up to 1.4 km (843 by 1,162 m, 852 by 1,376 m), because every grid element near them touches land.
+    - **The mesh:** a `Ball` field per mouth, at 50 m within 1 km, growing as the coast's size does. Near the mouths, `min_water` is `river_min_water`, so estuaries stay open, and the coastline is resampled at the local size.
+    - **Placement, farthest move** (all three meshes leave out the same four mouths south of the box):
+
+      | mesh | farthest move | 853 | 843 | 851 | 849 | 850 |
+      |---|---|---|---|---|---|---|
+      | 500 m grid | 1,376 m (852) | 0 | 1,162 | 616 | 499 | 212 |
+      | 200 m coastline | 565 m (847) | 88 | 0 | 54 | 116 | 121 |
+      | refined at mouths | 195 m (848) | 0 | 0 | 0 | 74 | 129 |
+
+      The residual is the data's: 848's NorKyst mouth is 34.5 m up a hill, 250 m from the DEM's water (an 800 m grid's position).
+    - **1 h in 3D** (20 levels, `cases/froya/rivers_coast_3d.toml`):
+      - **Refined:** 23,821 elements in water, 718 steps in 1,337 s; η max 2.165 m, |u| max 1.97 m/s.
+      - **Unrefined:** 12,101 elements, 486 steps in 456 s; η max 2.176 m, |u| max 1.24 m/s.
+      - **Not yet located:** the larger |u| on the refined mesh. Narrow sounds opened by `river_min_water` would be the first place to look.
+    - **Remaining:**
+      - NVE's own outlet coordinates would beat NorKyst's 800 m-grid positions on a 50 m mesh.
+      - The refined elements are shallow (843's 0.6–4.6 m), so they dry at low water. Their shares of the river are small, by depth.
   - [ ] A river spreads over one element. On a farm mesh of tens of metres a large river (Orkla, ~70 m³/s) into one small element is a strong local source (the 3D gate's 20 m³/s into 6250 m² raises that element by ≈ 3 mm/s): spread it over the elements within a radius, weighted by area, if mouths on fine meshes show jets or plumes one element wide.
   - [ ] River momentum: the water enters at rest (dilutes the local velocity). A discharge direction and speed (`Q/(width·depth)`) as a momentum source matter for jets at narrow mouths.
   - [x] A fixed-depth profile (the top `d` metres, whatever the local depth) for rivers into deep fjords; `TopFraction` is a σ-fraction, so in 400 m of water its top 20 % is 80 m. NorKyst's rivers enter over the top ≈ 3 m, the weight per metre falling about linearly to zero there (measured 2026-10-21, P5.1 in `operational.md`). Done 2026-10-21, PR #165: `RiverProfile::TopMetres(d)` and `TaperedTopMetres(d)` (NorKyst's; `River::new`'s default is now `TaperedTopMetres(3.0)`, was `TopFraction(0.2)`).

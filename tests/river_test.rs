@@ -45,7 +45,8 @@ fn rivers_add_exactly_their_discharge_to_the_volume() {
     let added = 12.5 * t_end + 3.0 * t_end;
 
     for formulation in [SWEFormulation2D::Standard, SWEFormulation2D::WetDry] {
-        let sources = RiverSources::new(rivers.clone(), &mesh, &geom, &bathymetry, SNAP).unwrap();
+        let sources =
+            RiverSources::new(rivers.clone(), &mesh, &geom, &bathymetry, SNAP, &[]).unwrap();
         let builder = PhysicsBuilder::swe_2d(
             mesh.clone(),
             ops.clone(),
@@ -135,8 +136,8 @@ fn a_mouth_on_the_beach_enters_the_nearest_water() {
     let geom = GeometricFactors2D::compute(&mesh, &ops);
     let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
     let beach = vec![River::new("beach", [1900.0, 250.0], 3.0)];
-    assert!(RiverSources::new(beach.clone(), &mesh, &geom, &bathymetry, SNAP - 1.0).is_err());
-    let sources = RiverSources::new(beach, &mesh, &geom, &bathymetry, SNAP).unwrap();
+    assert!(RiverSources::new(beach.clone(), &mesh, &geom, &bathymetry, SNAP - 1.0, &[]).is_err());
+    let sources = RiverSources::new(beach, &mesh, &geom, &bathymetry, SNAP, &[]).unwrap();
     let k = sources.element(0);
     let locator = dgcom::mesh::PointLocator2D::new(&mesh);
     assert_eq!(k, locator.locate([1300.0, 250.0]).unwrap().element);

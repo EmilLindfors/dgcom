@@ -137,7 +137,8 @@ result, with the bed L2-projected from the same model:
 ```bash
 uv run scripts/gmsh_coastline_mesh.py [coast=200] [far=1500] [dist=6000] \
     [min_land=2·coast] [min_water=2·coast] [min_island=40000] [farm=lon,lat] \
-    [farm_size=50] [farm_radius=1000] [out=data/froya_coast.msh]
+    [farm_size=50] [farm_radius=1000] [rivers=<file>] [river_size=50] \
+    [river_radius=1000] [river_min_water=2·river_size] [out=data/froya_coast.msh]
 cargo run --release --example froya_real_data -- mesh=data/froya_coast.msh lts=8
 ```
 
@@ -159,6 +160,18 @@ cargo run --release --example froya_real_data -- mesh=data/froya_coast.msh lts=8
   `farm_size` near `farm`. Gmsh's full-quad recombination halves every curve
   the same way. Its quasi-structured quads (`mesher=qs`) took over 20
   minutes on the Frøya coastline.
+- **River mouths.** `rivers=<file>` (a river file from
+  `examples/norkyst_river_subset.rs`) refines to `river_size` within
+  `river_radius` of every mouth inside the box. A river enters an element
+  whose nodes are all under water (`source::river`), so on a 200 m coast
+  its mouth moves to the nearest such element, hundreds of metres off.
+  - **Size:** a Gmsh `Ball` field per mouth (no model point, since mouths
+    often lie on land), growing beyond the radius as fast as the coast's
+    size does.
+  - **Estuaries:** near the mouths only water narrower than
+    `river_min_water` is filled, so estuaries and fjord heads stay open.
+  - **Coastline:** resampled at the local size, equally spaced in
+    `∫ ds / size`.
 - **Check.** Every quad must be convex and oriented like the rest (Laplace
   smoothing can fold elements). The script prints the shortest edges and
   the largest corner angle.
@@ -171,6 +184,23 @@ smaller than the rest: 1 % under 51 m and the smallest 19 m across, at a
 stepping (`lts=8`, which uses 5 levels here), a coarse step of 3.5 s costs
 ≈ 115 ms at 24 threads: 2 min per simulated hour, against 3.7 min with
 global steps.
+
+**Frøya refined at its river mouths** (`rivers=data/froya_rivers.nc`, the
+nine mouths inside the box at 50 m within 1 km; `data/froya_coast_rivers.msh`,
+`cases/froya/rivers_coast_3d.toml`):
+- **Size:** 25,383 quads, against 12,490 without. Nearly all the extra
+  quads are in the nine discs. The opened estuaries add 5 km of coastline.
+  The 1st percentile of the shortest edges is 17 m (51 m without), and the
+  largest corner is still 153°.
+- **Where the rivers enter,** the farthest a river moves to an element
+  under water:
+  - 1,376 m on the 500 m geographic grid (`rivers_3d.toml`);
+  - 565 m on the unrefined coastline mesh;
+  - 195 m here.
+  The remaining 195 m is river 848, whose NorKyst mouth sits 250 m from the
+  DEM's water. NorKyst places its mouths on an 800 m grid.
+- **Cost:** 1,337 s per model hour in 3D (20 levels), against 456 s
+  without the refinement: 2.9×. A smaller `river_radius` cuts most of it.
 
 Before the minimum recombination quality (Gmsh's default 0.01, no
 smoothing), the mesh had 12,206 quads and 110 corners over 160°. The worst

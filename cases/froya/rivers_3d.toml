@@ -3,9 +3,12 @@
 # `nested.toml` in 3D (`[three_d]`, 20 σ-layers started from NorKyst-800's
 # own columns) with the rivers that NorKyst-800 itself takes: NVE's daily
 # discharge, temperature and salinity at the river mouths (`[rivers]`). Each
-# river enters the element of its mouth, or the nearest boundary element
-# from up to 2 km off; its water enters the top 3 m, tapering to zero as
-# NorKyst's `river_Vshape` does. The parent must hold its profiles and reach
+# river enters the element of its mouth if it is under water, or else the
+# nearest element under water from up to 2 km off (on this 500 m grid up to
+# 1.2 km; `rivers_coast_3d.toml` refines the mesh at the mouths); the four
+# mouths south of the box are left out, the parent's water brings them in.
+# The water enters the top 3 m, tapering to zero as NorKyst's
+# `river_Vshape` does. The parent must hold its profiles and reach
 # a third of the longest 3D step past the run's end; the river file must
 # cover the run. The inputs, besides `nested.toml`'s atlas and gauge:
 #
