@@ -1034,7 +1034,6 @@ impl BarotropicMultirate {
             river_terms,
         } = self;
         let schedule: &MultirateStepper<SWESolution2D> = stepper;
-        let n_rivers = step.rivers.map_or(0, RiverSources::len);
         schedule.schedule(step.t, step.dt, |pass| match pass {
             MultiratePass::Stage {
                 stage: s,
@@ -1075,10 +1074,11 @@ impl BarotropicMultirate {
                     let nodes = k * nn..(k + 1) * nn;
                     let c = step.w_secondary * b_s / (step.n_bt as f64 * (1u64 << rates[k]) as f64);
                     if let Some(rivers) = step.rivers {
-                        for i in (0..n_rivers).filter(|&i| rivers.element(i).as_usize() == k) {
+                        for &i in rivers.in_element(k) {
                             let discharge = rivers.discharge(i, stage.time);
-                            let rate = discharge * rivers.inv_area(i);
-                            h.iter_mut().for_each(|h| *h += rate);
+                            for (h, s) in h.iter_mut().zip(rivers.share(i)) {
+                                *h += discharge * s;
+                            }
                             shared_terms.lock().unwrap_or_else(|e| e.into_inner())[i] =
                                 c * discharge;
                         }
@@ -2040,11 +2040,13 @@ impl ModeSplitIntegrator {
                     if let Some(rivers) = rivers {
                         for (i, mean) in transport.discharge.iter_mut().enumerate() {
                             let discharge = rivers.discharge(i, time);
-                            let rate = discharge * rivers.inv_area(i);
                             let k = rivers.element(i).as_usize();
-                            k_2d.data[SWE_VAR_H][k * nn..(k + 1) * nn]
+                            for (h, s) in k_2d.data[SWE_VAR_H][k * nn..(k + 1) * nn]
                                 .iter_mut()
-                                .for_each(|h| *h += rate);
+                                .zip(rivers.share(i))
+                            {
+                                *h += discharge * s;
+                            }
                             *mean += c * discharge;
                         }
                     }
@@ -2128,17 +2130,18 @@ impl ModeSplitIntegrator {
         for (k, mark) in element_means.iter_mut().enumerate() {
             let nodes = k * nn..(k + 1) * nn;
             let bed = bathymetry.element(ElementIndex::new(k));
-            let source = river_inflow.map_or(0.0, |r| r.volume_rate(k));
             let (mut residual, mut scale, mut depth) = (0.0_f64, 0.0_f64, 0.0_f64);
             // The largest relative change of a column's volume that its layers
             // would not carry (a tracer's constancy error there)
             let mut constancy = 0.0_f64;
-            for (((&rate, &div), &mass), (&eta, &b)) in rate_eta.data[nodes.clone()]
+            for (node, (((&rate, &div), &mass), (&eta, &b))) in rate_eta.data[nodes.clone()]
                 .iter()
                 .zip(&transport_divergence.data[nodes.clone()])
                 .zip(&transport.mass_source.data[nodes.clone()])
                 .zip(state.eta.data[nodes].iter().zip(bed))
+                .enumerate()
             {
+                let source = river_inflow.map_or(0.0, |r| r.volume_rate(k, node));
                 let r = (rate + div - source - mass).abs();
                 residual = residual.max(r);
                 scale = scale

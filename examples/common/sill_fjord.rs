@@ -389,7 +389,7 @@ pub fn run(config: &Config, mut progress: impl FnMut(&Progress)) -> Outcome {
         .with_temperature(RiverSeries::constant(eos.t0))
         .with_salinity(RiverSeries::constant(0.0))
         .with_profile(RiverProfile::TaperedTopMetres(3.0));
-    let rivers = RiverSources::new(vec![river], &mesh, &geom, 0.0).expect("the head");
+    let rivers = RiverSources::new(vec![river], &mesh, &geom, &bathymetry, 0.0).expect("the head");
 
     // The sea at rest, uniform: the fjord starts full of it
     let mut state = Solution3D::new(mesh.n_elements, nn, nl);

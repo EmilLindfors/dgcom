@@ -11,6 +11,14 @@ All notable changes to this project should be documented in this file.
   - "roms-rs" read as a port of ROMS, which this model is not.
   - Restart, snapshot and particle files keep their format, so files written before the rename still load.
 
+### Fixed
+
+- **River water no longer stands on land (TODO P1.6; `notes/inputs-forcing.md`).** A river's element had every node raised at the same rate, land nodes too, so on the Frøya mesh river water stood at the 5 m land elevation (the highest η after 1 h: 5.001 m, against 1.807 m without rivers).
+  - **Placement:** a river enters an element whose nodes are all under water at rest. A mouth on the coast, on land or off the mesh moves to the nearest such element within the snapping distance, as FVCOM's and SCHISM's sources must sit in the water.
+  - **Shares:** the discharge is shared over the element's nodes by still-water depth, `Q·d_j/∫_k d dA`. The volume still grows by exactly `∫Q dt`, the dilution rate is the same at every node, and a shallow node takes little. The barotropic steps, Ω, the tracers and the turbulence sources use the same shares.
+  - **API:** `RiverSources::new`/`on_mesh` take the bathymetry. `RiverSources::share(i)` and `add_volume_rates` replace `inv_area` and `volume_rate`. `set_levels` refuses a bed other than the one the rivers were placed on. `RiverError::OutsideMesh` is now `FarFromWater`. The river logs give each element's depth range.
+  - **Frøya:** `cases/froya/rivers_3d.toml` now reaches 1.807 m, the same as without rivers, and still matches `froya_real_data rivers=` bit for bit. Rivers 837 and 843 moved off coastal elements (1.6 and 1.2 km).
+
 ### Added
 
 - **Rivers in 3D cases (TODO P8.1; `notes/case-files.md`).** `[rivers]` (`file`, `snap_km`, `profile`) takes a river file's discharge, temperature and salinity into a 3D run as `froya_real_data rivers=` does, bit for bit (`cases/froya/rivers_3d.toml`, new): each river in the element of its mouth or snapped onto the mesh, those farther off listed and left out, the water entering the layers over the profile. `source::RiverProfile` parses from its text (`uniform`, `fraction:F`, `top:D`, `tapered:D`).
