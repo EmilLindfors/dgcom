@@ -362,6 +362,11 @@ impl CaseFile {
         let rivers = forcing
             .rivers(projection, &clock, &profile)
             .map_err(|e| CaseError::Invalid(format!("{}: {e}", path.display())))?;
+        // Mean discharges over the run
+        let offered: f64 = rivers
+            .iter()
+            .map(|r| r.discharge.mean_over(0.0, t_end))
+            .sum();
         let (sources, skipped) = RiverSources::on_mesh(
             rivers,
             &domain.mesh,
@@ -369,18 +374,12 @@ impl CaseFile {
             &domain.bathymetry,
             1000.0 * spec.snap_km,
         );
-        // Over the run, hourly
-        let hours = (t_end / 3600.0).ceil().max(1.0) as usize;
-        let mean = |i: usize| {
-            (0..=hours)
-                .map(|h| sources.discharge(i, (h as f64 * 3600.0).min(t_end)))
-                .sum::<f64>()
-                / (hours + 1) as f64
-        };
+        let mean = |i: usize| sources.river(i).discharge.mean_over(0.0, t_end);
         let total: f64 = (0..sources.len()).map(mean).sum();
         notes.push(format!(
-            "rivers: {} of {} from {} ({total:.1} m³/s over the run), entering over {}; {} more \
-             than {} km from the mesh's water left out",
+            "rivers: {} of {} from {} ({total:.1} of {offered:.1} m³/s over the run), entering \
+             over {}; {} left out (beyond an open boundary, or more than {} km from the mesh's \
+             water)",
             sources.len(),
             forcing.len(),
             path.display(),

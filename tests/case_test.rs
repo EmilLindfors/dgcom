@@ -2217,10 +2217,9 @@ fn a_rivers_water_fills_a_closed_3d_basin() {
     let domain = file.build_domain().unwrap();
     assert_eq!(domain.rivers.as_ref().map(|r| r.len()), Some(1));
     assert!(
-        domain
-            .notes
-            .iter()
-            .any(|n| n.starts_with("rivers: 1 of 2") && n.contains("1 more than 2 km")),
+        domain.notes.iter().any(|n| n.starts_with("rivers: 1 of 2")
+            && n.contains("(10.0 of 13.0 m³/s over the run)")
+            && n.contains("1 left out")),
         "{:?}",
         domain.notes
     );
