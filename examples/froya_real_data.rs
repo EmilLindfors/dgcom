@@ -289,8 +289,8 @@
 //! or 4 times longer ones, and the run reports the RHS work saved. On hours
 //! 6–8 against global substeps (2026-10-16): η 0.07 mm, ū 0.16 mm/s, T
 //! 0.011 °C RMS at the nodes ≥ 10 m deep (the run's sensitivity), the pass
-//! 472 → 236 ms per step. Use `slopes3d=on` for the stratified rest state on
-//! steep beds.
+//! 472 → 236 ms per step. The stratified rest state on steep beds needs
+//! `slopes3d=on`, a 3D run's default.
 //!
 //! The 3D stages are SSP-RK(4,3) (`rk_3d=43`, the default;
 //! `ModeSplitIntegrator::with_baroclinic_scheme`) at `cfl_3d=4`, or SSP-RK3
@@ -389,15 +389,17 @@
 //! dry at every water level. Only elements wet off their walls below the
 //! lowest water (2 m below MSL) are lowered. Off by default.
 //!
-//! `slopes3d=on` (for 3D runs, `levels=N`; in a 2D run it shows what the 3D
-//! bed does to the tide) smooths the bed, keeping its volume,
+//! `slopes3d=on` (the default for 3D runs, `levels=N`, since 2026-11-10;
+//! `slopes3d=off` keeps the bed as it is, with a warning when it is over the
+//! bound; in a 2D run it shows what the 3D bed does to the tide) smooths the
+//! bed, keeping its volume,
 //! until no element's depth range lets a σ-level cross the summer
 //! pycnocline between two of its nodes (`Bathymetry2D::smooth_element_slopes`,
 //! TODO P1.3): within an element r_x0 ≤ 0.15 (`slopes3d=r` for another bound)
 //! between columns that are not thin (`debug_3d=thin=`, 0.1 m) wherever the
 //! deeper one is below `free_depth` (19 m, the pycnocline's bottom).
 //! Shores need none (the 3D wetting and drying moves their layers on the 2D
-//! kernel's subcells) and do not move. Off by default. With it, `cliffs3d=D`
+//! kernel's subcells) and do not move. With it, `cliffs3d=D`
 //! raises to land (+2 m) the shore nodes of elements with a node deeper than
 //! D m (20 by default; `cliffs3d=off`) that a tide would make resolved
 //! columns beside the deep ones (`Bathymetry2D::raise_cliff_shores`): a
@@ -760,7 +762,8 @@ struct Options {
     rx0_min_depth: f64,
     /// For 3D runs (`levels=`), smooth the bed until every element is within
     /// this bound (`Bathymetry2D::smooth_element_slopes`): `slopes3d=on` (r_x0
-    /// 0.15) or `slopes3d=r`, off by default; `free_depth=` sets the depth
+    /// 0.15, the default for 3D runs), `slopes3d=r` or `slopes3d=off` (the
+    /// default for 2D runs); `free_depth=` sets the depth
     /// above which elements are free (1.5 × the summer pycnocline's bottom by
     /// default)
     slopes_3d: Option<ElementSlopeBound>,
@@ -1107,9 +1110,11 @@ impl Options {
             slopes_3d: {
                 let default = ElementSlopeBound::for_pycnocline(PYCNOCLINE_BOTTOM);
                 let free_depth = get("free_depth", default.free_depth)?;
+                let three_d = get("levels", 0.0)? as usize > 0;
                 match args.get("slopes3d").map(String::as_str) {
-                    None | Some("off") => None,
-                    Some("on") => Some(ElementSlopeBound {
+                    Some("off") => None,
+                    None if !three_d => None,
+                    None | Some("on") => Some(ElementSlopeBound {
                         free_depth,
                         ..default
                     }),
@@ -1666,6 +1671,21 @@ impl Domain {
                     report.area / 1e6,
                     report.volume,
                     report.left
+                );
+            }
+        } else if opts.levels > 0 {
+            // `slopes3d=off` in 3D: the bed against the bound it would have
+            // taken (the case runs' `CaseDomain::report_3d_slopes`)
+            let bound = ElementSlopeBound::for_pycnocline(PYCNOCLINE_BOTTOM);
+            let excess =
+                grid_bed.element_slope_excess(&grid, &ops, &grid_geom, bound, opts.thin_depth());
+            let over = excess.iter().filter(|&&e| e > bound.tolerance()).count();
+            if over > 0 {
+                println!(
+                    "  WARNING: slopes3d=off leaves {over} elements over the σ-levels' slope \
+                     bound (the largest {:.1} m too deep); σ-levels across them drive spurious \
+                     currents that can blow the run up",
+                    excess.iter().copied().fold(0.0, f64::max)
                 );
             }
         }

@@ -1651,15 +1651,16 @@ fn raster_case(
     CaseFile::read(&path, &[]).unwrap()
 }
 
-/// Regression (the refined Frøya mesh, 2026-11-09): a 3D run reports how
-/// many elements its bed has over the σ-levels' slope bound of
-/// `[bathymetry.slopes_3d]`, and warns when that is left out. Frøya's
-/// river case resolved cliffs (a 1.1 m node beside 75–84 m ones) whose
-/// σ-level currents reached 21 m/s and blew the run up, with nothing in
-/// the log to say why; its plain r_x0 (0.97, and 0.90 treated) would not
-/// have told the beds apart.
+/// Regression (the refined Frøya mesh, 2026-11-09): a 3D run on a raster
+/// bed takes `[bathymetry.slopes_3d]`'s defaults when the case leaves it
+/// out, and reports how many elements its bed has over the σ-levels' slope
+/// bound, with a warning when the bed was left as it is. Frøya's river case
+/// left it out and resolved cliffs (a 1.1 m node beside 75–84 m ones) whose
+/// σ-level currents reached 21 m/s and blew the run up, with nothing in the
+/// log to say why; its plain r_x0 (0.97, and 0.90 treated) would not have
+/// told the beds apart.
 #[test]
-fn a_3d_run_on_a_steep_bed_is_warned_of_its_slopes() {
+fn a_3d_run_on_a_raster_bed_takes_the_3d_bed_by_default() {
     // A 2 m shelf against a 60 m basin: the bound allows max(19, R·2) =
     // 19 m beside the shelf, so the basin is 41 m too deep
     fn cliff(_lon: f64, lat: f64) -> f64 {
@@ -1678,8 +1679,19 @@ fn a_3d_run_on_a_steep_bed_is_warned_of_its_slopes() {
             .notes
     };
     let has = |notes: &[String], text: &str| notes.iter().any(|n| n.contains(text));
+    let within = "3D bed: every element within the σ-levels' slope bound";
+    let by_default = "3D bed: [bathymetry.slopes_3d]'s defaults";
 
-    let steep = notes("", three_d);
+    // Left out, a 3D run smooths the bed and says so
+    let default = notes("", three_d);
+    assert!(has(&default, by_default), "{default:?}");
+    assert!(has(&default, "smoothed for 3D"), "{default:?}");
+    assert!(has(&default, within), "{default:?}");
+    assert!(!has(&default, "warning: σ-levels"), "{default:?}");
+
+    // Switched off, the bed is over the bound and the run is warned
+    let steep = notes("slopes_3d = false", three_d);
+    assert!(!has(&steep, "smoothed for 3D"), "{steep:?}");
     let report = steep
         .iter()
         .find(|n| n.starts_with("3D bed: "))
@@ -1690,24 +1702,23 @@ fn a_3d_run_on_a_steep_bed_is_warned_of_its_slopes() {
     );
     assert!(report.contains("the largest 41.0 m too deep"), "{report}");
     assert!(
-        has(&steep, "warning: σ-levels across these slopes"),
+        has(
+            &steep,
+            "warning: σ-levels across these slopes drive spurious currents that can blow the run \
+             up; leave out `slopes_3d = false`"
+        ),
         "{steep:?}"
     );
 
-    // The 3D bed brings every element within the bound
-    let treated = notes("[bathymetry.slopes_3d]", three_d);
-    assert!(
-        has(
-            &treated,
-            "3D bed: every element within the σ-levels' slope bound"
-        ),
-        "{treated:?}"
-    );
-    assert!(!has(&treated, "warning: σ-levels"), "{treated:?}");
+    // Written out, the case's own bed, without the default's note
+    let written = notes("[bathymetry.slopes_3d]", three_d);
+    assert!(has(&written, within), "{written:?}");
+    assert!(!has(&written, by_default), "{written:?}");
 
-    // A 2D run is not a σ-level model
+    // A 2D run is not a σ-level model: its bed is the raster's
     let flat = notes("", "");
     assert!(!has(&flat, "3D bed"), "{flat:?}");
+    assert!(!has(&flat, "smoothed for 3D"), "{flat:?}");
 }
 
 /// `[bathymetry.slopes_3d]` is `froya_real_data slopes3d=on`: the library's

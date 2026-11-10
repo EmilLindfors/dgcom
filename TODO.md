@@ -259,7 +259,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.6** Count wet as h > 1 cm in the example's η statistics, so mm films don't set "η max".
 - [ ] **P1.6** Cut the atmosphere forcing's memory (≈ 210 MB at 10⁶ nodes): share stencils per element, or drop them after regridding.
 - [ ] **P1.6** River mouths for fine meshes: NorKyst's mouths sit on its 800 m grid (Frøya's river 848 34.5 m up a hill, 250 m from the DEM's water), so on a 50 m mesh refined at them (`gmsh_coastline_mesh.py rivers=`) a river still moves up to 195 m. Read NVE's own outlet coordinates for the rivers (`notes/inputs-forcing.md`, rivers).
-- [ ] **P1.6** Make `[bathymetry.slopes_3d]` the default for 3D case runs on a raster bed (an explicit `slopes_3d = false` to opt out), now that a run reports and warns of a bed over its bound (`CaseDomain::report_3d_slopes`); and give `froya_real_data`'s 3D path without `slopes3d=on` the same report (`notes/inputs-forcing.md`, rivers, 2026-11-09).
+- [ ] **P1.6** Check a nested 3D case's tide against the default 3D bed's levels (−1.43 to +2 m) from the parent's own ζ at the boundary over the run, as `default_3d_bed_tide_warning` does for a `[[boundary]]` atlas; the shipped 3D cases are nested and unchecked (`notes/case-files.md`, P8.1 sixth part).
 - [ ] **P1.6** River details: river momentum `Q/(width·depth)` for jets at narrow mouths; spreading over elements within a radius if one-element plumes show.
 - [ ] **P1.6** If the wind-driven residual matters at farms: stress from the wind relative to the current, with a stability-dependent COARE drag.
 - [ ] **P1.6** Low priority (< 5 mm): the tidal-potential sign against its docs (`source/swe_2d/tidal.rs:299-305`) and the diurnal Love factor.

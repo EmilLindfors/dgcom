@@ -6,6 +6,12 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **A 3D run on a raster bed smooths its bed for σ-levels by default (TODO P1.6; `notes/case-files.md`).** A raster bed resolves underwater cliffs that σ-levels cannot cross: on the refined Frøya mesh they grew 21 m/s currents from rest and blew the run up. Cases had to know to add `[bathymetry.slopes_3d]`.
+  - **Cases:** `[bathymetry] slopes_3d` is now a `BedFor3D`. Left out, a 3D run on a raster bed takes `[bathymetry.slopes_3d]`'s defaults, and the run says so. `slopes_3d = false` keeps the bed as it is, with a warning when it is over the slope bound; `slopes_3d = true` or a table (`[bathymetry.slopes_3d]` or `slopes_3d = { … }`) applies it in 2D as in 3D. 2D runs and analytic beds (`depth_m`, `ramp`) are unchanged. `BathymetrySection::slopes_3d_for` resolves the setting.
+  - **Another coast's tide:** the defaults' cliff-shore and pond levels are Mausund's tides (−1.43 to +2 m). The run's note gives them, and a run whose `[[boundary]]` tidal atlas has a wider range (twice its largest sum of amplitudes, `TidalAtlas::largest_amplitude_sum`) is warned to set `pond_low_water_m` and `high_water_m`. Frøya's and Bodø's atlases give 2.8–3.3 m against the defaults' 3.43 m.
+  - **The shipped 3D cases** (`cases/froya/rivers_3d.toml`, `rivers_coast_3d.toml`, `cases/bodo/scored_3d_2026-06-12.toml`) drop their empty tables, with the same bed.
+  - **`froya_real_data`:** `slopes3d=on` is the default for `levels=N` runs; `slopes3d=off` prints a warning when the bed is over the bound.
+
 - **Renamed to DGCOM, the Discontinuous Galerkin Coastal Ocean Model (`notes/tech-debt.md`).**
   - The crate `dg-rs` is now `dgcom`, so `use dg_rs::…` becomes `use dgcom::…`.
   - "roms-rs" read as a port of ROMS, which this model is not.

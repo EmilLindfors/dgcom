@@ -542,7 +542,10 @@ file = \"parent.nc\"
         let b = &case.bathymetry;
         assert!(!b.lower_wall_land);
         assert_eq!(b.wall_low_water_m, -2.0);
-        let s = b.slopes_3d.as_ref().unwrap();
+        let BedFor3D::On(s) = &b.slopes_3d else {
+            panic!("{:?}", b.slopes_3d)
+        };
+        assert_eq!(*s, Slopes3D::default());
         assert_eq!(
             (s.r_max, s.free_depth_m, s.thin_depth_m),
             (0.15, 19.0, None)
@@ -588,6 +591,45 @@ file = \"parent.nc\"
                 .validate()
                 .unwrap_err();
         assert!(err.to_string().contains("wall_low_water_m"), "{err}");
+    }
+
+    /// `slopes_3d` left out, `false`, `true` or a table, and what a run
+    /// takes from each (a raster bed's 3D default is in `tests/case_test.rs`)
+    #[test]
+    fn the_3d_bed_is_switched_by_slopes_3d() {
+        let with =
+            |line: &str| MINIMAL.replace("depth_m = 10.0", &format!("depth_m = 10.0\n{line}"));
+        let bed = |text: &str| parse(text).unwrap().bathymetry;
+        let left_out = bed(MINIMAL);
+        assert_eq!(left_out.slopes_3d, BedFor3D::Default);
+        // An analytic bed is the case's own, in 3D too
+        assert_eq!(left_out.slopes_3d_for(true), None);
+        assert_eq!(left_out.slopes_3d_for(false), None);
+        let off = bed(&with("slopes_3d = false"));
+        assert_eq!(off.slopes_3d, BedFor3D::Off);
+        assert_eq!(off.slopes_3d_for(true), None);
+        let on = bed(&with("slopes_3d = true"));
+        assert_eq!(on.slopes_3d, BedFor3D::On(Slopes3D::default()));
+        assert_eq!(on.slopes_3d_for(false), Some(Slopes3D::default()));
+        let table = bed(&with("slopes_3d = { r_max = 0.2 }"));
+        assert_eq!(
+            table.slopes_3d_for(true).map(|s| s.r_max),
+            Some(0.2),
+            "an inline table"
+        );
+        // A misspelt key is named, not lost in an untagged enum's error
+        let err = parse(&with("slopes_3d = { rmax = 0.2 }"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rmax"), "{err}");
+        let err = parse(&with("slopes_3d = 1")).unwrap_err().to_string();
+        assert!(err.contains("`false`, `true` or a"), "{err}");
+        // The resolved case writes what was set and leaves the default out
+        for b in [left_out, off, table] {
+            let text = toml::to_string(&b).unwrap();
+            let back: BathymetrySection = toml::from_str(&text).unwrap();
+            assert_eq!(back, b, "{text}");
+        }
     }
 
     #[test]
@@ -768,7 +810,7 @@ file = \"parent.nc\"
             &three_d(profile).replace("depth_m = 10.0", "depth_m = 10.0\n[bathymetry.slopes_3d]"),
         )
         .unwrap();
-        let slopes = with_slopes.bathymetry.slopes_3d.as_ref().unwrap();
+        let slopes = with_slopes.bathymetry.slopes_3d_for(true).unwrap();
         assert_eq!(slopes.thin_depth(with_slopes.three_d.as_ref()), 1.0);
 
         for (text, says) in [
