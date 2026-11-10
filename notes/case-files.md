@@ -391,5 +391,37 @@ Tracking: #220 (Chiloé) and #221 (a coast-agnostic core). Chiloé (Los Lagos, C
   - Melinka's record has holes of hours (56–80 h here). The script interpolated across them, which showed as 27–35 cm for the run and TPXO10 alike; it now leaves out run samples further than `max_gap_min` from a gauge sample and does not score a window under 80 % coverage.
   - Not looked into: the domain's highest water stays at one value for an hour at a time while the tide falls (+3.80 m at 88.5–89.3 h, +4.73 m at the end), which reads as water left in a drying cell rather than a tide.
   - Castro's station sits in a 4.1 m deep element that GEBCO at 1 km leaves cut off from the sea (range 0.00 m): its fjord needs the coastline mesh.
+- **Where the over-amplification comes from (2026-11-10; scratch scripts, 2 km screening runs of 37.26 h scored on 12.42–37.26 h, then 1 km):**
+  - Method: one frequency per band (D1, D2, D4, D6) fitted by least squares to the run and the gauge at the same samples, so amplitude ratio and lag come apart; a lattice of 296 stations every 0.1° against TPXO10's own tide at the same points; one factor changed per run.
+  - By band, 1 km, four days: Puerto Montt D2 ×1.23 (+7 min) and D1 ×1.23 (−2 min); Ancud D2 ×0.98, Melinka D2 ×1.06. The quarter-diurnal band is 2–3 times the gauges' at Ancud and Melinka (1–4 cm amplitudes).
+  - The lattice (2 km), run over TPXO10 in D2: 1.00 off Ancud, 0.92 in Boca del Guafo, 1.13 in Corcovado, 1.28 at Desertores, 1.36 in the Gulf of Ancud, 1.39 in Reloncaví: it grows along the whole axis, at no single passage, the mark of a basin nearer its quarter-wave resonance than the real one. On the shelf by the south-west corner the run is 0.76–0.86 of the atlas it is forced with. D1 is 1.04–1.08 everywhere, the open ocean too.
+  - One factor at a time, 2 km (Puerto Montt D2, D1, D2 lag; Melinka D2; Ancud D2 — run over gauge):
+
+    | run | PM D2 | PM D1 | PM lag | Melinka D2 | Ancud D2 |
+    |---|---|---|---|---|---|
+    | Manning 0.025 (the case) | 1.28 | 1.17 | +39 min | 1.01 | 0.91 |
+    | C_D 0.0025 | 1.22 | 1.18 | +42 | 0.98 | 0.88 |
+    | C_D 0.004 | 1.16 | 1.21 | +47 | 0.94 | 0.83 |
+    | Manning 0.035 | 1.22 | 1.20 | +46 | 0.96 | 0.85 |
+    | `transport_scaling = 3` | 1.27 | 1.17 | +38 | 1.00 | 0.91 |
+    | atlas without land-filled points (2 km fill) | 1.28 | 1.17 | +40 | 1.00 | 0.90 |
+    | southern side's currents capped at √(g/h)·η | 1.26 | 1.17 | +35 | 0.99 | 0.91 |
+    | southern side's currents zero | 1.21 | 1.13 | +20 | 0.94 | 0.93 |
+    | southern side walled east of 74.05°W | 1.15 | 1.07 | +25 | 0.90 | 0.91 |
+    | box to 46.6°S (below) | 1.05 | 1.15 | +55 | 0.79 | 0.83 |
+    | inner sea's bed ×1.2 (east of 74°W, under 600 m) | 1.24 | 1.20 | +8 | 1.15 | 0.97 |
+    | inner sea's bed ×0.8 | 1.21 | 1.42 | +86 | 0.79 | 0.76 |
+
+  - Read. The friction is a weak lever: three times the drag takes 12 points off D2, adds to D1 and costs Ancud 8 (Manning 0.025 is C_D 1.3e-3 at 100 m and 1.05e-3 at 200 m, half the 2.5–3e-3 tide models use; there is no floor). The currents copied into land-filled atlas points do nothing. The southern cut is the strong lever on the level of the whole inner sea, and Melinka's score there was the boundary's, not the model's. The bed is the strong lever on the mouth-to-head ratio and the timing (Puerto Montt over Melinka: 1.27, 1.08 with the bed ×1.2, 1.53 with ×0.8); the 2 km mesh holds the same volume as the 1 km one to 0.04 %, so its late, over-amplified tide is the passages' representation, not lost depth. GEBCO's basin means are within 4 % of TPXO10's own bed, which is no independent check.
+  - **The box now reaches 46.6°S** (`bbox = [-75.9, -46.6, -72.3, -41.3]`, 288 × 589, 103,016 elements): Taitao closes the Moraleda and Aysén channels on land, the west side is in more than 1500 m everywhere, and the only southern water is 25 km of deep ocean. At 1 km, 12.42–37.26 h, against the box cut at 44.2°S:
+
+    | gauge | D2 ratio, was → is | centred RMSE per M2 period, was → is | D2 lag |
+    |---|---|---|---|
+    | Puerto Montt | 1.30 → 1.10 | 33, 30 → 17, 13 cm | +11 min |
+    | Ancud | 1.00 → 0.92 | 7, 8 → 8, 9 cm | −24 min |
+    | Melinka | 1.08 → 0.94 | 7, 7 → 5, 6 cm | +11 min |
+
+    The run is 97,473 steps in 3897 s for 37.26 h (the 44.2°S box: about 2000 s), with a smallest step of 0.003 s somewhere (0.26 s before; not looked into). Not yet run over the four days. Castro has no element within 3 km on this grid and is out of the case. The old inputs are kept as `data/chiloe_gebco_box44.tif` and `data/chiloe_boundary_tides_box44.txt`.
+  - Left: Puerto Montt's 10 % and D1's 11–15 % at all three gauges (the lattice has D1 5–8 % over TPXO10 in the open ocean, so that part comes in at the boundary). Next in order: the coastline mesh (the passages), an independent bed for the inner sea (SHOA soundings, or MOSA's grid, P8.7), and only then the friction, with a floor on C_D rather than a larger Manning.
 - **`Case::coriolis_source` (2026-11-10):** the 2D and 3D runners each built the Coriolis term from `physics.coriolis`; they take it from one place now, and `dgcom check`/`run` log it and the placement with hemispheres ("placed about 42.7500°S 73.8000°W", "Coriolis f = -9.900e-5 s⁻¹ + 1.681e-11 m⁻¹ s⁻¹ × y"). Gate: `the_coriolis_term_follows_the_placement_in_both_hemispheres`.
 
