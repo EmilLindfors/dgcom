@@ -1217,7 +1217,10 @@ mod tests {
         let mut atlas = source.clone();
         let added = atlas.infer_missing_minors().unwrap();
         assert_eq!(added, vec!["MU2", "NU2", "LDA2", "L2", "T2"]);
-        assert_eq!(atlas.points[0].constituents[..5], source.points[0].constituents[..]);
+        assert_eq!(
+            atlas.points[0].constituents[..5],
+            source.points[0].constituents[..]
+        );
         let t2 = atlas.points[0].constituents[9];
         assert_eq!(t2.name, "T2");
         // 0.056 of S2 (0.3 m at 10°), with 0.001 of M2

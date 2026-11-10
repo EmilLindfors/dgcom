@@ -847,9 +847,7 @@ impl CaseFile {
                         corrected.infer_from_theory().map_err(|e| invalid(&e))?
                     }
                     AtlasCorrection::Minors => {
-                        corrected
-                            .infer_missing_minors()
-                            .map_err(|e| invalid(&e))?;
+                        corrected.infer_missing_minors().map_err(|e| invalid(&e))?;
                     }
                 }
                 if let Some(gauge) = &spec.gauge {
