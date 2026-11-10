@@ -1,7 +1,7 @@
 //! Tide gauge validation for comparing model output against observations.
 //!
 //! This module provides tools for validating 2D shallow water model results
-//! against tide gauge observations from the Norwegian coast.
+//! against tide gauge observations.
 //!
 //! # Features
 //!
@@ -115,84 +115,6 @@ impl TideGaugeStation {
             self.x.expect("Local x-coordinate not set"),
             self.y.expect("Local y-coordinate not set"),
         )
-    }
-}
-
-/// Norwegian tide gauge stations.
-///
-/// Standard stations for validation along the Norwegian coast.
-/// Coordinates are approximate and should be verified against official sources.
-pub mod norwegian_stations {
-    use super::TideGaugeStation;
-
-    /// Bergen tide gauge (Kartverket station).
-    pub fn bergen() -> TideGaugeStation {
-        TideGaugeStation::new("Bergen", 5.32, 60.39)
-    }
-
-    /// Stavanger tide gauge.
-    pub fn stavanger() -> TideGaugeStation {
-        TideGaugeStation::new("Stavanger", 5.73, 58.97)
-    }
-
-    /// Trondheim tide gauge.
-    pub fn trondheim() -> TideGaugeStation {
-        TideGaugeStation::new("Trondheim", 10.39, 63.44)
-    }
-
-    /// Kristiansund tide gauge.
-    pub fn kristiansund() -> TideGaugeStation {
-        TideGaugeStation::new("Kristiansund", 7.73, 63.11)
-    }
-
-    /// Ålesund tide gauge.
-    pub fn alesund() -> TideGaugeStation {
-        TideGaugeStation::new("Ålesund", 6.15, 62.47)
-    }
-
-    /// Bodø tide gauge.
-    pub fn bodo() -> TideGaugeStation {
-        TideGaugeStation::new("Bodø", 14.39, 67.29)
-    }
-
-    /// Tromsø tide gauge.
-    pub fn tromso() -> TideGaugeStation {
-        TideGaugeStation::new("Tromsø", 18.96, 69.65)
-    }
-
-    /// Hammerfest tide gauge.
-    pub fn hammerfest() -> TideGaugeStation {
-        TideGaugeStation::new("Hammerfest", 23.68, 70.66)
-    }
-
-    /// Vardo tide gauge.
-    pub fn vardo() -> TideGaugeStation {
-        TideGaugeStation::new("Vardø", 31.11, 70.37)
-    }
-
-    /// Heimsjø tide gauge (Frøya region).
-    pub fn heimsjo() -> TideGaugeStation {
-        TideGaugeStation::new("Heimsjø", 9.10, 63.43)
-    }
-
-    /// Get all standard Norwegian coast stations.
-    pub fn all_stations() -> Vec<TideGaugeStation> {
-        vec![
-            bergen(),
-            stavanger(),
-            trondheim(),
-            kristiansund(),
-            alesund(),
-            bodo(),
-            tromso(),
-            hammerfest(),
-            vardo(),
-        ]
-    }
-
-    /// Get stations in the Trøndelag region (around Frøya).
-    pub fn trondelag_stations() -> Vec<TideGaugeStation> {
-        vec![trondheim(), kristiansund(), heimsjo()]
     }
 }
 
@@ -826,15 +748,6 @@ mod tests {
         assert!((station.datum_offset - 0.05).abs() < TOL);
         assert!(station.has_local_coords());
         assert_eq!(station.local_coords(), (1000.0, 2000.0));
-    }
-
-    #[test]
-    fn test_norwegian_stations() {
-        let stations = norwegian_stations::all_stations();
-        assert!(!stations.is_empty());
-
-        let bergen = norwegian_stations::bergen();
-        assert_eq!(bergen.name, "Bergen");
     }
 
     #[test]

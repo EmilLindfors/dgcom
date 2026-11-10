@@ -157,7 +157,7 @@ fn bench_rhs_with_sources(c: &mut Criterion) {
     let bathy = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, 50.0);
 
     // Create source terms
-    let coriolis = CoriolisSource2D::norwegian_coast();
+    let coriolis = CoriolisSource2D::f_plane(1.2e-4);
     let friction = ManningFriction2D::new(0.025, 1e-3);
     let bathy_source = BathymetrySource2D::new(9.81);
 

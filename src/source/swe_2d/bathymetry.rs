@@ -48,7 +48,7 @@ use crate::source::{SourceContext2D, SourceTerm2D};
 ///
 /// // Create source term
 /// let bathy_source = BathymetrySource2D::new(9.81);
-/// let coriolis = CoriolisSource2D::norwegian_coast();
+/// let coriolis = CoriolisSource2D::f_plane_at_latitude(60.0);
 ///
 /// // Combine with other source terms
 /// let combined = CombinedSource2D::new(vec![&bathy_source, &coriolis]);

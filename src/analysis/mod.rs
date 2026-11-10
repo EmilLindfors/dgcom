@@ -58,7 +58,7 @@ mod tide_gauge;
 
 pub use adcp::{
     ADCPStation, ADCPValidationResult, ADCPValidationSummary, CurrentPoint, CurrentTimeSeries,
-    CurrentValidationMetrics, norwegian_stations as adcp_norwegian_stations,
+    CurrentValidationMetrics,
 };
 pub use ellipse::{EllipseFit, TidalEllipse};
 pub use error::AnalysisError;
@@ -69,8 +69,7 @@ pub use metrics::{
 pub use stability::{StabilityMonitor, StabilityStatus, StabilityThresholds, StabilityWarning};
 pub use tide_gauge::{
     GaugeComparison, GaugeRecord, ModelExtractor, PrecomputedExtractor, SkillScore,
-    StationValidationResult, TideGaugeStation, ValidationSummary, norwegian_stations,
-    validate_stations,
+    StationValidationResult, TideGaugeStation, ValidationSummary, validate_stations,
 };
 
 use std::f64::consts::PI;

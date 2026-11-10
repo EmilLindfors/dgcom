@@ -40,7 +40,7 @@ use crate::types::Depth;
 /// ```
 /// use dgcom::equations::ShallowWater2D;
 ///
-/// // Norwegian coast at 60°N
+/// // An f-plane near 60°N
 /// let swe = ShallowWater2D::with_coriolis(9.81, 1.2e-4);
 ///
 /// // Compute fluxes
@@ -123,13 +123,6 @@ impl ShallowWater2D {
     /// Create with standard gravity (9.81 m/s²) and no Coriolis.
     pub fn standard() -> Self {
         Self::new(9.81)
-    }
-
-    /// Create configured for Norwegian coast modeling.
-    ///
-    /// Uses f ≈ 1.2×10⁻⁴ s⁻¹ appropriate for 60°N latitude.
-    pub fn norwegian_coast() -> Self {
-        Self::with_coriolis(9.81, 1.2e-4)
     }
 
     /// Compute the Coriolis parameter at a given y-coordinate.
@@ -375,13 +368,6 @@ mod tests {
         assert!((swe.g - 9.81).abs() < TOL);
         assert!((swe.h_min.meters() - 1e-6).abs() < TOL);
         assert!((swe.f0 - 0.0).abs() < TOL);
-    }
-
-    #[test]
-    fn test_norwegian_coast() {
-        let swe = ShallowWater2D::norwegian_coast();
-        assert!((swe.g - 9.81).abs() < TOL);
-        assert!((swe.f0 - 1.2e-4).abs() < TOL);
     }
 
     #[test]

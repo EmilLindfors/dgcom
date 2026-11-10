@@ -276,52 +276,6 @@ impl AtmosphericPressure2D {
         }
     }
 
-    /// Norwegian winter storm preset.
-    ///
-    /// Creates a typical North Atlantic low pressure system:
-    /// - Central pressure: 970 hPa
-    /// - Radius of max winds: 200 km
-    /// - Moving northeast at 15 m/s
-    /// - Holland B = 1.3 (broad storm)
-    ///
-    /// # Arguments
-    /// * `x0`, `y0` - Initial storm center position (m)
-    pub fn norwegian_winter_storm(x0: f64, y0: f64) -> Self {
-        Self::moving_storm(
-            move |t| {
-                // Northeast movement at 15 m/s (typical for Norwegian coast)
-                let speed = 15.0;
-                let angle = 45.0_f64.to_radians();
-                (x0 + speed * angle.cos() * t, y0 + speed * angle.sin() * t)
-            },
-            970.0,
-            200.0,
-            1.3,
-        )
-    }
-
-    /// Severe Norwegian storm preset.
-    ///
-    /// Creates an intense North Atlantic low:
-    /// - Central pressure: 950 hPa
-    /// - Radius of max winds: 150 km
-    /// - Holland B = 1.5
-    ///
-    /// # Arguments
-    /// * `x0`, `y0` - Initial storm center position (m)
-    pub fn severe_storm(x0: f64, y0: f64) -> Self {
-        Self::moving_storm(
-            move |t| {
-                let speed = 20.0;
-                let angle = 50.0_f64.to_radians();
-                (x0 + speed * angle.cos() * t, y0 + speed * angle.sin() * t)
-            },
-            950.0,
-            150.0,
-            1.5,
-        )
-    }
-
     /// Set water density (default: 1025 kg/m³).
     pub fn with_rho_water(mut self, rho: f64) -> Self {
         self.rho_water = rho;
@@ -627,16 +581,20 @@ mod tests {
     }
 
     #[test]
-    fn test_norwegian_presets() {
-        let storm = AtmosphericPressure2D::norwegian_winter_storm(0.0, 0.0);
-
-        // Storm center at t=0 should be at origin
-        let p_center = storm.pressure_at(0.0, 0.0, 0.0);
-        assert!((p_center - 97000.0).abs() < 1.0);
-
-        let severe = AtmosphericPressure2D::severe_storm(0.0, 0.0);
-        let p_severe = severe.pressure_at(0.0, 0.0, 0.0);
-        assert!((p_severe - 95000.0).abs() < 1.0);
+    fn a_moving_storm_has_its_central_pressure_at_its_centre() {
+        // 970 hPa, moving north-east at 15 m/s
+        let (speed, angle) = (15.0, 45.0_f64.to_radians());
+        let storm = AtmosphericPressure2D::moving_storm(
+            move |t| (speed * angle.cos() * t, speed * angle.sin() * t),
+            970.0,
+            200.0,
+            1.3,
+        );
+        assert!((storm.pressure_at(0.0, 0.0, 0.0) - 97000.0).abs() < 1.0);
+        let t = 3600.0;
+        let (x, y) = (speed * angle.cos() * t, speed * angle.sin() * t);
+        assert!((storm.pressure_at(x, y, t) - 97000.0).abs() < 1.0);
+        assert!(storm.pressure_at(0.0, 0.0, t) > 97000.0);
     }
 
     #[test]

@@ -264,9 +264,9 @@ impl HarmonicAnalysis {
         Self::new(&["M2", "S2", "K1", "O1"])
     }
 
-    /// The constituents that matter along the Norwegian coast from a month's
-    /// record: M2, S2, N2, K1 and O1 fitted, P1 inferred from K1.
-    pub fn norwegian_coast() -> Self {
+    /// What a month's record resolves of the largest constituents: M2, S2,
+    /// N2, K1 and O1 fitted, P1 inferred from K1.
+    pub fn monthly() -> Self {
         Self::new(&["M2", "S2", "N2", "K1", "O1"]).with_inferences(&[Inference::P1_FROM_K1])
     }
 

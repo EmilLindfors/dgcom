@@ -1,7 +1,7 @@
 //! ADCP (Acoustic Doppler Current Profiler) validation for comparing model currents against observations.
 //!
 //! This module provides tools for validating 2D shallow water model velocity results
-//! against ADCP current observations from the Norwegian coast.
+//! against ADCP current observations.
 //!
 //! # Features
 //!
@@ -119,34 +119,6 @@ impl ADCPStation {
             self.x.expect("Local x-coordinate not set"),
             self.y.expect("Local y-coordinate not set"),
         )
-    }
-}
-
-/// Norwegian ADCP stations.
-///
-/// Example stations for validation along the Norwegian coast.
-/// Coordinates are approximate.
-pub mod norwegian_stations {
-    use super::ADCPStation;
-
-    /// Froya area ADCP (example location).
-    pub fn froya() -> ADCPStation {
-        ADCPStation::new("Froya", 8.85, 63.75).with_water_depth(50.0)
-    }
-
-    /// Trondheimsfjorden ADCP.
-    pub fn trondheimsfjord() -> ADCPStation {
-        ADCPStation::new("Trondheimsfjord", 10.20, 63.50).with_water_depth(200.0)
-    }
-
-    /// Smola area ADCP.
-    pub fn smola() -> ADCPStation {
-        ADCPStation::new("Smola", 8.10, 63.40).with_water_depth(80.0)
-    }
-
-    /// Hitra strait ADCP.
-    pub fn hitra_strait() -> ADCPStation {
-        ADCPStation::new("Hitra Strait", 8.95, 63.55).with_water_depth(60.0)
     }
 }
 
@@ -864,15 +836,5 @@ mod tests {
         assert_eq!(summary.station_results.len(), 2);
         assert_eq!(summary.n_passing_basic, 2);
         assert_eq!(summary.n_passing_strict, 2);
-    }
-
-    #[test]
-    fn test_norwegian_stations() {
-        let froya = norwegian_stations::froya();
-        assert_eq!(froya.name, "Froya");
-        assert_eq!(froya.water_depth, Some(50.0));
-
-        let trond = norwegian_stations::trondheimsfjord();
-        assert_eq!(trond.name, "Trondheimsfjord");
     }
 }

@@ -57,9 +57,6 @@ use crate::source::{SourceContext2D, SourceTerm2D};
 ///
 /// // Create sill overflow source term
 /// let sill = SillOverflow2D::new(0.1, 0.5);  // gradient threshold = 0.1, Cd = 0.5
-///
-/// // Or use preset for typical Norwegian sills
-/// let sill = SillOverflow2D::norwegian_sill();
 /// ```
 #[derive(Clone, Debug)]
 pub struct SillOverflow2D {
@@ -108,15 +105,6 @@ impl SillOverflow2D {
             h_min,
             max_enhancement,
         }
-    }
-
-    /// Preset for typical Norwegian fjord sills.
-    ///
-    /// Uses parameters calibrated for steep sill bathymetry:
-    /// - gradient_threshold: 0.1 (10% slope)
-    /// - form_drag_coeff: 0.3
-    pub fn norwegian_sill() -> Self {
-        Self::new(0.1, 0.3)
     }
 
     /// Preset for gradual sills with moderate enhancement.
@@ -295,11 +283,6 @@ impl SillWithFriction {
     /// Create combined sill and friction source.
     pub fn new(sill: SillOverflow2D, manning_n: f64) -> Self {
         Self { sill, manning_n }
-    }
-
-    /// Norwegian fjord preset with typical friction.
-    pub fn norwegian_fjord() -> Self {
-        Self::new(SillOverflow2D::norwegian_sill(), 0.025)
     }
 }
 
@@ -635,10 +618,6 @@ mod tests {
 
     #[test]
     fn test_presets() {
-        let norwegian = SillOverflow2D::norwegian_sill();
-        assert!((norwegian.gradient_threshold - 0.1).abs() < TOL);
-        assert!((norwegian.form_drag_coeff - 0.3).abs() < TOL);
-
         let gentle = SillOverflow2D::gentle_sill();
         assert!((gentle.gradient_threshold - 0.05).abs() < TOL);
 
@@ -648,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_sill_with_friction() {
-        let combined = SillWithFriction::norwegian_fjord();
+        let combined = SillWithFriction::new(SillOverflow2D::new(0.1, 0.3), 0.025);
 
         // Test on flat bottom (no sill enhancement)
         let ctx_flat = make_context(2.0, 4.0, 0.0, 0.0, 0.0);
@@ -673,7 +652,7 @@ mod tests {
         let sill = SillOverflow2D::new(0.1, 0.3);
         assert_eq!(sill.name(), "sill_overflow_2d");
 
-        let combined = SillWithFriction::norwegian_fjord();
+        let combined = SillWithFriction::new(SillOverflow2D::new(0.1, 0.3), 0.025);
         assert_eq!(combined.name(), "sill_with_friction_2d");
     }
 
@@ -682,7 +661,7 @@ mod tests {
         let sill = SillOverflow2D::new(0.1, 0.3);
         assert!(sill.is_stiff());
 
-        let combined = SillWithFriction::norwegian_fjord();
+        let combined = SillWithFriction::new(SillOverflow2D::new(0.1, 0.3), 0.025);
         assert!(combined.is_stiff());
     }
 

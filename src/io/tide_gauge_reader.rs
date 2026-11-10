@@ -262,6 +262,78 @@ fn parse_time_value(s: &str) -> Result<f64, String> {
     parse_datetime_seconds(s).map_err(|e| format!("Unable to parse time value {s:?}: {e}"))
 }
 
+/// Read a list of tide gauges: a CSV file with a header row naming the
+/// columns `name`, `lat` and `lon` (degrees north and east), in any order,
+/// and optionally `code` (the gauge's ID at its provider, kept as
+/// [`TideGaugeStation::external_id`]). Other columns are ignored, as are
+/// blank lines and lines starting with `#`.
+///
+/// `scripts/norkyst_tide_gauges.csv` (Kartverket's 17 permanent gauges on
+/// the Norwegian mainland) is such a file.
+pub fn read_tide_gauge_stations(path: &Path) -> Result<Vec<TideGaugeStation>, TideGaugeFileError> {
+    let mut lines = BufReader::new(File::open(path)?)
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.as_ref().map_or(true, |l| {
+                !l.trim().is_empty() && !l.trim_start().starts_with('#')
+            })
+        });
+    let (_, header) = lines
+        .next()
+        .ok_or_else(|| TideGaugeFileError::InvalidFormat("no header row".into()))?;
+    let header = header?;
+    let columns: Vec<&str> = header.split(',').map(str::trim).collect();
+    let column = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
+    let required = |name: &str| {
+        column(name).ok_or_else(|| {
+            TideGaugeFileError::MissingMetadata(format!(
+                "a station list needs a {name:?} column (the header is {header:?})"
+            ))
+        })
+    };
+    let (name, lat, lon) = (required("name")?, required("lat")?, required("lon")?);
+    let code = column("code");
+
+    let mut stations = Vec::new();
+    for (index, line) in lines {
+        let line = line?;
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        let field = |i: usize| {
+            fields.get(i).copied().ok_or_else(|| {
+                TideGaugeFileError::ParseError(format!(
+                    "line {}: {} fields, the header has {}",
+                    index + 1,
+                    fields.len(),
+                    columns.len()
+                ))
+            })
+        };
+        let degrees = |i: usize, what: &str, limit: f64| {
+            let text = field(i)?;
+            text.parse::<f64>()
+                .ok()
+                .filter(|v| v.abs() <= limit)
+                .ok_or_else(|| {
+                    TideGaugeFileError::ParseError(format!(
+                        "line {}: {what} {text:?} is not within ±{limit}°",
+                        index + 1
+                    ))
+                })
+        };
+        let mut station = TideGaugeStation::new(
+            field(name)?,
+            degrees(lon, "longitude", 360.0)?,
+            degrees(lat, "latitude", 90.0)?,
+        );
+        if let Some(code) = code.map(field).transpose()?.filter(|c| !c.is_empty()) {
+            station = station.with_external_id(code);
+        }
+        stations.push(station);
+    }
+    Ok(stations)
+}
+
 /// Read multiple tide gauge files from a directory.
 ///
 /// Reads all .txt, .csv, and .dat files in the directory.
@@ -427,6 +499,54 @@ mod tests {
 
         assert_eq!(result.time_series.len(), 3);
         assert!((result.time_series.values()[2] - 0.58).abs() < 1e-10);
+    }
+
+    /// The station list the repository ships (Kartverket's permanent
+    /// gauges), which replaced the approximate positions once held in code
+    /// (Heimsjø and Bodø each ≈ 0.5 km off).
+    #[test]
+    fn the_shipped_station_list_reads() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/norkyst_tide_gauges.csv");
+        let stations = read_tide_gauge_stations(&path).unwrap();
+        assert_eq!(stations.len(), 17);
+        let find = |name: &str| stations.iter().find(|s| s.name == name).unwrap();
+        let heimsjo = find("Heimsjøen");
+        assert_eq!((heimsjo.longitude, heimsjo.latitude), (9.101504, 63.425224));
+        assert_eq!(heimsjo.external_id.as_deref(), Some("HEI"));
+        assert_eq!(find("Bodø").external_id.as_deref(), Some("BOO"));
+        // South to north along the coast, all on the mainland
+        assert!(stations.iter().all(|s| (57.0..72.0).contains(&s.latitude)));
+    }
+
+    #[test]
+    fn a_station_list_takes_its_columns_by_name() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "# SHOA gauges\nlon, name, datum, lat").unwrap();
+        writeln!(file, "-72.9667, Puerto Montt, NRS, -41.4833\n").unwrap();
+        writeln!(file, "-73.8333, Ancud, NRS, -41.8667").unwrap();
+        let stations = read_tide_gauge_stations(file.path()).unwrap();
+        assert_eq!(stations.len(), 2);
+        assert_eq!(stations[0].name, "Puerto Montt");
+        assert_eq!(
+            (stations[1].longitude, stations[1].latitude),
+            (-73.8333, -41.8667)
+        );
+        assert_eq!(stations[0].external_id, None);
+    }
+
+    #[test]
+    fn a_bad_station_list_names_what_is_wrong() {
+        let read = |text: &str| {
+            let mut file = NamedTempFile::new().unwrap();
+            write!(file, "{text}").unwrap();
+            read_tide_gauge_stations(file.path())
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(read("").contains("no header"));
+        assert!(read("name,latitude,lon\nA,1,2\n").contains("\"lat\""));
+        assert!(read("name,lat,lon\nA,95.0,2\n").contains("line 2: latitude \"95.0\""));
+        assert!(read("name,lat,lon\nA,1,2\nB,1\n").contains("line 3: 2 fields"));
     }
 
     #[test]

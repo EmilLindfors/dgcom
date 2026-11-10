@@ -46,8 +46,8 @@ pub fn coriolis_beta(latitude_deg: f64) -> f64 {
 /// use dgcom::source::{CoriolisSource2D, SourceTerm2D, SourceContext2D};
 /// use dgcom::SWEState2D;
 ///
-/// // Norwegian coast at 60°N
-/// let coriolis = CoriolisSource2D::norwegian_coast();
+/// // An f-plane at 60°N
+/// let coriolis = CoriolisSource2D::f_plane_at_latitude(60.0);
 ///
 /// let ctx = SourceContext2D::new(
 ///     0.0,
@@ -101,11 +101,9 @@ impl CoriolisSource2D {
         Self { f0, beta, y0 }
     }
 
-    /// Norwegian coast at 60°N latitude.
-    ///
-    /// Uses f ≈ 1.2×10⁻⁴ s⁻¹ (f-plane approximation).
-    pub fn norwegian_coast() -> Self {
-        Self::f_plane(1.2e-4)
+    /// f-plane at a latitude (degrees): f = 2Ω sin φ.
+    pub fn f_plane_at_latitude(latitude_deg: f64) -> Self {
+        Self::f_plane(coriolis_parameter(latitude_deg))
     }
 
     /// β-plane tangent at a latitude (degrees) at `y = y0`: f₀ = 2Ω sin φ,
@@ -116,12 +114,6 @@ impl CoriolisSource2D {
             coriolis_beta(latitude_deg),
             y0,
         )
-    }
-
-    /// Norwegian coast with beta-plane: tangent at 60°N at `y = 0`
-    /// (f₀ ≈ 1.26×10⁻⁴ s⁻¹, β ≈ 1.14×10⁻¹¹ m⁻¹ s⁻¹).
-    pub fn norwegian_coast_beta() -> Self {
-        Self::beta_plane_at_latitude(60.0, 0.0)
     }
 
     /// Compute Coriolis parameter at given y-coordinate.
@@ -190,8 +182,8 @@ mod tests {
 
     const TOL: f64 = 1e-14;
 
-    /// f and β from the latitude; `norwegian_coast_beta` had β = 1.6e-11,
-    /// the 45°N value, for 60°N.
+    /// f and β from the latitude (a 60°N preset once had β = 1.6e-11, the
+    /// 45°N value).
     #[test]
     fn the_coriolis_parameter_and_beta_follow_the_latitude() {
         assert!((coriolis_parameter(60.0) - 1.2630e-4).abs() < 1e-8);
@@ -200,7 +192,11 @@ mod tests {
         assert!(coriolis_parameter(0.0).abs() < TOL);
         assert!(coriolis_parameter(-30.0) < 0.0);
 
-        let c = CoriolisSource2D::norwegian_coast_beta();
+        let plane = CoriolisSource2D::f_plane_at_latitude(60.0);
+        assert_eq!(plane.f0, coriolis_parameter(60.0));
+        assert!(plane.is_f_plane());
+
+        let c = CoriolisSource2D::beta_plane_at_latitude(60.0, 0.0);
         assert_eq!(c.f0, coriolis_parameter(60.0));
         assert_eq!(c.beta, coriolis_beta(60.0));
         // One degree of latitude north (111 km) changes f by ≈ β · 111 km
@@ -257,13 +253,6 @@ mod tests {
         assert!(source.h.abs() < TOL);
         assert!((source.hu - 0.0055).abs() < TOL);
         assert!((source.hv - (-0.011)).abs() < TOL);
-    }
-
-    #[test]
-    fn test_norwegian_coast() {
-        let coriolis = CoriolisSource2D::norwegian_coast();
-        assert!((coriolis.f0 - 1.2e-4).abs() < TOL);
-        assert!(coriolis.is_f_plane());
     }
 
     #[test]

@@ -138,7 +138,7 @@ impl TidalPotentialConstituent {
 /// # Coordinate Systems
 ///
 /// Two coordinate modes are supported:
-/// - **Cartesian** (default for Norwegian coast): (x, y) in meters from reference point
+/// - **Cartesian**: (x, y) in meters from reference point
 /// - **Geographic**: (x, y) interpreted as (longitude, latitude) in degrees
 ///
 /// # Example
@@ -147,9 +147,9 @@ impl TidalPotentialConstituent {
 /// use dgcom::source::{TidalPotential, TidalPotentialConstituent, SourceTerm2D, SourceContext2D};
 /// use dgcom::SWEState2D;
 ///
-/// // Create M2 tidal potential for Norwegian coast
+/// // The M2 potential on a local plane about 5°E, 60°N
 /// let m2 = TidalPotentialConstituent::m2(0.5, 0.0);
-/// let potential = TidalPotential::norwegian_coast(vec![m2]);
+/// let potential = TidalPotential::cartesian(vec![m2], 5.0, 60.0);
 ///
 /// // Evaluate at a point
 /// let ctx = SourceContext2D::new(
@@ -191,17 +191,19 @@ impl TidalPotential {
         }
     }
 
-    /// Create for Norwegian coast (60°N, 5°E reference).
-    ///
-    /// Uses Cartesian coordinates (meters) from reference point.
-    pub fn norwegian_coast(constituents: Vec<TidalPotentialConstituent>) -> Self {
-        Self {
+    /// Create on a local plane: (x, y) in metres from the reference point
+    /// at `ref_longitude_deg`, `ref_latitude_deg` (degrees east and north).
+    pub fn cartesian(
+        constituents: Vec<TidalPotentialConstituent>,
+        ref_longitude_deg: f64,
+        ref_latitude_deg: f64,
+    ) -> Self {
+        Self::new(
             constituents,
-            ref_longitude: 5.0 * PI / 180.0,
-            ref_latitude: 60.0 * PI / 180.0,
-            cartesian_coords: true,
-            earth_radius: 6.371e6,
-        }
+            ref_longitude_deg.to_radians(),
+            ref_latitude_deg.to_radians(),
+            true,
+        )
     }
 
     /// Create with geographic coordinates (lon, lat in degrees).
@@ -333,7 +335,7 @@ mod tests {
     #[test]
     fn test_m2_periodicity() {
         let m2 = TidalPotentialConstituent::m2(1.0, 0.0);
-        let potential = TidalPotential::norwegian_coast(vec![m2.clone()]);
+        let potential = TidalPotential::cartesian(vec![m2.clone()], 5.0, 60.0);
 
         let period = m2.constituent.period; // ~12.42 hours in seconds
         let (phi_0, _, _) = potential.evaluate_potential(0.0, 0.0, 0.0);
@@ -349,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_empty_constituents() {
-        let potential = TidalPotential::norwegian_coast(vec![]);
+        let potential = TidalPotential::cartesian(vec![], 5.0, 60.0);
         let ctx = make_context(10.0, 0.0, 0.0, 0.0);
         let source = potential.evaluate(&ctx);
 
@@ -361,7 +363,7 @@ mod tests {
     #[test]
     fn test_potential_gradient_finite_diff() {
         let m2 = TidalPotentialConstituent::m2(1.0, 0.0);
-        let potential = TidalPotential::norwegian_coast(vec![m2]);
+        let potential = TidalPotential::cartesian(vec![m2], 5.0, 60.0);
 
         let x0 = 1000.0; // 1 km from reference
         let y0 = 1000.0;
@@ -406,7 +408,7 @@ mod tests {
     #[test]
     fn test_source_scaling_with_depth() {
         let m2 = TidalPotentialConstituent::m2(1.0, 0.0);
-        let potential = TidalPotential::norwegian_coast(vec![m2]);
+        let potential = TidalPotential::cartesian(vec![m2], 5.0, 60.0);
 
         let ctx1 = make_context(10.0, 1000.0, 1000.0, 0.0);
         let ctx2 = make_context(20.0, 1000.0, 1000.0, 0.0);
@@ -447,9 +449,9 @@ mod tests {
     fn test_multiple_constituents() {
         let m2 = TidalPotentialConstituent::m2(1.0, 0.0);
         let s2 = TidalPotentialConstituent::s2(0.5, 0.0);
-        let combined = TidalPotential::norwegian_coast(vec![m2.clone(), s2.clone()]);
-        let m2_only = TidalPotential::norwegian_coast(vec![m2]);
-        let s2_only = TidalPotential::norwegian_coast(vec![s2]);
+        let combined = TidalPotential::cartesian(vec![m2.clone(), s2.clone()], 5.0, 60.0);
+        let m2_only = TidalPotential::cartesian(vec![m2], 5.0, 60.0);
+        let s2_only = TidalPotential::cartesian(vec![s2], 5.0, 60.0);
 
         let x = 1000.0;
         let y = 1000.0;
@@ -471,7 +473,7 @@ mod tests {
     #[test]
     fn test_diurnal_constituent() {
         let k1 = TidalPotentialConstituent::k1(1.0, 0.0);
-        let potential = TidalPotential::norwegian_coast(vec![k1.clone()]);
+        let potential = TidalPotential::cartesian(vec![k1.clone()], 5.0, 60.0);
 
         let period = k1.constituent.period; // ~23.93 hours in seconds
         let (phi_0, _, _) = potential.evaluate_potential(0.0, 0.0, 0.0);

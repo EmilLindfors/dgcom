@@ -202,7 +202,7 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
     ///
     /// # Example
     /// ```ignore
-    /// let coriolis = CoriolisSource2D::norwegian_coast();
+    /// let coriolis = CoriolisSource2D::f_plane_at_latitude(60.0);
     /// let config = SWE2DRhsConfig::new(&equation, &bc)
     ///     .with_coriolis(false)  // Disable legacy Coriolis
     ///     .with_source_terms(&coriolis);

@@ -96,7 +96,7 @@ fn test_short_record_is_an_error() {
 }
 
 #[test]
-fn test_norwegian_coast_constituents() {
+fn a_month_resolves_the_monthly_set_and_infers_p1() {
     // 33 days: M2, S2, N2, K1, O1 fitted, P1 inferred from K1 at its
     // equilibrium ratio (separating it needs half a year)
     let truth = [
@@ -110,9 +110,7 @@ fn test_norwegian_coast_constituents() {
     let times = hourly(800);
     let values = tide(&times, 1.5, &truth);
 
-    let fit = HarmonicAnalysis::norwegian_coast()
-        .fit(&times, &values)
-        .unwrap();
+    let fit = HarmonicAnalysis::monthly().fit(&times, &values).unwrap();
     for (name, h, g) in truth {
         let c = fit.get(name).unwrap();
         assert!(

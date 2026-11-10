@@ -4,7 +4,7 @@
 
 use dgcom::analysis::{
     HarmonicAnalysis, PrecomputedExtractor, StationValidationResult, TideGaugeStation, TimeSeries,
-    ValidationSummary, norwegian_stations, validate_stations,
+    ValidationSummary, validate_stations,
 };
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -202,21 +202,6 @@ fn test_harmonic_comparison() {
             "M2 phase error should be small"
         );
     }
-}
-
-#[test]
-fn test_norwegian_stations_defined() {
-    let stations = norwegian_stations::all_stations();
-    assert!(!stations.is_empty());
-    assert!(stations.len() >= 9); // At least 9 major stations
-
-    let bergen = norwegian_stations::bergen();
-    assert_eq!(bergen.name, "Bergen");
-    assert!((bergen.longitude - 5.32).abs() < 0.1);
-    assert!((bergen.latitude - 60.39).abs() < 0.1);
-
-    let trondelag = norwegian_stations::trondelag_stations();
-    assert!(trondelag.len() >= 2);
 }
 
 #[test]
