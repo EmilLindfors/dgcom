@@ -38,9 +38,15 @@
 #            points_out=data/chiloe_station_tides.txt out=data/chiloe_boundary_tides.txt
 #   3. dgcom run cases/chiloe/case.toml
 #
-# Scored against SHOA's gauges (Puerto Montt, Ancud, Castro, Melinka, all
-# GLOSS/IOC stations) once their records are fetched (#216); until then the
-# stations record the model only.
+# Scored against SHOA's gauges (Puerto Montt, Ancud, Castro, Melinka, on the
+# IOC Sea Level Station Monitoring Facility as pmon, ancu, cstr, pmel):
+#
+#   uv run scripts/ioc_gauge_skill.py stations=cases/chiloe/output/chiloe/stations.csv #       start=2025-11-12T00:00:00 gauges="Puerto Montt:pmon;Ancud:ancu;Castro:cstr;Melinka:pmel"
+#
+# First look (2026-11-10, the second M2 period of this neap day; a day is
+# not a spun-up resonance): 7 cm at Melinka and Ancud, Puerto Montt's range
+# 3.79 m against 2.97 m observed, and Castro's fjord cut off from the sea on
+# GEBCO at 1 km (`notes/case-files.md`).
 #
 # Southern hemisphere: the Coriolis parameter is negative here (f ≈ −9.9e-5
 # s⁻¹ at 42.5°S). `beta_plane` takes it from the box's own latitude, so do

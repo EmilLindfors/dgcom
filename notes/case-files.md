@@ -365,7 +365,7 @@ Tracking: #220 (Chiloé) and #221 (a coast-agnostic core). Chiloé (Los Lagos, C
 - **End-to-end on synthetic inputs:** a synthetic GeoTIFF (shelf, a Chiloé-like island, mainland) and an M2/K1 atlas from a synthetic model. `dgcom check` is fine: 41,152 P2 elements at 1 km, 2 of 548 open faces walled for coverage. 6 h at 2 km (10,300 elements) ran stably in 93 s on this machine (|u| ≤ 2.1 m/s, η amplified 1.3 → 2.6 m in the closed basin), so the southern-hemisphere path (placement, raster, atlas, β-plane) works. Nothing is scored until the real GEBCO, TPXO and gauges are in (P8.6).
 - **Noticed:**
   - Stations are checked against the mesh: a gauge inside an element dropped as land is an error at `check`. Expect to move some SHOA gauges once the real bed is in.
-  - The log's "placed about -42.7500°N" (TODO P8.1).
+  - The log's "placed about -42.7500°N": fixed 2026-11-10 (below).
   - The tide-range keys default to Mausund's even under a 7 m range (P8.12).
 - **On the real TPXO10-atlas-v2 and GEBCO (2026-11-10):**
   - `scripts/tide_model_boundary_atlas.py` as first written did not run on the real model: pyTMD read every constituent's global 1/30° grid (0.9 GB each as complex128) before the crop, and the currents ran out of memory on a 31 GB machine. It now opens the model lazily (`chunks="auto"`, dask) and computes after the crop: 46 s for the box. TPXO's zip unpacks to `TPXO10_atlas_v2_nc/`; pyTMD wants `TPXO10_atlas_v2/`.
@@ -374,4 +374,19 @@ Tracking: #220 (Chiloé) and #221 (a coast-agnostic core). Chiloé (Los Lagos, C
   - TPXO10 has the amplification already: M2 0.46 m at Ancud, 0.85 m at Melinka, 1.85 m (S2 0.78 m) at Puerto Montt. Castro has no TPXO water within 10 km. So TPXO at the gauges is the baseline the case must beat, not only its boundary.
   - `scripts/cmems_parent_subset.py` read the top 500 m by default, and `depth_average_z` extends the deepest level read down to `deptho`: on a 3000 m boundary the depth-mean current would be the upper 500 m's. It reads the whole column by default now.
   - GEBCO: `download.gebco.net` is a web form; NOAA's ERDDAP serves `GEBCO_2020` as NetCDF by URL (its `.geotif` is an 8-bit picture), converted to a float GeoTIFF with rasterio. `dgcom check` passes on it with all four gauges on the mesh.
+- **First runs on real inputs, scored at SHOA's gauges (2026-11-10):**
+  - `cases/chiloe/case.toml` as committed: 51,172 P2 elements at 1 km (bed to −3816 m), 21 of 606 open faces walled for coverage, 24.84 h in 64,088 steps (dt 0.26–1.40 s) and 1348 s on this machine, |u| ≤ 3.4 m/s, stable with wetting and drying. At 2 km (13,221 elements): 227 s, but Castro has no wet element within 8 km and Ancud's is 3 km off.
+  - The gauges are on the IOC Sea Level Station Monitoring Facility (`pmon`, `ancu`, `cstr`, `pmel`; 1-minute records). `scripts/ioc_gauge_skill.py` (new) fetches them and scores a run's `stations.csv` per window, with a tide model's own prediction as the baseline.
+  - Second M2 period (12.42–24.84 h) of 2025-11-12, a neap day, centred RMSE and range:
+
+    | gauge | observed range | run, 1 km | run, 2 km | TPXO10 |
+    |---|---|---|---|---|
+    | Puerto Montt | 2.97 m | 3.79 m, 33 cm, 10 min late | 3.90 m, 51 cm, 40 min late | 2.90 m, 6 cm |
+    | Ancud | 1.11 m | 1.10 m, 7 cm, 20 min early | 0.92 m, 13 cm | 0.72 m, 18 cm |
+    | Castro | 2.62 m | 0.00 m (cut off) | no element | no water within 10 km |
+    | Melinka | 1.47 m | 1.50 m, 7 cm, 10 min late | 1.53 m, 9 cm | 1.47 m, 1 cm |
+
+  - Read: the tide enters right (Melinka, Ancud, where the run beats TPXO), and the resonance is there but 28 % too strong at Puerto Montt. One day after a 3 h ramp is not a spun-up resonance, so this is a first look, not a score: candidates are the spin-up, the friction (Manning 0.025 everywhere), GEBCO's interpolated bed in the channels, and the southern side's prescribed 1 m M2. TPXO10 is very good at Puerto Montt and Melinka (it likely assimilates them) and poor at Ancud.
+  - Castro's station sits in a 4.1 m deep element that GEBCO at 1 km leaves cut off from the sea (range 0.00 m): its fjord needs the coastline mesh.
+- **`Case::coriolis_source` (2026-11-10):** the 2D and 3D runners each built the Coriolis term from `physics.coriolis`; they take it from one place now, and `dgcom check`/`run` log it and the placement with hemispheres ("placed about 42.7500°S 73.8000°W", "Coriolis f = -9.900e-5 s⁻¹ + 1.681e-11 m⁻¹ s⁻¹ × y"). Gate: `the_coriolis_term_follows_the_placement_in_both_hemispheres`.
 

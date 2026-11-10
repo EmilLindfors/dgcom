@@ -31,6 +31,8 @@ All notable changes to this project should be documented in this file.
   - `scripts/cmems_parent_subset.py` merges `GLOBAL_ANALYSISFORECAST_PHY_001_024`'s split datasets (3D currents, T and S 6-hourly or daily, `zos` at the same times, the static depth and mask) into one parent file.
   - `scripts/tide_model_boundary_atlas.py` writes a tidal atlas along a box's sides, and at gauges, from any tide model pyTMD knows (TPXO10-atlas, FES2022, …).
   - `cases/chiloe/case.toml` runs the tide of Chiloé and the Chilean Inland Sea on GEBCO with that atlas: the first case outside Norway and in the southern hemisphere (`coriolis = "beta_plane"`, f₀ < 0, now in the Coriolis gate).
+  - `scripts/ioc_gauge_skill.py` scores a run's stations against the IOC Sea Level Station Monitoring Facility's gauge records, with a tide model's own prediction as the baseline. On the real GEBCO and TPXO10 the case runs at 1 km; the first look at SHOA's gauges is 7 cm at Melinka and Ancud, with Puerto Montt's range 28 % too large (`notes/case-files.md`).
+  - `Case::coriolis_source` builds the Coriolis term for the 2D and 3D runs in one place; `dgcom check`/`run` log it, and the placement with its hemispheres (42.75°S 73.80°W).
 
 - **Rivers in 3D cases (TODO P8.1; `notes/case-files.md`).** `[rivers]` (`file`, `snap_km`, `profile`) takes a river file's discharge, temperature and salinity into a 3D run as `froya_real_data rivers=` does, bit for bit (`cases/froya/rivers_3d.toml`, new): each river in the element of its mouth or snapped onto the mesh, those farther off listed and left out, the water entering the layers over the profile. `source::RiverProfile` parses from its text (`uniform`, `fraction:F`, `top:D`, `tapered:D`).
 
