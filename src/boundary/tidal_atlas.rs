@@ -504,6 +504,18 @@ impl TidalAtlas {
             .min_by(|a, b| a.1.total_cmp(&b.1))
     }
 
+    /// The largest sum of the elevation amplitudes over the points (m), `None`
+    /// without points: how far the tide reaches above and below its mean
+    /// level when its constituents peak together, the bound of the highest
+    /// and lowest astronomical tides (1.40 m on Frøya's NorKyst atlas, whose
+    /// Mausund gauge has its lowest at −1.43 m).
+    pub fn largest_amplitude_sum(&self) -> Option<f64> {
+        self.points
+            .iter()
+            .map(|p| p.constituents.iter().map(|c| c.eta.0).sum::<f64>())
+            .reduce(f64::max)
+    }
+
     /// Mean of the points' mean levels `Z0` (m), `None` if no point has
     /// one: for a parent fitted over a month around a run, minus this is the
     /// [`ParentDatum::Shift`](crate::boundary::ParentDatum::Shift) that

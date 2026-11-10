@@ -38,7 +38,8 @@ kind = "topobathy"
 fill_zero_holes = true
 land_elevation_m = 5.0
 
-[bathymetry.slopes_3d]                # thin_depth_m: [three_d]'s
+# The 3D bed, [bathymetry.slopes_3d]'s defaults, is a 3D run's by default
+# (thin_depth_m: [three_d]'s)
 
 [physics]
 coriolis = { f_plane = 1.31e-4 }      # the bed friction is [three_d]'s drag

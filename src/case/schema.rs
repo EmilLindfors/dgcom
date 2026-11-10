@@ -315,13 +315,91 @@ pub struct BathymetrySection {
     /// it lowers stay wet through the tide.
     #[serde(default = "default_wall_low_water")]
     pub wall_low_water_m: f64,
-    /// The bed for a 3D model (default: none). Smooths the bed, keeping its
+    /// The bed for a 3D model ([`Slopes3D`]). Smooths the bed, keeping its
     /// volume, until no element's depth range lets a σ-level cross the
     /// pycnocline between two of its nodes, then raises cliff shores to land
-    /// and fills tidal ponds. A 2D run on this bed shows what the 3D bed
-    /// does to the tide.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slopes_3d: Option<Slopes3D>,
+    /// and fills tidal ponds. A 3D run on a raster bed takes it by default
+    /// ([`BedFor3D`]); a 2D run on this bed shows what the 3D bed does to
+    /// the tide.
+    #[serde(default, skip_serializing_if = "BedFor3D::is_default")]
+    pub slopes_3d: BedFor3D,
+}
+
+impl BathymetrySection {
+    /// The 3D bed a run takes, 3D (`three_d`) or not: `[bathymetry.slopes_3d]`
+    /// as written; its defaults for a 3D run on a raster bed when it is left
+    /// out; otherwise none.
+    pub fn slopes_3d_for(&self, three_d: bool) -> Option<Slopes3D> {
+        match &self.slopes_3d {
+            BedFor3D::Default if three_d && self.raster.is_some() => Some(Slopes3D::default()),
+            BedFor3D::Default | BedFor3D::Off => None,
+            BedFor3D::On(spec) => Some(spec.clone()),
+        }
+    }
+}
+
+/// `[bathymetry] slopes_3d`: whether the bed is smoothed for σ-levels.
+///
+/// A raster bed resolves underwater cliffs that σ-levels cannot cross: the
+/// refined Frøya mesh, with a 1.2 m node beside 75–80 m ones, grew σ-level
+/// currents of 21 m/s from rest within 400 s and blew up at `cfl_3d = 4`
+/// (TODO P1.6, 2026-11-09). So a 3D run on a raster bed takes
+/// [`Slopes3D`]'s defaults unless the case says otherwise.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum BedFor3D {
+    /// Left out: [`Slopes3D`]'s defaults for a 3D run on a raster bed, the
+    /// bed as it is for a 2D run or an analytic bed.
+    #[default]
+    Default,
+    /// `slopes_3d = false`: the bed as it is, in 3D too.
+    Off,
+    /// `[bathymetry.slopes_3d]` (or `slopes_3d = true`, its defaults), in
+    /// 2D as in 3D.
+    On(Slopes3D),
+}
+
+impl BedFor3D {
+    fn is_default(&self) -> bool {
+        *self == Self::Default
+    }
+}
+
+impl Serialize for BedFor3D {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // Skipped (`is_default`); a unit where a field cannot be skipped
+            Self::Default => serializer.serialize_unit(),
+            Self::Off => serializer.serialize_bool(false),
+            Self::On(spec) => spec.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BedFor3D {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Setting;
+        impl<'de> serde::de::Visitor<'de> for Setting {
+            type Value = BedFor3D;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("`false`, `true` or a [bathymetry.slopes_3d] table")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, on: bool) -> Result<BedFor3D, E> {
+                Ok(if on {
+                    BedFor3D::On(Slopes3D::default())
+                } else {
+                    BedFor3D::Off
+                })
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<BedFor3D, A::Error> {
+                Slopes3D::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(BedFor3D::On)
+            }
+        }
+        deserializer.deserialize_any(Setting)
+    }
 }
 
 /// `[bathymetry.slopes_3d]`: the bed a σ-coordinate model needs (TODO
@@ -1977,7 +2055,7 @@ impl Case {
         if !b.wall_low_water_m.is_finite() {
             return invalid("bathymetry.wall_low_water_m must be finite".into());
         }
-        if let Some(s) = &b.slopes_3d {
+        if let Some(s) = b.slopes_3d_for(self.three_d.is_some()) {
             s.validate(s.thin_depth(self.three_d.as_ref()))?;
         }
         if let Some(a) = &self.atmosphere {
