@@ -96,10 +96,17 @@ fn describe(file: &CaseFile, domain: &Domain) -> Vec<String> {
         bed.min(),
         bed.max(),
         match file.case.projection_center() {
-            Some(c) => format!(", placed about {:.4}°N {:.4}°E", c.lat, c.lon),
+            Some(c) => format!(", placed about {}", c.hemispheres()),
             None => String::new(),
         }
     )];
+    if let Some(c) = file.case.coriolis_source() {
+        lines.push(if c.beta == 0.0 {
+            format!("Coriolis f = {:.4e} s⁻¹", c.f0)
+        } else {
+            format!("Coriolis f = {:.4e} s⁻¹ + {:.3e} m⁻¹ s⁻¹ × y", c.f0, c.beta)
+        });
+    }
     lines.extend(domain.notes.iter().cloned());
     lines
 }

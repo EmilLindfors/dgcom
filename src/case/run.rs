@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::domain::Domain;
-use super::schema::{BoundaryVelocity, Coriolis, Friction, SideTag};
+use super::schema::{BoundaryVelocity, Friction, SideTag};
 use super::{CaseError, CaseFile};
 use crate::boundary::{
     CharacteristicOBC, ExternalStateProvider, HarmonicTide, InverseBarometer,
@@ -34,8 +34,7 @@ use crate::solver::{
     SWEPointSample, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, total_mass_2d,
 };
 use crate::source::{
-    CageDrag2D, ChezyFriction2D, CoriolisSource2D, GriddedAtmosphere2D, HorizontalViscosity2D,
-    ManningFriction2D, coriolis_parameter,
+    CageDrag2D, ChezyFriction2D, GriddedAtmosphere2D, HorizontalViscosity2D, ManningFriction2D,
 };
 use crate::tides::{canonical_name, constituent_period};
 use crate::time::{Multirate, TimeIntegrator};
@@ -481,20 +480,8 @@ impl CaseFile {
                 .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
                 .with_wet_dry(WetDryConfig::default());
         }
-        match p.coriolis {
-            Some(Coriolis::FPlane(f)) => {
-                builder = builder.with_source(CoriolisSource2D::f_plane(f))
-            }
-            Some(Coriolis::Latitude(lat)) => {
-                builder = builder.with_source(CoriolisSource2D::f_plane(coriolis_parameter(lat)));
-            }
-            Some(Coriolis::BetaPlane) => {
-                // The projection's centre is at y = 0
-                let center = self.case.projection_center().expect("validated: placed");
-                builder =
-                    builder.with_source(CoriolisSource2D::beta_plane_at_latitude(center.lat, 0.0));
-            }
-            None => {}
+        if let Some(coriolis) = self.case.coriolis_source() {
+            builder = builder.with_source(coriolis);
         }
         // The nesting's relaxation bands
         for (tag, parent) in &domain.parents {
