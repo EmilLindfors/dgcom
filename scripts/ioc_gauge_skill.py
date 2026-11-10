@@ -12,7 +12,10 @@ tide model's own prediction at the gauges as the baseline to beat.
 For each station it prints, per window of `window_h` hours after `skip_h`:
 the observed and modelled range, the centred RMSE (both series with their
 window mean removed: the gauges' datum is the station's own, and the record
-holds the weather's surge too) and the lag that fits best.
+holds the weather's surge too) and the lag that fits best. Run samples
+further than `max_gap_min` (default 15) from a gauge sample are left out, and
+a window with less than 80 % of its samples left is reported as a gap: the
+real-time records have holes of hours.
 
 The records are fetched once into `cache` (one JSON per gauge and period; the
 service gives at most 30 days per request). With `model=` and `model_dir=`
@@ -24,7 +27,7 @@ Usage:
     uv run scripts/ioc_gauge_skill.py stations=cases/chiloe/output/chiloe/stations.csv \\
         start=2025-11-12T00:00:00 \\
         gauges="Puerto Montt:pmon;Ancud:ancu;Castro:cstr;Melinka:pmel" \\
-        [skip_h=12.42] [window_h=12.42] [cache=data/tide_gauges/ioc] \\
+        [skip_h=12.42] [window_h=12.42] [max_gap_min=15] [cache=data/tide_gauges/ioc] \\
         [model=TPXO10-atlas-v2-nc model_dir=data/tide_models \\
          positions="Puerto Montt:-72.9608,-41.4850;…"]
 """
@@ -39,6 +42,7 @@ import pandas as pd
 
 SERVICE = "https://www.ioc-sealevelmonitoring.org/service.php"
 MAX_LAG_STEPS = 12
+MIN_COVERAGE = 0.8
 
 
 def parse_args(argv):
@@ -115,6 +119,7 @@ def main():
     start = pd.Timestamp(args["start"]).tz_localize(None)
     skip = float(args.get("skip_h", 12.42)) * 3600.0
     window = float(args.get("window_h", 12.42)) * 3600.0
+    max_gap = float(args.get("max_gap_min", 15.0)) * 60.0
     codes = pairs(args["gauges"])
     positions = {
         name: tuple(float(v) for v in value.split(","))
@@ -134,6 +139,10 @@ def main():
             print(f"{name}: no record at {codes[name]}")
             continue
         observed = np.interp(t, seconds, level)
+        # the distance from each run sample to the nearest gauge sample
+        after = np.clip(np.searchsorted(seconds, t), 1, len(seconds) - 1)
+        nearest = np.minimum(np.abs(t - seconds[after - 1]), np.abs(seconds[after] - t))
+        covered = nearest <= max_gap
         tide = None
         if "model" in args and name in positions:
             tide = model_tide(args["model"], args["model_dir"], *positions[name], start, t)
@@ -142,9 +151,16 @@ def main():
         begin = skip
         while begin + window <= t[-1] + step:
             w = (t >= begin) & (t < begin + window)
+            label = f"  {begin / 3600:6.1f}-{(begin + window) / 3600:6.1f} h:"
+            begin += window
+            coverage = covered[w].mean()
+            if coverage < MIN_COVERAGE:
+                print(f"{label} the gauge record covers {100 * coverage:.0f} %: not scored")
+                continue
+            w &= covered
             o, m = observed[w], eta[w]
             line = (
-                f"  {begin / 3600:6.1f}-{(begin + window) / 3600:6.1f} h: range obs {np.ptp(o):.2f} m, "
+                f"{label} range obs {np.ptp(o):.2f} m, "
                 f"run {np.ptp(m):.2f} m, RMSE {centred_rmse(m, o):.3f} m, {lag_minutes(m, o, step):+.0f} min"
             )
             if tide is not None:
@@ -157,7 +173,6 @@ def main():
                 else:
                     line += f" | {args['model']}: no water within 10 km"
             print(line)
-            begin += window
 
 
 if __name__ == "__main__":
