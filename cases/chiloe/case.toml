@@ -46,11 +46,13 @@
 #
 #   uv run scripts/ioc_gauge_skill.py stations=cases/chiloe/output/chiloe/stations.csv #       start=2025-11-12T00:00:00 gauges="Puerto Montt:pmon;Ancud:ancu;Castro:cstr;Melinka:pmel"
 #
-# At 1 km on GEBCO (2026-11-10, 12-37 h of this neap day): 5-6 cm at
-# Melinka, 8-9 cm at Ancud, 13-17 cm at Puerto Montt, whose range is still
-# 10 % too large (TPXO10 itself: 6-12 cm there). The rest follows the bed and
-# the passages' resolution, not the friction: a coastline mesh is next
-# (`notes/case-files.md`). Castro's fjord is not on the mesh at 1 km.
+# At 1 km on GEBCO, over four days (2026-11-10, centred RMSE per M2 period):
+# 3-6 cm at Ancud (TPXO10 itself: 18-26 cm), 10-14 cm at Melinka (1-4 cm),
+# 29-36 cm at Puerto Montt (6-15 cm). The inner sea's tide is 25-35 min late
+# from Boca del Guafo inward and 8-17 % too large at its head: a basin whose
+# resonance is too low on this bed and mesh, not the friction. A coastline
+# mesh and an independent bed are next (`notes/case-files.md`). Castro's
+# fjord is not on the mesh at 1 km.
 #
 # Southern hemisphere: the Coriolis parameter is negative here (f ≈ −9.9e-5
 # s⁻¹ at 42.5°S). `beta_plane` takes it from the box's own latitude, so do
@@ -83,6 +85,7 @@ tag = "open"
 [boundary.atlas]
 file = "../../data/chiloe_boundary_tides.txt"   # TPXO10-atlas along the box
 ramp_hours = 3.0                # the inner sea's resonance needs a gentler start
+correction = "minors"           # μ2, ν2, λ2, L2, T2 by admittance: 15 cm RMS at Puerto Montt
 
 [output]
 interval_minutes = 10.0
