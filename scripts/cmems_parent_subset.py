@@ -37,8 +37,8 @@ COPERNICUSMARINE_SERVICE_USERNAME/PASSWORD in the environment (`.env` is
 git-ignored).
 
 Usage:
-    uv run scripts/cmems_parent_subset.py bbox=-74.6,-44.2,-72.3,-41.3 \\
-        start=2025-11-12 days=3 [period=6h] [max_depth=500] [margin=0.25] \\
+    uv run scripts/cmems_parent_subset.py bbox=-75.3,-44.2,-72.3,-41.3 \\
+        start=2025-11-12 days=3 [period=6h] [max_depth=M] [margin=0.25] \\
         out=data/chiloe_cmems.nc
 """
 import sys
@@ -92,7 +92,9 @@ def main():
         sys.exit(f"period must be one of {', '.join(DATASETS)}")
     start = datetime.fromisoformat(args["start"])
     end = start + timedelta(days=float(args.get("days", 3)))
-    max_depth = float(args.get("max_depth", 500.0))
+    # The whole column by default: the reader extends the deepest level read
+    # down to `deptho`, so a cut above the bed biases the depth-mean current
+    max_depth = float(args.get("max_depth", 7000.0))
     region = dict(
         minimum_longitude=west - margin,
         maximum_longitude=east + margin,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["pyTMD>=3.1", "numpy", "xarray", "netCDF4", "scipy"]
+# dependencies = ["pyTMD>=3.1", "numpy", "xarray", "netCDF4", "scipy", "dask"]
 # ///
 """
 A tidal atlas for an open boundary from a global tide model (TPXO, FES, GOT,
@@ -31,10 +31,11 @@ nearest water point.
 The models are not downloadable without registration: TPXO10-atlas from
 https://www.tpxo.net (free for academic use), FES2022 from AVISO. Put them under
 `model_dir` as pyTMD's database expects (e.g. `TPXO10_atlas_v2/*.nc` for
-`TPXO10-atlas-v2-nc`).
+`TPXO10-atlas-v2-nc`; TPXO's own zip unpacks to `TPXO10_atlas_v2_nc/`, which
+has to be renamed).
 
 Usage:
-    uv run scripts/tide_model_boundary_atlas.py bbox=-74.6,-44.2,-72.3,-41.3 \\
+    uv run scripts/tide_model_boundary_atlas.py bbox=-75.3,-44.2,-72.3,-41.3 \\
         model=TPXO10-atlas-v2-nc model_dir=data/tide_models \\
         [spacing_km=2] [extrapolate_km=10] \\
         [points=-72.9608,-41.4850;-73.8327,-41.8674] [points_out=data/chiloe_station_tides.txt] \\
@@ -192,8 +193,14 @@ def main():
     bounds = [min(xs) - margin, max(xs) + margin, min(ys) - margin, max(ys) + margin]
 
     def open_group(group):
-        ds = pyTMD.io.open_dataset(model, directory=directory, group=group)
-        return ds.tmd.crop(bounds)
+        # Lazily (dask), so only the crop is read: TPXO10-atlas's global 1/30°
+        # grids are 0.9 GB per constituent in memory, and 15 of them per
+        # group do not fit
+        try:
+            ds = pyTMD.io.open_dataset(model, directory=directory, group=group, chunks="auto")
+        except TypeError:  # a format whose reader takes no `chunks`
+            ds = pyTMD.io.open_dataset(model, directory=directory, group=group)
+        return ds.tmd.crop(bounds).compute()
 
     z = to_units(open_group("z"), "m")
     try:

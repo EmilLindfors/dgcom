@@ -367,3 +367,11 @@ Tracking: #220 (Chiloé) and #221 (a coast-agnostic core). Chiloé (Los Lagos, C
   - Stations are checked against the mesh: a gauge inside an element dropped as land is an error at `check`. Expect to move some SHOA gauges once the real bed is in.
   - The log's "placed about -42.7500°N" (TODO P8.1).
   - The tide-range keys default to Mausund's even under a 7 m range (P8.12).
+- **On the real TPXO10-atlas-v2 and GEBCO (2026-11-10):**
+  - `scripts/tide_model_boundary_atlas.py` as first written did not run on the real model: pyTMD read every constituent's global 1/30° grid (0.9 GB each as complex128) before the crop, and the currents ran out of memory on a 31 GB machine. It now opens the model lazily (`chunks="auto"`, dask) and computes after the crop: 46 s for the box. TPXO's zip unpacks to `TPXO10_atlas_v2_nc/`; pyTMD wants `TPXO10_atlas_v2/`.
+  - The box's west side moved from 74.6°W to 75.3°W. At 74.6°W it ran past Isla Guafo, through TPXO M2 currents of 0.3–0.65 m/s south of 43.2°S; at 75.3°W it lies in 700–3400 m with M2 at 0.42 m and currents under 0.05 m/s. The cost is the deep water's time step (c ≈ 180 m/s).
+  - The southern side still cuts the Chonos passages and Moraleda: TPXO's M2 there is 0.7–1.0 m with currents up to 1.3 m/s, the same value at neighbouring points (the nearest model cell's, at filled land points). It prescribes part of the resonance; wall it on a coastline mesh or nest it (P8.6, P8.7).
+  - TPXO10 has the amplification already: M2 0.46 m at Ancud, 0.85 m at Melinka, 1.85 m (S2 0.78 m) at Puerto Montt. Castro has no TPXO water within 10 km. So TPXO at the gauges is the baseline the case must beat, not only its boundary.
+  - `scripts/cmems_parent_subset.py` read the top 500 m by default, and `depth_average_z` extends the deepest level read down to `deptho`: on a 3000 m boundary the depth-mean current would be the upper 500 m's. It reads the whole column by default now.
+  - GEBCO: `download.gebco.net` is a web form; NOAA's ERDDAP serves `GEBCO_2020` as NetCDF by URL (its `.geotif` is an 8-bit picture), converted to a float GeoTIFF with rasterio. `dgcom check` passes on it with all four gauges on the mesh.
+
