@@ -13,6 +13,8 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **A run's step range is the stability bounds' (`SimulationResult::dt_min`, `dt_max`).** A step shortened to land on an output time or the end was counted, so a run at one step of 1.38 s reported "dt 0.003–1.377 s" (Chiloé, `notes/case-files.md`). The range is now taken before the landing.
+
 - **Rivers beyond an open boundary are left out (TODO P1.6; `notes/inputs-forcing.md`).** A river whose mouth is outside the mesh and nearest an open boundary (open, tidal or river faces) is now left out and listed (`RiverError::BeyondOpenBoundary`). Its mouth lies outside the domain, and the water entering through the boundary already brings it in: a parent model has its own rivers.
   - **Why:** at Frøya, the three largest placed rivers (837, 844, 836: 0.9, 0.8 and 0.55 m³/s) lie 1.5–1.9 km south of the box. They were snapped in across the open boundary into the 3 km nesting band, where the parent's T and S already carry their water and relax theirs away.
   - **Logs:** the case and the example now give the placed discharge against the file's, over the run: "9 of 13 … (0.9 of 2.1 m³/s over the run); 4 left out".
