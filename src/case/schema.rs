@@ -1444,6 +1444,12 @@ pub enum AtlasCorrection {
     /// ([`crate::boundary::TidalAtlas::infer_from_theory`]): no gauge needed.
     /// Needs M2, S2, N2 and K1 in the atlas.
     Theory,
+    /// The minor semidiurnals the atlas lacks (of 2N2, μ2, ν2, λ2, L2, T2)
+    /// added by admittance, and what it carries kept
+    /// ([`crate::boundary::TidalAtlas::infer_missing_minors`]): for a global
+    /// tide model's atlas (TPXO, FES), whose own prediction adds them. Needs
+    /// M2, S2 and N2 in the atlas.
+    Minors,
 }
 
 /// One constituent: `{ name = "M2", amplitude_m = 1.0, phase_deg = 0.0 }`.

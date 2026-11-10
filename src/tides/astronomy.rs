@@ -395,6 +395,11 @@ fn constituent_def(name: &str) -> Option<ConstituentDef> {
             doodson: d(2.0, 1.0, 0.0, -1.0, 0.0, 180.0),
             nodal: NodalKind::L2,
         },
+        // 2T − h + p₁: S2's neighbour from the Sun's elliptic orbit
+        "T2" => ConstituentDef {
+            doodson: d(2.0, 2.0, -3.0, 0.0, 1.0, 0.0),
+            nodal: NodalKind::None,
+        },
         // --- Diurnal (±90° offsets are Schureman's convention) ---
         "K1" => ConstituentDef {
             doodson: d(1.0, 1.0, 0.0, 0.0, 0.0, 90.0),
@@ -448,9 +453,9 @@ fn constituent_def(name: &str) -> Option<ConstituentDef> {
 }
 
 /// Names of the supported constituents, in their conventional spelling.
-pub const CONSTITUENT_NAMES: [&str; 20] = [
-    "M2", "S2", "N2", "K2", "2N2", "MU2", "NU2", "LDA2", "L2", "K1", "O1", "P1", "Q1", "M4", "MS4",
-    "MN4", "M6", "Mf", "Mm", "Ssa",
+pub const CONSTITUENT_NAMES: [&str; 21] = [
+    "M2", "S2", "N2", "K2", "2N2", "MU2", "NU2", "LDA2", "L2", "T2", "K1", "O1", "P1", "Q1", "M4",
+    "MS4", "MN4", "M6", "Mf", "Mm", "Ssa",
 ];
 
 /// The conventional (`'static`) spelling of a supported constituent name,
@@ -709,6 +714,7 @@ mod tests {
             ("Mm", 0.544_374_7),
             ("Ssa", 0.082_137_3),
             ("2N2", 27.895_354_8),
+            ("T2", 29.958_933_3),
             ("MU2", 27.968_208_4),
             ("NU2", 28.512_583_1),
             ("LDA2", 29.455_625_3),

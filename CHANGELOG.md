@@ -28,6 +28,11 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The minor constituents a global tide model's atlas lacks: `correction = "minors"` (TODO P8.6; `notes/case-files.md`).** `[boundary.atlas]` and `[boundary.nesting]` take `correction = "minors"`: 2N2, μ2, ν2, λ2, L2 and T2 are added by linear admittance from M2, S2 and N2 where the atlas has none, and what it carries is kept (`TidalAtlas::infer_missing_minors`, `AdmittanceInference::MINORS`). TPXO's and FES's own prediction programs add them, a run forced with the atlas's constituents did not.
+  - **Why:** at Puerto Montt they are 15 cm RMS of the tide (μ2 8.7, ν2 7.8, L2 6.0, T2 4.6 cm on TPXO10), and on a neap day they delay it by 20 minutes; a gauge score of a run without them mixes that with the model's own error.
+  - **T2** is a new constituent (`tides::CONSTITUENT_NAMES`: 2T − h + p₁, 29.9589333°/h, no nodal modulation; equilibrium amplitude 0.006614 m).
+  - `correction = "theory"` is unchanged: it also replaces K2, P1 and 2N2, for a source that carries them wrongly.
+
 - **Copernicus Marine parent files, and the inputs for a second coast, Chiloé (TODO P8.6; #212, tracking #220; `notes/case-files.md`).**
   - `OceanModelReader` takes Copernicus Marine's names: `zos`, `uo`/`vo` (averaged over the column like any z-level velocity), `thetao`/`so` and `deptho`.
   - `scripts/cmems_parent_subset.py` merges `GLOBAL_ANALYSISFORECAST_PHY_001_024`'s split datasets (3D currents, T and S 6-hourly or daily, `zos` at the same times, the static depth and mask) into one parent file.
