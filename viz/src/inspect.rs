@@ -231,7 +231,7 @@ impl Inspector {
         match &self.projection {
             Some(p) => {
                 let (lat, lon) = p.xy_to_geo(x, y);
-                format!("{km} ({:.4}° N, {:.4}° E)", lat, lon)
+                format!("{km} ({})", geo(lat, lon))
             }
             None => km,
         }
@@ -688,4 +688,26 @@ fn marker(
         thickness,
     ));
     visible.set_if_neq(Visibility::Inherited);
+}
+
+/// A position with its hemispheres: `41.4443° S, 72.9529° W`.
+fn geo(lat: f64, lon: f64) -> String {
+    format!(
+        "{:.4}° {}, {:.4}° {}",
+        lat.abs(),
+        if lat < 0.0 { 'S' } else { 'N' },
+        lon.abs(),
+        if lon < 0.0 { 'W' } else { 'E' }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_position_names_its_hemispheres() {
+        assert_eq!(geo(-41.4443, -72.9529), "41.4443° S, 72.9529° W");
+        assert_eq!(geo(63.8693, 8.6652), "63.8693° N, 8.6652° E");
+    }
 }

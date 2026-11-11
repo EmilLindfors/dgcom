@@ -75,6 +75,8 @@
 //!   and cages, the cages dragging on the flow of a live run. Repeat it for more sites;
 //!   the close-up (F) then frames the first. Needs the domain's projection, as
 //!   `--terrain` does
+//! - `--station NAME` the station of a replayed run that is its point of interest (the
+//!   close-up and the trace) [the first]
 //! - `--pin X,Y` pin the point at mesh coordinates X, Y (km) at the start, as a click
 //!   on it does ([`inspect`]: hover any point for its readout, click to pin one, Esc
 //!   to let go)
@@ -222,6 +224,8 @@ struct Args {
     places: Vec<(String, [f64; 2])>,
     /// A point pinned at the start (`--pin X_KM,Y_KM`), in mesh metres
     pin: Option<[f64; 2]>,
+    /// `--station NAME`: the station that is the point of interest
+    station: Option<String>,
     origin: Option<String>,
     mesh: Option<PathBuf>,
     /// `--order`, `--sigma`: else the scenario's defaults
@@ -276,6 +280,7 @@ impl Args {
             sites: Vec::new(),
             places: Vec::new(),
             pin: None,
+            station: None,
             origin: None,
             mesh: None,
             order: None,
@@ -333,6 +338,7 @@ impl Args {
                 "--terrain-margin" => args.terrain_margin = num(&flag, &value)?,
                 "--site" => args.sites.push(value.into()),
                 "--place" => args.places.push(place(&value)?),
+                "--station" => args.station = Some(value),
                 "--pin" => {
                     let (_, at) = place(&format!("pin,{value}"))
                         .map_err(|_| format!("--pin takes X,Y (km), not {value}"))?;
@@ -451,10 +457,7 @@ impl Args {
                 "--size" => {
                     let bad = || format!("--size takes WxH in pixels, not {value}");
                     let (w, h) = value.split_once('x').ok_or_else(bad)?;
-                    args.size = (
-                        w.parse().map_err(|_| bad())?,
-                        h.parse().map_err(|_| bad())?,
-                    );
+                    args.size = (w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?);
                 }
                 _ => {
                     return Err(format!(
@@ -662,6 +665,9 @@ impl Run {
                 })?,
             );
         }
+        if let Some(name) = &args.station {
+            scenario.farm = station(&scenario.places, name).map_err(|e| fail(2, e))?;
+        }
         // The gauge trace stays at the scenario's point of interest when a site takes
         // the close-up
         let gauge_point = scenario.farm;
@@ -827,7 +833,7 @@ impl Run {
             places,
             domain: OrbitCamera {
                 focus: Vec3::ZERO,
-                yaw: 0.35,
+                yaw: domain_yaw(hi[0] - lo[0], hi[1] - lo[1]),
                 pitch: 0.7,
                 distance: 0.85 * extent,
             },
@@ -1196,7 +1202,12 @@ impl Run {
                     }
                 }
             };
-            world.insert_resource(record::Recording::new(dir.clone(), args.fps, drive, args.ui));
+            world.insert_resource(record::Recording::new(
+                dir.clone(),
+                args.fps,
+                drive,
+                args.ui,
+            ));
         }
         world.insert_resource(FrameTimes {
             wanted: args.frame_times.unwrap_or(0),
@@ -1522,9 +1533,55 @@ fn capture(
     }
 }
 
+/// The whole domain's heading (the orbit camera's yaw): from the south-south-east,
+/// and from the west-south-west for a domain much taller than wide (Chile's coast),
+/// so its long side lies along the screen's.
+fn domain_yaw(width: f64, height: f64) -> f32 {
+    if height > 1.3 * width {
+        0.35 - std::f32::consts::FRAC_PI_2
+    } else {
+        0.35
+    }
+}
+
+/// The station `name` (any case) among a run's `places`.
+fn station(places: &[(String, [f64; 2])], name: &str) -> Result<[f64; 2], String> {
+    places
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, at)| *at)
+        .ok_or_else(|| {
+            let names: Vec<_> = places.iter().map(|(n, _)| n.as_str()).collect();
+            format!(
+                "--station {name}: the run's stations are {}",
+                names.join(", ")
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_station_is_found_by_its_name() {
+        let places = vec![
+            ("Puerto Montt".to_string(), [1.0, 2.0]),
+            ("Ancud".to_string(), [3.0, 4.0]),
+        ];
+        assert_eq!(station(&places, "ancud"), Ok([3.0, 4.0]));
+        assert!(
+            station(&places, "Castro")
+                .unwrap_err()
+                .contains("Puerto Montt, Ancud")
+        );
+    }
+
+    #[test]
+    fn a_tall_domain_is_seen_from_its_long_side() {
+        assert_eq!(domain_yaw(150e3, 120e3), 0.35);
+        assert!(domain_yaw(288e3, 589e3) < -1.0);
+    }
 
     #[test]
     fn a_place_is_named_in_km() {
