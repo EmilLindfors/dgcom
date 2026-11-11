@@ -207,6 +207,14 @@ mod tests {
         let dy = EARTH_MEAN_RADIUS * 1f64.to_radians();
         let exact = coriolis_parameter(61.0) - coriolis_parameter(60.0);
         assert!((c.f_at(dy) - c.f0 - exact).abs() < 0.02 * exact);
+
+        // Southern hemisphere (Chiloé, `cases/chiloe`): f < 0, β > 0, so f
+        // grows towards 0 northwards
+        let s = CoriolisSource2D::beta_plane_at_latitude(-42.5, 0.0);
+        assert!((s.f0 + 9.853e-5).abs() < 1e-8, "{}", s.f0);
+        assert!(s.beta > 0.0 && s.f_at(dy) > s.f0);
+        let exact = coriolis_parameter(-41.5) - coriolis_parameter(-42.5);
+        assert!((s.f_at(dy) - s.f0 - exact).abs() < 0.02 * exact);
     }
 
     fn make_context(h: f64, hu: f64, hv: f64, y: f64) -> SourceContext2D {

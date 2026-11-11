@@ -19,6 +19,7 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **A run's step range is the stability bounds' (`SimulationResult::dt_min`, `dt_max`).** A step shortened to land on an output time or the end was counted, so a run at one step of 1.38 s reported "dt 0.003–1.377 s" (Chiloé, `notes/case-files.md`). The range is now taken before the landing.
 - **The Frøya river cases' 3D blow-ups were their bed (TODO P1.6; `notes/inputs-forcing.md`).** `cases/froya/rivers_coast_3d.toml` stopped at 555 s, 744 s or 5.12 h depending on its output intervals.
   - **Cause:** its 50 m mesh resolves underwater cliffs (a 1.2 m node beside 75–80 m ones, r_x0 ≈ 0.97) and the case left out `[bathymetry.slopes_3d]`. σ-level currents grew there from rest to 21 m/s within 400 s. The "555 s" failure was millions of 1e-11 s steps at 1e11 m/s in that element, not a global one.
   - **Fix:** `rivers_coast_3d.toml` and `rivers_3d.toml` take `[bathymetry.slopes_3d]`. Over the same 600 s the largest |u| is 0.44 m/s instead of 21, in 62 steps instead of 89. At the default `cfl_3d = 4` all three failing configurations now run to their end (6 h, 4.5 h, 6 h; |u| ≤ 2.2 m/s, the same peak as the untreated bed at CFL 2), the 4.5 h one in 2,358 steps instead of 4,387 at CFL 2.
@@ -62,6 +63,19 @@ All notable changes to this project should be documented in this file.
   - **Frøya:** `cases/froya/rivers_3d.toml` now reaches 1.807 m, the same as without rivers, and still matches `froya_real_data rivers=` bit for bit. Rivers 837 and 843 moved off coastal elements (1.6 and 1.2 km).
 
 ### Added
+
+- **The minor constituents a global tide model's atlas lacks: `correction = "minors"` (TODO P8.6; `notes/case-files.md`).** `[boundary.atlas]` and `[boundary.nesting]` take `correction = "minors"`: 2N2, μ2, ν2, λ2, L2 and T2 are added by linear admittance from M2, S2 and N2 where the atlas has none, and what it carries is kept (`TidalAtlas::infer_missing_minors`, `AdmittanceInference::MINORS`). TPXO's and FES's own prediction programs add them, a run forced with the atlas's constituents did not.
+  - **Why:** at Puerto Montt they are 15 cm RMS of the tide (μ2 8.7, ν2 7.8, L2 6.0, T2 4.6 cm on TPXO10), and on a neap day they delay it by 20 minutes; a gauge score of a run without them mixes that with the model's own error.
+  - **T2** is a new constituent (`tides::CONSTITUENT_NAMES`: 2T − h + p₁, 29.9589333°/h, no nodal modulation; equilibrium amplitude 0.006614 m).
+  - `correction = "theory"` is unchanged: it also replaces K2, P1 and 2N2, for a source that carries them wrongly.
+
+- **Copernicus Marine parent files, and the inputs for a second coast, Chiloé (TODO P8.6; #212, tracking #220; `notes/case-files.md`).**
+  - `OceanModelReader` takes Copernicus Marine's names: `zos`, `uo`/`vo` (averaged over the column like any z-level velocity), `thetao`/`so` and `deptho`.
+  - `scripts/cmems_parent_subset.py` merges `GLOBAL_ANALYSISFORECAST_PHY_001_024`'s split datasets (3D currents, T and S 6-hourly or daily, `zos` at the same times, the static depth and mask) into one parent file.
+  - `scripts/tide_model_boundary_atlas.py` writes a tidal atlas along a box's sides, and at gauges, from any tide model pyTMD knows (TPXO10-atlas, FES2022, …).
+  - `cases/chiloe/case.toml` runs the tide of Chiloé and the Chilean Inland Sea on GEBCO with that atlas: the first case outside Norway and in the southern hemisphere (`coriolis = "beta_plane"`, f₀ < 0, now in the Coriolis gate).
+  - `scripts/ioc_gauge_skill.py` scores a run's stations against the IOC Sea Level Station Monitoring Facility's gauge records, with a tide model's own prediction as the baseline. On the real GEBCO and TPXO10 the case runs at 1 km; Holes in a gauge's record are left out of the score. With the box cut at 44.2°S, across Moraleda, Puerto Montt's range was 19–28 % too large over four days: the cut prescribed the tide of the inner sea's southern arm. The box reaches the Taitao peninsula (46.6°S) now, with every open face in the ocean, and the atlas carries its inferred minor constituents. Over four days: 3–6 cm at Ancud (TPXO10 itself 18–26 cm), 10–14 cm at Melinka (1–4 cm), 29–36 cm at Puerto Montt (6–15 cm), where the tide is 25 min late and 8–17 % too large. The case runs on a coastline mesh now (`scripts/gmsh_coastline_mesh.py`, 500 m at the coast): the lag is gone (3–6 min in the inner sea) and over four days Puerto Montt scores 16–18 cm where the 1 km mesh scored 29–36, with the amplitude 22 % over the gauge at neaps and 7–9 % three days later (`notes/case-files.md`, with the sensitivity runs: friction is a weak lever, the passages' geometry the strong one).
+  - `Case::coriolis_source` builds the Coriolis term for the 2D and 3D runs in one place; `dgcom check`/`run` log it, and the placement with its hemispheres (42.75°S 73.80°W).
 
 - **Rivers in 3D cases (TODO P8.1; `notes/case-files.md`).** `[rivers]` (`file`, `snap_km`, `profile`) takes a river file's discharge, temperature and salinity into a 3D run as `froya_real_data rivers=` does, bit for bit (`cases/froya/rivers_3d.toml`, new): each river in the element of its mouth or snapped onto the mesh, those farther off listed and left out, the water entering the layers over the profile. `source::RiverProfile` parses from its text (`uniform`, `fraction:F`, `top:D`, `tapered:D`).
 

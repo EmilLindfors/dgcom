@@ -175,11 +175,18 @@ impl CaseFile {
             let path = self.resolve(&spec.file);
             let mut atlas = TidalAtlas::read(&path)
                 .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
-            if spec.correction == AtlasCorrection::Theory {
-                atlas
-                    .infer_from_theory()
-                    .map_err(|e| CaseError::Invalid(format!("{}: {e}", path.display())))?;
-            }
+            let invalid = |e| CaseError::Invalid(format!("{}: {e}", path.display()));
+            let correction = match spec.correction {
+                AtlasCorrection::None => String::new(),
+                AtlasCorrection::Theory => {
+                    atlas.infer_from_theory().map_err(invalid)?;
+                    ", corrected from theory".into()
+                }
+                AtlasCorrection::Minors => {
+                    let added = atlas.infer_missing_minors().map_err(invalid)?;
+                    format!(", {} of them inferred: {}", added.len(), added.join(" "))
+                }
+            };
             if let Some(gauge) = &spec.gauge {
                 for change in self.correct_at_gauge(&mut atlas, gauge)? {
                     notes.push(format!("tidal atlas {}: {change}", path.display()));
@@ -206,10 +213,7 @@ impl CaseFile {
                  {:.1} km from it made walls",
                 path.display(),
                 atlas.names().len(),
-                match spec.correction {
-                    AtlasCorrection::None => "",
-                    AtlasCorrection::Theory => ", corrected from theory",
-                },
+                correction,
                 coverage.n_faces(),
                 b.tag.name(),
                 spec.coverage_m / 1000.0
@@ -937,8 +941,14 @@ impl CaseFile {
         let parent = match atlas {
             Some(raw) if spec.correction != AtlasCorrection::None || spec.gauge.is_some() => {
                 let mut corrected = raw.clone();
-                if spec.correction == AtlasCorrection::Theory {
-                    corrected.infer_from_theory().map_err(|e| invalid(&e))?;
+                match spec.correction {
+                    AtlasCorrection::None => {}
+                    AtlasCorrection::Theory => {
+                        corrected.infer_from_theory().map_err(|e| invalid(&e))?
+                    }
+                    AtlasCorrection::Minors => {
+                        corrected.infer_missing_minors().map_err(|e| invalid(&e))?;
+                    }
                 }
                 if let Some(gauge) = &spec.gauge {
                     for change in self.correct_at_gauge(&mut corrected, gauge)? {

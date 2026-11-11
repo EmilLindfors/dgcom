@@ -419,6 +419,29 @@ impl TidalAtlas {
         Ok(())
     }
 
+    /// Add the minor constituents the atlas lacks
+    /// ([`AdmittanceInference::MINORS`]: 2N2, μ2, ν2, λ2, L2, T2) by linear
+    /// admittance from its M2, S2 and N2, and return their names. What the
+    /// atlas carries is kept: a global tide model has its own 2N2, K2 and
+    /// P1, and its prediction programs (OTPS, pyTMD) add the rest like
+    /// this. A run forced with the major constituents only lacks them
+    /// against a tide gauge.
+    pub fn infer_missing_minors(&mut self) -> Result<Vec<&'static str>, TidalAtlasError> {
+        let present = self.names();
+        let mut added = Vec::new();
+        for inference in &AdmittanceInference::MINORS {
+            if present
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(inference.name))
+            {
+                continue;
+            }
+            self.infer_by_admittance(inference)?;
+            added.push(canonical_name(inference.name).expect("inferred: a known constituent"));
+        }
+        Ok(added)
+    }
+
     /// Correct the atlas at a tide gauge whose reference constants are
     /// `gauge` ([`HarmonicAnalysis::fit_gauge_record`]).
     ///
@@ -1191,6 +1214,34 @@ mod tests {
         assert_eq!(atlas.names().len(), 3);
         let nu2 = AdmittanceInference::new("NU2", "N2", "M2");
         assert!(atlas.infer_by_admittance(&nu2).is_err());
+    }
+
+    /// The missing minors are added and nothing the atlas carries changes:
+    /// its own 2N2 and K2 stay, and a second call adds nothing.
+    #[test]
+    fn missing_minors_are_added_and_the_atlas_kept() {
+        let source = TidalAtlas::parse(
+            "8.0 63.0 100.0 M2 0.9 330.0\n8.0 63.0 100.0 S2 0.3 10.0\n\
+             8.0 63.0 100.0 N2 0.18 305.0\n8.0 63.0 100.0 2N2 0.05 280.0\n\
+             8.0 63.0 100.0 K2 0.068 18.0\n",
+        )
+        .unwrap();
+        let mut atlas = source.clone();
+        let added = atlas.infer_missing_minors().unwrap();
+        assert_eq!(added, vec!["MU2", "NU2", "LDA2", "L2", "T2"]);
+        assert_eq!(
+            atlas.points[0].constituents[..5],
+            source.points[0].constituents[..]
+        );
+        let t2 = atlas.points[0].constituents[9];
+        assert_eq!(t2.name, "T2");
+        // 0.056 of S2 (0.3 m at 10°), with 0.001 of M2
+        assert!((t2.eta.0 - 0.0563 * 0.3).abs() < 1e-3, "{:?}", t2.eta);
+        assert!((t2.eta.1 - 10.0).abs() < 3.0, "{:?}", t2.eta);
+        assert!(atlas.infer_missing_minors().unwrap().is_empty());
+        // Without N2 there is nothing to infer μ2 and ν2 from
+        let mut bare = TidalAtlas::parse(ATLAS).unwrap();
+        assert!(bare.infer_missing_minors().is_err());
     }
 
     /// Theory replaces a source's K2 and P1 by the equilibrium ratios to S2

@@ -75,9 +75,10 @@ pub struct SimulationResult {
     pub final_time: f64,
     /// Total number of time steps taken.
     pub n_steps: usize,
-    /// Minimum time step used.
+    /// Smallest time step the stability bounds (and `dt_max`) allowed. Steps
+    /// shortened to land on a callback time or the end are not counted.
     pub dt_min: f64,
-    /// Maximum time step used.
+    /// Largest time step the stability bounds (and `dt_max`) allowed.
     pub dt_max: f64,
     /// Total wall-clock time in seconds.
     pub wall_time: f64,
@@ -392,6 +393,12 @@ where
                 );
             }
 
+            // The step the stability bounds (and dt_max) allow is the one
+            // reported: a step shortened to land on an output time says
+            // nothing about the mesh or the flow
+            dt_min_used = dt_min_used.min(dt);
+            dt_max_used = dt_max_used.max(dt);
+
             // Don't overshoot the end time or the next callback time, and
             // don't leave a sliver of it: steps that should land exactly
             // (ten steps of 0.1 to 1.0) accumulate round-off, and the sliver
@@ -402,10 +409,6 @@ where
             if landed {
                 dt = target - t;
             }
-
-            // Track dt statistics
-            dt_min_used = dt_min_used.min(dt);
-            dt_max_used = dt_max_used.max(dt);
 
             // Advance the solution. Stiff damping (friction, wet/dry
             // relaxation) is implicit in every RK stage; limiters
@@ -664,6 +667,26 @@ mod tests {
                 result.dt_min
             );
         }
+    }
+
+    /// The reported step range is the stability bounds', not the slivers
+    /// that land on output times: a still lake has one step, whatever the
+    /// callback interval (a 37 h Chiloé run reported "dt 0.003–1.377 s").
+    #[test]
+    fn landing_steps_are_not_in_the_step_range() {
+        let (physics, mut state) = create_test_setup();
+        let sim = Simulation::new(physics, SSPRK3)
+            .with_cfl(0.5)
+            .with_callback_interval(0.037); // 2.3 of the CFL step (0.016)
+        let result = sim.run_with_callback(&mut state, 0.0, 0.2, |_, _| {});
+        assert!(result.success);
+        assert!(result.n_steps > 12, "{} steps", result.n_steps);
+        assert!(
+            result.dt_min > 0.999 * result.dt_max,
+            "dt {} to {}",
+            result.dt_min,
+            result.dt_max
+        );
     }
 
     /// An interval that is not a multiple of dt: callbacks land exactly on

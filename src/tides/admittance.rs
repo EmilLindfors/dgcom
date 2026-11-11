@@ -48,6 +48,7 @@ pub fn equilibrium_amplitude(name: &str) -> Option<f64> {
         "NU2" => 0.008_811,
         "LDA2" => 0.001_790,
         "L2" => 0.006_863,
+        "T2" => 0.006_614,
         "K1" => 0.141_565,
         "O1" => 0.100_514,
         "P1" => 0.046_843,
@@ -77,6 +78,22 @@ impl AdmittanceInference {
         Self::new("NU2", "N2", "M2"),
         Self::new("LDA2", "M2", "S2"),
         Self::new("L2", "M2", "S2"),
+    ];
+
+    /// The minor constituents a global tide model's prediction adds to its
+    /// major ones (OTPS, Ray's `perth`, pyTMD's `infer_minor`), as far as
+    /// they are semidiurnal: [`MINOR_SEMIDIURNALS`](Self::MINOR_SEMIDIURNALS)
+    /// and T2 from M2 and S2 (0.056 S2: its equilibrium ratio to S2, 0.0586,
+    /// at 96 % of the way from M2 to S2). Together they are 15 cm RMS of a
+    /// 1.4 m RMS tide at Puerto Montt (μ2 8.7, ν2 7.8, L2 6.0, T2 4.6 cm on
+    /// TPXO10), and shift a neap tide by 20 minutes.
+    pub const MINORS: [Self; 6] = [
+        Self::new("2N2", "N2", "M2"),
+        Self::new("MU2", "N2", "M2"),
+        Self::new("NU2", "N2", "M2"),
+        Self::new("LDA2", "M2", "S2"),
+        Self::new("L2", "M2", "S2"),
+        Self::new("T2", "M2", "S2"),
     ];
 
     /// `name` from `lower` and `upper`.
@@ -122,6 +139,16 @@ impl AdmittanceInference {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T2 is S2's neighbour: nearly its equilibrium ratio to S2 (0.0586;
+    /// OTPS takes 0.0585 S2), and next to nothing of M2.
+    #[test]
+    fn t2_follows_s2() {
+        let (wa, wb) = AdmittanceInference::MINORS[5].weights().unwrap();
+        assert_eq!(AdmittanceInference::MINORS[5].name, "T2");
+        assert!((wb - 0.0563).abs() < 5e-4, "{wb}");
+        assert!((wa - 0.0011).abs() < 2e-4, "{wa}");
+    }
 
     /// The weights are Ray's (`perth`, OTPS): 2N2 0.264 N2 − 0.0253 M2,
     /// μ2 0.298 N2 − 0.0264 M2, ν2 0.165 N2 + 0.00487 M2, λ2 0.0040 M2 +
