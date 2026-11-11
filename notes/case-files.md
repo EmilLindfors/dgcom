@@ -446,5 +446,20 @@ Tracking: #220 (Chiloé) and #221 (a coast-agnostic core). Chiloé (Los Lagos, C
       | Ancud | 3, 5, 5, 4, 4, 5, 6 cm | 0.86–0.95 | −14 to −26 min | 18, 21, 21, 22, 23, 24, 26 cm |
 
       The estimate made by adding the minors to the earlier run's series (32 cm, 11.5 cm, 3.9 cm in the first period) held. Ancud, on the open coast, is four to five times better than TPXO10. The inner sea is late by half an hour and Puerto Montt 8–17 % too large: that is what is left of the over-amplification, and it is the basin's response (bed, mouths), as above. The error at Puerto Montt grows over the four days as the tide grows towards springs.
+    - **The coastline mesh, GEBCO_2026 and the drag (2026-11-11; 37.26 h each, scored over the second M2 period, 24.84–37.26 h, with the minors).** The mesh: `scripts/gmsh_coastline_mesh.py dem=data/chiloe_gebco.tif bbox=-75.9,-46.6,-72.3,-41.3 coast=500 far=4000 dist=15000 min_water=1500 min_land=1500` (94,685 elements, shortest edge 84 m, `local_time_stepping_levels = 8`: 2277 steps of 42–84 s in 5432 s; the generator's default sizes left 18 non-convex quads).
+
+      | run | Puerto Montt | Melinka | Ancud |
+      |---|---|---|---|
+      | 1 km, GEBCO_2020 | 28.7 cm, ×1.17, +27 min | 12.7 cm, ×1.04, +35 min | 4.5 cm, ×0.95, −14 min |
+      | 1 km, GEBCO_2026 | 29.7 cm, ×1.25, +24 min | 14.4 cm, ×1.18, +35 min | 7.1 cm, ×1.04, +19 min |
+      | coastline mesh, Manning 0.025 | 15.9 cm, ×1.23, −1 min | 4.7 cm, ×1.15, +11 min | 3.1 cm, ×1.15, +7 min |
+      | coastline mesh, C_D 0.0025 | 12.7 cm, ×1.17, +6 min | 4.9 cm, ×1.09, +13 min | 2.8 cm, ×1.12, +12 min |
+      | TPXO10 with minors | 11.6 cm, ×0.88, +1 min | 1.7 cm, ×1.01, +2 min | 20.9 cm, ×0.80, −49 min |
+
+      - **The lag was the mesh.** Against TPXO10 with its minors on the lattice, the coastline run is 3–6 min late in the Gulf of Ancud and Reloncaví (25–31 on the 1 km mesh), 7–14 min through Boca del Guafo and Corcovado, 17–40 min down Moraleda. The reading above ("resonance too low: the bed or the mouths") was half right: the mouths as a staircase at 1 km, not the bed. The case uses the coastline mesh now.
+      - **What is left is amplitude:** 1.22–1.26 of TPXO10 in the north of the inner sea with the phase right, 1.04–1.09 already on the ocean side of Boca del Guafo, 0.92–0.95 on the shelf south-west of Guafo.
+      - **Drag is still a weak lever:** C_D = 0.0025 (Manning 0.025 is 1.2e-3 in 150 m) takes 5 points off (1.17–1.21 of TPXO10) and adds 5 min. The case keeps Manning: one neap window is too thin to tune on. Candidates for the rest: what `min_water=1500` removed (storage and narrows; Chacao's width on the mesh is not checked), the fjords missing at the head (Reloncaví's estuary, Comau, Castro), dissipation a depth-mean model lacks (internal tides).
+      - **GEBCO_2026 is no better than 2020 on the 1 km mesh** (above; a box of it from CEDA, `https://dap.ceda.ac.uk/bodc/gebco/global/gebco_2026/`). Its type-identifier grid: Boca del Guafo is 77 % predicted from gravity and Moraleda 68 %; Reloncaví and the Gulf of Ancud are 70 % measured, Chacao 83 %. No open gridded SHOA product was found; IFOP's MOSA grid (GEBCO and SHOA charts, 1 km) has no download (a request is drafted); the R/V Falkor (too) 2024 multibeam at MGDS (doi:10.60521/332326) is partial and CC BY-NC-SA.
+      - The lattice comparison must carry the same constituents as the run: against TPXO10's 14 majors alone a run with minors shows 25 min of "lag" on the open ocean in this window.
 - **`Case::coriolis_source` (2026-11-10):** the 2D and 3D runners each built the Coriolis term from `physics.coriolis`; they take it from one place now, and `dgcom check`/`run` log it and the placement with hemispheres ("placed about 42.7500°S 73.8000°W", "Coriolis f = -9.900e-5 s⁻¹ + 1.681e-11 m⁻¹ s⁻¹ × y"). Gate: `the_coriolis_term_follows_the_placement_in_both_hemispheres`.
 
