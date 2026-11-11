@@ -150,3 +150,21 @@ Asked for 2026-11-05: a video of the project to share on LinkedIn (16:9, ≈ 45 
 - **Found on the way:** the viewer had not compiled since `4d3a160` (2026-10-28, `TidalAtlas::boundary_tides` lost its `duration`): `viz/` is its own workspace, so dg-rs's `cargo test` and CI never build it. Fixed (`Scenario::froya` lost the argument too); TODO F.3 has the guard.
 - Gates: `record::tests` (the path file, keys hit and eased ends, the short way round, an eye key, the frame count, and the systems run once, which caught a B0001 query conflict in `hide_ui`), `surface::tests::a_scale_set_by_hand_stays_and_the_others_follow`.
 - **clippy `large_enum_variant`** on `scenario::Tide` (2026-11-05): the atlas variant is boxed (`Tide::Atlas(Box<BoundaryTides>)`); `viz/` is clippy-clean with `--all-targets`.
+
+### River water mixing into the sea (2026-11-09)
+- [x] The water coloured by **salinity** or **temperature** (`--colour salinity|temperature`, C, the Colour menu) of the layer shown (`,` `.`: the surface layer down, or the depth mean `Σ Δσ_l C_l`). It works in any 3D run, live or replayed, with cmocean's haline map for the salinity and thermal for the temperature.
+  - **Scale:** it spans the field's range in half units. An end steps out as soon as the field passes it, so the fresh water at a mouth is the low end however few its nodes, and back in once the field clears it by more than a step. Only wet nodes count: a dry node's tracers drift (P4.5). `--range LO,HI` fixes the scale.
+  - Status line: "layer:", not "current:", since the layer now sets the colouring too.
+- [x] **A case's rivers in the viewer:**
+  - A case's snapshot file lists its rivers (`river=name,x,y`, where each one's water enters, the largest first).
+  - The viewer marks them (`viz/src/rivers.rs`: a post from the bed to above the surface and a cross on the water, sized to the camera's distance).
+  - The number keys frame them after the stations, from 2 km and looking steeply down on the plume.
+  - With the pinned point's salinity profile and the halocline sheet, that shows a river's fresh water mixing into the sea.
+- [x] **`--screenshot` of a large replay** was black, or failed with "sending on a closed channel":
+  - **Cause:** the capture spawned the screenshot 10 frames after the shown time arrived and quit 30 frames later. A replay starts at once, before Bevy has compiled its pipelines, and Frøya's refined mesh (214k nodes) reads back more slowly than 30 frames.
+  - **Fix:** it now waits 5 s and 10 frames before the screenshot, and quits once the file is written (with a 3000-frame fallback).
+- **The run:** `cases/froya/rivers_coast_3d.toml --set run.duration_hours=4.5 --set output.interval_minutes=10 --set output.directory=../../output/river_mixing`, at the default `cfl_3d = 4` since the case has the 3D bed (2,358 steps, ≈ 3.3 h on 24 threads with two other runs alongside; `notes/inputs-forcing.md`, rivers).
+  - **View it:** `cd viz && cargo run --release -- --replay ../output/river_mixing/froya_rivers_coast_3d.dgsnap --colour salinity --layer surface --view 2`. Place 2 is river 853, the largest of the nine.
+  - **First 50 min:** a plume about 32.5 against 33–34 around 853's mouth.
+  - **At 4 h** (`--at 14400 --screenshot`): the plume leaves the shore at 853's marker, about 29.5 at the mouth and 31.5 a kilometre out, and spreads northeast against 33–34.
+- [ ] A vertical section through a mouth (S over distance and depth along a line between two pins): the pinned point's profile shows one column, and a plume's mixing is a section's story.

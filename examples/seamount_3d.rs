@@ -258,7 +258,8 @@ fn main() {
     }
     println!(
         "seamount_3d: {nx}×{nx} P{order} ({:.2} km node spacing), {nl} {} levels, \
-         H₀ {depth} m, A {amp}, L {:.1} km, f {f:.1e}, profile {profile}, ν {viscosity:.0e},          {pgf:?}, {momentum_form:?} momentum{}",
+         H₀ {depth} m, A {amp}, L {:.1} km, f {f:.1e}, profile {profile}, ν {viscosity:.0e}, \
+         {pgf:?}, {momentum_form:?} momentum{}",
         domain / nx as f64 / order as f64 / 1e3,
         if uniform != 0 { "uniform" } else { "stretched" },
         width / 1e3,

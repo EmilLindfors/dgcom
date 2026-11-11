@@ -1606,7 +1606,20 @@ fn fjord_elevation(lon: f64, lat: f64) -> f64 {
 /// A case on the fjord raster in `dir`, sampled at the nodes, its land
 /// kept, with `bathymetry` appended to its `[bathymetry]`.
 fn fjord_case(dir: &Path, bathymetry: &str) -> CaseFile {
-    write_raster(&dir.join("fjord.tif"), BAY, (200, 100), fjord_elevation);
+    let friction = "[physics]\nfriction = { manning = 0.025 }";
+    raster_case(dir, fjord_elevation, bathymetry, friction)
+}
+
+/// A case on a raster of `elevation` over `BAY` in `dir`, sampled at the
+/// nodes, its land kept, with `bathymetry` appended to its `[bathymetry]`
+/// and `sections` (such as `[physics]` or `[three_d]`) to the file.
+fn raster_case(
+    dir: &Path,
+    elevation: fn(f64, f64) -> f64,
+    bathymetry: &str,
+    sections: &str,
+) -> CaseFile {
+    write_raster(&dir.join("fjord.tif"), BAY, (200, 100), elevation);
     let text = format!(
         r#"
         [run]
@@ -1626,17 +1639,86 @@ fn fjord_case(dir: &Path, bathymetry: &str) -> CaseFile {
         kind = "topobathy"
         sampling = "point"
 
-        [physics]
-        friction = {{ manning = 0.025 }}
-
         [[boundary]]
         tag = "open"
         still = {{}}
+
+        {sections}
         "#
     );
     let path = dir.join("case.toml");
     std::fs::write(&path, text).unwrap();
     CaseFile::read(&path, &[]).unwrap()
+}
+
+/// Regression (the refined Frøya mesh, 2026-11-09): a 3D run on a raster
+/// bed takes `[bathymetry.slopes_3d]`'s defaults when the case leaves it
+/// out, and reports how many elements its bed has over the σ-levels' slope
+/// bound, with a warning when the bed was left as it is. Frøya's river case
+/// left it out and resolved cliffs (a 1.1 m node beside 75–84 m ones) whose
+/// σ-level currents reached 21 m/s and blew the run up, with nothing in the
+/// log to say why; its plain r_x0 (0.97, and 0.90 treated) would not have
+/// told the beds apart.
+#[test]
+fn a_3d_run_on_a_raster_bed_takes_the_3d_bed_by_default() {
+    // A 2 m shelf against a 60 m basin: the bound allows max(19, R·2) =
+    // 19 m beside the shelf, so the basin is 41 m too deep
+    fn cliff(_lon: f64, lat: f64) -> f64 {
+        match lat {
+            l if l < 63.53 => -2.0,
+            l if l < 63.57 => -60.0,
+            _ => 3.0,
+        }
+    }
+    let three_d = "[three_d]\nlevels = 6\nprofile = [[-6.0, 14.0, 32.0], [-14.0, 10.0, 34.0]]";
+    let notes = |bathymetry: &str, sections: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        raster_case(dir.path(), cliff, bathymetry, sections)
+            .build_domain()
+            .unwrap()
+            .notes
+    };
+    let has = |notes: &[String], text: &str| notes.iter().any(|n| n.contains(text));
+    let within = "3D bed: every element within the σ-levels' slope bound";
+    let by_default = "3D bed: [bathymetry.slopes_3d]'s defaults";
+
+    // Left out, a 3D run smooths the bed and says so
+    let default = notes("", three_d);
+    assert!(has(&default, by_default), "{default:?}");
+    assert!(has(&default, "smoothed for 3D"), "{default:?}");
+    assert!(has(&default, within), "{default:?}");
+    assert!(!has(&default, "warning: σ-levels"), "{default:?}");
+
+    // Switched off, the bed is over the bound and the run is warned
+    let steep = notes("slopes_3d = false", three_d);
+    assert!(!has(&steep, "smoothed for 3D"), "{steep:?}");
+    let report = steep
+        .iter()
+        .find(|n| n.starts_with("3D bed: "))
+        .unwrap_or_else(|| panic!("no slope report: {steep:?}"));
+    assert!(
+        report.contains("elements over the σ-levels' slope bound"),
+        "{report}"
+    );
+    assert!(report.contains("the largest 41.0 m too deep"), "{report}");
+    assert!(
+        has(
+            &steep,
+            "warning: σ-levels across these slopes drive spurious currents that can blow the run \
+             up; leave out `slopes_3d = false`"
+        ),
+        "{steep:?}"
+    );
+
+    // Written out, the case's own bed, without the default's note
+    let written = notes("[bathymetry.slopes_3d]", three_d);
+    assert!(has(&written, within), "{written:?}");
+    assert!(!has(&written, by_default), "{written:?}");
+
+    // A 2D run is not a σ-level model: its bed is the raster's
+    let flat = notes("", "");
+    assert!(!has(&flat, "3D bed"), "{flat:?}");
+    assert!(!has(&flat, "smoothed for 3D"), "{flat:?}");
 }
 
 /// `[bathymetry.slopes_3d]` is `froya_real_data slopes3d=on`: the library's
@@ -2153,7 +2235,12 @@ fn a_rivers_water_fills_a_closed_3d_basin() {
     let projection = LocalProjection::new(ORIGIN.0, ORIGIN.1);
     let mouth = |id: i64, x: f64, y: f64| {
         let (lat, lon) = projection.xy_to_geo(x, y);
-        RiverMouth { id, lon, lat }
+        RiverMouth {
+            id,
+            lon,
+            lat,
+            inland: None,
+        }
     };
     // Constant over two days around the run
     let day = 86_400.0;

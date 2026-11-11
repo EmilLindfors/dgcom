@@ -18,15 +18,27 @@
 //! water enters with no momentum of its own (`hu`, `hv` are untouched, so the
 //! river dilutes the local velocity), as ROMS's `LwSrc` point sources do.
 //!
-//! The mouth is the river's position. River databases put mouths on the
-//! coastline, often a little inland of a mesh's water: a mouth outside the
+//! The mouth is the river's position. A parent model's mouth lies on its own
+//! coastline, a face of its grid between a land cell and a sea cell: on a
+//! finer mesh that face can be open water, hundreds of metres off the shore
+//! the river reaches, and the parent's land cell can be water too (its
+//! 800 m land mask closes sounds and joins skerries). A river from a parent
+//! (with an `inland` point, the parent's land cell) enters from land: at the
+//! *shore element* nearest the segment from its face to its land cell, an
+//! element under water at every node with a neighbour that is not, or a
+//! wall face (the coast; an open boundary is not one), within the given
+//! distance of the mouth. Otherwise,
+//! river databases put mouths on the coastline, often a little inland of a
+//! mesh's water: a mouth outside the
 //! mesh, or in an element on the coast (one with a node on land), moves to
 //! the nearest element under water within a given distance, as FVCOM's and
-//! SCHISM's sources must sit in the water. A mouth outside the mesh whose
-//! nearest boundary is open is left out: it lies outside the domain, and the
-//! water that enters through the boundary (a parent model's, which has its
-//! own rivers) carries it in; placed inside, its water would enter twice, or
-//! be relaxed away in a nesting band. In a coastal element the water
+//! SCHISM's sources must sit in the water. A mouth outside the mesh and
+//! beyond the nearest boundary face nested in a parent model (on the far
+//! side of its line) is left out: it lies outside the domain, and the parent's water (with its own rivers) carries it in
+//! through the boundary; placed inside, its water would enter twice, or be
+//! relaxed away in the nesting band. Beyond any other boundary (a wall, or
+//! an open boundary with only a tide or still water outside) nothing brings
+//! it in, and it moves to the nearest element under water. In a coastal element the water
 //! would stand on the land nodes at the land's height (TODO P1.6: η of 5 m
 //! on the 5 m land of the Frøya mesh, with the rate shared evenly), or crowd
 //! into the element's sliver of water and spill up the beach.
@@ -65,7 +77,7 @@
 use thiserror::Error;
 
 use crate::mesh::PointLocator2D;
-use crate::mesh::{Bathymetry2D, Mesh2D};
+use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use crate::operators::GeometricFactors2D;
 use crate::solver::{Blocks, SWEState2D};
 use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
@@ -288,6 +300,11 @@ pub struct River {
     pub name: String,
     /// Mouth position in the mesh coordinates (m).
     pub position: [f64; 2],
+    /// A point on land the river comes from (m), if known: a parent model's
+    /// land cell behind its mouth on the parent's coarser coast. The river
+    /// then enters at the mesh's shore nearest the segment from the mouth to
+    /// it (see the module docs).
+    pub inland: Option<[f64; 2]>,
     /// Discharge `Q` (m³/s, ≥ 0).
     pub discharge: RiverSeries,
     /// Temperature of the river water (°C; 3D only).
@@ -306,6 +323,7 @@ impl River {
         Self {
             name: name.into(),
             position,
+            inland: None,
             discharge: RiverSeries::constant(discharge),
             temperature: RiverSeries::constant(5.0),
             salinity: RiverSeries::constant(0.0),
@@ -334,6 +352,12 @@ impl River {
     /// With a vertical distribution of the inflow.
     pub fn with_profile(mut self, profile: RiverProfile) -> Self {
         self.profile = profile;
+        self
+    }
+
+    /// Coming from `inland` (m), a point on land behind the mouth.
+    pub fn with_inland(mut self, inland: Option<[f64; 2]>) -> Self {
+        self.inland = inland;
         self
     }
 }
@@ -375,20 +399,20 @@ pub enum RiverError {
         /// Allowed snapping distance (m)
         max_snap: f64,
     },
-    /// A mouth beyond an open boundary: outside the domain, where the water
-    /// that enters through the boundary (a parent model's) carries it.
+    /// A mouth beyond a boundary nested in a parent model: outside the
+    /// domain, where the parent's water carries it in.
     #[error(
-        "river {name}: the mouth at ({x:.0}, {y:.0}) m lies {distance:.0} m beyond an open \
-         boundary, whose water carries it in"
+        "river {name}: the mouth at ({x:.0}, {y:.0}) m lies {distance:.0} m beyond a nested \
+         boundary, whose parent's water carries it in"
     )]
-    BeyondOpenBoundary {
+    BeyondParentBoundary {
         /// River name
         name: String,
         /// Mouth position (m)
         x: f64,
         /// Mouth position (m)
         y: f64,
-        /// Distance to the open boundary (m)
+        /// Distance to the nested boundary (m)
         distance: f64,
     },
 }
@@ -423,15 +447,19 @@ impl RiverSources {
     /// Place `rivers` on `mesh` over its still-water bed `bathymetry` (the
     /// model's own): each in the element holding its mouth if that element
     /// is under water, or else in the nearest element under water if it is
-    /// within `max_snap` (m) of the mouth.
+    /// within `max_snap` (m) of the mouth. A mouth outside the mesh and
+    /// beyond the nearest face with one of `parent_tags` (the faces nested in
+    /// a parent model, whose water carries the rivers beyond them in) is left
+    /// out.
     pub fn new(
         rivers: Vec<River>,
         mesh: &Mesh2D,
         geom: &GeometricFactors2D,
         bathymetry: &Bathymetry2D,
         max_snap: f64,
+        parent_tags: &[BoundaryTag],
     ) -> Result<Self, RiverError> {
-        let placer = Placer::new(mesh, bathymetry);
+        let placer = Placer::new(mesh, bathymetry, parent_tags);
         let placed = rivers
             .iter()
             .map(|river| placer.place(river, max_snap))
@@ -440,17 +468,18 @@ impl RiverSources {
     }
 
     /// [`Self::new`] for the rivers that can be placed, with the errors of
-    /// those that cannot (a mouth beyond `max_snap` of the water, a negative
-    /// discharge): for rivers selected by a box around a mesh, some of which
-    /// flow into water the mesh does not reach.
+    /// those that cannot (a mouth beyond `max_snap` of the water or beyond a
+    /// parent's boundary, a negative discharge): for rivers selected by a box
+    /// around a mesh, some of which flow into water the mesh does not reach.
     pub fn on_mesh(
         rivers: Vec<River>,
         mesh: &Mesh2D,
         geom: &GeometricFactors2D,
         bathymetry: &Bathymetry2D,
         max_snap: f64,
+        parent_tags: &[BoundaryTag],
     ) -> (Self, Vec<RiverError>) {
-        let placer = Placer::new(mesh, bathymetry);
+        let placer = Placer::new(mesh, bathymetry, parent_tags);
         let (mut kept, mut placed, mut errors) = (Vec::new(), Vec::new(), Vec::new());
         for river in rivers {
             match placer.place(&river, max_snap) {
@@ -654,13 +683,16 @@ struct Placer<'m> {
     /// The elements under water, with their bounding boxes
     /// `[x_min, y_min, x_max, y_max]`.
     water: Vec<(ElementIndex, [f64; 4])>,
-    /// The boundary faces, as their end points and whether they are open
-    /// (open, tidal or river faces: [`crate::mesh::BoundaryTag::is_open`]).
-    boundary: Vec<([f64; 2], [f64; 2], bool)>,
+    /// The boundary faces nested in a parent (their tag is one of the
+    /// parent's), as their end points and their element's centre.
+    nested: Vec<([f64; 2], [f64; 2], [f64; 2])>,
+    /// The shore: elements under water with a neighbour that is not, or a
+    /// wall face (the coast).
+    shore: Vec<ElementIndex>,
 }
 
 impl<'m> Placer<'m> {
-    fn new(mesh: &'m Mesh2D, bathymetry: &Bathymetry2D) -> Self {
+    fn new(mesh: &'m Mesh2D, bathymetry: &Bathymetry2D, parent_tags: &[BoundaryTag]) -> Self {
         let wet: Vec<bool> = (0..mesh.n_elements)
             .map(|k| {
                 bathymetry
@@ -686,27 +718,47 @@ impl<'m> Placer<'m> {
                 (k, bounds)
             })
             .collect();
-        let mut boundary = Vec::new();
+        let mut nested = Vec::new();
         for k in ElementIndex::iter(mesh.n_elements) {
             let corners = mesh.element_vertices(k);
-            for face in (0..4).filter(|&f| mesh.is_boundary_face(k, f)) {
-                let open = mesh.boundary_tag(k, face).is_some_and(|tag| tag.is_open());
-                boundary.push((corners[face], corners[(face + 1) % 4], open));
+            let centre = corners
+                .iter()
+                .fold([0.0, 0.0], |c, v| [c[0] + 0.25 * v[0], c[1] + 0.25 * v[1]]);
+            for face in 0..4 {
+                let tag = mesh.boundary_tag(k, face);
+                if mesh.is_boundary_face(k, face) && tag.is_some_and(|t| parent_tags.contains(&t)) {
+                    nested.push((corners[face], corners[(face + 1) % 4], centre));
+                }
             }
         }
+        let shore = (0..mesh.n_elements)
+            .map(ElementIndex::new)
+            .filter(|&k| {
+                wet[k.as_usize()]
+                    && (0..4).any(|f| match mesh.neighbor(k, f) {
+                        _ if mesh.is_boundary_face(k, f) => {
+                            mesh.boundary_tag(k, f).is_none_or(|t| t.is_wall())
+                        }
+                        Some(other) => !wet[other.element],
+                        None => true,
+                    })
+            })
+            .collect();
         Self {
             mesh,
             locator: PointLocator2D::new(mesh),
             wet,
             water,
-            boundary,
+            nested,
+            shore,
         }
     }
 
     /// The element holding `river`'s mouth if it is under water, or else
     /// the nearest element under water within `max_snap`, with the distance
-    /// the mouth moves. A mouth outside the mesh whose nearest boundary is
-    /// open lies outside the domain: the water entering there carries it.
+    /// the mouth moves. A mouth outside the mesh and beyond the nearest
+    /// face nested in a parent (on the other side of its line from its
+    /// element) lies outside the domain: the parent's water carries it in.
     fn place(&self, river: &River, max_snap: f64) -> Result<(ElementIndex, f64), RiverError> {
         let low = river.discharge.min();
         if low < 0.0 {
@@ -716,27 +768,24 @@ impl<'m> Placer<'m> {
             });
         }
         let p = river.position;
-        match self.locator.locate(p) {
+        let located = self.locator.locate(p);
+        if located.is_none()
+            && let Some(error) = self.beyond_parent(river)
+        {
+            return Err(error);
+        }
+        // From a parent's grid: in from land, at the shore nearest the
+        // segment from the face to the parent's land cell
+        if let Some(q) = river.inland
+            && let Some((k, moved)) = self.shore_toward(p, q, max_snap)
+        {
+            return Ok((k, moved));
+        }
+        match located {
             Some(point) if self.wet[point.element.as_usize()] => {
                 return Ok((point.element, 0.0));
             }
-            Some(_) => {}
-            None => {
-                let (distance, open) = self
-                    .boundary
-                    .iter()
-                    .map(|&(a, b, open)| (distance_to_segment(a, b, p), open))
-                    .min_by(|x, y| x.0.total_cmp(&y.0))
-                    .unwrap_or((f64::INFINITY, false));
-                if open {
-                    return Err(RiverError::BeyondOpenBoundary {
-                        name: river.name.clone(),
-                        x: p[0],
-                        y: p[1],
-                        distance,
-                    });
-                }
-            }
+            _ => {}
         }
         // The bounding box is never farther than the element: skip the
         // elements whose box is beyond the nearest so far
@@ -765,12 +814,109 @@ impl<'m> Placer<'m> {
     }
 }
 
+impl Placer<'_> {
+    /// The error of a mouth outside the mesh that lies beyond the nearest
+    /// face nested in a parent (on the far side of its line from its
+    /// element): outside the domain, where the parent's water carries it in.
+    fn beyond_parent(&self, river: &River) -> Option<RiverError> {
+        let p = river.position;
+        // Beyond the nearest nested face's line, on the side away
+        // from its element: outside the domain (wherever the coast
+        // runs between the mouth and the face)
+        let nearest = self
+            .nested
+            .iter()
+            .map(|&(a, b, c)| (distance_to_segment(a, b, p), a, b, c))
+            .min_by(|x, y| x.0.total_cmp(&y.0));
+        let side = |a: [f64; 2], b: [f64; 2], q: [f64; 2]| {
+            (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0])
+        };
+        if let Some((distance, a, b, c)) = nearest
+            && side(a, b, p) * side(a, b, c) < 0.0
+        {
+            return Some(RiverError::BeyondParentBoundary {
+                name: river.name.clone(),
+                x: p[0],
+                y: p[1],
+                distance,
+            });
+        }
+        None
+    }
+
+    /// The shore element nearest the segment from the mouth `p` to the land
+    /// point `q`, if one is within `max_snap` of `p`, with its distance from
+    /// `p`.
+    fn shore_toward(&self, p: [f64; 2], q: [f64; 2], max_snap: f64) -> Option<(ElementIndex, f64)> {
+        self.shore
+            .iter()
+            .map(|&k| {
+                let corners = self.mesh.element_vertices(k);
+                (
+                    k,
+                    distance_quad_segment(&corners, p, q),
+                    distance_to_quad_or_in(&corners, p),
+                )
+            })
+            .filter(|&(_, _, from_p)| from_p <= max_snap)
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
+            .map(|(k, _, from_p)| (k, from_p))
+    }
+}
+
 /// Distance from `p` to the quadrilateral with straight edges `vertices`
 /// (counter-clockwise), for a point outside it.
 fn distance_to_quad(vertices: &[[f64; 2]; 4], p: [f64; 2]) -> f64 {
     (0..4)
         .map(|e| distance_to_segment(vertices[e], vertices[(e + 1) % 4], p))
         .fold(f64::INFINITY, f64::min)
+}
+
+/// Distance from `p` to the quadrilateral `vertices` (counter-clockwise),
+/// zero inside it.
+fn distance_to_quad_or_in(vertices: &[[f64; 2]; 4], p: [f64; 2]) -> f64 {
+    if inside_quad(vertices, p) {
+        0.0
+    } else {
+        distance_to_quad(vertices, p)
+    }
+}
+
+/// Whether `p` is inside the convex quadrilateral `vertices` (either
+/// orientation).
+fn inside_quad(vertices: &[[f64; 2]; 4], p: [f64; 2]) -> bool {
+    let sides: Vec<f64> = (0..4)
+        .map(|e| cross(vertices[e], vertices[(e + 1) % 4], p))
+        .collect();
+    sides.iter().all(|&s| s >= 0.0) || sides.iter().all(|&s| s <= 0.0)
+}
+
+/// Distance between the quadrilateral `vertices` (with its inside) and the
+/// segment from `a` to `b`.
+fn distance_quad_segment(vertices: &[[f64; 2]; 4], a: [f64; 2], b: [f64; 2]) -> f64 {
+    if inside_quad(vertices, a) || inside_quad(vertices, b) {
+        return 0.0;
+    }
+    (0..4)
+        .map(|e| distance_segments(vertices[e], vertices[(e + 1) % 4], a, b))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// `(b − a) × (p − a)`: positive with `p` left of the line from `a` to `b`.
+fn cross(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+}
+
+/// Distance between the segments `a`–`b` and `c`–`d` (zero if they cross).
+fn distance_segments(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> f64 {
+    let crosses = cross(a, b, c) * cross(a, b, d) < 0.0 && cross(c, d, a) * cross(c, d, b) < 0.0;
+    if crosses {
+        return 0.0;
+    }
+    distance_to_segment(a, b, c)
+        .min(distance_to_segment(a, b, d))
+        .min(distance_to_segment(c, d, a))
+        .min(distance_to_segment(c, d, b))
 }
 
 /// Distance from `p` to the segment from `a` to `b`.
@@ -1079,7 +1225,7 @@ mod tests {
             // 30 m north of the top boundary, above element (3, 1)
             River::new("outside", [350.0, 230.0], 1.0),
         ];
-        let sources = RiverSources::new(rivers, &mesh, &geom, &bed, 50.0).unwrap();
+        let sources = RiverSources::new(rivers, &mesh, &geom, &bed, 50.0, &[]).unwrap();
         let locator = PointLocator2D::new(&mesh);
         let inside = locator.locate([150.0, 50.0]).unwrap().element;
         let corner = locator.locate([350.0, 190.0]).unwrap().element;
@@ -1104,12 +1250,12 @@ mod tests {
 
         let far = vec![River::new("far", [350.0, 300.0], 1.0)];
         assert!(matches!(
-            RiverSources::new(far, &mesh, &geom, &bed, 50.0),
+            RiverSources::new(far, &mesh, &geom, &bed, 50.0, &[]),
             Err(RiverError::FarFromWater { .. })
         ));
         let negative = vec![River::new("dry", [10.0, 10.0], -1.0)];
         assert!(matches!(
-            RiverSources::new(negative, &mesh, &geom, &bed, 50.0),
+            RiverSources::new(negative, &mesh, &geom, &bed, 50.0, &[]),
             Err(RiverError::NegativeDischarge { .. })
         ));
 
@@ -1120,7 +1266,7 @@ mod tests {
             River::new("dry", [10.0, 10.0], -1.0),
             River::new("outside", [350.0, 230.0], 1.0),
         ];
-        let (sources, errors) = RiverSources::on_mesh(rivers, &mesh, &geom, &bed, 50.0);
+        let (sources, errors) = RiverSources::on_mesh(rivers, &mesh, &geom, &bed, 50.0, &[]);
         assert_eq!(sources.len(), 2);
         assert_eq!(sources.river(0).name, "inside");
         assert_eq!(sources.element(0), inside);
@@ -1143,7 +1289,7 @@ mod tests {
         let (mesh, ops, geom, bed) = mesh();
         let discharge = RiverSeries::new(vec![0.0, 100.0], vec![4.0, 8.0]).unwrap();
         let rivers = vec![River::new("r", [250.0, 150.0], 0.0).with_discharge(discharge)];
-        let sources = RiverSources::new(rivers, &mesh, &geom, &bed, 0.0).unwrap();
+        let sources = RiverSources::new(rivers, &mesh, &geom, &bed, 0.0, &[]).unwrap();
         let solution = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
         let nn = ops.n_nodes;
         let mut total = 0.0;
@@ -1185,12 +1331,12 @@ mod tests {
             // On land, 150 m from the water
             River::new("inland", [350.0, 50.0], 1.0),
         ];
-        let sources = RiverSources::new(rivers.clone(), &mesh, &geom, &bed, 150.0).unwrap();
+        let sources = RiverSources::new(rivers.clone(), &mesh, &geom, &bed, 150.0, &[]).unwrap();
         for (i, distance) in [0.0, 20.0, 150.0].into_iter().enumerate() {
             assert_eq!(sources.element(i), at(150.0), "{}", rivers[i].name);
             assert!((sources.snap_distance(i) - distance).abs() < 1e-9);
         }
-        let too_far = RiverSources::new(rivers, &mesh, &geom, &bed, 149.0);
+        let too_far = RiverSources::new(rivers, &mesh, &geom, &bed, 149.0, &[]);
         assert!(
             matches!(too_far, Err(RiverError::FarFromWater { distance, .. })
             if (distance - 150.0).abs() < 1e-9)
@@ -1227,8 +1373,8 @@ mod tests {
 
         // Off the mesh, 50 m from its (dry) edge but 250 m from its water
         let off = vec![River::new("off", [450.0, 50.0], 1.0)];
-        assert!(RiverSources::new(off.clone(), &mesh, &geom, &bed, 249.0).is_err());
-        let off = RiverSources::new(off, &mesh, &geom, &bed, 250.0).unwrap();
+        assert!(RiverSources::new(off.clone(), &mesh, &geom, &bed, 249.0, &[]).is_err());
+        let off = RiverSources::new(off, &mesh, &geom, &bed, 250.0, &[]).unwrap();
         assert_eq!(off.element(0), k);
 
         // The levels are laid over the bed the rivers were placed on
@@ -1243,11 +1389,11 @@ mod tests {
         ));
     }
 
-    /// A mouth beyond an open boundary lies outside the domain, where the
-    /// water entering through the boundary (a parent model's) carries it:
-    /// left out, not snapped in. One beyond a wall still snaps.
+    /// A mouth beyond a boundary nested in a parent lies outside the domain,
+    /// where the parent's water carries it in: left out, not snapped in. One
+    /// beyond a wall, or beyond an open boundary with no parent, still snaps.
     #[test]
-    fn a_mouth_beyond_an_open_boundary_is_left_out() {
+    fn a_mouth_beyond_a_parents_boundary_is_left_out() {
         use crate::mesh::BoundaryTag::{Open, Wall};
         // Open to the east, walls on the other sides
         let mesh = Mesh2D::uniform_rectangle_with_sides(
@@ -1269,21 +1415,51 @@ mod tests {
             River::new("north", [340.0, 230.0], 2.0),
             River::new("inside", [390.0, 50.0], 3.0),
         ];
-        let (sources, errors) = RiverSources::on_mesh(rivers, &mesh, &geom, &bed, 100.0);
+        let (sources, errors) = RiverSources::on_mesh(rivers, &mesh, &geom, &bed, 100.0, &[Open]);
         assert_eq!(sources.len(), 2);
         assert_eq!(sources.river(0).name, "north");
         assert!((sources.snap_distance(0) - 30.0).abs() < 1e-9);
         assert_eq!(sources.river(1).name, "inside");
         assert!(matches!(
             errors.as_slice(),
-            [RiverError::BeyondOpenBoundary { name, distance, .. }]
+            [RiverError::BeyondParentBoundary { name, distance, .. }]
                 if name == "east" && (distance - 50.0).abs() < 1e-9
         ));
         // However close: the parent carries it
         let near = vec![River::new("near", [400.5, 50.0], 1.0)];
         assert!(matches!(
-            RiverSources::new(near, &mesh, &geom, &bed, 1e4),
-            Err(RiverError::BeyondOpenBoundary { .. })
+            RiverSources::new(near.clone(), &mesh, &geom, &bed, 1e4, &[Open]),
+            Err(RiverError::BeyondParentBoundary { .. })
+        ));
+        // An open boundary not nested in a parent (a tide, still water)
+        // brings no river in: the mouth snaps to the nearest water
+        let alone = RiverSources::new(near, &mesh, &geom, &bed, 1.0, &[]).unwrap();
+        assert!((alone.snap_distance(0) - 0.5).abs() < 1e-9);
+
+        // Nested to the south only: beyond its line is outside the domain,
+        // though a wall lies as near (the coast between the mouth and the
+        // nested faces, as at Frøya's southern edge); short of it, beside
+        // the east wall, the mouth snaps in
+        let south = Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            400.0,
+            0.0,
+            200.0,
+            4,
+            2,
+            [Open, Wall, Wall, Wall],
+        );
+        let rivers = vec![
+            River::new("south-east", [480.0, -5.0], 1.0),
+            River::new("east", [480.0, 5.0], 1.0),
+        ];
+        let (sources, errors) = RiverSources::on_mesh(rivers, &south, &geom, &bed, 100.0, &[Open]);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources.river(0).name, "east");
+        assert!((sources.snap_distance(0) - 80.0).abs() < 1e-9);
+        assert!(matches!(
+            errors.as_slice(),
+            [RiverError::BeyondParentBoundary { name, .. }] if name == "south-east"
         ));
     }
 
@@ -1297,5 +1473,54 @@ mod tests {
         // Within one piece: the mean of its ends
         assert!((s.mean_over(2.0, 6.0) - s.at(4.0)).abs() < 1e-15);
         assert_eq!(s.mean_over(5.0, 5.0), s.at(5.0));
+    }
+
+    /// A parent's mouth in open water, with the land cell behind it: the river
+    /// enters from land, at the shore element nearest the segment from the
+    /// mouth to its land, not out in the water at the mouth.
+    #[test]
+    fn a_river_enters_where_it_meets_the_water_from_its_land() {
+        // Open on every side: no wall is a shore here
+        let mesh = Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            400.0,
+            0.0,
+            200.0,
+            4,
+            2,
+            [crate::mesh::BoundaryTag::Open; 4],
+        );
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        // The coast at x = 250 m, across the elements of 200–300 m
+        let bed = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| (x - 250.0) / 10.0);
+        let locator = PointLocator2D::new(&mesh);
+        let at = |x: f64| locator.locate([x, 50.0]).unwrap().element;
+        // The parent's face 150 m out from the first element under water,
+        // its land cell 300 m behind, on land
+        let river = River::new("parent", [50.0, 50.0], 1.0).with_inland(Some([350.0, 50.0]));
+        let sources =
+            RiverSources::new(vec![river.clone()], &mesh, &geom, &bed, 1000.0, &[]).unwrap();
+        assert_eq!(sources.element(0), at(150.0));
+        // From the mouth to the shore element's near side
+        assert!(
+            (sources.snap_distance(0) - 50.0).abs() < 1e-9,
+            "{}",
+            sources.snap_distance(0)
+        );
+        // Beyond the allowed distance: the mouth's own element, as without one
+        let near = RiverSources::new(vec![river.clone()], &mesh, &geom, &bed, 40.0, &[]).unwrap();
+        assert_eq!(near.element(0), at(50.0));
+        assert_eq!(near.snap_distance(0), 0.0);
+        let plain = RiverSources::new(
+            vec![river.with_inland(None)],
+            &mesh,
+            &geom,
+            &bed,
+            1000.0,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plain.element(0), at(50.0));
     }
 }

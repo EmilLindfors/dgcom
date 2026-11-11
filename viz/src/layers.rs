@@ -15,6 +15,9 @@ use crate::screen::{RunResources, Viewing};
 #[derive(Resource, Clone, Debug)]
 pub struct Levels {
     pub sigma: Vec<f32>,
+    /// The layers' thicknesses Δσ_l from the bed up, summing to one (the depth
+    /// means of the salinity and temperature)
+    pub d_sigma: Vec<f32>,
     /// Water depth at rest at the farm (m)
     pub depth: f32,
 }

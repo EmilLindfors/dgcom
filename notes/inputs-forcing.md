@@ -64,6 +64,61 @@
       - 9 of 13 rivers are placed, 0.9 of the file's 2.1 m³/s (run means, now exact: `RiverSeries::mean_over`). The four outside the box are listed as beyond the open boundary.
       - η max 1.807 m. The case equals `froya_real_data rivers=` bit for bit (7 frames).
       - Inside, the snaps are 843 1162 m, 851 616 m, 849 499 m and 850 212 m: the 500 m geographic grid's coastal elements all touch land. That is the mesh-refinement item in `TODO.md`.
+  - [x] Only a parent's boundary takes rivers in (2026-11-09, `feat/mesh-river-mouths`).
+    - **Why:** #211 left out any mouth outside the mesh whose nearest boundary face was open. Beyond a tide-only or radiation boundary, though, nothing brings the river in.
+    - **Inputs:** `RiverSources::new`/`on_mesh` now take the parent's boundary tags. A case gives those of its `[boundary.nesting]` sections, and `froya_real_data` gives `open` with `norkyst=`.
+    - **Test:** a mouth outside the mesh is left out if it lies on the far side of the nearest nested face's line from that face's element. The old test, "the nearest face is open", depended on where the coast runs. On the plain Frøya coastline mesh a coastal wall is nearer than the open faces to rivers 836 and 837, south of the box, so they were snapped 1.7–1.9 km in. Now the geographic grid, the coastline mesh and the refined mesh all leave out the same four (836, 837, 844, 845).
+    - **Gate:** `a_mouth_beyond_a_parents_boundary_is_left_out`:
+      - beyond the nested face, 0.5 m out with a 10 km snap allowed: left out;
+      - with no parent: snapped in;
+      - beyond the line of a nested south side, though as near the east wall: left out;
+      - short of that line, beside the east wall: snapped in.
+  - [x] Meshes refined at the mouths (2026-11-09, `feat/mesh-river-mouths`): `scripts/gmsh_coastline_mesh.py rivers=<file>` (`docs/gmsh-meshes.md`).
+    - **Why:** measured against the DEM, the nine Frøya mouths inside the box all lie within 250 m of its water. On the 500 m `[mesh.geographic]` grid they still moved up to 1.4 km (843 by 1,162 m, 852 by 1,376 m), because every grid element near them touches land.
+    - **The mesh:** a `Ball` field per mouth, at 50 m within 1 km, growing as the coast's size does. Near the mouths, `min_water` is `river_min_water`, so estuaries stay open, and the coastline is resampled at the local size.
+    - **Placement, farthest move** (all three meshes leave out the same four mouths south of the box):
+
+      | mesh | farthest move | 853 | 843 | 851 | 849 | 850 |
+      |---|---|---|---|---|---|---|
+      | 500 m grid | 1,376 m (852) | 0 | 1,162 | 616 | 499 | 212 |
+      | 200 m coastline | 565 m (847) | 88 | 0 | 54 | 116 | 121 |
+      | refined at mouths | 195 m (848) | 0 | 0 | 0 | 74 | 129 |
+
+      The residual is the data's: 848's NorKyst mouth is 34.5 m up a hill, 250 m from the DEM's water (an 800 m grid's position).
+    - **1 h in 3D** (20 levels, `cases/froya/rivers_coast_3d.toml`):
+      - **Refined:** 23,821 elements in water, 718 steps in 1,337 s; η max 2.165 m, |u| max 1.97 m/s.
+      - **Unrefined:** 12,101 elements, 486 steps in 456 s; η max 2.176 m, |u| max 1.24 m/s.
+      - **Located (2026-11-09):** the larger |u| was the cliffs' σ-level currents, below; with `[bathymetry.slopes_3d]` the case has the 3D bed.
+    - **Remaining:**
+      - NVE's own outlet coordinates would beat NorKyst's 800 m-grid positions on a 50 m mesh.
+      - The refined elements are shallow (843's 0.6–4.6 m), so they dry at low water. Their shares of the river are small, by depth.
+  - [x] Rivers from a parent enter from land (2026-11-09, `feat/viz-river-mixing`). In the viewer, river 853's plume started in the middle of its bay (asked about that day).
+    - **Why:** NorKyst's mouth is a face of its 800 m grid, the parent's coastline. On the 50 m refined mesh the face is open water about 330 m off the shore.
+    - **The land side:** `RiverForcing` keeps each face's land cell, the ρ-point the transport flows from (positive transport along +ξ/+η: the lower index). `norkyst_river_subset` writes it as `river_inland_lon/lat`. The refetched `data/froya_rivers.nc` is otherwise identical to the old one. The land cells lie ≈ 400 m from the faces, at 8.6–8.9°E.
+    - **Dead end:** following the line from the land cell through the face to the first water.
+      - 853 moved 386 m, into 6–18 m of water, because NorKyst's land cell there is water: the bay goes on past it.
+      - 851 moved 406 m into 70–80 m of open sea, where NorKyst's 800 m mask counts sea as land.
+      - The parent's land mask is too coarse to follow.
+    - **The rule:** a river with a land cell enters at the *shore element* nearest the segment from its face to that cell. A shore element is under water at every node and has a neighbour that is not, or a wall face; an open boundary is not a shore. The element must lie within `max_snap` of the face, or the old rule applies. Rivers without a land cell, such as idealised point sources, keep their element.
+    - **Frøya** (`rivers_coast_3d.toml`): 853 moves 332 m to the shore (2.4–17.9 m deep), 851 26 m, 843 46 m, 849 74 m and 850 129 m; the farthest is 846 at 359 m.
+    - **Gate:** `a_river_enters_where_it_meets_the_water_from_its_land`. The mouth sits 150 m out in an open-sided basin with its land cell behind the coast. It enters the shore column, 50 m from the mouth; within 40 m it falls back to its own element, as without a land cell.
+    - **Still open:** NVE's own outlet coordinates. NorKyst's file has no names or NVE numbers to match them by.
+  - [x] The refined Frøya mesh's 3D blow-ups were its bed (2026-11-09, `fix/river-cases-3d-bed`). `rivers_coast_3d.toml` stopped at 555 s, 744 s or 5.12 h depending on the output intervals, and the viewer's run fell back to `three_d.cfl = 2`.
+    - **The trace** (each step's dt, n_bt, the bound and the element setting it, and the binding column of the suspect elements; a temporary `DGCOM_TRACE_AFTER` build):
+      - **"555 s" was no global failure.** At t = 555.17 s the run was taking steps of ≈ 1e-11 s with |u| ≈ 1e11 m/s in element 22853, for millions of steps, until a NaN reached η everywhere. The TODO's "η in every element in one step" was the end of that, not its start.
+      - **The growth began at rest.** Elements 22853 and 14975, at (18.4, −19.4) km, grew from 0.03 m/s to 3–8 m/s by 400 s and 21 m/s at 422 s, at a node 1.2–1.3 m deep. The step followed their speed, jumping between 1.3 and 9.9 s.
+      - **Both are cliffs.** 14975 is 44–50 m across with nodes from 0 to 75.6 m deep; 22853 is 28 m across with nodes from 1.24 to 81.2 m deep. Its r_x0 is ≈ 0.97 against ROMS's ≲ 0.2. The 200 m coastline mesh averaged these slopes away; the 50 m refinement resolves them.
+      - **Ruled out on the way:** the barotropic filter (`BarotropicFilter::new` is finite, sums to one and has its centroid at `n_bt` for every `n_bt` from 4 to 20,000) and a sliver step at a landing time (`Simulation3D` makes the steps up to a landing equal).
+    - **The cause:** `rivers_3d.toml` and `rivers_coast_3d.toml` (#211, #223) left out `[bathymetry.slopes_3d]`, the 3D bed every other 3D raster case has. The same failure was found before (the coastline mesh at `cfl_3d=1.5` blew up in a cliff element, 1.2 m beside 82 m; `CHANGELOG.md`) and led to `slopes3d=on`, but nothing in the case path said so.
+    - **The fix:** both cases take `[bathymetry.slopes_3d]` (defaults). The same 600 s: max |u| 21.0 → 0.44 m/s, 89 → 62 steps (mean 6.7 → 9.7 s). The bed moves a lot: 9,193 elements over the bound (the largest 339 m too deep), nodes changed by up to 245 m, cliff shores raised in 1,830 elements (14.4 km² of water at mean sea level), 380 ponds filled. Rivers 851 and 850 now enter 17–23 m and 41–55 m deep water (the cliff shores they entered are land).
+    - **The guard:** every 3D case run reports its bed against `slopes_3d`'s bound ("3D bed: N elements over the σ-levels' slope bound … the largest X m too deep, at (x, y) km", or "every element within"), and warns when the bed is over it without `[bathymetry.slopes_3d]` (`CaseDomain::report_3d_slopes`, gate `a_3d_run_on_a_steep_bed_is_warned_of_its_slopes`).
+      - **Why not r_x0:** plain r_x0 cannot tell the two beds apart. It is 0.97 untreated (1.1 m beside 83.6 m) and 0.90 treated (1.0 m beside 19.0 m, above the free depth, which `slopes_3d` leaves to the σ-levels by design). The element bound is what was calibrated against growth (`ElementSlopeBound::for_pycnocline`).
+    - **Judged at the default `cfl_3d = 4`** in the three configurations that failed, each runs to its end with no negative-depth clip:
+      - **6 h, output every 15 min, stations every 5 min** (stopped at 555 s): 2,903 steps of 2.17–10.03 s, |u| ≤ 2.14 m/s.
+      - **4.5 h, output every 10 min** (the viewer's run, stopped at 744 s): 2,358 steps of 2.09–10.0 s, |u| ≤ 2.21 m/s.
+      - **6 h, output every 10 min, stations every 5 min** (stopped at 5.12 h): 3,049 steps, |u| ≤ 2.21 m/s.
+      - **The 2.2 m/s peak is the tide, not a cliff:** the untreated bed at `three_d.cfl = 2` reached the same 2.20 m/s over 4.5 h, in 4,387 steps of 1.40–5.22 s. The treated bed takes the default CFL in about half the steps.
+    - **Since 2026-11-10 the 3D bed is the default** for a 3D run on a raster bed (`slopes_3d = false` to keep the bed as it is; `notes/case-files.md`, P8.1 sixth part), so a case can no longer leave it out by accident.
   - [ ] A river spreads over one element. On a farm mesh of tens of metres a large river (Orkla, ~70 m³/s) into one small element is a strong local source (the 3D gate's 20 m³/s into 6250 m² raises that element by ≈ 3 mm/s): spread it over the elements within a radius, weighted by area, if mouths on fine meshes show jets or plumes one element wide.
   - [ ] River momentum: the water enters at rest (dilutes the local velocity). A discharge direction and speed (`Q/(width·depth)`) as a momentum source matter for jets at narrow mouths.
   - [x] A fixed-depth profile (the top `d` metres, whatever the local depth) for rivers into deep fjords; `TopFraction` is a σ-fraction, so in 400 m of water its top 20 % is 80 m. NorKyst's rivers enter over the top ≈ 3 m, the weight per metre falling about linearly to zero there (measured 2026-10-21, P5.1 in `operational.md`). Done 2026-10-21, PR #165: `RiverProfile::TopMetres(d)` and `TaperedTopMetres(d)` (NorKyst's; `River::new`'s default is now `TaperedTopMetres(3.0)`, was `TopFraction(0.2)`).

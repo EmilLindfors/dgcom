@@ -6,6 +6,12 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **A 3D run on a raster bed smooths its bed for σ-levels by default (TODO P1.6; `notes/case-files.md`).** A raster bed resolves underwater cliffs that σ-levels cannot cross: on the refined Frøya mesh they grew 21 m/s currents from rest and blew the run up. Cases had to know to add `[bathymetry.slopes_3d]`.
+  - **Cases:** `[bathymetry] slopes_3d` is now a `BedFor3D`. Left out, a 3D run on a raster bed takes `[bathymetry.slopes_3d]`'s defaults, and the run says so. `slopes_3d = false` keeps the bed as it is, with a warning when it is over the slope bound; `slopes_3d = true` or a table (`[bathymetry.slopes_3d]` or `slopes_3d = { … }`) applies it in 2D as in 3D. 2D runs and analytic beds (`depth_m`, `ramp`) are unchanged. `BathymetrySection::slopes_3d_for` resolves the setting.
+  - **Another coast's tide:** the defaults' cliff-shore and pond levels are Mausund's tides (−1.43 to +2 m). The run's note gives them, and a run whose `[[boundary]]` tidal atlas has a wider range (twice its largest sum of amplitudes, `TidalAtlas::largest_amplitude_sum`) is warned to set `pond_low_water_m` and `high_water_m`. Frøya's and Bodø's atlases give 2.8–3.3 m against the defaults' 3.43 m.
+  - **The shipped 3D cases** (`cases/froya/rivers_3d.toml`, `rivers_coast_3d.toml`, `cases/bodo/scored_3d_2026-06-12.toml`) drop their empty tables, with the same bed.
+  - **`froya_real_data`:** `slopes3d=on` is the default for `levels=N` runs; `slopes3d=off` prints a warning when the bed is over the bound.
+
 - **Renamed to DGCOM, the Discontinuous Galerkin Coastal Ocean Model (`notes/tech-debt.md`).**
   - The crate `dg-rs` is now `dgcom`, so `use dg_rs::…` becomes `use dgcom::…`.
   - "roms-rs" read as a port of ROMS, which this model is not.
@@ -14,6 +20,36 @@ All notable changes to this project should be documented in this file.
 ### Fixed
 
 - **A run's step range is the stability bounds' (`SimulationResult::dt_min`, `dt_max`).** A step shortened to land on an output time or the end was counted, so a run at one step of 1.38 s reported "dt 0.003–1.377 s" (Chiloé, `notes/case-files.md`). The range is now taken before the landing.
+- **The Frøya river cases' 3D blow-ups were their bed (TODO P1.6; `notes/inputs-forcing.md`).** `cases/froya/rivers_coast_3d.toml` stopped at 555 s, 744 s or 5.12 h depending on its output intervals.
+  - **Cause:** its 50 m mesh resolves underwater cliffs (a 1.2 m node beside 75–80 m ones, r_x0 ≈ 0.97) and the case left out `[bathymetry.slopes_3d]`. σ-level currents grew there from rest to 21 m/s within 400 s. The "555 s" failure was millions of 1e-11 s steps at 1e11 m/s in that element, not a global one.
+  - **Fix:** `rivers_coast_3d.toml` and `rivers_3d.toml` take `[bathymetry.slopes_3d]`. Over the same 600 s the largest |u| is 0.44 m/s instead of 21, in 62 steps instead of 89. At the default `cfl_3d = 4` all three failing configurations now run to their end (6 h, 4.5 h, 6 h; |u| ≤ 2.2 m/s, the same peak as the untreated bed at CFL 2), the 4.5 h one in 2,358 steps instead of 4,387 at CFL 2.
+  - **Guard:** a 3D case run reports how many elements of its bed are over `slopes_3d`'s slope bound (r_x0 ≤ 0.15 within an element below the pycnocline), and warns when that is not zero without `[bathymetry.slopes_3d]`. Plain r_x0 would not have told the beds apart (0.97 untreated, 0.90 treated). New `Slopes3D: Default`, `ElementSlopeBound::tolerance`.
+  - **Messages:** nine strings had lost a line continuation and carried a run of spaces: the 3D blow-up message, the gmsh mesh errors, the parent-datum error, and some test and example output.
+
+### Added
+
+- **Rivers from a parent model enter from land (TODO P1.6; `notes/inputs-forcing.md`).** NorKyst-800 puts a river on a face of its 800 m grid. On a finer mesh that face can be open water, hundreds of metres off the shore the river reaches: river 853's water entered in the middle of its bay.
+  - **Land side:** `RiverForcing` now keeps each river's land cell, the ρ-point the transport flows from across the face, read from the transport's sign (`RomsSource`, `roms_source`, `RiverMouth::inland`). `norkyst_river_subset` writes it as `river_inland_lon`, `river_inland_lat`.
+  - **Placement:** a river with a land cell enters at the *shore element* nearest the segment from its face to that cell: an element under water at every node with a neighbour that is not, or a wall face. A river given without one (an idealised point source) keeps its own element.
+  - **Frøya** (`rivers_coast_3d.toml`): 853 moves 332 m to its shore, 851 26 m and 843 46 m. Following the line from the land cell to the first water instead put 851 in 70–80 m of open water, because NorKyst's land cell there is sea at 50 m resolution.
+
+- **River water mixing into the sea, in the viewer (`notes/viz.md`).**
+  - **Colouring:** `dg-viz --colour salinity|temperature` (C, and the Colour menu) colours a 3D run's water by the salinity or temperature of the layer shown, or its depth mean. The maps are cmocean's haline and thermal. The scale follows the wet nodes' range in half units, or `--range LO,HI` fixes it.
+  - **Rivers:** a case's snapshot file lists its rivers (`river=name,x,y`, the largest first). The viewer marks where each one's water enters, and the number keys frame them from 2 km above.
+  - **Example:** `cases/froya/rivers_coast_3d.toml`'s river 853 shows a plume of about 32.5 against 33–34 within the first hour.
+  - **`--screenshot` of a large replay** saves the frame. It used to save a black window, or fail with "sending on a closed channel".
+  - **Blow-up message:** a 3D blow-up now names the field and how many elements it reached, and where the first is.
+
+- **Coastline meshes refined at river mouths (TODO P1.6; `docs/gmsh-meshes.md`).** `scripts/gmsh_coastline_mesh.py rivers=<file> [river_size=50] [river_radius=1000] [river_min_water=2·river_size]` refines the mesh around each river mouth inside the box. It uses a Gmsh `Ball` field, which works for mouths on land. Near the mouths it keeps estuaries open by using the smaller `river_min_water`, and it resamples the coastline at the local size.
+  - **Frøya** (`cases/froya/rivers_coast_3d.toml`, new): the farthest a river moves to its element is 195 m, against 1,376 m on the 500 m grid of `rivers_3d.toml`. The mesh has 25,383 quads against 12,490, and costs 2.9× per model hour in 3D.
+  - **Logs:** the river log names the river that moved farthest.
+
+### Fixed
+
+- **Rivers are left out only beyond a boundary nested in a parent (TODO P1.6; `notes/inputs-forcing.md`).** Earlier, any open boundary counted, but only a parent model brings a river's water in through a boundary. Beyond a tide-only or radiation boundary, a mouth now moves to the nearest element under water, as beyond a wall.
+  - **Inputs:** `RiverSources::new`/`on_mesh` take the parent's boundary tags. A case passes those of its `[boundary.nesting]` sections, and `froya_real_data` passes `open` with `norkyst=`.
+  - **Rule:** a mouth outside the mesh is left out if it lies beyond the line of the nearest nested face. Before, the test was whether the nearest boundary face was open. On the Frøya coastline mesh a coastal wall lies nearer to rivers 836 and 837, south of the box, than the open faces do, so they were snapped 1.7–1.9 km in. Now all three Frøya meshes leave out the same four rivers.
+  - **Renamed:** `RiverError::BeyondOpenBoundary` is now `BeyondParentBoundary`.
 
 - **Rivers beyond an open boundary are left out (TODO P1.6; `notes/inputs-forcing.md`).** A river whose mouth is outside the mesh and nearest an open boundary (open, tidal or river faces) is now left out and listed (`RiverError::BeyondOpenBoundary`). Its mouth lies outside the domain, and the water entering through the boundary already brings it in: a parent model has its own rivers.
   - **Why:** at Frøya, the three largest placed rivers (837, 844, 836: 0.9, 0.8 and 0.55 m³/s) lie 1.5–1.9 km south of the box. They were snapped in across the open boundary into the 3 km nesting band, where the parent's T and S already carry their water and relax theirs away.

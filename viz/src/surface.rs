@@ -32,7 +32,7 @@ use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 
 use crate::actions::{Act, Action};
-use crate::colormap::{CIVIDIS, DIVERGING, ICE, Lut, SEABED, THERMAL, VIRIDIS};
+use crate::colormap::{CIVIDIS, DIVERGING, HALINE, ICE, Lut, SEABED, THERMAL, VIRIDIS};
 use crate::field::{Field, Frame, Nodes};
 use crate::photo::{Photo, PhotoPart};
 use crate::playback::Playback;
@@ -69,18 +69,41 @@ pub enum ColourBy {
     WavePeriod,
     /// Whitecapping and depth-induced breaking, on a log scale
     WaveDissipation,
+    /// Salinity of the shown layer (or its depth mean) of a 3D run
+    Salinity,
+    /// Temperature of the shown layer (or its depth mean) of a 3D run
+    Temperature,
 }
 
+/// The colourings in the order C steps through them.
+pub const COLOURINGS: [ColourBy; 7] = [
+    ColourBy::Speed,
+    ColourBy::Elevation,
+    ColourBy::WaveHeight,
+    ColourBy::WavePeriod,
+    ColourBy::WaveDissipation,
+    ColourBy::Salinity,
+    ColourBy::Temperature,
+];
+
 impl ColourBy {
-    /// The colouring C steps to: the waves' only in a run that has them.
-    pub fn next(self, waves: bool) -> Self {
+    /// The colouring C steps to: the next one `has` (the run has its field).
+    pub fn next(self, has: impl Fn(Self) -> bool) -> Self {
+        let i = COLOURINGS.iter().position(|&c| c == self).unwrap_or(0);
+        (1..=COLOURINGS.len())
+            .map(|k| COLOURINGS[(i + k) % COLOURINGS.len()])
+            .find(|&c| has(c))
+            .unwrap_or(Self::Speed)
+    }
+
+    /// Whether `field` has what this colouring shows: the waves' only a run with
+    /// waves, the salinity and temperature only a 3D run's.
+    pub fn shows_in(self, field: &Field) -> bool {
         match self {
-            Self::Speed => Self::Elevation,
-            Self::Elevation if waves => Self::WaveHeight,
-            Self::Elevation => Self::Speed,
-            Self::WaveHeight => Self::WavePeriod,
-            Self::WavePeriod => Self::WaveDissipation,
-            Self::WaveDissipation => Self::Speed,
+            Self::WaveHeight | Self::WavePeriod | Self::WaveDissipation => field.waves.is_some(),
+            Self::Salinity => !field.salt.is_empty(),
+            Self::Temperature => !field.temp.is_empty(),
+            Self::Speed | Self::Elevation => true,
         }
     }
 
@@ -91,6 +114,17 @@ impl ColourBy {
         )
     }
 
+    /// The salinity or the temperature.
+    pub fn is_tracer(self) -> bool {
+        matches!(self, Self::Salinity | Self::Temperature)
+    }
+
+    /// A map of a field of its own, which reads on opaque water, not mixed with the
+    /// bed's colours: the waves', the salinity, the temperature.
+    pub fn is_map(self) -> bool {
+        self.is_waves() || self.is_tracer()
+    }
+
     /// The colouring a `--colour` value names.
     pub fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -99,8 +133,35 @@ impl ColourBy {
             "hs" | "height" => Self::WaveHeight,
             "tp" | "period" => Self::WavePeriod,
             "dissipation" | "breaking" => Self::WaveDissipation,
+            "salinity" | "salt" => Self::Salinity,
+            "temperature" | "temp" => Self::Temperature,
             _ => return None,
         })
+    }
+}
+
+/// Steps `ends` out to the range of `values` in multiples of `step` as soon as they
+/// pass it, and in once they clear an end by more than a step (non-finite values
+/// skipped).
+fn follow_range(ends: &mut [f32; 2], values: impl Iterator<Item = f32>, step: f32) {
+    let (lo, hi) = values
+        .filter(|v| v.is_finite())
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        });
+    if !(lo.is_finite() && hi.is_finite()) {
+        return;
+    }
+    let (floor, ceil) = ((lo / step).floor() * step, (hi / step).ceil() * step);
+    if lo < ends[0] || lo > ends[0] + 2.0 * step {
+        ends[0] = floor;
+    }
+    if hi > ends[1] || hi < ends[1] - 2.0 * step {
+        ends[1] = ceil;
+    }
+    // A uniform field still spans a step
+    if ends[1] - ends[0] < step {
+        ends[1] = ends[0] + step;
     }
 }
 
@@ -119,16 +180,21 @@ pub struct Colouring {
     pub tp_max: f32,
     /// Top of the dissipation's log scale (W/m², a power of ten)
     pub dissipation_max: f32,
-    /// The colouring whose scale was set by hand (`--scale-max`): it stays, where
-    /// the others follow the field
+    /// Ends of the salinity and temperature (°C) scales
+    pub salt_range: [f32; 2],
+    pub temp_range: [f32; 2],
+    /// The colouring whose scale was set by hand (`--scale-max`, `--range`): it
+    /// stays, where the others follow the field
     fixed: Option<ColourBy>,
-    luts: [Lut; 5],
+    luts: [Lut; 7],
 }
 
 impl Colouring {
     /// Colouring by `by`, its scale's top fixed at `scale_max` if given (m/s for the
-    /// speed, m for η's half-width and H_s, s for T_p, W/m² for the dissipation).
-    pub fn new(scale_max: Option<f32>, by: ColourBy) -> Self {
+    /// speed, m for η's half-width and H_s, s for T_p, W/m² for the dissipation, the
+    /// salinity's or temperature's top), a salinity's or temperature's both ends at
+    /// `range`.
+    pub fn new(scale_max: Option<f32>, range: Option<[f32; 2]>, by: ColourBy) -> Self {
         let mut colouring = Self {
             by,
             speed_max: 0.05,
@@ -136,11 +202,16 @@ impl Colouring {
             hs_max: 1.0,
             tp_max: 10.0,
             dissipation_max: 100.0,
-            fixed: scale_max.map(|_| by),
-            luts: [VIRIDIS, DIVERGING, THERMAL, CIVIDIS, ICE].map(Lut::new),
+            salt_range: [30.0, 35.0],
+            temp_range: [5.0, 15.0],
+            fixed: (scale_max.is_some() || (range.is_some() && by.is_tracer())).then_some(by),
+            luts: [VIRIDIS, DIVERGING, THERMAL, CIVIDIS, ICE, HALINE, THERMAL].map(Lut::new),
         };
         if let Some(top) = scale_max {
             *colouring.scale_of(by) = top;
+        }
+        if let (Some(range), Some(ends)) = (range, colouring.range_of(by)) {
+            *ends = range;
         }
         colouring
     }
@@ -153,6 +224,17 @@ impl Colouring {
             ColourBy::WaveHeight => &mut self.hs_max,
             ColourBy::WavePeriod => &mut self.tp_max,
             ColourBy::WaveDissipation => &mut self.dissipation_max,
+            ColourBy::Salinity => &mut self.salt_range[1],
+            ColourBy::Temperature => &mut self.temp_range[1],
+        }
+    }
+
+    /// Both ends of a salinity's or temperature's scale.
+    fn range_of(&mut self, by: ColourBy) -> Option<&mut [f32; 2]> {
+        match by {
+            ColourBy::Salinity => Some(&mut self.salt_range),
+            ColourBy::Temperature => Some(&mut self.temp_range),
+            _ => None,
         }
     }
 
@@ -167,6 +249,14 @@ impl Colouring {
                 let power = w.whitecapping[g] + w.breaking[g];
                 1.0 + (power.max(1e-30) / self.dissipation_max).log10() / DISSIPATION_DECADES
             }
+            (ColourBy::Salinity, _) if !field.salt.is_empty() => {
+                let [lo, hi] = self.salt_range;
+                (field.salt[g] - lo) / (hi - lo)
+            }
+            (ColourBy::Temperature, _) if !field.temp.is_empty() => {
+                let [lo, hi] = self.temp_range;
+                (field.temp[g] - lo) / (hi - lo)
+            }
             // The speed, also for a wave colouring of a field without waves
             _ => speed[g] / self.speed_max,
         }
@@ -174,10 +264,10 @@ impl Colouring {
 
     /// The colour of node `g`.
     fn at(&self, g: usize, speed: &[f32], field: &Field) -> [f32; 4] {
-        let by = if self.by.is_waves() && field.waves.is_none() {
-            ColourBy::Speed
-        } else {
+        let by = if self.by.shows_in(field) {
             self.by
+        } else {
+            ColourBy::Speed
         };
         self.luts[by as usize].at(self.position(g, speed, field))
     }
@@ -210,9 +300,7 @@ impl Colouring {
             follows(ColourBy::WavePeriod),
             follows(ColourBy::WaveDissipation),
         );
-        if speed_follows
-            && let Some(p98) = percentile(speed, 0.98, &|g| speed[g])
-        {
+        if speed_follows && let Some(p98) = percentile(speed, 0.98, &|g| speed[g]) {
             follow(&mut self.speed_max, p98, 1e-3);
         }
         let eta_abs = eta
@@ -241,6 +329,21 @@ impl Colouring {
         }
     }
 
+    /// Fits the salinity and temperature scales to the field's range in half units:
+    /// an end steps out as soon as the field passes it, and in once the field clears
+    /// it by more than a step (the fresh water at a river mouth is the low end,
+    /// however few its nodes). Only the nodes `wet` says are: a dry node's tracers
+    /// drift (TODO P4.5), and the water there is not drawn.
+    fn fit_tracers(&mut self, salt: &[f32], temp: &[f32], wet: impl Fn(usize) -> bool) {
+        for (by, values) in [(ColourBy::Salinity, salt), (ColourBy::Temperature, temp)] {
+            if self.fixed != Some(by) && !values.is_empty() {
+                let ends = self.range_of(by).expect("a tracer");
+                let wet_values = values.iter().enumerate().filter(|&(g, _)| wet(g));
+                follow_range(ends, wet_values.map(|(_, &v)| v), 0.5);
+            }
+        }
+    }
+
     pub fn stops(&self) -> &'static [[u8; 3]] {
         match self.by {
             ColourBy::Speed => VIRIDIS,
@@ -248,6 +351,8 @@ impl Colouring {
             ColourBy::WaveHeight => THERMAL,
             ColourBy::WavePeriod => CIVIDIS,
             ColourBy::WaveDissipation => ICE,
+            ColourBy::Salinity => HALINE,
+            ColourBy::Temperature => THERMAL,
         }
     }
 
@@ -267,6 +372,11 @@ impl Colouring {
             ),
             ColourBy::WaveHeight => ("significant wave height H_s (m)", linear(0.0, self.hs_max)),
             ColourBy::WavePeriod => ("peak period T_p (s)", linear(0.0, self.tp_max)),
+            ColourBy::Salinity => ("salinity", linear(self.salt_range[0], self.salt_range[1])),
+            ColourBy::Temperature => (
+                "temperature (°C)",
+                linear(self.temp_range[0], self.temp_range[1]),
+            ),
             ColourBy::WaveDissipation => (
                 "waves' losses (W/m², log)",
                 std::array::from_fn(|i| {
@@ -288,15 +398,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn c_cycles_through_the_waves_only_when_the_run_has_them() {
-        let mut by = ColourBy::Speed;
-        let mut seen = Vec::new();
-        for _ in 0..5 {
-            by = by.next(true);
-            seen.push(by);
-        }
+    fn c_cycles_through_the_fields_the_run_has() {
+        let cycle = |has: &dyn Fn(ColourBy) -> bool| {
+            let mut by = ColourBy::Speed;
+            let mut seen = Vec::new();
+            loop {
+                by = by.next(has);
+                seen.push(by);
+                if by == ColourBy::Speed {
+                    return seen;
+                }
+            }
+        };
+        // A 2D run with waves
         assert_eq!(
-            seen,
+            cycle(&|c| !c.is_tracer()),
             [
                 ColourBy::Elevation,
                 ColourBy::WaveHeight,
@@ -305,14 +421,60 @@ mod tests {
                 ColourBy::Speed
             ]
         );
-        assert_eq!(ColourBy::Elevation.next(false), ColourBy::Speed);
+        // A 3D run without waves
+        assert_eq!(
+            cycle(&|c| !c.is_waves()),
+            [
+                ColourBy::Elevation,
+                ColourBy::Salinity,
+                ColourBy::Temperature,
+                ColourBy::Speed
+            ]
+        );
+        assert_eq!(
+            cycle(&|c| !c.is_map()),
+            [ColourBy::Elevation, ColourBy::Speed]
+        );
         assert_eq!(ColourBy::parse("hs"), Some(ColourBy::WaveHeight));
+        assert_eq!(ColourBy::parse("salinity"), Some(ColourBy::Salinity));
         assert_eq!(ColourBy::parse("waves"), None);
+    }
+
+    /// The salinity scale spans the field in half units, steps out at once to take
+    /// the fresh water in and back in only once it is gone by more than a step.
+    #[test]
+    fn the_salinity_scale_spans_the_fresh_water() {
+        let mut colouring = Colouring::new(None, None, ColourBy::Salinity);
+        let mut sea = vec![33.2_f32; 1000];
+        colouring.fit_tracers(&sea, &[], |_| true);
+        assert_eq!(colouring.salt_range, [33.0, 33.5]);
+        // A river's water at one node
+        sea[17] = 4.3;
+        colouring.fit_tracers(&sea, &[], |_| true);
+        assert_eq!(colouring.salt_range, [4.0, 33.5]);
+        assert_eq!(colouring.legend().1, ["4", "18.75", "33.5"]);
+        // Mixed up to 31.9: the end steps back in
+        sea[17] = 31.9;
+        colouring.fit_tracers(&sea, &[], |_| true);
+        assert_eq!(colouring.salt_range, [31.5, 33.5]);
+        // Up to 32.1, within two steps of 31.5: it stays
+        sea[17] = 32.1;
+        colouring.fit_tracers(&sea, &[], |_| true);
+        assert_eq!(colouring.salt_range, [31.5, 33.5]);
+        // A dry node's drifted salinity is not the water's
+        sea[17] = 33.2;
+        sea[400] = 50.0;
+        colouring.fit_tracers(&sea, &[], |g| g != 400);
+        assert_eq!(colouring.salt_range, [33.0, 33.5]);
+        // Fixed by hand: stays
+        let mut fixed = Colouring::new(None, Some([25.0, 35.0]), ColourBy::Salinity);
+        fixed.fit_tracers(&sea, &[], |_| true);
+        assert_eq!(fixed.salt_range, [25.0, 35.0]);
     }
 
     #[test]
     fn the_dissipation_scale_follows_in_decades() {
-        let mut colouring = Colouring::new(None, ColourBy::WaveDissipation);
+        let mut colouring = Colouring::new(None, None, ColourBy::WaveDissipation);
         let n = 1000;
         let waves = |power: f32| Waves {
             hs: vec![1.0; n],
@@ -338,7 +500,7 @@ mod tests {
 
     #[test]
     fn a_scale_set_by_hand_stays_and_the_others_follow() {
-        let mut colouring = Colouring::new(Some(10.0), ColourBy::WaveHeight);
+        let mut colouring = Colouring::new(Some(10.0), None, ColourBy::WaveHeight);
         assert_eq!(colouring.legend().1, ["0", "5", "10"]);
         let n = 1000;
         let waves = Waves {
@@ -354,7 +516,7 @@ mod tests {
         // The others still fit the field
         assert_eq!(colouring.tp_max, 20.0);
         assert_eq!(colouring.speed_max, 0.5);
-        let mut speed_fixed = Colouring::new(Some(0.35), ColourBy::Speed);
+        let mut speed_fixed = Colouring::new(Some(0.35), None, ColourBy::Speed);
         speed_fixed.fit(&vec![2.0; n], &vec![0.0; n], None);
         assert_eq!(speed_fixed.speed_max, 0.35);
     }
@@ -663,7 +825,7 @@ fn keys(
 ) {
     for &Act(action) in acts.read() {
         let next = match action {
-            Action::NextColour => colouring.by.next(field.waves.is_some()),
+            Action::NextColour => colouring.by.next(|c| c.shows_in(&field)),
             Action::Colour(by) => by,
             Action::WaterStyle => {
                 *style = match *style {
@@ -683,8 +845,9 @@ fn keys(
             }
             _ => continue,
         };
-        // The waves' maps read on opaque water, not mixed with the bed's colours
-        match (colouring.by.is_waves(), next.is_waves(), *style) {
+        // The maps of a field of their own read on opaque water, not mixed with the
+        // bed's colours
+        match (colouring.by.is_map(), next.is_map(), *style) {
             (false, true, SurfaceStyle::Translucent) => *style = SurfaceStyle::Opaque,
             (true, false, SurfaceStyle::Opaque) => *style = SurfaceStyle::Translucent,
             _ => {}
@@ -787,6 +950,11 @@ fn update_water(
     colouring
         .bypass_change_detection()
         .fit(speed, &field.eta, field.waves.as_ref());
+    colouring
+        .bypass_change_detection()
+        .fit_tracers(&field.salt, &field.temp, |g| {
+            field.eta[g] - nodes.bed[g] > H_DRY
+        });
 
     let Some(mut mesh) = meshes.get_mut(&water.mesh) else {
         return;

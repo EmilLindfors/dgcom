@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use super::schema::{
-    AtlasCorrection, AtmosphereSection, FarmSection, GaugeCorrection, MeshSection, Nesting,
-    RasterKind, RiversSection, Sampling, SideTag, Slopes3D,
+    AtlasCorrection, AtmosphereSection, BathymetrySection, BedFor3D, Case, FarmSection,
+    GaugeCorrection, MeshSection, Nesting, RasterKind, RiversSection, Sampling, SideTag, Slopes3D,
 };
 use super::{CaseError, CaseFile};
 use crate::analysis::{GaugeRecord, HarmonicAnalysis, TideGaugeStation};
@@ -220,6 +220,7 @@ impl CaseFile {
             ));
             atlases.push((b.tag, atlas));
         }
+        Self::check_3d_bed_tide(case, &atlases, &mut notes);
 
         // Parent models: the open faces they have no water at become walls,
         // and the bed is blended to theirs across the band
@@ -371,18 +372,28 @@ impl CaseFile {
             .iter()
             .map(|r| r.discharge.mean_over(0.0, t_end))
             .sum();
+        // The faces nested in a parent, whose water carries the rivers
+        // beyond them in
+        let parent_tags: Vec<_> = self
+            .case
+            .boundaries
+            .iter()
+            .filter(|b| b.nesting.is_some())
+            .map(|b| b.tag.boundary_tag())
+            .collect();
         let (sources, skipped) = RiverSources::on_mesh(
             rivers,
             &domain.mesh,
             &domain.geom,
             &domain.bathymetry,
             1000.0 * spec.snap_km,
+            &parent_tags,
         );
         let mean = |i: usize| sources.river(i).discharge.mean_over(0.0, t_end);
         let total: f64 = (0..sources.len()).map(mean).sum();
         notes.push(format!(
             "rivers: {} of {} from {} ({total:.1} of {offered:.1} m³/s over the run), entering \
-             over {}; {} left out (beyond an open boundary, or more than {} km from the mesh's \
+             over {}; {} left out (beyond a nested boundary, or more than {} km from the mesh's \
              water)",
             sources.len(),
             forcing.len(),
@@ -401,6 +412,18 @@ impl CaseFile {
                 sources.element(i).as_usize(),
                 sources.depth_range(i).0,
                 sources.depth_range(i).1,
+                sources.snap_distance(i)
+            ));
+        }
+        let farthest = (0..sources.len()).max_by(|&a, &b| {
+            sources
+                .snap_distance(a)
+                .total_cmp(&sources.snap_distance(b))
+        });
+        if let Some(i) = farthest {
+            notes.push(format!(
+                "  farthest moved: river {}, {:.0} m",
+                sources.river(i).name,
                 sources.snap_distance(i)
             ));
         }
@@ -673,6 +696,83 @@ impl CaseFile {
             });
         }
         Ok(stations)
+    }
+
+    /// The case's tide against a 3D bed taken by default
+    /// ([`default_3d_bed_tide_warning`]).
+    fn check_3d_bed_tide(case: &Case, atlases: &[(SideTag, TidalAtlas)], notes: &mut Vec<String>) {
+        let atlases: Vec<&TidalAtlas> = atlases.iter().map(|(_, a)| a).collect();
+        notes.extend(default_3d_bed_tide_warning(
+            &case.bathymetry,
+            case.three_d.is_some(),
+            &atlases,
+        ));
+    }
+
+    /// A 3D run's bed against the slope bound of `[bathymetry.slopes_3d]`
+    /// (its own, or the defaults' when it is left out): how many elements
+    /// let a σ-level cross the pycnocline between two of their resolved
+    /// nodes (at least `thin` deep), and the largest of them. σ-levels
+    /// across such slopes drive spurious currents (the hydrostatic
+    /// inconsistency of the pressure gradient, Beckmann & Haidvogel 1993;
+    /// ROMS reports r_x0 for every grid). Plain r_x0 does not tell a treated
+    /// bed from one that blows up: the refined Frøya mesh has r_x0 0.97 (a
+    /// 1.1 m node beside an 83.6 m one) untreated and 0.90 (1.0 m beside
+    /// 19.0 m, above the free depth) treated. Untreated, its 9193 elements
+    /// over the bound grew σ-level currents of 21 m/s within 400 s and blew
+    /// up at `cfl_3d = 4` (TODO P1.6, 2026-11-09). A bed over the bound
+    /// that was not smoothed (`spec` none: `slopes_3d = false`, or an
+    /// analytic bed) is warned about.
+    #[allow(clippy::too_many_arguments)]
+    fn report_3d_slopes(
+        b: &BathymetrySection,
+        spec: Option<&Slopes3D>,
+        thin: f64,
+        grid: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        bed: &Bathymetry2D,
+        notes: &mut Vec<String>,
+    ) {
+        let bound = spec.cloned().unwrap_or_default().bound();
+        let excess = bed.element_slope_excess(grid, ops, geom, bound, thin);
+        let over = excess.iter().filter(|&&e| e > bound.tolerance()).count();
+        let (worst, largest) =
+            excess.iter().enumerate().fold(
+                (0, 0.0),
+                |(k, m), (j, &e)| if e > m { (j, e) } else { (k, m) },
+            );
+        let rule = format!(
+            "r_x0 ≤ {} within an element below {} m, nodes ≥ {thin} m deep",
+            bound.r_max, bound.free_depth
+        );
+        if over == 0 {
+            notes.push(format!(
+                "3D bed: every element within the σ-levels' slope bound ({rule})"
+            ));
+            return;
+        }
+        let corners = grid.element_vertices(ElementIndex::new(worst));
+        let [x, y] = corners
+            .iter()
+            .fold([0.0, 0.0], |c, v| [c[0] + 0.25 * v[0], c[1] + 0.25 * v[1]]);
+        notes.push(format!(
+            "3D bed: {over} elements over the σ-levels' slope bound ({rule}), the largest \
+             {largest:.1} m too deep, at ({:.1}, {:.1}) km",
+            x / 1e3,
+            y / 1e3
+        ));
+        if spec.is_none() {
+            let instead = if b.slopes_3d == BedFor3D::Off {
+                "leave out `slopes_3d = false` to smooth the bed for 3D"
+            } else {
+                "[bathymetry.slopes_3d] smooths the bed for 3D"
+            };
+            notes.push(format!(
+                "warning: σ-levels across these slopes drive spurious currents that can blow \
+                 the run up; {instead}"
+            ));
+        }
     }
 
     /// `[bathymetry.slopes_3d]`: smooth the element slopes, then raise the
@@ -1020,9 +1120,31 @@ impl CaseFile {
                 s.before, s.after, b.rx0_min_depth_m, s.changed, s.max_change
             ));
         }
-        if let Some(spec) = &b.slopes_3d {
+        let slopes_3d = b.slopes_3d_for(case.three_d.is_some());
+        if let Some(spec) = &slopes_3d {
+            if b.slopes_3d == BedFor3D::Default {
+                notes.push(format!(
+                    "3D bed: [bathymetry.slopes_3d]'s defaults, as for every 3D run on a raster \
+                     bed: r_x0 ≤ {} below the summer pycnocline's {} m, cliff shores raised to \
+                     +{} m and ponds filled from {} m, Frøya's summer and Mausund's tides (set \
+                     them for another coast; `slopes_3d = false` keeps the bed as it is)",
+                    spec.r_max, spec.free_depth_m, spec.high_water_m, spec.pond_low_water_m
+                ));
+            }
             let thin = spec.thin_depth(case.three_d.as_ref());
             Self::bed_for_3d(spec, thin, &grid, &ops, &grid_geom, &mut bed, notes);
+        }
+        if let Some(three_d) = &case.three_d {
+            Self::report_3d_slopes(
+                b,
+                slopes_3d.as_ref(),
+                three_d.thin_depth_m,
+                &grid,
+                &ops,
+                &grid_geom,
+                &bed,
+                notes,
+            );
         }
 
         let (mesh, bathymetry, geom) = if m.drop_land {
@@ -1321,4 +1443,97 @@ fn open_tags(mesh: &Mesh2D) -> Result<Vec<SideTag>, CaseError> {
         }
     }
     Ok(tags)
+}
+
+/// A 3D bed taken by default (`slopes_3d` left out) against the case's
+/// tide. Its defaults raise cliff shores to +2 m and fill ponds from
+/// −1.43 m (Mausund's tides), a band of 3.43 m. A tide whose range (twice
+/// its tidal atlases' largest sum of amplitudes) is wider than that floods
+/// the raised shores at high water, or leaves ponds below the band, so the
+/// run is warned to set the levels. Frøya's and Bodø's NorKyst atlases give
+/// 2.8–3.3 m. A case without an atlas (a parent model's tide alone) is not
+/// checked: the run's note gives the levels.
+fn default_3d_bed_tide_warning(
+    b: &BathymetrySection,
+    three_d: bool,
+    atlases: &[&TidalAtlas],
+) -> Option<String> {
+    if b.slopes_3d != BedFor3D::Default {
+        return None;
+    }
+    let spec = b.slopes_3d_for(three_d)?;
+    let range = 2.0
+        * atlases
+            .iter()
+            .filter_map(|a| a.largest_amplitude_sum())
+            .fold(0.0, f64::max);
+    (range > spec.high_water_m - spec.pond_low_water_m).then(|| {
+        format!(
+            "warning: the tide's range is up to {range:.2} m (twice the tidal atlas's largest sum \
+             of amplitudes), wider than the default 3D bed's {} to +{} m (Mausund's tides): set \
+             [bathymetry.slopes_3d] pond_low_water_m and high_water_m to this coast's lowest and \
+             highest astronomical tides",
+            spec.pond_low_water_m, spec.high_water_m
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (a side review of the 3D bed's default, 2026-11-10): the
+    /// default's tide levels are Mausund's, and a coast with a larger tide
+    /// (Chiloé's metres) is warned to set its own.
+    #[test]
+    fn a_default_3d_bed_is_checked_against_the_tide() {
+        let case = |bathymetry: &str| {
+            Case::parse(
+                &format!(
+                    "[run]\nduration_hours = 1.0\n[mesh.rectangle]\nx_m = [0.0, 1000.0]\n\
+                     y_m = [0.0, 100.0]\nnx = 4\nny = 1\n[bathymetry]\n{bathymetry}\n\
+                     [bathymetry.raster]\nfile = \"bed.tif\"\nkind = \"topobathy\"\n"
+                ),
+                false,
+                &[],
+            )
+            .unwrap()
+            .bathymetry
+        };
+        let atlas = |amplitudes: &[(&str, f64)]| {
+            let mut text = String::from("# lon lat depth name eta_amp eta_lag\n");
+            for (lon, scale) in [(8.0, 0.5), (8.1, 1.0)] {
+                for (name, amp) in amplitudes {
+                    text += &format!("{lon} 63.6 50.0 {name} {} 0.0\n", amp * scale);
+                }
+            }
+            TidalAtlas::parse(&text).unwrap()
+        };
+        // Frøya's boundary: M2 0.70, S2 0.25, … sums to 1.40 m at most
+        let froya = atlas(&[
+            ("M2", 0.70),
+            ("S2", 0.25),
+            ("N2", 0.25),
+            ("K1", 0.12),
+            ("O1", 0.08),
+        ]);
+        assert!((froya.largest_amplitude_sum().unwrap() - 1.40).abs() < 1e-12);
+        // A macrotidal coast: M2 1.9 m
+        let large = atlas(&[("M2", 1.9), ("S2", 0.6), ("N2", 0.4)]);
+
+        let default = case("");
+        assert_eq!(default_3d_bed_tide_warning(&default, true, &[&froya]), None);
+        let warning = default_3d_bed_tide_warning(&default, true, &[&froya, &large]).unwrap();
+        assert!(warning.contains("up to 5.80 m"), "{warning}");
+        assert!(warning.contains("-1.43 to +2 m"), "{warning}");
+        // No 3D bed, or one the case set: nothing to say
+        assert_eq!(
+            default_3d_bed_tide_warning(&default, false, &[&large]),
+            None
+        );
+        let set = case("slopes_3d = { high_water_m = 3.5, pond_low_water_m = -3.5 }");
+        assert_eq!(default_3d_bed_tide_warning(&set, true, &[&large]), None);
+        let off = case("slopes_3d = false");
+        assert_eq!(default_3d_bed_tide_warning(&off, true, &[&large]), None);
+    }
 }

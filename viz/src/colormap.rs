@@ -44,7 +44,7 @@ pub const PLASMA: &[[u8; 3]] = &[
 ];
 
 /// cmocean's thermal (perceptually uniform, deep blue through purple and orange to
-/// pale yellow): significant wave height.
+/// pale yellow): significant wave height, and temperature.
 pub const THERMAL: &[[u8; 3]] = &[
     [0x04, 0x23, 0x33],
     [0x0F, 0x32, 0x6A],
@@ -72,6 +72,22 @@ pub const CIVIDIS: &[[u8; 3]] = &[
     [0xC8, 0xB8, 0x66],
     [0xE5, 0xCF, 0x52],
     [0xFE, 0xE8, 0x38],
+];
+
+/// cmocean's haline (perceptually uniform, deep indigo through blue and green to
+/// pale yellow): salinity, the fresh water dark.
+pub const HALINE: &[[u8; 3]] = &[
+    [0x2A, 0x18, 0x6C],
+    [0x15, 0x37, 0x9B],
+    [0x07, 0x56, 0x8F],
+    [0x13, 0x6E, 0x8B],
+    [0x23, 0x84, 0x89],
+    [0x30, 0x9A, 0x84],
+    [0x46, 0xB0, 0x79],
+    [0x6F, 0xC3, 0x69],
+    [0xA4, 0xD2, 0x5F],
+    [0xD3, 0xDF, 0x75],
+    [0xFD, 0xEE, 0x99],
 ];
 
 /// cmocean's ice (perceptually uniform, near black through blue to white): the power

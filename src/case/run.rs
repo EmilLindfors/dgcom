@@ -754,8 +754,9 @@ fn summarize(domain: &Domain, q: &SWESolution2D, t: f64, t_end: f64) -> Progress
 
 /// A case snapshot's header metadata: the run and the build that made it,
 /// and what the viewer draws over the fields: the stations where they are
-/// sampled, the mesh's projection (for the land around it) and the farm's
-/// cages, in `froya_real_data`'s and `farm_3d`'s keys.
+/// sampled, the rivers where their water enters, the mesh's projection (for
+/// the land around it) and the farm's cages, in `froya_real_data`'s and
+/// `farm_3d`'s keys.
 fn snapshot_metadata(name: &str, domain: &Domain) -> Vec<(&'static str, String)> {
     let mut metadata = vec![
         ("title", name.to_string()),
@@ -766,6 +767,25 @@ fn snapshot_metadata(name: &str, domain: &Domain) -> Vec<(&'static str, String)>
     for s in &domain.stations {
         let [x, y] = s.probe.position();
         metadata.push(("station", format!("{},{x:.1},{y:.1}", s.name)));
+    }
+    // Where each river's water enters, the centre of its element, the largest
+    // river first (the viewer's number keys reach the first nine places)
+    if let Some(rivers) = &domain.rivers {
+        let mut order: Vec<usize> = (0..rivers.len()).collect();
+        order.sort_by(|&a, &b| {
+            rivers
+                .discharge(b, 0.0)
+                .total_cmp(&rivers.discharge(a, 0.0))
+        });
+        for i in order {
+            let corners = domain.mesh.element_vertices(rivers.element(i));
+            let x = corners.iter().map(|c| c[0]).sum::<f64>() / 4.0;
+            let y = corners.iter().map(|c| c[1]).sum::<f64>() / 4.0;
+            metadata.push((
+                "river",
+                format!("river {},{x:.1},{y:.1}", rivers.river(i).name),
+            ));
+        }
     }
     if let Some(projection) = &domain.projection {
         metadata.push((

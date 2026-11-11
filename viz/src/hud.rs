@@ -123,7 +123,13 @@ fn spawn(mut commands: Commands) {
             },
         ))
         .with_children(|scale| {
-            scale.spawn((BedTitle, BedLegend, Text::new("bed depth (m)"), font(13.0), shadow()));
+            scale.spawn((
+                BedTitle,
+                BedLegend,
+                Text::new("bed depth (m)"),
+                font(13.0),
+                shadow(),
+            ));
             scale.spawn((
                 BedBar,
                 BedLegend,
@@ -288,12 +294,12 @@ fn status(
         let n = levels.sigma.len();
         s += &match *shown {
             ShownLayer::DepthMean => format!(
-                "\ncurrent: depth mean ({} {})",
+                "\nlayer: the depth mean ({} {})",
                 key(Action::LayerUp),
                 key(Action::LayerDown)
             ),
             ShownLayer::Level(l) => format!(
-                "\ncurrent: layer {} of {n} from the surface, {:.1} m deep ({} {})",
+                "\nlayer: {} of {n} from the surface, {:.1} m deep ({} {})",
                 n - l,
                 -levels.sigma[l] * levels.depth,
                 key(Action::LayerUp),
