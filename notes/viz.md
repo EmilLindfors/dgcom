@@ -74,6 +74,11 @@
   - [x] ~~R toggling back and forth was not tested~~. Done 2026-10-20: gate `the_chart_view_comes_back_after_the_photo_view` runs `switch` and `animate` (registered once, so their `Local`s live as in the app) in a bare `World` through two round trips, and checks the water's own material back (none of the photo view's), the sky hidden, the camera without HDR, bloom and fog, the clear colour, the light's transform and illuminance and the ambient light. It passed on the code as it was.
   - [x] ~~The stratification sheet showed in the photo view~~ (found 2026-10-20 in a photo screenshot of the 72 h 3D replay: pink and yellow over the sea): it is a chart overlay, hidden in the photo view now as the arrows and contours are.
 
+### A case run on another coast: Chiloé (2026-11-11)
+- `dgcom run`'s snapshot file replays as it is: `--replay ../cases/chiloe/output/chiloe_coast500/chiloe_coast500.dgsnap --terrain ../data/chiloe_gebco.tif` (94,685 P2 elements, 852,165 nodes, 225 frames, 2.3 GB; 4 frames held, 41 MB; GEBCO's 15″ grid as the terrain, 983 × 2038 cells built in 1.9 s). The header's `projection=local,lat,lon` and stations are enough: the close-up is Puerto Montt, the first station.
+- The gauge trace takes SHOA's record from the IOC facility through `scripts/ioc_gauge_file.py` (the JSON `scripts/ioc_gauge_skill.py` keeps, as a `kartverket_gauge.sh` file about its own mean): the model's 20 % excess at Puerto Montt shows at every high and low water.
+- Open (TODO F.3): the domain framing of a tall domain, one trace for several stations, η's visibility at a 2 m scale, hemispheres in the readout.
+
 ### Does the viewer show what the model computed? (2026-10-20, a depth pass)
 - **Judge:** `scripts/dgsnap_check.py RUN_DIR`, an independent numpy decoder of `.dgsnap` written from the format spec (not the library's or the viewer's reader). For the header's first station it compares the snapshot at the node the run sampled with the solver's own f64 `station_*.txt` (η) and `currents_*.txt` (ū, v̄) at every frame. The node order (r fastest) is confirmed by the bed's continuity between elements: 7e-15 m against 150 m for s fastest.
   - The 72 h nested 3D run (`3d_rk43`): 72 of 72 frames, η within 5.1e-7 m, ū, v̄ within 9.5e-11 m/s.

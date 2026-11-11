@@ -61,6 +61,15 @@
 # left is amplitude; C_D = 0.0025 takes 5 points of it (`notes/case-files.md`).
 # Castro's fjord is not on the mesh.
 #
+# In the viewer (`viz/`), with GEBCO's land around the model and Puerto
+# Montt's gauge against the model's trace:
+#
+#   uv run scripts/ioc_gauge_file.py data/tide_gauges/ioc/pmon_<span>.json \
+#       "Puerto Montt" pmon -41.4850 -72.9608 data/tide_gauges/chiloe_puerto_montt_obs.txt
+#   cd viz && cargo run --release -- --replay ../cases/chiloe/output/chiloe/chiloe.dgsnap \
+#       --terrain ../data/chiloe_gebco.tif --gauge ../data/tide_gauges/chiloe_puerto_montt_obs.txt \
+#       --colour elevation --scale-max 2 --view domain
+#
 # Southern hemisphere: the Coriolis parameter is negative here (f ≈ −9.9e-5
 # s⁻¹ at 42.5°S). `beta_plane` takes it from the box's own latitude, so do
 # not copy a Norwegian `f_plane` value.
