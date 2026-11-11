@@ -1186,7 +1186,9 @@ impl CaseFile {
             ))
         } else if let Some(path) = &m.gmsh {
             let path = self.resolve(path);
+            // In memory order: a generator's numbering scatters neighbours
             read_gmsh_mesh(&path)
+                .map(|mesh| mesh.in_hilbert_order().0)
                 .map_err(|e| CaseError::Io(format!("mesh.gmsh {}: {e}", path.display())))
         } else {
             let g = m.geographic.as_ref().expect("validated");

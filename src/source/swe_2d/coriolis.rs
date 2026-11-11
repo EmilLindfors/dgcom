@@ -17,6 +17,7 @@
 //! - Coriolis effects are significant for mesoscale circulation
 //! - β ≈ 1.14×10⁻¹¹ m⁻¹ s⁻¹
 
+use crate::mesh::Mesh2D;
 use crate::solver::SWEState2D;
 use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
 
@@ -160,11 +161,15 @@ impl SourceTerm2D for CoriolisSource2D {
         hu: &mut [f64],
         hv: &mut [f64],
     ) {
+        // The element's corners once, not once per node
+        let corners = (self.beta != 0.0).then(|| element.mesh.element_vertices(element.element));
         for i in 0..element.n_nodes() {
-            let f = if self.beta == 0.0 {
-                self.f0
-            } else {
-                self.f_at(element.position(i).1)
+            let f = match &corners {
+                None => self.f0,
+                Some(corners) => {
+                    let (r, s) = (element.ops.nodes_r[i], element.ops.nodes_s[i]);
+                    self.f_at(Mesh2D::bilinear(corners, r, s)[1])
+                }
             };
             let state = element.state(i);
             hu[i] += f * state.hv;

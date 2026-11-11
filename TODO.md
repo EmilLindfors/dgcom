@@ -277,6 +277,11 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Performance (P2) — [notes/performance.md](notes/performance.md)
 
+- [ ] **P2.8** The Chiloé tidal run at 60 s per model hour: 102.5 since 2026-11-11 (146 before; `notes/performance.md` P2.8). What is left is the kernels, evenly: the batched volume term, `element_rhs` and the face pass ≈ 20 % of one thread each, `outer_node` 9 % (the P2.2 lines below), and the stage rates' spreading, ×1.49 (P2.5).
+- [ ] **P2.8** `dgcom run` says nothing of the local time stepping's work: report the evaluations per model second against the ideal (own step each), the levels and the spreading in the run's notes (`MultirateStats` has only the ratio to global steps); the per-pass timings by list length were a temporary patch.
+- [ ] **P2.8** Read every Gmsh mesh in Hilbert order (`Mesh2D::in_hilbert_order` is in the case reader only: `froya_real_data` and the other examples call `read_gmsh_mesh` themselves), and measure it on the Frøya coastline mesh's 2D and 3D runs (Chiloé: 1.26×).
+- [ ] **P2.8** Subset passes of 100–1000 elements are slower on 24 threads than on one (223 µs against ≈ 130 µs at 173 elements; 6 % of the Chiloé run): choose `SUBSET_PARALLEL_MIN` by work, or give the small lists fewer, larger tasks.
+- [ ] **P2.8** The wet/dry correction (`wet_dry_element`, a square root and a division per node for the velocity cap) and `ChezyFriction2D`'s rates in blocks, as `damp_wet_block` does for Manning's (3 % of one thread on Chiloé).
 - [ ] **P2.5** A semi-implicit free surface (θ-method, as TRIM/UnTRIM, SLIM, Thetis), the main cost lever: farm meshes step at ≈ 0.024 s on gravity waves. Needs a global SPD solve and wet/dry care.
 - [ ] **P2.1** Port `compute_dt_advection_2d`, `compute_dt_tracer_2d`, `compute_dt_viscosity`, `Mesh::compute_dt`, `time/ssp_rk3.rs:110` and 1D `compute_dt_swe` to `compute_dt_swe_2d`'s per-node metric form in one helper (`2/(λ_r+λ_s)` for advection).
 - [ ] **P2.5** LTS oversubscription: under ≈ 40 % external load the farm took 358 s at 24 threads against 3.9 s at 4. Serial cut-off by work, a capped pool for small meshes, or documented thread counts.

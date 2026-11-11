@@ -1605,32 +1605,42 @@ const MAX_ELEMENT_MASS_FLUXES: usize = 4 * 9 + 2 * 9 * 8;
 #[cfg(feature = "parallel")]
 const SUBSET_PARALLEL_MIN: usize = 64;
 
-/// The distinct edges of a list of elements, in order of first appearance,
-/// without sorting: an edge is taken when its stamp is not the current pass.
+/// Which elements a subset pass lists: an element is listed when its stamp
+/// is the current pass. The interior edges of the listed elements are then
+/// shared out without a list of them ([`Self::owns`]), so that the face pass
+/// runs over the elements in parallel and each edge is evaluated once.
 #[derive(Default)]
 struct SubsetEdges {
-    list: Vec<u32>,
     stamp: Vec<u32>,
     pass: u32,
 }
 
 impl SubsetEdges {
-    fn collect(&mut self, mesh: &Mesh2D, elements: &[u32]) {
-        if self.stamp.len() != mesh.n_edges || self.pass == u32::MAX {
+    /// Mark `elements` as the listed ones (one write per element).
+    fn mark(&mut self, mesh: &Mesh2D, elements: &[u32]) {
+        if self.stamp.len() != mesh.n_elements || self.pass == u32::MAX {
             self.stamp.clear();
-            self.stamp.resize(mesh.n_edges, 0);
+            self.stamp.resize(mesh.n_elements, 0);
             self.pass = 0;
         }
         self.pass += 1;
-        self.list.clear();
         for &k in elements {
-            for e in mesh.element_edges[k as usize] {
-                if self.stamp[e] != self.pass {
-                    self.stamp[e] = self.pass;
-                    self.list.push(e as u32);
-                }
-            }
+            self.stamp[k as usize] = self.pass;
         }
+    }
+
+    /// Whether the listed element `k` evaluates the edge of its face `face`:
+    /// an interior edge belongs to its left element, or to its right one when
+    /// the left is not listed. Boundary edges belong to nobody (their faces
+    /// are evaluated per element).
+    #[inline]
+    fn owns(&self, mesh: &Mesh2D, k: usize, face: usize) -> Option<usize> {
+        let e = mesh.element_edges[k][face];
+        let edge = &mesh.edges[e];
+        edge.right?;
+        let left = edge.left;
+        let own = (left.element == k && left.face == face) || self.stamp[left.element] != self.pass;
+        own.then_some(e)
     }
 }
 
@@ -1801,31 +1811,41 @@ fn subset_then<BC: SWEBoundaryCondition2D>(
         Some(split_form) => {
             faces.resize(split_form.face_buffer_len(), SWEState2D::zero());
             let mut scratch = SUBSET_EDGES.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-            scratch.collect(mesh, elements);
-            let edges = &scratch.list;
+            scratch.mark(mesh, elements);
+            let listed = &scratch;
             let per_edge = 2 * ops.n_face_nodes;
             let slots = DisjointChunks::new(&mut faces[..], per_edge);
-            let batch = |batch: &[u32]| {
-                let mut edges = [0; VOLUME_BATCH];
-                for (edge, &e) in edges.iter_mut().zip(batch) {
-                    *edge = e as usize;
+            // The edges the elements of a chunk own, VOLUME_BATCH at a time
+            let chunk = |ks: &[u32]| {
+                let mut own = [0; 4 * ELEMENT_CHUNK];
+                let mut n_own = 0;
+                for &k in ks {
+                    for face in 0..4 {
+                        if let Some(e) = listed.owns(mesh, k as usize, face) {
+                            own[n_own] = e;
+                            n_own += 1;
+                        }
+                    }
                 }
-                let mut edge_slots = edges.map(|_| -> &mut [SWEState2D] { &mut [] });
-                for (slot, &e) in edge_slots.iter_mut().zip(batch) {
-                    // SAFETY: `edges` is distinct, so each edge's slots once
-                    *slot = unsafe { slots.chunk(e as usize) };
+                for edges in own[..n_own].chunks(VOLUME_BATCH) {
+                    let mut edge_slots =
+                        [(); VOLUME_BATCH].map(|_| -> &mut [SWEState2D] { &mut [] });
+                    for (slot, &e) in edge_slots.iter_mut().zip(edges) {
+                        // SAFETY: every edge has one owner among the (distinct)
+                        // listed elements, at one of its faces: its slots once
+                        *slot = unsafe { slots.chunk(e) };
+                    }
+                    split_form.edge_fluxes_batch(edges, &mut edge_slots[..edges.len()]);
                 }
-                let n = batch.len();
-                split_form.edge_fluxes_batch(&edges[..n], &mut edge_slots[..n]);
             };
             #[cfg(feature = "parallel")]
             if parallel {
-                edges.par_chunks(VOLUME_BATCH).for_each(batch);
+                elements.par_chunks(ELEMENT_CHUNK).for_each(chunk);
             } else {
-                edges.chunks(VOLUME_BATCH).for_each(batch);
+                elements.chunks(ELEMENT_CHUNK).for_each(chunk);
             }
             #[cfg(not(feature = "parallel"))]
-            edges.chunks(VOLUME_BATCH).for_each(batch);
+            elements.chunks(ELEMENT_CHUNK).for_each(chunk);
             SUBSET_EDGES.with(|cell| *cell.borrow_mut() = scratch);
         }
         None => faces.clear(),
