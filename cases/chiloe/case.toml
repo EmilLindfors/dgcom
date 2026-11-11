@@ -54,7 +54,9 @@
 # On the coastline mesh (2026-11-11, centred RMSE over the second M2 period
 # of a neap day): 3 cm at Ancud (TPXO10 itself: 21 cm), 5 cm at Melinka
 # (2 cm), 16 cm at Puerto Montt (12 cm). The inner sea is within 3-6 min of
-# TPXO10 and 22-26 % larger than it (17-23 % over the gauges). A uniform
+# TPXO10 and 22-26 % larger than it (17-23 % over the gauges). Over four
+# days: 16-18 cm at Puerto Montt, 3-6 cm at Ancud, 5-6 cm at Melinka, within
+# 10 min, and Puerto Montt's excess falls to 7-14 % from the third cycle. A uniform
 # 1 km mesh of the same box (`[mesh.geographic]`, bbox as above, nx = 288,
 # ny = 589) was 25-35 min late from Boca del Guafo inward and scored 29-36 cm
 # at Puerto Montt: the lag was the staircase coast, not the bed. What is
