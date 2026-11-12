@@ -26,7 +26,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P8.9** Chilean weather (MOSA-WRF names), rivers (FLOW, DGA), gauges (SHOA via IOC/UHSLC) and farm sites (Subpesca) as inputs (#216).
 - [ ] **P8.10** One table of variable roles for the gridded readers, CF `standard_name` first, with case overrides, instead of the name lists in `io/netcdf_read.rs` (#217; tracking #221).
 - [ ] **P8.11** Providers at the edges: canonical input formats in `docs/inputs.md`, fetchers under `scripts/sources/<provider>/`, `norkyst_boundary_tides` → `parent_boundary_tides`, `io::norkyst_parquet` and `io::norkyst_reader` moved out of `io` with their one caller, `examples/norkyst_tidal_validation.rs` (#218).
-- [ ] **P8.12** Mausund's tide as the 3D bed's defaults (#219, the part left; the presets and station lists went 2026-11-10): `[bathymetry.slopes_3d]`'s `pond_low_water_m` −1.43 and `high_water_m` 2, `wall_low_water_m` −2 and the 19 m pycnocline. Derive the levels from the case's tide (± `TidalAtlas::largest_amplitude_sum`), require them without one; Frøya's atlas gives ±1.40 m, so the shipped 3D cases change bits and need their scores rerun (`notes/tech-debt.md`).
+- [ ] **P8.12** Mausund's tide as the 3D bed's defaults (#219, the part left; the presets and station lists went 2026-11-10): `[bathymetry.slopes_3d]`'s `pond_low_water_m` −1.43, `high_water_m` 2 and `cliff_depth_m` 20, `[bathymetry] wall_low_water_m` −2, `[bathymetry.raster] land_elevation_m` 5 and the 19 m pycnocline (`free_depth_m`). Derive the levels from the case's tide (± `TidalAtlas::largest_amplitude_sum`), require them without one; Frøya's atlas gives ±1.40 m, so the shipped 3D cases change bits and need their scores rerun (`notes/tech-debt.md`).
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -434,7 +434,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P6** Prune ~200 root re-exports to a `prelude`; export `Simulation3D`.
 - [ ] **P6** Feature-gate `tiff`/`shapefile`/`geo` behind `geodata`.
 - [ ] **P6** `SillOverflow2D`/`SillWithFriction`/`SillDetector`, `StraitFriction2D` and `TidalPotential` have no caller outside their own tests (≈ 1,800 lines with their presets `gentle_sill`, `steep_sill`, `narrow_sound`, `ManningFriction2D::fjord`): delete them, or gate each on a case that needs it (`notes/tech-debt.md`).
-- [ ] **P6** `examples/tide_gauge_validation.rs` keeps its own table of Trøndelag gauges and constants: read `scripts/norkyst_tide_gauges.csv` with `read_tide_gauge_stations`, or retire the example for `dgcom` gauge scores.
 - [ ] **P6** Retire the mostly dead `solver/simd/` with the `Standard` kernel (P1.2).
 - [ ] **P6** The other examples still ignore options they do not read: `wave_growth` (its `fetch` reads keys during the run), `norkyst_boundary_tides`, `tide_gauge_fit` and `common/dap.rs`'s `arguments()` (whose users also drop bare flags). Move them onto `common/arguments.rs` (`Arguments::refuse_unread` after the last read). Its unit tests run only with `cargo test --example <name>`, not in CI.
 - [ ] **P6** Decide whether to split the DG core from the ocean model into a workspace (the name is settled: `dgcom`, 2026-11-07).

@@ -1,6 +1,7 @@
 # Architecture
 
-A DG (Discontinuous Galerkin) solver for Norwegian coastal ocean modeling: a
+A DG (Discontinuous Galerkin) solver for coastal ocean modeling, validated first
+on the Norwegian coast (Frøya, Bodø): a
 2D barotropic SWE model (well-balanced split-form DGSEM with wetting and
 drying, characteristic open boundaries, NorKyst nesting, local time stepping),
 a ROMS-style 3D layer (2D DG horizontal × finite-difference vertical, sigma

@@ -61,8 +61,10 @@ pub fn coriolis_beta(latitude_deg: f64) -> f64 {
 /// );
 ///
 /// let source = coriolis.evaluate(&ctx);
-/// // source.hu = f * hv = 1.2e-4 * 50 = 0.006
-/// // source.hv = -f * hu = -1.2e-4 * 100 = -0.012
+/// // f = 2Ω sin 60° ≈ 1.263e-4 s⁻¹: S_hu = f·hv, S_hv = −f·hu
+/// assert!((coriolis.f0 - 1.263e-4).abs() < 1e-7);
+/// assert!((source.hu - coriolis.f0 * 50.0).abs() < 1e-15);
+/// assert!((source.hv + coriolis.f0 * 100.0).abs() < 1e-15);
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct CoriolisSource2D {

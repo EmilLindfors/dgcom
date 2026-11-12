@@ -232,7 +232,6 @@ pub use io::{
     read_norkyst_text_file,
     read_tide_gauge_directory,
     read_tide_gauge_file,
-    read_tide_gauge_stations,
     read_timeseries_file,
     write_tide_gauge_file,
     write_vtk_series,

@@ -198,10 +198,12 @@ impl TidalPotential {
         ref_longitude_deg: f64,
         ref_latitude_deg: f64,
     ) -> Self {
+        // `x * PI / 180` rather than `to_radians` (`x * (PI / 180)`), which
+        // can differ in the last bit: the same as the preset this replaced
         Self::new(
             constituents,
-            ref_longitude_deg.to_radians(),
-            ref_latitude_deg.to_radians(),
+            ref_longitude_deg * PI / 180.0,
+            ref_latitude_deg * PI / 180.0,
             true,
         )
     }

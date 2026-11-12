@@ -263,10 +263,12 @@ fn parse_time_value(s: &str) -> Result<f64, String> {
 }
 
 /// Read a list of tide gauges: a CSV file with a header row naming the
-/// columns `name`, `lat` and `lon` (degrees north and east), in any order,
-/// and optionally `code` (the gauge's ID at its provider, kept as
-/// [`TideGaugeStation::external_id`]). Other columns are ignored, as are
-/// blank lines and lines starting with `#`.
+/// columns `name`, `lat` and `lon` (degrees north, and east within ±180),
+/// in any order, and optionally `code` (the gauge's ID at its provider,
+/// kept as [`TideGaugeStation::external_id`]). Other columns are ignored, as
+/// are blank lines, lines starting with `#` and a UTF-8 byte-order mark.
+/// Fields are not quoted: every row has exactly the header's number of
+/// fields, so a comma inside a name is an error rather than a shifted row.
 ///
 /// `scripts/norkyst_tide_gauges.csv` (Kartverket's 17 permanent gauges on
 /// the Norwegian mainland) is such a file.
@@ -276,14 +278,19 @@ pub fn read_tide_gauge_stations(path: &Path) -> Result<Vec<TideGaugeStation>, Ti
         .enumerate()
         .filter(|(_, line)| {
             line.as_ref().map_or(true, |l| {
-                !l.trim().is_empty() && !l.trim_start().starts_with('#')
+                let l = l.trim_start_matches('\u{feff}').trim();
+                !l.is_empty() && !l.starts_with('#')
             })
         });
     let (_, header) = lines
         .next()
         .ok_or_else(|| TideGaugeFileError::InvalidFormat("no header row".into()))?;
     let header = header?;
-    let columns: Vec<&str> = header.split(',').map(str::trim).collect();
+    let columns: Vec<&str> = header
+        .trim_start_matches('\u{feff}')
+        .split(',')
+        .map(str::trim)
+        .collect();
     let column = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
     let required = |name: &str| {
         column(name).ok_or_else(|| {
@@ -298,35 +305,37 @@ pub fn read_tide_gauge_stations(path: &Path) -> Result<Vec<TideGaugeStation>, Ti
     let mut stations = Vec::new();
     for (index, line) in lines {
         let line = line?;
+        let at = |message: String| {
+            TideGaugeFileError::ParseError(format!("line {}: {message}", index + 1))
+        };
         let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-        let field = |i: usize| {
-            fields.get(i).copied().ok_or_else(|| {
-                TideGaugeFileError::ParseError(format!(
-                    "line {}: {} fields, the header has {}",
-                    index + 1,
-                    fields.len(),
-                    columns.len()
-                ))
-            })
-        };
+        if fields.len() != columns.len() {
+            return Err(at(format!(
+                "{} fields, the header has {}",
+                fields.len(),
+                columns.len()
+            )));
+        }
         let degrees = |i: usize, what: &str, limit: f64| {
-            let text = field(i)?;
-            text.parse::<f64>()
-                .ok()
-                .filter(|v| v.abs() <= limit)
-                .ok_or_else(|| {
-                    TideGaugeFileError::ParseError(format!(
-                        "line {}: {what} {text:?} is not within ±{limit}°",
-                        index + 1
-                    ))
-                })
+            let text = fields[i];
+            let value: f64 = text
+                .parse()
+                .map_err(|_| at(format!("{what} {text:?} is not a number")))?;
+            if value.is_finite() && value.abs() <= limit {
+                Ok(value)
+            } else {
+                Err(at(format!("{what} {text:?} is not within ±{limit}°")))
+            }
         };
+        if fields[name].is_empty() {
+            return Err(at("the name is empty".into()));
+        }
         let mut station = TideGaugeStation::new(
-            field(name)?,
-            degrees(lon, "longitude", 360.0)?,
+            fields[name],
+            degrees(lon, "longitude", 180.0)?,
             degrees(lat, "latitude", 90.0)?,
         );
-        if let Some(code) = code.map(field).transpose()?.filter(|c| !c.is_empty()) {
+        if let Some(code) = code.map(|i| fields[i]).filter(|c| !c.is_empty()) {
             station = station.with_external_id(code);
         }
         stations.push(station);
@@ -503,7 +512,7 @@ mod tests {
 
     /// The station list the repository ships (Kartverket's permanent
     /// gauges), which replaced the approximate positions once held in code
-    /// (Heimsjø and Bodø each ≈ 0.5 km off).
+    /// (Heimsjø and Bodø ≈ 0.5 km off, Bergen 0.9 km).
     #[test]
     fn the_shipped_station_list_reads() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/norkyst_tide_gauges.csv");
@@ -545,8 +554,25 @@ mod tests {
         };
         assert!(read("").contains("no header"));
         assert!(read("name,latitude,lon\nA,1,2\n").contains("\"lat\""));
-        assert!(read("name,lat,lon\nA,95.0,2\n").contains("line 2: latitude \"95.0\""));
-        assert!(read("name,lat,lon\nA,1,2\nB,1\n").contains("line 3: 2 fields"));
+        assert!(
+            read("name,lat,lon\nA,95.0,2\n").contains("line 2: latitude \"95.0\" is not within")
+        );
+        assert!(read("name,lat,lon\nA,1,-300\n").contains("longitude \"-300\" is not within ±180"));
+        assert!(read("name,lat,lon\nA,abc,2\n").contains("latitude \"abc\" is not a number"));
+        assert!(read("name,lat,lon\nA,1,inf\n").contains("longitude \"inf\" is not within"));
+        assert!(read("name,lat,lon\nA,1,2\nB,1\n").contains("line 3: 2 fields, the header has 3"));
+        // An unquoted comma in a name shifts the row: refused, not misread
+        assert!(read("name,lat,lon\nBodø, havn,67.29,14.40\n").contains("4 fields"));
+        assert!(read("name,lat,lon\n ,1,2\n").contains("line 2: the name is empty"));
+    }
+
+    /// A spreadsheet's CSV export starts with a byte-order mark.
+    #[test]
+    fn a_station_list_with_a_byte_order_mark_reads() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "\u{feff}name,lat,lon\nA,1,2\n").unwrap();
+        let stations = read_tide_gauge_stations(file.path()).unwrap();
+        assert_eq!(stations[0].name, "A");
     }
 
     #[test]
