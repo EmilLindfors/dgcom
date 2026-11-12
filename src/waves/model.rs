@@ -120,11 +120,14 @@ static SCALAR_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 #[cfg(feature = "simd")]
 #[inline]
 fn vector_kernels() -> bool {
-    #[cfg(all(test, feature = "simd"))]
-    if SCALAR_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
+    #[cfg(test)]
+    {
+        !SCALAR_ONLY.load(std::sync::atomic::Ordering::Relaxed)
     }
-    true
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 
 /// Default minimum depth (m): shallower water, and land, is taken this deep.
