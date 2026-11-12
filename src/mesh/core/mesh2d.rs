@@ -46,6 +46,69 @@ pub struct Edge {
     pub boundary_tag: Option<BoundaryTag>,
 }
 
+/// The other side of one face of an element, in four bytes: what the
+/// element kernels read of the connectivity, an element's four faces in one
+/// place ([`Mesh2D::face_links`]; [`Mesh2D::neighbor`] reads the same from
+/// the edge list).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaceLink(u32);
+
+impl FaceLink {
+    /// A boundary face: no other side.
+    pub const BOUNDARY: Self = Self(u32::MAX);
+    /// Most elements a mesh may have: 28 bits of a link, less the pattern
+    /// of [`Self::BOUNDARY`].
+    pub const MAX_ELEMENTS: usize = (1 << 28) - 1;
+
+    /// The face whose other side is `neighbour`; `left`: the face itself is
+    /// the left side of its edge; `shared`: the two faces have the same two
+    /// vertices (not a periodic pair).
+    fn new(neighbour: ElementFace, left: bool, shared: bool) -> Self {
+        debug_assert!(neighbour.element < Self::MAX_ELEMENTS && neighbour.face < 4);
+        // (an element index below MAX_ELEMENTS leaves a zero bit: never BOUNDARY)
+        Self(
+            (neighbour.element as u32) << 4
+                | u32::from(shared) << 3
+                | u32::from(left) << 2
+                | neighbour.face as u32,
+        )
+    }
+
+    /// Whether the face is on the boundary.
+    #[inline]
+    pub fn is_boundary(self) -> bool {
+        self == Self::BOUNDARY
+    }
+
+    /// The neighbour element (not for a boundary face).
+    #[inline]
+    pub fn element(self) -> usize {
+        (self.0 >> 4) as usize
+    }
+
+    /// Whether the two faces have the same two vertices, traversed in
+    /// opposite directions: every interior face but a periodic pair's. Their
+    /// outward normals and lengths are then equal and opposite to the bit
+    /// (not for a boundary face).
+    #[inline]
+    pub fn shares_vertices(self) -> bool {
+        self.0 & 8 != 0
+    }
+
+    /// The neighbour's face (not for a boundary face).
+    #[inline]
+    pub fn face(self) -> usize {
+        (self.0 & 3) as usize
+    }
+
+    /// Whether this face, not the neighbour's, is the left side of the edge
+    /// (not for a boundary face).
+    #[inline]
+    pub fn is_left(self) -> bool {
+        self.0 & 4 != 0
+    }
+}
+
 /// Position of the cell `(x, y)` of a `2^bits × 2^bits` grid along the
 /// Hilbert curve through it: cells next to each other on the curve share a
 /// side, and cells near each other in the plane are mostly near on the curve.
@@ -207,6 +270,11 @@ pub struct Mesh2D {
 
     /// Element-to-edge mapping: element_edges[k][f] = edge index for face f of element k
     pub element_edges: Vec<[usize; 4]>,
+
+    /// The other side of every face of every element, packed
+    /// (`face_links[k][f]`): the neighbours of [`Self::neighbor`] without
+    /// the edge list.
+    pub face_links: Vec<[FaceLink; 4]>,
 
     /// Number of elements
     pub n_elements: usize,
@@ -453,7 +521,23 @@ impl Mesh2D {
             edge.boundary_tag = Some(boundary_tag(edge.left));
         }
 
+        assert!(
+            n_elements <= FaceLink::MAX_ELEMENTS,
+            "a mesh holds at most {} elements",
+            FaceLink::MAX_ELEMENTS
+        );
+        let mut face_links = vec![[FaceLink::BOUNDARY; 4]; n_elements];
+        for edge in &edges {
+            if let Some(right) = edge.right {
+                let (a, b) = face_vertices(edge.left);
+                let shared = face_vertices(right) == (b, a);
+                face_links[edge.left.element][edge.left.face] = FaceLink::new(right, true, shared);
+                face_links[right.element][right.face] = FaceLink::new(edge.left, false, shared);
+            }
+        }
+
         Ok(Self {
+            face_links,
             vertex_to_elements: Self::build_vertex_to_elements(&elements, n_vertices),
             vertices,
             elements,
@@ -1655,5 +1739,67 @@ mod tests {
         assert_eq!(verts[1], [1.0, 0.0]);
         assert_eq!(verts[2], [1.0, 1.0]);
         assert_eq!(verts[3], [0.0, 1.0]);
+    }
+
+    /// The packed face links say what the edge list says: the neighbour and
+    /// its face, which side of the edge the face is, and whether the two
+    /// faces share their vertices (all but the periodic pairs).
+    #[test]
+    fn face_links_are_the_neighbours_of_the_edge_list() {
+        let single = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 1, 1);
+        for (name, mesh) in [
+            (
+                "rectangle",
+                Mesh2D::uniform_rectangle(0.0, 4.0, 0.0, 3.0, 4, 3),
+            ),
+            (
+                "channel",
+                Mesh2D::channel_periodic_x(0.0, 4.0, 0.0, 3.0, 4, 3),
+            ),
+            (
+                "periodic",
+                Mesh2D::uniform_periodic(0.0, 4.0, 0.0, 3.0, 4, 3),
+            ),
+            ("one periodic element", single),
+        ] {
+            let face_vertices = |ef: ElementFace| {
+                let quad = mesh.elements[ef.element];
+                (quad[ef.face], quad[(ef.face + 1) % 4])
+            };
+            let mut apart = 0;
+            for k in 0..mesh.n_elements {
+                for face in 0..4 {
+                    let link = mesh.face_links[k][face];
+                    let Some(neighbour) = mesh.neighbor(ElementIndex::new(k), face) else {
+                        assert!(link.is_boundary(), "{name}: {k}/{face}");
+                        continue;
+                    };
+                    assert!(!link.is_boundary(), "{name}: {k}/{face}");
+                    assert_eq!(
+                        ElementFace::new(link.element(), link.face()),
+                        neighbour,
+                        "{name}: {k}/{face}"
+                    );
+                    let edge = &mesh.edges[mesh.element_edges[k][face]];
+                    assert_eq!(
+                        link.is_left(),
+                        edge.left == ElementFace::new(k, face),
+                        "{name}: {k}/{face}"
+                    );
+                    let (a, b) = face_vertices(ElementFace::new(k, face));
+                    let shared = face_vertices(neighbour) == (b, a);
+                    assert_eq!(link.shares_vertices(), shared, "{name}: {k}/{face}");
+                    apart += usize::from(!shared);
+                }
+            }
+            // Both faces of every periodic pair, and no other
+            let pairs = match name {
+                "rectangle" => 0,
+                "channel" => 3,
+                "periodic" => 3 + 4,
+                _ => 2,
+            };
+            assert_eq!(apart, 2 * pairs, "{name}");
+        }
     }
 }

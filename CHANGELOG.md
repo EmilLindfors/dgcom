@@ -6,6 +6,11 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **The wet/dry 2D kernel reads a quarter of what it read, and the Chiloé tide takes 61.5 s per model hour against 99 (issue #229; `notes/performance.md` P2.8).** Every value is the same bit for bit.
+  - **Face fluxes where they are used.** With the `simd` feature (P1–P4), a batch of eight elements evaluates the hydrostatic HLL flux of its elements' faces itself, in the edge's orientation, so both sides compute the same bits. The face pass and its buffer are gone for `WetDry`; the other split forms and the builds without `simd` keep them.
+  - **Geometry from the corners.** `GeometricFactors2D::corners(k)`: the batch computes the metric, 1/J, the normals and sJ of a bilinear element from its four corners as `GeometricFactors2D::compute` does, instead of reading the per-node fields.
+  - **`Mesh2D::face_links`** (`FaceLink`): the other side of every face in four bytes. A mesh holds at most 2²⁸ − 1 elements.
+  - **Also:** the subcells' outer nodes gathered in vectors; substeps of fewer than 1024 elements ended on one thread; a `split_form_subset_p2` bench of the subset RHS.
 - **A 2D run with local time stepping on a Gmsh mesh costs 1.4× less (TODO P2.8; `notes/performance.md`).** The Chiloé tide (94,685 P2 elements, 8 levels) takes 102.5 s per model hour on 24 threads against 146; its gauge scores are unchanged.
   - **Meshes:** `read_gmsh_mesh` returns the mesh in Hilbert order of the element centroids (`Mesh2D::in_hilbert_order`), for cases, examples and the viewer alike (Frøya's 12,000 elements: 1.1× in 2D, 4–7 % per step in 3D). Gmsh's numbering left 44 % of the face neighbours more than 1000 elements apart; now 99 % are within 1024. Results change by round-off (0.1–0.4 mm rms of η at Chiloé's gauges over two tides), and restart files written on the old numbering no longer fit.
   - **The face pass of a subset RHS** runs over the listed elements in parallel, each interior edge evaluated by the element that owns it; it collected a list of edges serially in every pass (7 % of the run). Bit for bit.

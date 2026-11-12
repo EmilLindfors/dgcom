@@ -91,6 +91,15 @@ pub struct GeometricFactors2D {
     /// of the (strided) node-0 entries of the per-node fields.
     elements: Vec<ElementGeometry>,
 
+    /// The corners of every element, counter-clockwise from `(r, s) =
+    /// (−1, −1)`: all of a bilinear element's geometry in one cache line
+    /// ([`Self::corners`]).
+    corners: Vec<[[f64; 2]; 4]>,
+
+    /// Whether each element is a parallelogram, one byte each
+    /// ([`Self::element_is_affine`]).
+    parallelograms: Vec<bool>,
+
     /// Whether every element is a parallelogram
     affine: bool,
 }
@@ -136,6 +145,8 @@ impl GeometricFactors2D {
             n_nodes,
             n_face_nodes,
             elements: Vec::with_capacity(n_elements),
+            corners: Vec::with_capacity(n_elements),
+            parallelograms: Vec::with_capacity(n_elements),
             affine: true,
         };
 
@@ -143,6 +154,8 @@ impl GeometricFactors2D {
             let verts = mesh.element_vertices(k);
             let affine = is_parallelogram(&verts);
             geom.affine &= affine;
+            geom.corners.push(verts);
+            geom.parallelograms.push(affine);
 
             let mut area = 0.0;
             for i in 0..n_nodes {
@@ -218,7 +231,24 @@ impl GeometricFactors2D {
     /// round-off), so kernels may use the values at node 0 throughout.
     #[inline]
     pub fn element_is_affine(&self, k: usize) -> bool {
-        self.elements[k].affine
+        self.parallelograms[k]
+    }
+
+    /// The corners of element `k`, counter-clockwise from `(r, s) = (−1, −1)`.
+    ///
+    /// Every per-node field of this struct is a function of them, computed
+    /// by `BilinearMetric::at`: with `x_r, x_s, y_r, y_s` the derivatives of
+    /// the bilinear map at a node and `J = x_r y_s − x_s y_r`,
+    /// `(r_x, r_y, s_x, s_y) = (y_s, −x_s, −y_r, x_r) / J`; at a face node
+    /// `sJ n` is `(y_r, −x_r)`, `(y_s, −x_s)`, `(−y_r, x_r)`, `(−y_s, x_s)`
+    /// on faces 0–3. A kernel that evaluates these itself, operation for
+    /// operation, reads 64 bytes per element instead of the per-node fields
+    /// (≈ 1 kB at P2) and gets the same values to the bit. Along a face they
+    /// do not depend on the node: `sJ n` is half the face's vertex
+    /// difference, turned.
+    #[inline]
+    pub fn corners(&self, k: usize) -> &[[f64; 2]; 4] {
+        &self.corners[k]
     }
 
     /// Node-0 geometry of element `k` from a dense per-element array: for a
@@ -677,5 +707,48 @@ mod tests {
         mesh.vertices[top_right] = [0.2, 0.2];
         let ops = DGOperators2D::new(2);
         let _ = GeometricFactors2D::compute(&mesh, &ops);
+    }
+
+    /// What the element kernels take from the corners instead of the
+    /// per-node fields (`swe_2d_split_form_batch.rs`): a face's normal and
+    /// surface Jacobian are the same at every node of it, to the bit (they
+    /// are half the face's vertex difference, turned), and across a face
+    /// whose two sides share their vertices the normals are opposite and the
+    /// surface Jacobians equal, to the bit.
+    #[test]
+    fn test_face_geometry_is_constant_along_a_face_and_opposite_across_it() {
+        let mesh = distorted_mesh(5, 0.04);
+        for order in 1..=4 {
+            let ops = DGOperators2D::new(order);
+            let geom = GeometricFactors2D::compute(&mesh, &ops);
+            assert!(!geom.is_affine());
+            let bits = |(x, y): (f64, f64)| (x.to_bits(), y.to_bits());
+            for k in 0..mesh.n_elements {
+                assert_eq!(
+                    *geom.corners(k),
+                    mesh.element_vertices(ElementIndex::new(k))
+                );
+                for face in 0..4 {
+                    let (normal, s_j) = geom.element_geometry(k).faces[face];
+                    for fi in 0..ops.n_face_nodes {
+                        assert_eq!(bits(geom.normal(k, face, fi)), bits(normal));
+                        assert_eq!(geom.surface_jacobian(k, face, fi).to_bits(), s_j.to_bits());
+                    }
+                    let link = mesh.face_links[k][face];
+                    if link.is_boundary() {
+                        continue;
+                    }
+                    assert!(link.shares_vertices());
+                    let (other, s_j_other) =
+                        geom.element_geometry(link.element()).faces[link.face()];
+                    assert_eq!(
+                        bits(other),
+                        bits((-normal.0, -normal.1)),
+                        "P{order}, {k}/{face}"
+                    );
+                    assert_eq!(s_j_other.to_bits(), s_j.to_bits(), "P{order}, {k}/{face}");
+                }
+            }
+        }
     }
 }

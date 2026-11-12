@@ -26,7 +26,7 @@ use crate::time::SspScheme;
 use crate::types::ElementIndex;
 
 use super::diffusion_2d::ScalarGradient2D;
-use super::swe_2d_split_form::{ELEMENT_CHUNK, SplitFormSWE2D, SplitFormWorkspace, VOLUME_BATCH};
+use super::swe_2d_split_form::{ELEMENT_CHUNK, SplitFormSWE2D, SplitFormWorkspace};
 use super::swe_2d_viscosity::{ViscousScratch, ViscousTerm, ViscousWorkspace};
 #[cfg(feature = "simd")]
 use crate::solver::simd::{apply_diff_matrix, apply_lift, coriolis_source};
@@ -566,22 +566,6 @@ fn viscous_gradients_all<BC: SWEBoundaryCondition2D>(
     }
 }
 
-/// The face fluxes of the consecutive edges `e0..` whose slots are `batch`
-/// (`per_edge` values each, at most [`VOLUME_BATCH`] edges), batched.
-fn edge_batch<BC: SWEBoundaryCondition2D>(
-    split_form: &SplitFormSWE2D<BC>,
-    e0: usize,
-    batch: &mut [SWEState2D],
-    per_edge: usize,
-) {
-    let count = batch.len() / per_edge;
-    let edges: [usize; VOLUME_BATCH] = std::array::from_fn(|l| e0 + l);
-    let mut chunks = batch.chunks_exact_mut(per_edge);
-    let mut slots: [&mut [SWEState2D]; VOLUME_BATCH] =
-        std::array::from_fn(|_| chunks.next().unwrap_or_default());
-    split_form.edge_fluxes_batch(&edges[..count], &mut slots[..count]);
-}
-
 /// One 2D SWE RHS evaluation. `element` is the only place the per-element
 /// terms are computed; the serial and parallel drivers just iterate over it.
 struct SWE2DRhsKernel<'a, 'c, BC: SWEBoundaryCondition2D> {
@@ -615,17 +599,24 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         }
     }
 
+    /// The split form whose interior-face fluxes need a face pass: not the
+    /// collocated formulation, and not a split form whose element batches
+    /// evaluate them ([`SplitFormSWE2D::fuses_faces`]).
+    fn face_pass(&self) -> Option<&SplitFormSWE2D<'a, 'c, BC>> {
+        self.split_form.as_ref().filter(|s| !s.fuses_faces())
+    }
+
     /// Interior-face fluxes of the split forms, once per face, into `faces`
-    /// (resized as needed; left empty for the collocated formulation).
+    /// (resized as needed; left empty without a [`Self::face_pass`]).
     fn face_fluxes(&self, faces: &mut Vec<SWEState2D>) {
-        let Some(split_form) = &self.split_form else {
+        let Some(split_form) = self.face_pass() else {
             faces.clear();
             return;
         };
         faces.resize(split_form.face_buffer_len(), SWEState2D::zero());
         let per_edge = 2 * self.ops.n_face_nodes;
-        for (b, batch) in faces.chunks_mut(VOLUME_BATCH * per_edge).enumerate() {
-            edge_batch(split_form, b * VOLUME_BATCH, batch, per_edge);
+        for (e, slots) in faces.chunks_mut(per_edge).enumerate() {
+            split_form.edge_fluxes(e, slots);
         }
     }
 
@@ -634,16 +625,16 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
     fn face_fluxes_parallel(&self, faces: &mut Vec<SWEState2D>) {
         use rayon::prelude::*;
 
-        let Some(split_form) = &self.split_form else {
+        let Some(split_form) = self.face_pass() else {
             faces.clear();
             return;
         };
         faces.resize(split_form.face_buffer_len(), SWEState2D::zero());
         let per_edge = 2 * self.ops.n_face_nodes;
         faces
-            .par_chunks_mut(VOLUME_BATCH * per_edge)
+            .par_chunks_mut(per_edge)
             .enumerate()
-            .for_each(|(b, batch)| edge_batch(split_form, b * VOLUME_BATCH, batch, per_edge));
+            .for_each(|(e, slots)| split_form.edge_fluxes(e, slots));
     }
 
     /// Volume, surface and source terms of element `k`, written (not added)
@@ -655,8 +646,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
     /// if given, the mass flux through every subcell interface (NaN where the
     /// element has no subcells; see [`compute_rhs_swe_2d_mass_fluxes_into`]).
     ///
-    /// `volume`: the slot of the workspace's batch holding the element's
-    /// split-form volume term, from [`Self::volume_chunk`].
+    /// `batched`: the slot of the workspace's batch holding the element's
+    /// split-form terms, from [`Self::chunk_rhs`].
     fn element(
         &self,
         k: usize,
@@ -665,7 +656,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         out: [&mut [f64]; 3],
         face_mass: Option<&mut [f64]>,
         subcell_mass: Option<&mut [f64]>,
-        volume: Option<usize>,
+        batched: Option<usize>,
     ) {
         let k_idx = ElementIndex::new(k);
         let [out_h, out_hu, out_hv] = out;
@@ -679,7 +670,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
                 [out_h, out_hu, out_hv],
                 face_mass,
                 subcell_mass,
-                volume,
+                batched,
             ),
             None => {
                 if let Some(mass) = subcell_mass {
@@ -693,19 +684,30 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         self.source_terms(k_idx, ws, [out_h, out_hu, out_hv]);
     }
 
-    /// Split-form volume terms of the elements `ks` (at most
+    /// Split-form volume and surface terms of the elements `ks` (at most
     /// [`ELEMENT_CHUNK`]), vectorised across them (`simd` feature), into
     /// the workspace for the next [`Self::element`] calls: bit `j` of the
-    /// result is set if `ks[j]`'s is there (slot `j`).
-    fn volume_chunk(&self, ks: &[usize], ws: &mut ElementWorkspace) -> u64 {
+    /// result is set if `ks[j]`'s are there (slot `j`). `time_of(k)` is the
+    /// time of element `k`'s boundary faces; `face_mass`: whether those
+    /// calls ask for the face mass fluxes; `ahead`: the elements this thread
+    /// evaluates next (prefetched).
+    fn chunk_rhs(
+        &self,
+        ks: &[usize],
+        ahead: &[u32],
+        faces: &[SWEState2D],
+        time_of: &dyn Fn(usize) -> f64,
+        face_mass: bool,
+        ws: &mut ElementWorkspace,
+    ) -> u64 {
         self.split_form.as_ref().map_or(0, |split_form| {
-            split_form.volume_chunk(ks, &mut ws.split_form)
+            split_form.chunk_rhs(ks, ahead, faces, time_of, face_mass, &mut ws.split_form)
         })
     }
 
     /// [`Self::element`] for the consecutive elements `k0..` whose rows are
     /// `out` (at most [`ELEMENT_CHUNK`] elements; `face_mass` and
-    /// `subcell_mass` likewise), their volume terms batched, then
+    /// `subcell_mass` likewise), their split-form terms batched, then
     /// `after(k, ws, hu, hv)` for each.
     fn element_batch(
         &self,
@@ -720,7 +722,17 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         let ops = self.ops;
         let n = ops.n_nodes;
         let ks: [usize; ELEMENT_CHUNK] = std::array::from_fn(|l| k0 + l);
-        let volumes = self.volume_chunk(&ks[..out_h.len() / n], ws);
+        // The next chunk's elements, if this thread goes on to it
+        let next = (k0 + ELEMENT_CHUNK).min(self.mesh.n_elements);
+        let ahead: [u32; ELEMENT_CHUNK] = std::array::from_fn(|l| (next + l) as u32);
+        let batched = self.chunk_rhs(
+            &ks[..out_h.len() / n],
+            &ahead[..ELEMENT_CHUNK.min(self.mesh.n_elements - next)],
+            faces,
+            &|_| self.time,
+            face_mass.is_some(),
+            ws,
+        );
         let mut face_mass = face_mass.map(|fm| fm.chunks_exact_mut(4 * ops.n_face_nodes));
         let mut subcell_mass =
             subcell_mass.map(|sm| sm.chunks_exact_mut(subcell_interfaces(ops.n_1d)));
@@ -733,8 +745,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
             let k = k0 + l;
             let fm = face_mass.as_mut().and_then(Iterator::next);
             let sm = subcell_mass.as_mut().and_then(Iterator::next);
-            let volume = ((volumes >> l) & 1 == 1).then_some(l);
-            self.element(k, ws, faces, [h, &mut *hu, &mut *hv], fm, sm, volume);
+            let slot = ((batched >> l) & 1 == 1).then_some(l);
+            self.element(k, ws, faces, [h, &mut *hu, &mut *hv], fm, sm, slot);
             after(k, ws, hu, hv);
         }
     }
@@ -1807,7 +1819,7 @@ fn subset_then<BC: SWEBoundaryCondition2D>(
     // depend on time)
     let faces_kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, 0.0);
     let mut faces = FaceFluxGuard::take();
-    match &faces_kernel.split_form {
+    match faces_kernel.face_pass() {
         Some(split_form) => {
             faces.resize(split_form.face_buffer_len(), SWEState2D::zero());
             let mut scratch = SUBSET_EDGES.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
@@ -1815,27 +1827,17 @@ fn subset_then<BC: SWEBoundaryCondition2D>(
             let listed = &scratch;
             let per_edge = 2 * ops.n_face_nodes;
             let slots = DisjointChunks::new(&mut faces[..], per_edge);
-            // The edges the elements of a chunk own, VOLUME_BATCH at a time
+            // The edges the elements of a chunk own
             let chunk = |ks: &[u32]| {
-                let mut own = [0; 4 * ELEMENT_CHUNK];
-                let mut n_own = 0;
                 for &k in ks {
                     for face in 0..4 {
                         if let Some(e) = listed.owns(mesh, k as usize, face) {
-                            own[n_own] = e;
-                            n_own += 1;
+                            // SAFETY: every edge has one owner among the
+                            // (distinct) listed elements, at one of its
+                            // faces: its slots once
+                            split_form.edge_fluxes(e, unsafe { slots.chunk(e) });
                         }
                     }
-                }
-                for edges in own[..n_own].chunks(VOLUME_BATCH) {
-                    let mut edge_slots =
-                        [(); VOLUME_BATCH].map(|_| -> &mut [SWEState2D] { &mut [] });
-                    for (slot, &e) in edge_slots.iter_mut().zip(edges) {
-                        // SAFETY: every edge has one owner among the (distinct)
-                        // listed elements, at one of its faces: its slots once
-                        *slot = unsafe { slots.chunk(e) };
-                    }
-                    split_form.edge_fluxes_batch(edges, &mut edge_slots[..edges.len()]);
                 }
             };
             #[cfg(feature = "parallel")]
@@ -1904,7 +1906,7 @@ fn subset_then<BC: SWEBoundaryCondition2D>(
             DisjointChunks::new(hv, n),
         ]
     });
-    let element = |ws: &mut WorkspaceGuard, k: usize, volume: Option<usize>| {
+    let element = |ws: &mut WorkspaceGuard, k: usize, batched: Option<usize>| {
         // SAFETY: the elements are distinct, so each element's rows once
         let [h, hu, hv] = out_rows.each_ref().map(|rows| unsafe { rows.chunk(k) });
         let extra = extra_rows
@@ -1919,7 +1921,7 @@ fn subset_then<BC: SWEBoundaryCondition2D>(
             [&mut *h, &mut *hu, &mut *hv],
             mass_fluxes.then_some(&mut *face),
             mass_fluxes.then_some(&mut *subcell),
-            volume,
+            batched,
         );
         if let Some((term, grads)) = &viscous {
             term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
@@ -1927,27 +1929,35 @@ fn subset_then<BC: SWEBoundaryCondition2D>(
         let mass = mass_fluxes.then_some(ElementMassFluxes { face, subcell });
         then(k, [h, hu, hv], extra, mass);
     };
-    // The volume terms (independent of time) ELEMENT_CHUNK elements at a time
-    let chunk = |ws: &mut WorkspaceGuard, ks: &[u32]| {
+    // The split-form terms ELEMENT_CHUNK elements at a time
+    let chunk = |ws: &mut WorkspaceGuard, c: usize| {
+        // The list's chunk c, and the next for the prefetch
+        let chunk_of = |c: usize| {
+            let first = (c * ELEMENT_CHUNK).min(elements.len());
+            &elements[first..(first + ELEMENT_CHUNK).min(elements.len())]
+        };
+        let (ks, ahead) = (chunk_of(c), chunk_of(c + 1));
         let mut slots = [0; ELEMENT_CHUNK];
         for (slot, &k) in slots.iter_mut().zip(ks) {
             *slot = k as usize;
         }
-        let volumes = faces_kernel.volume_chunk(&slots[..ks.len()], ws);
+        let batched =
+            faces_kernel.chunk_rhs(&slots[..ks.len()], ahead, faces, time_of, mass_fluxes, ws);
         for (j, &k) in slots[..ks.len()].iter().enumerate() {
-            element(ws, k, ((volumes >> j) & 1 == 1).then_some(j));
+            element(ws, k, ((batched >> j) & 1 == 1).then_some(j));
         }
     };
+    let n_chunks = elements.len().div_ceil(ELEMENT_CHUNK);
     #[cfg(feature = "parallel")]
     if parallel {
-        elements
-            .par_chunks(ELEMENT_CHUNK)
+        (0..n_chunks)
+            .into_par_iter()
             .for_each_init(|| WorkspaceGuard::take(ops), chunk);
         return;
     }
     let mut ws = WorkspaceGuard::take(ops);
-    for ks in elements.chunks(ELEMENT_CHUNK) {
-        chunk(&mut ws, ks);
+    for c in 0..n_chunks {
+        chunk(&mut ws, c);
     }
 }
 

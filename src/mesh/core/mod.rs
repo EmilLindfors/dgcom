@@ -12,6 +12,6 @@ mod mesh2d_builder;
 mod point_locator;
 
 pub use mesh1d::{BoundaryFace, Mesh1D};
-pub use mesh2d::{Edge, ElementFace, Mesh2D, QuadMeshError};
+pub use mesh2d::{Edge, ElementFace, FaceLink, Mesh2D, QuadMeshError};
 pub use mesh2d_builder::{BoundaryConfig, Mesh2DBuilder};
 pub use point_locator::{MeshPoint, PointLocator2D, inverse_bilinear};
