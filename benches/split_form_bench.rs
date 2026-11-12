@@ -10,6 +10,13 @@
 //! coastline mesh. `shoreline` is `curved` over tidal flats where 33 % of
 //! the elements take the subcells (none of them dry), close to the Frøya
 //! coastline mesh (38.5 %). Serial and parallel full RHS evaluations.
+//!
+//! `split_form_subset_p2` is the kernels' cost as local time stepping runs
+//! them (issue #229): the subset RHS over lists that skip through the
+//! `shoreline` case's elements in Hilbert order (a rectangle, since the
+//! reordering keeps no periodic pairs apart from the mesh's own), in ns per
+//! element evaluation. Compare runs made back to back: a laptop's clock
+//! falls within seconds of load, by 2× on the one these were written on.
 
 use std::f64::consts::PI;
 
@@ -20,6 +27,7 @@ use dgcom::mesh::{Bathymetry2D, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
 use dgcom::solver::{
     SWE2DRhsConfig, SWEFormulation2D, SWESolution2D, SWEState2D, compute_rhs_swe_2d_into,
+    compute_rhs_swe_2d_subset_then,
 };
 use dgcom::types::ElementIndex;
 
@@ -37,7 +45,14 @@ struct Case {
 }
 
 fn case(curved: bool, shoreline: bool) -> Case {
-    let mut mesh = Mesh2D::uniform_periodic(0.0, L, 0.0, L, N, N);
+    case_on(
+        Mesh2D::uniform_periodic(0.0, L, 0.0, L, N, N),
+        curved,
+        shoreline,
+    )
+}
+
+fn case_on(mut mesh: Mesh2D, curved: bool, shoreline: bool) -> Case {
     let tau = 2.0 * PI / L;
     if curved {
         // About 10 % of an element's size: general quadrilaterals everywhere
@@ -128,5 +143,59 @@ fn bench_split_form(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_split_form);
+/// The subset RHS of local time stepping: the listed elements only, each
+/// with the stage's continuation left empty.
+fn bench_subset(c: &mut Criterion) {
+    let equation = ShallowWater2D::new(G);
+    let bc = Reflective2D::new();
+    let mut group = c.benchmark_group("split_form_subset_p2");
+    group.sample_size(30);
+    // Vertices moved first, so that the curve orders the elements as built
+    let Case {
+        mesh,
+        ops,
+        geom,
+        bathymetry,
+        q,
+    } = case_on(
+        Mesh2D::uniform_rectangle(0.0, L, 0.0, L, N, N)
+            .in_hilbert_order()
+            .0,
+        true,
+        true,
+    );
+    let config = SWE2DRhsConfig::new(&equation, &bc)
+        .with_coriolis(false)
+        .with_formulation(SWEFormulation2D::WetDry)
+        .with_bathymetry(&bathymetry)
+        .with_dry_threshold(1e-3);
+    let mut out = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    let all = 0..mesh.n_elements as u32;
+    for (name, elements) in [
+        ("all", all.clone().collect::<Vec<_>>()),
+        ("two_of_three", all.clone().filter(|k| k % 3 != 0).collect()),
+        ("runs_of_40_in_100", all.filter(|k| k % 100 < 40).collect()),
+    ] {
+        group.throughput(Throughput::Elements(elements.len() as u64));
+        group.bench_function(BenchmarkId::new("subset", name), |b| {
+            b.iter(|| {
+                compute_rhs_swe_2d_subset_then(
+                    black_box(&q),
+                    &mesh,
+                    &ops,
+                    &geom,
+                    &config,
+                    &elements,
+                    &|_| 0.0,
+                    &mut out,
+                    None,
+                    &|_, _, _| {},
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_split_form, bench_subset);
 criterion_main!(benches);

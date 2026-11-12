@@ -105,11 +105,12 @@ use super::swe_2d::{SWE2DRhsConfig, SWEFormulation2D};
 #[path = "swe_2d_split_form_batch.rs"]
 mod batch;
 
-/// SIMD lanes (`simd` feature): volume terms and face fluxes are evaluated
-/// this many elements or edges at a time, one per lane.
+/// SIMD lanes (`simd` feature): the element terms are evaluated this many
+/// elements at a time, one per lane.
+#[cfg(feature = "simd")]
 pub(super) const VOLUME_BATCH: usize = 8;
 
-/// Elements per [`SplitFormSWE2D::volume_chunk`]: sorted into the
+/// Elements per [`SplitFormSWE2D::chunk_rhs`]: sorted into the
 /// flux-differencing and the subcell kind before they are batched, so both
 /// kinds fill their lanes.
 pub(super) const ELEMENT_CHUNK: usize = 64;
@@ -272,14 +273,22 @@ pub(super) struct SplitFormWorkspace {
     /// neighbour element on the GLL line through it, and its distance from
     /// the face in this element's reference coordinate (`None` at boundaries)
     outer: Vec<Option<(SWENodeState2D, f64)>>,
-    /// Volume terms (times J) of a chunk of elements, element `j` of the
-    /// chunk from `j · n_nodes` ([`SplitFormSWE2D::volume_chunk`])
+    /// The RHS (`[h, hu, hv]`, volume and surface terms) of a chunk of
+    /// elements, element `j` of the chunk from `j · n_nodes`
+    /// ([`SplitFormSWE2D::chunk_rhs`])
     #[cfg_attr(not(feature = "simd"), allow(dead_code))]
-    batch: Vec<SWEState2D>,
+    batch: [Vec<f64>; 3],
     /// Subcell interface mass fluxes of the chunk's subcell elements,
     /// element `j` from `j · subcell_interfaces(n_1d)`
     #[cfg_attr(not(feature = "simd"), allow(dead_code))]
     batch_mass: Vec<f64>,
+    /// The mass component of `F*` at the chunk's face nodes, element `j`
+    /// from `j · 4 n_1d` (if asked for)
+    #[cfg_attr(not(feature = "simd"), allow(dead_code))]
+    batch_face_mass: Vec<f64>,
+    /// Bit `j`: element `j` of the chunk took the subcell volume term
+    #[cfg_attr(not(feature = "simd"), allow(dead_code))]
+    batch_subcells: u64,
 }
 
 impl SplitFormWorkspace {
@@ -300,8 +309,10 @@ impl SplitFormWorkspace {
             interfaces: padded(n_1d + 1, (0.0, 0.0)),
             faces: padded(n_1d, Default::default()),
             outer: padded(4 * n_1d, None),
-            batch: padded(ELEMENT_CHUNK * n_nodes, SWEState2D::zero()),
+            batch: std::array::from_fn(|_| padded(ELEMENT_CHUNK * n_nodes, 0.0)),
             batch_mass: padded(ELEMENT_CHUNK * 2 * n_1d * n_1d.saturating_sub(1), 0.0),
+            batch_face_mass: padded(ELEMENT_CHUNK * 4 * n_1d, 0.0),
+            batch_subcells: 0,
         }
     }
 }
@@ -370,24 +381,26 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         })
     }
 
-    /// Without the `simd` feature no volume term is batched: every element
-    /// evaluates its own in [`Self::element_rhs`].
+    /// Without the `simd` feature nothing is batched: every element is
+    /// evaluated by itself in [`Self::element_rhs`].
     #[cfg(not(feature = "simd"))]
-    pub(super) fn volume_chunk(&self, _ks: &[usize], _ws: &mut SplitFormWorkspace) -> u64 {
+    pub(super) fn chunk_rhs(
+        &self,
+        _ks: &[usize],
+        _ahead: &[u32],
+        _faces: &[SWEState2D],
+        _time_of: &dyn Fn(usize) -> f64,
+        _face_mass: bool,
+        _ws: &mut SplitFormWorkspace,
+    ) -> u64 {
         0
     }
 
-    /// [`Self::edge_fluxes`] of up to [`VOLUME_BATCH`] edges, `slots[i]` for
-    /// `edges[i]`: vectorised across the edges with the `simd` feature
-    /// (`WetDry`, P1–P4; the same result bit for bit), else one by one.
-    pub(super) fn edge_fluxes_batch(&self, edges: &[usize], slots: &mut [&mut [SWEState2D]]) {
-        #[cfg(feature = "simd")]
-        if self.edge_fluxes_simd(edges, slots) {
-            return;
-        }
-        for (&e, slot) in edges.iter().zip(slots) {
-            self.edge_fluxes(e, slot);
-        }
+    /// Without the `simd` feature the interior-face fluxes come from the face
+    /// pass ([`Self::edge_fluxes`]).
+    #[cfg(not(feature = "simd"))]
+    pub(super) fn fuses_faces(&self) -> bool {
+        false
     }
 
     #[inline]
@@ -490,10 +503,9 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     /// ([`crate::solver::rhs::subcells`]), or NaN in all of them if the element
     /// takes the flux-differencing volume term.
     ///
-    /// `volume`: the slot of `ws.batch` holding this element's volume term
-    /// (and, for a subcell element, of `ws.batch_mass` holding its subcell
-    /// mass fluxes), if [`Self::volume_chunk`] computed it. Then only the
-    /// surface terms are evaluated here; the result is the same bit for bit.
+    /// `batched`: the slot of the workspace's batch holding this element's
+    /// terms (and mass fluxes), if [`Self::chunk_rhs`] computed them: they
+    /// are copied out, the same bit for bit as evaluated here.
     pub(super) fn element_rhs(
         &self,
         k: ElementIndex,
@@ -502,7 +514,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         out: [&mut [f64]; 3],
         mut face_mass: Option<&mut [f64]>,
         mut subcell_mass: Option<&mut [f64]>,
-        volume: Option<usize>,
+        batched: Option<usize>,
     ) {
         let ops = self.ops;
         let n1 = ops.n_1d;
@@ -511,16 +523,30 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let g = self.config.equation.g;
         let h_min = self.config.equation.h_min.meters();
 
+        if let Some(slot) = batched {
+            let n = ops.n_nodes;
+            for (out, batch) in out.into_iter().zip(&ws.batch) {
+                out.copy_from_slice(&batch[slot * n..(slot + 1) * n]);
+            }
+            if let Some(mass) = face_mass {
+                let len = mass.len();
+                mass.copy_from_slice(&ws.batch_face_mass[slot * len..(slot + 1) * len]);
+            }
+            if let Some(mass) = subcell_mass {
+                if (ws.batch_subcells >> slot) & 1 == 1 {
+                    let len = mass.len();
+                    mass.copy_from_slice(&ws.batch_mass[slot * len..(slot + 1) * len]);
+                } else {
+                    mass.fill(f64::NAN);
+                }
+            }
+            return;
+        }
+
         for i in 0..ops.n_nodes {
             ws.nodes[i] = SWENodeState2D::new(&self.q.get_state(k, i), self.bed(k, i), h_min);
         }
-        match volume {
-            Some(slot) => {
-                let n = ops.n_nodes;
-                ws.rhs.copy_from_slice(&ws.batch[slot * n..(slot + 1) * n]);
-            }
-            None => ws.rhs.fill(SWEState2D::zero()),
-        }
+        ws.rhs.fill(SWEState2D::zero());
 
         // 1. Volume term (times J), line by line (node ordering i = j·n1 + a,
         //    r fastest): flux differencing with the collocated bed slope, or
@@ -529,13 +555,9 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let subcells = self
             .subcells
             .is_some_and(|(depth, _)| ws.nodes.iter().any(|n| n.h < depth));
-        match (subcells, volume, subcell_mass.as_deref_mut()) {
-            (true, None, _) => self.outer_nodes(k, ws),
-            (true, Some(slot), Some(mass)) => {
-                let len = mass.len();
-                mass.copy_from_slice(&ws.batch_mass[slot * len..(slot + 1) * len]);
-            }
-            (false, _, Some(mass)) => mass.fill(f64::NAN),
+        match (subcells, subcell_mass.as_deref_mut()) {
+            (true, _) => self.outer_nodes(k, ws),
+            (false, Some(mass)) => mass.fill(f64::NAN),
             _ => {}
         }
         // A parallelogram has a constant metric: take it from the dense
@@ -544,9 +566,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let element = self.geom.element_geometry(ki);
         let affine = element.affine;
         let (affine_r, affine_s) = element.metric.contravariant();
-        // A batched volume term is already in `ws.rhs`
-        let lines = if volume.is_some() { 0 } else { n1 };
-        for line in 0..lines {
+        for line in 0..n1 {
             let r_line = |a: usize| line * n1 + a;
             let s_line = |j: usize| j * n1 + line;
             // Line ends on faces 3/1 (r-lines) and 0/2 (s-lines); faces 2
@@ -619,19 +639,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
                 let q_int = ws.nodes[node];
                 let f_star = match slots {
                     Some(slots) => slots[fi],
-                    // Boundary state with mirrored bathymetry: no bed step at
-                    // boundaries
-                    None => match self.boundary_state(k, face, node, normal) {
-                        // State on the boundary: its physical flux F(q_b)·n
-                        BoundaryState::Exact(q) => {
-                            let q_b = SWENodeState2D::new(&q, q_int.b, h_min);
-                            wintermeyer_flux_2d(&q_b, &q_b, normal, g)
-                        }
-                        BoundaryState::Ghost(q) => {
-                            let q_ext = SWENodeState2D::new(&q, q_int.b, h_min);
-                            self.surface_flux(&q_int, &q_ext, normal, g).0
-                        }
-                    },
+                    None => self.boundary_flux(k, face, node, &q_int, normal, self.time),
                 };
                 if let Some(face_mass) = face_mass.as_deref_mut() {
                     face_mass[face * n_face_nodes + fi] = f_star.h;
@@ -967,25 +975,42 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         })
     }
 
-    /// Boundary state from the configured boundary condition.
-    fn boundary_state(
+    /// `F*` at the boundary face node `node` (state `q_int`) of `face` of
+    /// element `k` at `time`, from the configured boundary condition. The
+    /// boundary state takes the node's bed: no bed step at boundaries.
+    fn boundary_flux(
         &self,
         k: ElementIndex,
         face: usize,
         node: usize,
+        q_int: &SWENodeState2D,
         normal: (f64, f64),
-    ) -> BoundaryState {
-        super::swe_2d::boundary_state(
+        time: f64,
+    ) -> SWEState2D {
+        let g = self.config.equation.g;
+        let h_min = self.config.equation.h_min.meters();
+        let state = super::swe_2d::boundary_state(
             self.q,
             self.mesh,
             self.ops,
             self.config,
-            self.time,
+            time,
             k,
             face,
             node,
             normal,
-        )
+        );
+        match state {
+            // State on the boundary: its physical flux F(q_b)·n
+            BoundaryState::Exact(q) => {
+                let q_b = SWENodeState2D::new(&q, q_int.b, h_min);
+                wintermeyer_flux_2d(&q_b, &q_b, normal, g)
+            }
+            BoundaryState::Ghost(q) => {
+                let q_ext = SWENodeState2D::new(&q, q_int.b, h_min);
+                self.surface_flux(q_int, &q_ext, normal, g).0
+            }
+        }
     }
 }
 
@@ -1842,6 +1867,117 @@ mod tests {
                             "{case}, subset subcell mass fluxes of element {k}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The batches against the per-element kernel where the gate above does
+    /// not reach. Periodic pairs: faces that do not share their vertices, so
+    /// that the edge's normal is not minus the right side's own and the
+    /// neighbour's `sJ` not the element's (`FaceLink::shares_vertices`); on
+    /// general quadrilaterals, with walls (the channel) and without. And a
+    /// boundary condition that depends on time, in a subset pass that gives
+    /// each element its own time, as local time stepping does.
+    #[test]
+    #[cfg(feature = "simd")]
+    fn test_batches_are_bit_for_bit_at_periodic_faces_and_timed_boundaries() {
+        use super::batch::UNBATCHED;
+        use crate::boundary::{BCContext2D, SWEBoundaryCondition2D};
+        use crate::solver::rhs::swe_2d::compute_rhs_swe_2d_subset_then;
+
+        /// A ghost state that changes with time
+        struct Pulsing;
+        impl SWEBoundaryCondition2D for Pulsing {
+            fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
+                let q = ctx.interior_state;
+                let a = 1.0 + 0.1 * (0.37 * ctx.time).sin();
+                SWEState2D::new(a * q.h, -q.hu, 0.5 * a * q.hv)
+            }
+            fn name(&self) -> &'static str {
+                "pulsing"
+            }
+        }
+
+        let equation = ShallowWater2D::new(G);
+        let bc = Pulsing;
+        let unbatched = |f: &dyn Fn() -> SWESolution2D| {
+            UNBATCHED.with(|u| u.set(true));
+            let q = f();
+            UNBATCHED.with(|u| u.set(false));
+            q
+        };
+        let tau = 2.0 * std::f64::consts::PI / L;
+        for order in 1..=4 {
+            for (name, mut mesh) in [
+                (
+                    "periodic",
+                    Mesh2D::uniform_periodic(0.0, L, 0.0, 0.5 * L, 7, 5),
+                ),
+                (
+                    "channel",
+                    Mesh2D::channel_periodic_x(0.0, L, 0.0, 0.5 * L, 7, 5),
+                ),
+            ] {
+                // General quadrilaterals; the two sides of a periodic pair
+                // are moved apart in shape as well
+                let a = 0.03 * L;
+                for v in &mut mesh.vertices {
+                    let [x, y] = *v;
+                    let (sx, sy) = ((0.7 * tau * x).sin(), (1.3 * tau * y).cos());
+                    *v = [x + a * sx * sy, y - 0.7 * a * sx * sy];
+                }
+                assert!(
+                    mesh.face_links
+                        .iter()
+                        .flatten()
+                        .any(|link| !link.is_boundary() && !link.shares_vertices()),
+                    "{name}: periodic pairs"
+                );
+                let ops = DGOperators2D::new(order);
+                let geom = GeometricFactors2D::compute(&mesh, &ops);
+                let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+                    -1.0 + 1.5 * (tau * x).cos() * (tau * y).cos()
+                });
+                let q = shoreline_state(&mesh, &ops, &bathymetry, 1.0);
+                let deep = state(&mesh, &ops, &bathymetry, 1.0);
+                for (formulation, q) in [
+                    (SWEFormulation2D::WetDry, &q),
+                    (SWEFormulation2D::EntropyStable, &deep),
+                ] {
+                    let config = SWE2DRhsConfig::new(&equation, &bc)
+                        .with_coriolis(false)
+                        .with_formulation(formulation)
+                        .with_bathymetry(&bathymetry);
+                    let case = format!("P{order}, {name}, {formulation:?}");
+                    let rhs = || compute_rhs_swe_2d(q, &mesh, &ops, &geom, &config, 1.7);
+                    assert!(bits(&rhs()) == bits(&unbatched(&rhs)), "{case}");
+
+                    // Each element at its own time (35 elements: on this
+                    // thread, so that the reference is unbatched)
+                    let elements: Vec<u32> = (0..mesh.n_elements as u32)
+                        .map(|k| (k * 11) % mesh.n_elements as u32)
+                        .collect();
+                    let subset = || {
+                        let mut out = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+                        compute_rhs_swe_2d_subset_then(
+                            q,
+                            &mesh,
+                            &ops,
+                            &geom,
+                            &config,
+                            &elements,
+                            &|k| 0.3 * k as f64,
+                            &mut out,
+                            None,
+                            &|_, _, _| {},
+                        );
+                        out
+                    };
+                    assert!(
+                        bits(&subset()) == bits(&unbatched(&subset)),
+                        "{case}, own times"
+                    );
                 }
             }
         }

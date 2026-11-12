@@ -475,6 +475,14 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
     }
 }
 
+/// Lists shorter than this end their substeps on one thread: an element's
+/// end is a copy of three rows and its wet/dry correction, and a parallel
+/// dispatch costs about a thousand of them (on the Chiloé tide's 64–127
+/// element lists ≈ 100 µs a pass, 1.5 µs per element, against 14–24 ns per
+/// element in the lists of 16,000 and more, 24 threads).
+#[cfg(feature = "parallel")]
+const FINISH_PARALLEL_MIN: usize = 1024;
+
 /// Local time stepping ([`crate::time::Multirate`]). Supports every
 /// formulation, source term, boundary condition, wetting/drying, the
 /// point-implicit damping and horizontal viscosity (a two-hop stencil); not
@@ -606,7 +614,7 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
             self.post_process_element(k, rows)
         };
         #[cfg(feature = "parallel")]
-        let clips = if elements.len() >= 64 {
+        let clips = if elements.len() >= FINISH_PARALLEL_MIN {
             use rayon::prelude::*;
             elements.par_iter().map(element).sum()
         } else {
