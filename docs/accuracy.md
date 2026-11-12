@@ -264,7 +264,7 @@ For smooth solutions, all flux types produce similar results:
 
 ### Coriolis Verification
 
-Norwegian coast configuration (f = 1.2×10⁻⁴ s⁻¹):
+f-plane with f = 1.2×10⁻⁴ s⁻¹:
 - Source term correctly deflects x-momentum to negative v
 - d(hv)/dt = -f × h × u verified to < 1e-8 error
 

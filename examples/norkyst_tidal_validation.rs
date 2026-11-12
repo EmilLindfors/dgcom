@@ -300,7 +300,7 @@ fn synthetic_self_check() {
     );
 
     // A month resolves M2, S2, N2, K1 and O1; P1 is inferred from K1
-    let fit = HarmonicAnalysis::norwegian_coast()
+    let fit = HarmonicAnalysis::monthly()
         .fit_series(&zeta_series)
         .expect("a month of hourly samples");
     print_comparison(&fit);

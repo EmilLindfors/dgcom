@@ -1,11 +1,11 @@
 # Claude Guidelines for DGCOM
 
-This is a high-performance Discontinuous Galerkin (DG) solver for coastal ocean modeling, targeting simulation of currents along the Norwegian coast. Numerical accuracy and computational efficiency are critical.
+This is a high-performance Discontinuous Galerkin (DG) solver for coastal ocean modeling. The Norwegian coast (Frøya, Bodø) is its first validation, not its scope: a coast is described by its case file, never by code. Numerical accuracy and computational efficiency are critical.
 
 ## Project Context
 
 ### Primary Application
-- **Norwegian coastal current simulation**: Complex fjord geometry, strong tidal forcing, steep bathymetry
+- **Coastal current simulation**: Complex fjord geometry, strong tidal forcing, steep bathymetry (validated on the Norwegian coast first)
 - **Shallow water equations**: Mass and momentum conservation with Coriolis, bottom friction, wetting/drying
 - **Operational oceanography**: Results must be accurate enough for real-world decision support
 
@@ -116,13 +116,19 @@ sigma coordinates with mode splitting (open work: `TODO.md` P4; context:
 - Layer-thickness (Hz) weighted fluxes for anything advected; divide back to concentration/velocity after
 - Known open numerics: see `TODO.md` P4 (the history is in `notes/3d-*.md`)
 
-## Norwegian Coast Specifics
+## Coast Specifics
+
+No coast lives in the library: no presets, station lists or defaults named after a place. A coast's latitude, tidal range, gauges and inputs go in its case file and data files (GitHub issue #221).
 
 ### Physical Considerations
 - **Fjords**: Long, narrow, deep - need anisotropic mesh refinement
-- **Tides**: M2 dominant, strong currents in narrow straits
-- **Fresh water**: River runoff creates stratification (future 3D)
-- **Coriolis**: f ≈ 1.2×10⁻⁴ s⁻¹ at 60°N, important for circulation
+- **Tides**: strong currents in narrow straits; the range sets the wetting/drying band and the 3D bed's shore levels
+- **Fresh water**: River runoff creates stratification
+- **Coriolis**: f = 2Ω sin φ from the case's latitude (`CoriolisSource2D::f_plane_at_latitude`, `beta_plane_at_latitude`); negative in the southern hemisphere
+
+### Norway (Frøya, Bodø: the first validation)
+- **Tides**: M2 dominant, range ≈ 3 m; f ≈ 1.3×10⁻⁴ s⁻¹ at 63–67°N
+- **Parent and inputs**: NorKyst-800, MET Nordic/MEPS, Kartverket's topobathy and gauges (`scripts/norkyst_tide_gauges.csv`)
 
 ### Numerical Considerations
 - **Wetting/drying**: Tidal flats require robust treatment

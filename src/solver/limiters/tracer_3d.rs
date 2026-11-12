@@ -52,16 +52,6 @@ impl TracerBounds {
             s_max,
         }
     }
-
-    /// Norwegian coastal water bounds (slightly relaxed for numerical margin).
-    pub fn norwegian_coast() -> Self {
-        Self {
-            t_min: -2.0,
-            t_max: 25.0,
-            s_min: 0.0,
-            s_max: 36.0,
-        }
-    }
 }
 
 const MIN_LAYER_THICKNESS: f64 = 1.0e-12;

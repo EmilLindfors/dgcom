@@ -173,7 +173,7 @@ impl<F: BottomFriction2D + ?Sized> BottomFriction2D for std::sync::Arc<F> {
 /// use dg::source::{ManningFriction2D, CombinedSource2D, CoriolisSource2D};
 ///
 /// let friction = ManningFriction2D::standard(0.025);  // Rocky fjord bottom
-/// let coriolis = CoriolisSource2D::norwegian_coast();
+/// let coriolis = CoriolisSource2D::f_plane_at_latitude(60.0);
 ///
 /// let combined = CombinedSource2D::new(vec![&friction, &coriolis]);
 /// ```

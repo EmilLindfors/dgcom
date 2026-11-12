@@ -1,10 +1,12 @@
 //! Tide Gauge Validation Example
 //!
-//! Demonstrates validation of model output against tide gauge observations
-//! for the Norwegian coast (Trøndelag region).
+//! Demonstrates validation of model output against tide gauge observations,
+//! here three Trøndelag gauges.
 //!
 //! This example:
-//! 1. Generates synthetic tide gauge observations with realistic Norwegian tidal characteristics
+//! 1. Reads the gauges' positions from a station list
+//!    (`scripts/norkyst_tide_gauges.csv`, `io::read_tide_gauge_stations`) and
+//!    generates synthetic observations from tidal constants given here
 //! 2. Runs a 2D SWE simulation with tidal forcing
 //! 3. Extracts model water levels at gauge locations
 //! 4. Compares model vs observations using multiple metrics
@@ -28,6 +30,7 @@ use dgcom::boundary::{
     CharacteristicOBC, HarmonicTidal2D, MultiBoundaryCondition2D, Reflective2D, TidalConstituent,
 };
 use dgcom::equations::ShallowWater2D;
+use dgcom::io::read_tide_gauge_stations;
 use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
 use dgcom::solver::{
@@ -52,15 +55,19 @@ const H_MIN: f64 = 0.01;
 const F_CORIOLIS: f64 = 1.26e-4;
 
 // ============================================================================
-// Tidal Constituents for Norwegian Coast (Trøndelag Region)
+// Tidal constants of three Trøndelag gauges
 // ============================================================================
 
-/// Tidal constituent data for Norwegian coast stations.
-/// Based on Kartverket harmonic constants.
+/// The gauge list the positions come from (Kartverket's permanent gauges).
+const STATION_LIST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/scripts/norkyst_tide_gauges.csv"
+);
+
+/// Illustrative tidal constants for a gauge, named as in [`STATION_LIST`].
+/// Synthetic, in the range of Kartverket's harmonic constants there.
 struct StationTidalData {
     name: &'static str,
-    longitude: f64,
-    latitude: f64,
     m2_amplitude: f64,
     m2_phase_deg: f64,
     s2_amplitude: f64,
@@ -75,9 +82,7 @@ struct StationTidalData {
 fn trondelag_tidal_data() -> Vec<StationTidalData> {
     vec![
         StationTidalData {
-            name: "Heimsjø",
-            longitude: 9.10,
-            latitude: 63.43,
+            name: "Heimsjøen",
             m2_amplitude: 0.85,
             m2_phase_deg: 125.0,
             s2_amplitude: 0.28,
@@ -89,8 +94,6 @@ fn trondelag_tidal_data() -> Vec<StationTidalData> {
         },
         StationTidalData {
             name: "Trondheim",
-            longitude: 10.39,
-            latitude: 63.44,
             m2_amplitude: 0.92,
             m2_phase_deg: 132.0,
             s2_amplitude: 0.30,
@@ -102,8 +105,6 @@ fn trondelag_tidal_data() -> Vec<StationTidalData> {
         },
         StationTidalData {
             name: "Kristiansund",
-            longitude: 7.73,
-            latitude: 63.11,
             m2_amplitude: 0.78,
             m2_phase_deg: 118.0,
             s2_amplitude: 0.26,
@@ -189,7 +190,7 @@ fn ssp_rk3_step<BC: dgcom::SWEBoundaryCondition2D>(
 
 fn main() {
     println!("==============================================");
-    println!("Tide Gauge Validation - Norwegian Coast");
+    println!("Tide Gauge Validation - Trøndelag gauges");
     println!("==============================================\n");
 
     // ========================================================================
@@ -226,6 +227,8 @@ fn main() {
     println!("Generating synthetic tide gauge observations...");
 
     let tidal_data = trondelag_tidal_data();
+    let gauges = read_tide_gauge_stations(std::path::Path::new(STATION_LIST))
+        .unwrap_or_else(|e| panic!("{STATION_LIST}: {e}"));
     let n_outputs = (t_end / output_interval) as usize + 1;
     let times: Vec<f64> = (0..n_outputs).map(|i| i as f64 * output_interval).collect();
 
@@ -239,8 +242,6 @@ fn main() {
         // Generate scaled observations matching the reduced forcing amplitude
         let scaled_data = StationTidalData {
             name: data.name,
-            longitude: data.longitude,
-            latitude: data.latitude,
             m2_amplitude: data.m2_amplitude * amp_scale,
             m2_phase_deg: data.m2_phase_deg,
             s2_amplitude: data.s2_amplitude * amp_scale,
@@ -254,15 +255,19 @@ fn main() {
         let ts = TimeSeries::new(&times, &values).with_name(data.name);
         observations.insert(data.name.to_string(), ts);
 
-        // Create station (map geographic coords to model domain)
-        // Place stations within the domain interior
-        let x = domain_size * 0.2 + (data.longitude - 7.0) / 4.0 * domain_size * 0.6;
-        let y = domain_size * 0.2 + (data.latitude - 63.0) / 1.0 * domain_size * 0.6;
-        let station = TideGaugeStation::new(data.name, data.longitude, data.latitude)
-            .with_local_coords(
-                x.clamp(5000.0, domain_size - 5000.0),
-                y.clamp(5000.0, domain_size - 5000.0),
-            );
+        // The gauge from the list, its geographic position mapped into the
+        // model domain's interior
+        let gauge: TideGaugeStation = gauges
+            .iter()
+            .find(|g| g.name == data.name)
+            .unwrap_or_else(|| panic!("{} is not in {STATION_LIST}", data.name))
+            .clone();
+        let x = domain_size * 0.2 + (gauge.longitude - 7.0) / 4.0 * domain_size * 0.6;
+        let y = domain_size * 0.2 + (gauge.latitude - 63.0) / 1.0 * domain_size * 0.6;
+        let station = gauge.with_local_coords(
+            x.clamp(5000.0, domain_size - 5000.0),
+            y.clamp(5000.0, domain_size - 5000.0),
+        );
         stations.push(station);
 
         println!(

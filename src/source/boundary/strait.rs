@@ -105,15 +105,6 @@ where
         }
     }
 
-    /// Create with standard parameters for Norwegian straits.
-    ///
-    /// Uses typical values:
-    /// - critical_width: 500m (typical strait widths)
-    /// - enhancement_factor: 2.0 (doubles friction at narrowest points)
-    pub fn norwegian_strait(base_friction: ManningFriction2D, width_fn: F) -> Self {
-        Self::new(base_friction, width_fn, 500.0, 2.0)
-    }
-
     /// Create for very narrow straits (sounds).
     ///
     /// Uses parameters suitable for very narrow passages:
@@ -572,15 +563,6 @@ mod tests {
         // At ends: width = end_width = 300
         let w_end = width_fn(100.0, 0.0).unwrap();
         assert!((w_end - 300.0).abs() < 1.0);
-    }
-
-    #[test]
-    fn test_norwegian_strait_preset() {
-        let width_fn = |_x: f64, _y: f64| Some(200.0);
-        let friction = StraitFriction2D::norwegian_strait(ManningFriction2D::fjord(), width_fn);
-
-        assert_eq!(friction.critical_width, 500.0);
-        assert_eq!(friction.enhancement_factor, 2.0);
     }
 
     #[test]

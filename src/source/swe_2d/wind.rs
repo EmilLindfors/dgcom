@@ -294,20 +294,6 @@ impl WindStress2D {
         )
     }
 
-    /// Create typical Norwegian coast winter storm.
-    ///
-    /// Strong southwesterly wind (15 m/s from 225°).
-    pub fn norwegian_winter_storm() -> Self {
-        Self::from_direction(15.0, 225.0)
-    }
-
-    /// Create typical Norwegian coast summer breeze.
-    ///
-    /// Light variable wind (5 m/s from west).
-    pub fn norwegian_summer() -> Self {
-        Self::from_direction(5.0, 270.0)
-    }
-
     /// Get wind velocity at given position and time.
     fn wind_at(&self, x: f64, y: f64, t: f64) -> (f64, f64) {
         match &self.wind {
@@ -513,9 +499,9 @@ mod tests {
     }
 
     #[test]
-    fn test_norwegian_presets() {
-        // Winter storm: 15 m/s from SW (225°)
-        let winter = WindStress2D::norwegian_winter_storm();
+    fn the_stress_follows_the_direction_the_wind_comes_from() {
+        // 15 m/s from SW (225°)
+        let winter = WindStress2D::from_direction(15.0, 225.0);
         let ctx = make_context(50.0);
         let s = winter.evaluate(&ctx);
 
@@ -523,8 +509,8 @@ mod tests {
         assert!(s.hu > 0.0);
         assert!(s.hv > 0.0);
 
-        // Summer breeze: 5 m/s from W (270°)
-        let summer = WindStress2D::norwegian_summer();
+        // 5 m/s from W (270°)
+        let summer = WindStress2D::from_direction(5.0, 270.0);
         let s_summer = summer.evaluate(&ctx);
 
         // From W means flow to E: u>0, v≈0

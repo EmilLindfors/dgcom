@@ -78,7 +78,7 @@ fn bench_coriolis(c: &mut Criterion) {
     for (nx, ny) in [(8, 8), (16, 16), (32, 32)] {
         let n_elements = nx * ny;
         let (mesh, ops, _, q, _) = setup_problem(nx, ny, 3);
-        let coriolis = CoriolisSource2D::norwegian_coast();
+        let coriolis = CoriolisSource2D::f_plane(1.2e-4);
 
         // Pre-allocate source output
         let mut results = vec![SWEState2D::zero(); q.n_elements * ops.n_nodes];
@@ -181,7 +181,7 @@ fn bench_combined_sources(c: &mut Criterion) {
     let mut group = c.benchmark_group("combined_sources");
 
     let (mesh, ops, _, q, bathy) = setup_problem(16, 16, 3);
-    let coriolis = CoriolisSource2D::norwegian_coast();
+    let coriolis = CoriolisSource2D::f_plane(1.2e-4);
     let friction = ManningFriction2D::new(G, 0.025);
     let bathy_source = BathymetrySource2D::new(G);
 

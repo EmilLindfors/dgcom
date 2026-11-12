@@ -187,7 +187,6 @@ pub use analysis::{
     TimeSeries,
     ValidationSummary,
     compare_harmonics,
-    norwegian_stations,
     validate_stations,
 };
 

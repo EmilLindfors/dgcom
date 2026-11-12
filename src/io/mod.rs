@@ -159,7 +159,7 @@ pub use snapshot::{
 };
 pub use tide_gauge_reader::{
     TideGaugeFile, TideGaugeFileError, files_to_observation_map, read_tide_gauge_directory,
-    read_tide_gauge_file, write_tide_gauge_file,
+    read_tide_gauge_file, read_tide_gauge_stations, write_tide_gauge_file,
 };
 pub use timeseries_reader::{
     BoundaryTimeSeries, TimeSeriesFileError, TimeSeriesRecord, parse_timeseries,

@@ -1,6 +1,6 @@
 # DGCOM
 
-**DGCOM, the Discontinuous Galerkin Coastal Ocean Model**, is a highly experimental coastal ocean model written in Rust. It uses nodal DG on unstructured quadrilateral meshes for the 2D shallow-water equations, and a ROMS-style 3D layer: sigma coordinates, mode splitting and GLS mixing. It was developed for currents along the Norwegian coast, nested in NorKyst-800. Running any coastal domain from a case file is the next step (`TODO.md` P8).
+**DGCOM, the Discontinuous Galerkin Coastal Ocean Model**, is a highly experimental coastal ocean model written in Rust. It uses nodal DG on unstructured quadrilateral meshes for the 2D shallow-water equations, and a ROMS-style 3D layer: sigma coordinates, mode splitting and GLS mixing. A coast is described by its case file. So far it is validated on the Norwegian coast (Frøya, Bodø), nested in NorKyst-800; running any coastal domain from a case file is the work in progress (`TODO.md` P8).
 
 DGCOM is not a port of ROMS. It follows ROMS's recipe for the 3D physics and is validated against ROMS-based NorKyst-800.
 

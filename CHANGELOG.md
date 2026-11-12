@@ -29,6 +29,14 @@ All notable changes to this project should be documented in this file.
   - "roms-rs" read as a port of ROMS, which this model is not.
   - Restart, snapshot and particle files keep their format, so files written before the rename still load.
 
+### Removed
+
+- **The presets and station lists named after Norway (issue #219; `notes/tech-debt.md`).** A coast is described by its case file, not by code.
+  - **Deleted:** `CoriolisSource2D::norwegian_coast`/`norwegian_coast_beta`, `ShallowWater2D::norwegian_coast`, `WindStress2D::norwegian_winter_storm`/`norwegian_summer`, `AtmosphericPressure2D::norwegian_winter_storm`/`severe_storm`, `SillOverflow2D::norwegian_sill`, `SillWithFriction::norwegian_fjord`, `StraitFriction2D::norwegian_strait`, `TracerBounds::norwegian_coast`, and the `norwegian_stations` modules of `analysis::tide_gauge` and `analysis::adcp`.
+  - **Renamed:** `HarmonicAnalysis::norwegian_coast` is `monthly()`; `TidalPotential::norwegian_coast(c)` is `cartesian(c, lon°, lat°)`.
+  - **New:** `CoriolisSource2D::f_plane_at_latitude(φ)`; `io::read_tide_gauge_stations`, which reads a gauge list from a CSV (`name`, `lat`, `lon`, optional `code`) such as `scripts/norkyst_tide_gauges.csv`. `examples/tide_gauge_validation.rs` takes its gauges' positions from that file.
+  - No numerics changed.
+
 ### Fixed
 
 - **A run's step range is the stability bounds' (`SimulationResult::dt_min`, `dt_max`).** A step shortened to land on an output time or the end was counted, so a run at one step of 1.38 s reported "dt 0.003–1.377 s" (Chiloé, `notes/case-files.md`). The range is now taken before the landing.
