@@ -113,3 +113,41 @@ On the Frøya coastline day in 3D (`froya_real_data mesh=data/froya_coast.msh �
   - The bed side (`notes/geometry-mesh.md` "Tidal ponds"): since 2026-10-15 `ponds3d` fills the ponds of up to one element's nodes over the tidal range, P and the 2.2 m pond among them. A 0.2 m film on +0.27 m land at (13.228, −4.318) km still runs at 0.8 m/s at the same η from 5 to 8 h: the kernel's part is open (TODO P1.2).
 - **Tools.** The temporary snapshot tools `examples/tmp_snap_elem.rs` (one element over time, and the fastest deep nodes) and `examples/tmp_snap_ponds.rs` (ponds at a level, with their speeds) are uncommitted in the working tree.
 
+
+### Mixed polynomial order (#231): the measurement says no (2026-11-12)
+
+The first step of #231: uniform P1–P4 at about equal unknowns on the Mausund sub-domain and on Chiloé, at the gauges and by wall time (24 threads, commit `eb3cf06`, 8 local-time-stepping levels, SSP-RK(4,3)). The scripts and logs are in the git-ignored `output/p231/` (`run.sh`, `score.py`, `dry.py`, `mausund.toml`, `walls.txt`).
+
+- **Meshes.** `scripts/gmsh_coastline_mesh.py` with the coastal and offshore sizes scaled together. Chiloé: `coast=333 far=2667`, the case's `500/4000`, `667/5333`, `800/6400`, all `dist=15000 min_water=1500 min_land=1500`. Mausund: `133/1000`, the shipped `200/1500`, `267/2000`, `300/2250`, `350/2600`, `dist=6000`; the 133 m mesh with `min_water=min_land=400` as the 200 m one, the coarser ones with the default 2 × `coast` (at 400 they do not mesh: "edges from different curves share nodes"), so their sounds differ a little. The element count goes as size^−1.3, not ^−2 (the coast sets it), so the unknowns are only roughly equal. `coast=833` (Chiloé) and `coast=333` (Mausund) left 24 and 3 non-convex quads whatever `smooth=` and `recombine_quality=`.
+- **Mausund sub-domain** (`output/p231/mausund.toml`: the atlas tide with the gauge correction and `transport_scaling = 3`, 49.68 h from 2025-06-15, centred RMSE at the gauge against its tidal prediction after the ramp; the last column is the RMS difference of η at the station from P4 on the 200 m mesh over 12.42–49.68 h):
+
+  | run | nodes | wall (s) | steps | RMSE | against P4, 200 m |
+  |---|---|---|---|---|---|
+  | 200 m, P1 | 11,124 | 109 | 2,399 | 7.9 cm | 3.8 cm, +7.6 min |
+  | 200 m, P2 | 25,191 | 293 | 6,177 | 5.2 cm | 1.0 cm, +1.0 min |
+  | 200 m, P3 | 44,784 | 721 | 9,926 | 5.0 cm | 0.8 cm, +0.8 min |
+  | 200 m, P4 | 70,000 | 1,439 | 14,982 | 4.7 cm | – |
+  | 133 m, P1 | 19,484 | 212 | 2,409 | 7.7 cm | 3.3 cm, +7.0 min |
+  | 267 m, P3 | 22,304 | 416 | 9,775 | 5.3 cm | 1.1 cm, +1.1 min |
+  | 300 m, P4 | 28,100 | 731 | 16,335 | 5.3 cm | 1.2 cm, +1.6 min |
+  | 350 m, P4 | 19,750 | 543 | 15,612 | 9.0 cm | 5.2 cm, +10.1 min |
+
+- **Chiloé** (`cases/chiloe/case.toml`, 24.84 h, scored over 12.42–24.84 h: centred RMSE at SHOA's gauges and the shift that fits best; the last column is the RMS difference of η from P3 on the 500 m mesh at Puerto Montt / Ancud / Melinka):
+
+  | run | nodes | wall (s) | Puerto Montt | Ancud | Melinka | against P3, 500 m |
+  |---|---|---|---|---|---|---|
+  | 333 m, P1 | 678,700 | 1,051 | 29.5 cm, +33 min | 5.1 cm | 8.0 cm | 25.0 / 6.5 / 7.3 cm |
+  | 500 m, P1 (`opt_p1`, 2026-11-11) | ≈ 379,000 | – | 41.3 cm, +50 min | 6.7 cm | 9.9 cm | – |
+  | 500 m, P2 (the case) | 852,165 | 1,581 | 19.4 cm, +13 min | 3.9 cm | 5.9 cm | 3.0 / 2.5 / 1.2 cm |
+  | 667 m, P3 | 998,288 | 2,307 | 19.6 cm, +11 min | 3.5 cm | 6.1 cm | 1.6 / 1.7 / 1.0 cm |
+  | 800 m, P4 | 1,203,275 | 3,766 | 18.9 cm, +11 min | 4.1 cm | 6.4 cm | 1.2 / 2.6 / 0.7 cm |
+  | 500 m, P3 (reference) | 1,514,832 | 3,530 | 18.5 cm, +9 min | 3.9 cm | 6.5 cm | – |
+
+  The 667 m and 800 m runs needed `boundary.atlas.max_closed = 0.08`: 11 of 203 and 9 of 173 open faces lie outside the atlas, over the 5 % limit the 500 m mesh stays under.
+- **Elements that hold a dry node in some frame after 3 h** (depth ≤ 1 mm at a node, 10 min frames; permanently part-dry shore elements count): Chiloé 17.6 % at P1 on 333 m, 22.1 % at P2 on 500 m, 26.5 % at P3 on 667 m, 28.9 % at P4 on 800 m, holding 1.7, 2.4, 3.1 and 3.7 % of the area. Mausund 38 % (P1, 133 m), 48 % (P2, 200 m), 51 % (P3, 267 m), 54 % (P4, 300 m), holding 18, 23, 29 and 39 % of the area.
+- **Read.**
+  - P2 is converged for the tide at the gauges. On Chiloé it is within 1–3 cm of P3 on the same mesh, and no run of P2 or above moves a gauge score by more than 1 cm: what is left (Puerto Montt's 19 cm, its range 12 % over) is the bed and the basin, not the order (`notes/case-files.md`, Chiloé). At Mausund P2 to P4 on one mesh is 5.2 to 4.7 cm for 5 × the wall time.
+  - At about equal unknowns P3 and P4 buy nothing and cost 1.4–2.5 × P2 (Mausund 416 and 731 s against 293; Chiloé 2,307 and 3,766 s against 1,581, with 1.2 and 1.4 × the unknowns). The step falls with the order (Chiloé's coarse step 84 s at P2 on 500 m, 54 s at P3 on 667 m, 58 s at P4 on 800 m) and the work per node grows.
+  - P1 does not get there by refining: at 0.8 of P2's unknowns Chiloé is 10 cm worse and 20 min later at Puerto Montt, and Mausund's 133 m mesh scores as its 200 m one (7.7 against 7.9 cm, 7 min late on both). P1's error there is not the element size.
+  - So the premise of #231 does not hold on these two domains: there is no accuracy for a higher deep order to buy, and by the issue's own rule the fixed-stride refactor is not worth it. What was not measured is the other direction, P1 at the shore under P2 in deep water. It could save at most the shore elements' share of the work (22 % of Chiloé's elements), and P1's lag would have to come from the deep water for it to keep P2's scores; the 133 m Mausund run, 38 % shore elements, says it does not.
+  - Not judged: currents. Each run's station is the nearest node of an element at least 3 m deep, which moves with the mesh and the order (Melinka's station depth 4.4–14.5 m over the runs), so the stations' currents differ by as much as the current itself (2–6 cm/s) and say nothing about the order.
