@@ -360,3 +360,127 @@ Each is a `TODO.md` line under its area; the context:
 - **Bit for bit:** `cases/froya/rivers_3d.toml` (new: `nested.toml` in 3D with 20 levels, the 3D parent, the rivers) against `froya_real_data norkyst=data/froya_norkyst_3d.nc levels=20 tide3d=1 rivers=data/froya_rivers.nc rest_hours=0`, 1 h with 10-minute snapshots: 0 values differ in all 7 frames (η, ū, the surface layer's u and T). Both place 12 of the file's 13 rivers (1.7 m³/s over the hour), river 845 left out at 4.1 km.
 - **Found: river water on land nodes (TODO P1.6).** The 1 h run's highest wet η is 5.001 m with the rivers and 1.81 m without. `RiverSources::volume_rate` gives every node of a river's element the same ∂h/∂t, and two river elements hold a node at the land elevation (5 m): element 59 (river 837, snapped 1.5 km onto the mesh; bed 4.47, 2.83, −5.18, 3.23, 5.0, … m) and element 1912. The water stands there (≈ 2 mm in the hour) instead of entering the sea. The example does the same, so the two runs still agree. Fixed 2026-11-09 (`notes/inputs-forcing.md`, rivers): η max 1.807 m after 1 h, the same as without rivers.
 - **Gate** (`tests/case_test.rs`, NetCDF): `a_rivers_water_fills_a_closed_3d_basin`: a river of 10 m³/s into a closed 2 × 2 km basin in 3D adds 35,999.999999 m³ in the hour (36,000 to 3e-11), and a second 5 km off is left out and listed. Unit: `rivers_take_the_examples_defaults_and_need_a_placed_3d_run` (the defaults and the refusals), `a_profile_reads_from_its_text`.
+
+## A second coast: Chiloé (P8.6–P8.12, 2026-11-09)
+
+Tracking: #220 (Chiloé) and #221 (a coast-agnostic core). Chiloé (Los Lagos, Chile) is the first domain outside Norway and in the southern hemisphere: what it needs shows where Norway is built in.
+
+- **Inputs mapped:** the parent is IFOP's MOSA (ROMS/CROCO, 1 km, 42 σ, on CHONOS; P8.7), or Copernicus Marine's global 1/12° for the residual and the tracers; the boundary tide is TPXO10-atlas or FES2022 through pyTMD; the bed is GEBCO 15″ (+ SHOA charts); the gauges are SHOA's (Puerto Montt, Ancud, Castro, Melinka); the weather is MOSA-WRF 3 km (ERA5 as fallback); the rivers are FLOW-VIC (climatology) and DGA gauges.
+- **Physics that set the domain:** M2 resonates in the inner sea (≈ 2 m range at Boca del Guafo, ≈ 6 m in the Gulf of Ancud, > 7 m at Puerto Montt), so the open boundary lies in the Pacific; Chacao's narrows (2 km, 3–4 m/s) want 100–200 m elements; f < 0.
+- **Done here (PR for #212):**
+  - `OceanModelReader` reads Copernicus Marine's names (`zos`, `uo`/`vo`, `thetao`/`so`, `deptho`). Gate: `copernicus_marine_names_are_read` (1D lat/lon in the south-west quadrant, z-levels with fill below the bed, no depth variable).
+  - `scripts/cmems_parent_subset.py` merges the product's split datasets into one parent file. The dataset IDs and variables were checked against the Copernicus Marine catalogue on 2026-11-09; the download itself is untested here (it needs an account).
+  - `scripts/tide_model_boundary_atlas.py` writes a `TidalAtlas` from any pyTMD model along a bbox's sides (and at gauges), leaving out constituents outside `tides::CONSTITUENT_NAMES` (TPXO's S1). It was tested on a synthetic global model (land beyond `extrapolate_km` dropped, currents in m/s). pyTMD 3's extrapolation `cutoff` is in km, not m: the first draft passed metres and filled points 60 km inland.
+  - `cases/chiloe/case.toml`: a lon/lat box (−74.6…−72.3, −44.2…−41.3), GEBCO bed, the atlas, `coriolis = "beta_plane"` (f₀ = −9.85e-5 at the box's centre, now in the Coriolis gate), the four SHOA stations.
+- **End-to-end on synthetic inputs:** a synthetic GeoTIFF (shelf, a Chiloé-like island, mainland) and an M2/K1 atlas from a synthetic model. `dgcom check` is fine: 41,152 P2 elements at 1 km, 2 of 548 open faces walled for coverage. 6 h at 2 km (10,300 elements) ran stably in 93 s on this machine (|u| ≤ 2.1 m/s, η amplified 1.3 → 2.6 m in the closed basin), so the southern-hemisphere path (placement, raster, atlas, β-plane) works. Nothing is scored until the real GEBCO, TPXO and gauges are in (P8.6).
+- **Noticed:**
+  - Stations are checked against the mesh: a gauge inside an element dropped as land is an error at `check`. Expect to move some SHOA gauges once the real bed is in.
+  - The log's "placed about -42.7500°N": fixed 2026-11-10 (below).
+  - The tide-range keys default to Mausund's even under a 7 m range (P8.12).
+- **On the real TPXO10-atlas-v2 and GEBCO (2026-11-10):**
+  - `scripts/tide_model_boundary_atlas.py` as first written did not run on the real model: pyTMD read every constituent's global 1/30° grid (0.9 GB each as complex128) before the crop, and the currents ran out of memory on a 31 GB machine. It now opens the model lazily (`chunks="auto"`, dask) and computes after the crop: 46 s for the box. TPXO's zip unpacks to `TPXO10_atlas_v2_nc/`; pyTMD wants `TPXO10_atlas_v2/`.
+  - The box's west side moved from 74.6°W to 75.3°W. At 74.6°W it ran past Isla Guafo, through TPXO M2 currents of 0.3–0.65 m/s south of 43.2°S; at 75.3°W it lies in 700–3400 m with M2 at 0.42 m and currents under 0.05 m/s. The cost is the deep water's time step (c ≈ 180 m/s).
+  - The southern side still cuts the Chonos passages and Moraleda: TPXO's M2 there is 0.7–1.0 m with currents up to 1.3 m/s, the same value at neighbouring points (the nearest model cell's, at filled land points). It prescribes part of the resonance; wall it on a coastline mesh or nest it (P8.6, P8.7).
+  - TPXO10 has the amplification already: M2 0.46 m at Ancud, 0.85 m at Melinka, 1.85 m (S2 0.78 m) at Puerto Montt. Castro has no TPXO water within 10 km. So TPXO at the gauges is the baseline the case must beat, not only its boundary.
+  - `scripts/cmems_parent_subset.py` read the top 500 m by default, and `depth_average_z` extends the deepest level read down to `deptho`: on a 3000 m boundary the depth-mean current would be the upper 500 m's. It reads the whole column by default now.
+  - GEBCO: `download.gebco.net` is a web form; NOAA's ERDDAP serves `GEBCO_2020` as NetCDF by URL (its `.geotif` is an 8-bit picture), converted to a float GeoTIFF with rasterio. `dgcom check` passes on it with all four gauges on the mesh.
+- **First runs on real inputs, scored at SHOA's gauges (2026-11-10):**
+  - `cases/chiloe/case.toml` as committed: 51,172 P2 elements at 1 km (bed to −3816 m), 21 of 606 open faces walled for coverage, 24.84 h in 64,088 steps (dt 0.26–1.40 s) and 1348 s on this machine, |u| ≤ 3.4 m/s, stable with wetting and drying. At 2 km (13,221 elements): 227 s, but Castro has no wet element within 8 km and Ancud's is 3 km off.
+  - The gauges are on the IOC Sea Level Station Monitoring Facility (`pmon`, `ancu`, `cstr`, `pmel`; 1-minute records). `scripts/ioc_gauge_skill.py` (new) fetches them and scores a run's `stations.csv` per window, with a tide model's own prediction as the baseline.
+  - Second M2 period (12.42–24.84 h) of 2025-11-12, a neap day, centred RMSE and range:
+
+    | gauge | observed range | run, 1 km | run, 2 km | TPXO10 |
+    |---|---|---|---|---|
+    | Puerto Montt | 2.97 m | 3.79 m, 33 cm, 10 min late | 3.90 m, 51 cm, 40 min late | 2.90 m, 6 cm |
+    | Ancud | 1.11 m | 1.10 m, 7 cm, 20 min early | 0.92 m, 13 cm | 0.72 m, 18 cm |
+    | Castro | 2.62 m | 0.00 m (cut off) | no element | no water within 10 km |
+    | Melinka | 1.47 m | 1.50 m, 7 cm, 10 min late | 1.53 m, 9 cm | 1.47 m, 1 cm |
+
+  - Read: the tide enters right (Melinka, Ancud, where the run beats TPXO), and the resonance is there but 28 % too strong at Puerto Montt. One day after a 3 h ramp is not a spun-up resonance, so this is a first look, not a score: candidates are the spin-up, the friction (Manning 0.025 everywhere), GEBCO's interpolated bed in the channels, and the southern side's prescribed 1 m M2. TPXO10 is very good at Puerto Montt and Melinka (it likely assimilates them) and poor at Ancud.
+  - **Four days, neap towards spring (99.36 h, 256,349 steps in 5240 s; `run.name=chiloe_4d`):** the over-amplification at Puerto Montt is not the spin-up. Run range over observed per M2 period, from the second: 1.28, 1.28, 1.25, 1.22, 1.21, 1.19, 1.20 (3.79/2.97 m to 4.95/4.13 m), centred RMSE 26–33 cm against TPXO10's 6–15 cm, timing within 10 min. It falls as the tide grows, which is what too little friction would look like (quadratic drag), but the bed and the southern side are not ruled out. Ancud holds at 7–10 cm (TPXO10: 18–26 cm, 40–60 min early) and Melinka at 7–13 cm in the periods its gauge covers.
+  - Melinka's record has holes of hours (56–80 h here). The script interpolated across them, which showed as 27–35 cm for the run and TPXO10 alike; it now leaves out run samples further than `max_gap_min` from a gauge sample and does not score a window under 80 % coverage.
+  - Not looked into: the domain's highest water stays at one value for an hour at a time while the tide falls (+3.80 m at 88.5–89.3 h, +4.73 m at the end), which read as water left in a drying cell. It is not (2026-11-10, the Taitao run's snapshot): no element holds more than 5 cm above +2 m through a tidal cycle. The progress line takes η over every node deeper than `h_dry` (1 mm), and 500–1100 nodes carry a film of 1–50 mm on beds of +1 to +4 m (one had 22 cm on a +2.8 m bed, 1.2 m above the tide around it). Among nodes at least 1 m deep the highest water was the tide's +1.86 m. The line's largest speed is real: 3.1 m/s in 47 m of water in Chacao (TODO P8.13).
+  - Castro's station sits in a 4.1 m deep element that GEBCO at 1 km leaves cut off from the sea (range 0.00 m): its fjord needs the coastline mesh.
+- **Where the over-amplification comes from (2026-11-10; scratch scripts, 2 km screening runs of 37.26 h scored on 12.42–37.26 h, then 1 km):**
+  - Method: one frequency per band (D1, D2, D4, D6) fitted by least squares to the run and the gauge at the same samples, so amplitude ratio and lag come apart; a lattice of 296 stations every 0.1° against TPXO10's own tide at the same points; one factor changed per run.
+  - By band, 1 km, four days: Puerto Montt D2 ×1.23 (+7 min) and D1 ×1.23 (−2 min); Ancud D2 ×0.98, Melinka D2 ×1.06. The quarter-diurnal band is 2–3 times the gauges' at Ancud and Melinka (1–4 cm amplitudes).
+  - The lattice (2 km), run over TPXO10 in D2: 1.00 off Ancud, 0.92 in Boca del Guafo, 1.13 in Corcovado, 1.28 at Desertores, 1.36 in the Gulf of Ancud, 1.39 in Reloncaví: it grows along the whole axis, at no single passage, the mark of a basin nearer its quarter-wave resonance than the real one. On the shelf by the south-west corner the run is 0.76–0.86 of the atlas it is forced with. D1 is 1.04–1.08 everywhere, the open ocean too.
+  - One factor at a time, 2 km (Puerto Montt D2, D1, D2 lag; Melinka D2; Ancud D2 — run over gauge):
+
+    | run | PM D2 | PM D1 | PM lag | Melinka D2 | Ancud D2 |
+    |---|---|---|---|---|---|
+    | Manning 0.025 (the case) | 1.28 | 1.17 | +39 min | 1.01 | 0.91 |
+    | C_D 0.0025 | 1.22 | 1.18 | +42 | 0.98 | 0.88 |
+    | C_D 0.004 | 1.16 | 1.21 | +47 | 0.94 | 0.83 |
+    | Manning 0.035 | 1.22 | 1.20 | +46 | 0.96 | 0.85 |
+    | `transport_scaling = 3` | 1.27 | 1.17 | +38 | 1.00 | 0.91 |
+    | atlas without land-filled points (2 km fill) | 1.28 | 1.17 | +40 | 1.00 | 0.90 |
+    | southern side's currents capped at √(g/h)·η | 1.26 | 1.17 | +35 | 0.99 | 0.91 |
+    | southern side's currents zero | 1.21 | 1.13 | +20 | 0.94 | 0.93 |
+    | southern side walled east of 74.05°W | 1.15 | 1.07 | +25 | 0.90 | 0.91 |
+    | box to 46.6°S (below) | 1.05 | 1.15 | +55 | 0.79 | 0.83 |
+    | inner sea's bed ×1.2 (east of 74°W, under 600 m) | 1.24 | 1.20 | +8 | 1.15 | 0.97 |
+    | inner sea's bed ×0.8 | 1.21 | 1.42 | +86 | 0.79 | 0.76 |
+
+  - Read. The friction is a weak lever: three times the drag takes 12 points off D2, adds to D1 and costs Ancud 8 (Manning 0.025 is C_D 1.3e-3 at 100 m and 1.05e-3 at 200 m, half the 2.5–3e-3 tide models use; there is no floor). The currents copied into land-filled atlas points do nothing. The southern cut is the strong lever on the level of the whole inner sea, and Melinka's score there was the boundary's, not the model's. The bed is the strong lever on the mouth-to-head ratio and the timing (Puerto Montt over Melinka: 1.27, 1.08 with the bed ×1.2, 1.53 with ×0.8); the 2 km mesh holds the same volume as the 1 km one to 0.04 %, so its late, over-amplified tide is the passages' representation, not lost depth. GEBCO's basin means are within 4 % of TPXO10's own bed, which is no independent check.
+  - **The box now reaches 46.6°S** (`bbox = [-75.9, -46.6, -72.3, -41.3]`, 288 × 589, 103,016 elements): Taitao closes the Moraleda and Aysén channels on land, the west side is in more than 1500 m everywhere, and the only southern water is 25 km of deep ocean. At 1 km, 12.42–37.26 h, against the box cut at 44.2°S:
+
+    | gauge | D2 ratio, was → is | centred RMSE per M2 period, was → is | D2 lag |
+    |---|---|---|---|
+    | Puerto Montt | 1.30 → 1.10 | 33, 30 → 17, 13 cm | +11 min |
+    | Ancud | 1.00 → 0.92 | 7, 8 → 8, 9 cm | −24 min |
+    | Melinka | 1.08 → 0.94 | 7, 7 → 5, 6 cm | +11 min |
+
+    The run is 97,473 steps in 3897 s for 37.26 h (the 44.2°S box: about 2000 s), at one step throughout (37.26 h over 97,473 steps is 1.376 s, the largest being 1.377 s): the cost per step doubled with the elements. The reported smallest step of 0.003 s (0.26 s before) was a step shortened to land on an output time, not a stability bound; `SimulationResult::dt_min` no longer counts those (2026-11-10). Not yet run over the four days. Castro has no element within 3 km on this grid and is out of the case. The old inputs are kept as `data/chiloe_gebco_box44.tif` and `data/chiloe_boundary_tides_box44.txt`.
+  - Left (as read then; corrected below: the lag, not D1): Puerto Montt's 10 % and D1's 11–15 % at all three gauges. Next in order: the coastline mesh (the passages), an independent bed for the inner sea (SHOA soundings, or MOSA's grid, P8.7), and only then the friction, with a floor on C_D rather than a larger Manning.
+  - **The scores above mix the model's error with constituents the run did not have (2026-11-10, later).** The atlas carries TPXO10's 14 constituents. A gauge, and TPXO10's own prediction (pyTMD, `infer_minor`, the default), also have the minor ones inferred by admittance. At Puerto Montt those are μ2 8.7, ν2 7.8, L2 6.0, T2 4.6, J1 1.9, OO1 1.8, M1 1.1 cm (fitted to 60 days of the prediction): 17 cm RMS over 12–37 h of this neap day (7.6 at Melinka, 4.4 at Ancud), and they delay the tide by 20 min there (12 at Ancud). They are real: TPXO10 against the gauges goes from 14.3 to 6.1 cm at Puerto Montt and from 8.1 to 1.0 cm at Melinka with them.
+    - Like for like (the gauge with the inferred minors taken out; 1 km, the Taitao box, 12.42–37.26 h):
+
+      | gauge | D2 run / gauge | D2 lag | centred RMSE | TPXO10's 14 the same way |
+      |---|---|---|---|---|
+      | Puerto Montt | 1.09 | +31 min | 29.4 cm | 9.3 cm |
+      | Melinka | 0.94 | +31 min | 12.1 cm | 1.8 cm |
+      | Ancud | 0.98 | −12 min | 4.7 cm | 19.2 cm |
+
+      So the 13–17 cm at Puerto Montt was the model's half-hour lag partly cancelled by the missing minors' 20 min, not skill. The box change is still real, the minors being the same in both runs: with them added to the series, Puerto Montt's first period goes from 42 cm (44.2°S box) to 32 cm (Taitao), not from 33 to 17.
+    - D1 is right. Against TPXO10's 14 constituents the run's D1 is 0.99–1.05 everywhere, the inner sea included (lag 24 min at its head). The "D1 5–8 % over TPXO10 in the open ocean" was the reference's minors (3.5 % of D1 in this window), and the rest of the 11–15 % at the gauges is TPXO10's own D1 against them in this one window (1.05–1.12; 0.84–1.10 in the other three).
+    - Where the lag is (the snapshot on a 0.25° lattice against TPXO10's 14, D2): 0–3 min and 0.97–1.00 on the ocean north of 43°S; the lag grows through Boca del Guafo (7, 15, 23, 29 min along 43.5°S from 74.25 to 73.5°W) and is 25–31 min in the whole inner sea, while the amplitude grows from 1.00 at the mouth to 1.16–1.18 in the Gulf of Ancud and Reloncaví. A lag set at the mouth and an amplitude growing inward are one thing: a basin whose resonance is too low (too shallow, or its mouths too tight on a 1 km GEBCO), which the bed ×1.2 run already showed at 2 km (lag +39 → +8 min). On the shelf south-west of Guafo (43.5–46°S) the run is 0.89–0.93 of the atlas, 6 min early.
+    - The 2 km lattice above was against the prediction with minors; its D2 ratios move by 1–2 %.
+    - **`correction = "minors"`** (`TidalAtlas::infer_missing_minors`): μ2, ν2, λ2, L2 and T2 added to the atlas by admittance (2N2 is TPXO10's own). The minor diurnals (J1, OO1, M1: 2–3 cm together at Puerto Montt) need their nodal factors first.
+    - **Four days with the minors at the boundary** (1 km, the Taitao box, 99.36 h; 259,926 steps of 1.377 s in 10,188 s; the case's setting now), centred RMSE per M2 period from 12.42 h, D2 by a fit to each period:
+
+      | gauge | run | D2 ratio | D2 lag | TPXO10 with minors |
+      |---|---|---|---|---|
+      | Puerto Montt | 30, 29, 29, 30, 34, 35, 36 cm | 1.08–1.17 | +21 to +27 min (+50 the first) | 6, 12, 11, 14, 13, 15, 11 cm |
+      | Melinka | 10, 13, 12, –, –, –, 14 cm (holes) | 0.98–1.05 | +30 to +44 min | 1, 2, 1, –, –, –, 4 cm |
+      | Ancud | 3, 5, 5, 4, 4, 5, 6 cm | 0.86–0.95 | −14 to −26 min | 18, 21, 21, 22, 23, 24, 26 cm |
+
+      The estimate made by adding the minors to the earlier run's series (32 cm, 11.5 cm, 3.9 cm in the first period) held. Ancud, on the open coast, is four to five times better than TPXO10. The inner sea is late by half an hour and Puerto Montt 8–17 % too large: that is what is left of the over-amplification, and it is the basin's response (bed, mouths), as above. The error at Puerto Montt grows over the four days as the tide grows towards springs.
+    - **The coastline mesh, GEBCO_2026 and the drag (2026-11-11; 37.26 h each, scored over the second M2 period, 24.84–37.26 h, with the minors).** The mesh: `scripts/gmsh_coastline_mesh.py dem=data/chiloe_gebco.tif bbox=-75.9,-46.6,-72.3,-41.3 coast=500 far=4000 dist=15000 min_water=1500 min_land=1500` (94,685 elements, shortest edge 84 m, `local_time_stepping_levels = 8`: 2277 steps of 42–84 s in 5432 s; the generator's default sizes left 18 non-convex quads).
+
+      | run | Puerto Montt | Melinka | Ancud |
+      |---|---|---|---|
+      | 1 km, GEBCO_2020 | 28.7 cm, ×1.17, +27 min | 12.7 cm, ×1.04, +35 min | 4.5 cm, ×0.95, −14 min |
+      | 1 km, GEBCO_2026 | 29.7 cm, ×1.25, +24 min | 14.4 cm, ×1.18, +35 min | 7.1 cm, ×1.04, +19 min |
+      | coastline mesh, Manning 0.025 | 15.9 cm, ×1.23, −1 min | 4.7 cm, ×1.15, +11 min | 3.1 cm, ×1.15, +7 min |
+      | coastline mesh, C_D 0.0025 | 12.7 cm, ×1.17, +6 min | 4.9 cm, ×1.09, +13 min | 2.8 cm, ×1.12, +12 min |
+      | TPXO10 with minors | 11.6 cm, ×0.88, +1 min | 1.7 cm, ×1.01, +2 min | 20.9 cm, ×0.80, −49 min |
+
+      - **The lag was the mesh.** Against TPXO10 with its minors on the lattice, the coastline run is 3–6 min late in the Gulf of Ancud and Reloncaví (25–31 on the 1 km mesh), 7–14 min through Boca del Guafo and Corcovado, 17–40 min down Moraleda. The reading above ("resonance too low: the bed or the mouths") was half right: the mouths as a staircase at 1 km, not the bed. The case uses the coastline mesh now.
+      - **What is left is amplitude:** 1.22–1.26 of TPXO10 in the north of the inner sea with the phase right, 1.04–1.09 already on the ocean side of Boca del Guafo, 0.92–0.95 on the shelf south-west of Guafo.
+      - **Drag is still a weak lever:** C_D = 0.0025 (Manning 0.025 is 1.2e-3 in 150 m) takes 5 points off (1.17–1.21 of TPXO10) and adds 5 min. The case keeps Manning: one neap window is too thin to tune on. Candidates for the rest: what `min_water=1500` removed (storage and narrows; Chacao's width on the mesh is not checked), the fjords missing at the head (Reloncaví's estuary, Comau, Castro), dissipation a depth-mean model lacks (internal tides).
+      - **GEBCO_2026 is no better than 2020 on the 1 km mesh** (above; a box of it from CEDA, `https://dap.ceda.ac.uk/bodc/gebco/global/gebco_2026/`). Its type-identifier grid: Boca del Guafo is 77 % predicted from gravity and Moraleda 68 %; Reloncaví and the Gulf of Ancud are 70 % measured, Chacao 83 %. No open gridded SHOA product was found; IFOP's MOSA grid (GEBCO and SHOA charts, 1 km) has no download (a request is drafted); the R/V Falkor (too) 2024 multibeam at MGDS (doi:10.60521/332326) is partial and CC BY-NC-SA.
+      - The lattice comparison must carry the same constituents as the run: against TPXO10's 14 majors alone a run with minors shows 25 min of "lag" on the open ocean in this window.
+    - **Four days on the coastline mesh (2026-11-11; 99.36 h, 5995 steps of 42–84 s in 14,190 s beside other work; `chiloe_coast_4d`)**, centred RMSE per M2 period from 12.42 h, D2 by a fit to each period:
+
+      | gauge | run | D2 ratio | D2 lag | TPXO10 with minors |
+      |---|---|---|---|---|
+      | Puerto Montt | 19, 16, 18, 16, 16, 16, 18 cm | 1.27, 1.22, 1.14, 1.11, 1.07, 1.09, 1.09 | +30, −1, −9, −6, −5, −3, −3 min | 6, 12, 11, 14, 13, 15, 11 cm |
+      | Melinka | 6, 5, 5, –, –, –, 6 cm (holes) | 1.13, 1.16, 1.11, –, –, –, 1.14 | +30, +12, +3, –, –, –, +11 min | 1, 2, 1, –, –, –, 4 cm |
+      | Ancud | 4, 3, 5, 4, 4, 5, 6 cm | 0.99, 1.13, 1.00, 1.07, 0.95, 0.99, 0.96 | +11, +6, −9, −1, −8, −2, −8 min | 18, 21, 21, 22, 23, 24, 26 cm |
+
+      Half the 1 km mesh's error at Puerto Montt (29–36 cm) and Melinka (10–14 cm), and no growth over the four days. The first period is still spin-up (+30 min at two gauges). Puerto Montt's ratio falls from 1.22 to 1.07–1.09 as the tide grows towards springs, so the 17–23 % read from the second period overstates it: either quadratic drag biting harder at springs, or a one-period fit mixing constituents the model amplifies differently (N2 and the minors against M2 and S2). A harmonic analysis over a spring–neap cycle separates the two. Melinka stays 11–16 % over, Ancud within 7 %.
+    - **P1 on the coastline mesh fails (2026-11-11; `opt_p1`, 24.84 h).** Three times cheaper (47.7 s per model hour against 146) and half as good: Puerto Montt 41.5 cm and +50 min in the second M2 period (P2: 19.3 cm, +10 min), Ancud 6.7 cm and +20 min (3.9 cm, 0), Melinka 10.0 cm and +20 min (5.9 cm, +10 min), ranges 5–11 % under the gauges'. The case keeps `order = 2`; its cost is `notes/performance.md` P2.8 (102.5 s per model hour since).
+    - **What the coastline mesh holds of GEBCO's water** (`meshcover.py` in the session's scratch: wet 15″ pixels outside every element): 0.2–1.7 % of the area missing in Reloncaví, the Gulf of Ancud, Chacao and Chiloé's east channels, 4 % in the Comau and Hornopirén fjords, 5 % in Chonos–Moraleda; Chacao at GEBCO's full width along its length (2.3 km at the narrows). So `min_water=1500` is not where the excess comes from.
+- **`Case::coriolis_source` (2026-11-10):** the 2D and 3D runners each built the Coriolis term from `physics.coriolis`; they take it from one place now, and `dgcom check`/`run` log it and the placement with hemispheres ("placed about 42.7500°S 73.8000°W", "Coriolis f = -9.900e-5 s⁻¹ + 1.681e-11 m⁻¹ s⁻¹ × y"). Gate: `the_coriolis_term_follows_the_placement_in_both_hemispheres`.
+

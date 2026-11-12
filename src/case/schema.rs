@@ -14,6 +14,7 @@ use super::CaseError;
 use crate::io::LocalProjection;
 use crate::mesh::BoundaryTag;
 use crate::solver::{LINEAR_CFL_SAFETY, linear_cfl_swe_2d};
+use crate::source::{CoriolisSource2D, coriolis_parameter};
 use crate::tides::{canonical_name, constituent_period};
 use crate::time::ModelClock;
 use crate::time::{IntegratorInfo, Multirate, StandardIntegrator};
@@ -202,6 +203,20 @@ pub struct GeoPoint {
     pub lat: f64,
     /// Longitude (degrees east)
     pub lon: f64,
+}
+
+impl GeoPoint {
+    /// The point with its hemispheres named, for a log line: `42.7500°S
+    /// 73.8000°W` (a negative "°N" is easy to misread, and to copy).
+    pub fn hemispheres(&self) -> String {
+        format!(
+            "{:.4}°{} {:.4}°{}",
+            self.lat.abs(),
+            if self.lat < 0.0 { 'S' } else { 'N' },
+            self.lon.abs(),
+            if self.lon < 0.0 { 'W' } else { 'E' },
+        )
+    }
 }
 
 /// `[mesh.rectangle]`
@@ -1523,6 +1538,12 @@ pub enum AtlasCorrection {
     /// ([`crate::boundary::TidalAtlas::infer_from_theory`]): no gauge needed.
     /// Needs M2, S2, N2 and K1 in the atlas.
     Theory,
+    /// The minor semidiurnals the atlas lacks (of 2N2, μ2, ν2, λ2, L2, T2)
+    /// added by admittance, and what it carries kept
+    /// ([`crate::boundary::TidalAtlas::infer_missing_minors`]): for a global
+    /// tide model's atlas (TPXO, FES), whose own prediction adds them. Needs
+    /// M2, S2 and N2 in the atlas.
+    Minors,
 }
 
 /// One constituent: `{ name = "M2", amplitude_m = 1.0, phase_deg = 0.0 }`.
@@ -2420,6 +2441,20 @@ impl Case {
             (Some(g), _) => Some(g.center()),
             (None, origin) => origin,
         }
+    }
+
+    /// The Coriolis term of `physics.coriolis`, if the case has one: the 2D
+    /// and 3D runs both take it from here. A β-plane is about the projection
+    /// centre's latitude, which lies at y = 0.
+    pub fn coriolis_source(&self) -> Option<CoriolisSource2D> {
+        Some(match self.physics.coriolis? {
+            Coriolis::FPlane(f) => CoriolisSource2D::f_plane(f),
+            Coriolis::Latitude(lat) => CoriolisSource2D::f_plane(coriolis_parameter(lat)),
+            Coriolis::BetaPlane => {
+                let center = self.projection_center().expect("validated: placed");
+                CoriolisSource2D::beta_plane_at_latitude(center.lat, 0.0)
+            }
+        })
     }
 
     /// The projection that places the mesh, if it is placed.

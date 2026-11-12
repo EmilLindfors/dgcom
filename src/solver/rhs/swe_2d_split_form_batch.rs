@@ -1,23 +1,41 @@
-//! The split-form kernel's hot loops for [`VOLUME_BATCH`] elements or edges
-//! at once, one per SIMD lane (`fearless_simd`, `f64x8` at the CPU's best
-//! level): the flux-differencing volume term of
-//! [`SplitFormSWE2D::line_volume`], the shoreline subcells of
-//! [`SplitFormSWE2D::line_subcells`], and the interior-face fluxes of
-//! [`SplitFormSWE2D::edge_fluxes`] (the hydrostatic HLL of `WetDry`).
+//! [`SplitFormSWE2D::element_rhs`] for [`VOLUME_BATCH`] elements at once,
+//! one per SIMD lane (`fearless_simd`, `f64x8` at the CPU's best level): the
+//! flux-differencing volume term of [`SplitFormSWE2D::line_volume`], the
+//! shoreline subcells of [`SplitFormSWE2D::line_subcells`], the surface
+//! terms with the interior-face fluxes of [`SplitFormSWE2D::edge_fluxes`]
+//! (the hydrostatic HLL of `WetDry`), and the division by J.
 //!
 //! A tensor-product element's lines are 2–5 nodes long at P1–P4, too short to
 //! fill a vector, but every element runs the same arithmetic: lanes are
-//! elements. [`SplitFormSWE2D::volume_chunk`] takes [`ELEMENT_CHUNK`]
-//! consecutive elements, sorts them into the two kinds (a node shallower than
-//! the subcell depth or not) so that both fill their lanes, and evaluates each
-//! kind a batch at a time. The node states (and bed and contravariant
-//! vectors) of a batch are transposed into `[node][lane]` vectors, the line
-//! loops run on them in the scalar order, and each element's volume term
-//! (times J) goes to [`SplitFormWorkspace::batch`], where
-//! [`SplitFormSWE2D::element_rhs`] continues with the surface terms. The
-//! subcells' branches (incomplete stencils at boundaries, the limiter's
-//! extrema, the dry-node rule for `η`, dry HLL sides, upwind wave speeds)
-//! become selects; so do the face pass's, which takes one edge per lane.
+//! elements. [`SplitFormSWE2D::chunk_rhs`] takes [`ELEMENT_CHUNK`] elements,
+//! sorts them into the two kinds (a node shallower than the subcell depth or
+//! not) so that both fill their lanes, and evaluates each kind a batch at a
+//! time. The node states and bed of a batch are transposed into
+//! `[node][lane]` vectors, the loops run on them in the scalar order, and
+//! each element's terms go to [`SplitFormWorkspace::batch`], from where
+//! [`SplitFormSWE2D::element_rhs`] copies them out. The subcells' branches
+//! (incomplete stencils at boundaries, the limiter's extrema, the dry-node
+//! rule for `η`, dry HLL sides, upwind wave speeds) become selects.
+//!
+//! **What a batch reads.** Arithmetic is the smaller part of an element's
+//! cost: the kernel is bound by what it reads (`notes/performance.md`, P2.8,
+//! 2026-11-12). So a batch reads, per element, its three rows of the state,
+//! its bed, its four corners and its four face links, and its neighbours'
+//! face nodes of the state and the bed:
+//! - **Geometry from the corners.** Every element is a bilinear
+//!   quadrilateral, and `GeometricFactors2D::compute` derives each per-node
+//!   field from its four corners. A batch does the same in vectors, operation
+//!   for operation ([`Corners::at`]): 64 bytes per element instead of the
+//!   per-node metric, Jacobian, normals and surface Jacobians (≈ 1 kB at P2).
+//! - **Face fluxes where they are used.** An interior face's flux is
+//!   evaluated in the batch of each of its two elements, from the edge's left
+//!   side to its right with the left side's normal, as
+//!   [`SplitFormSWE2D::edge_fluxes`] does: both get the same flux to the bit
+//!   and exchange exactly opposite fluxes. There is no face pass and no face
+//!   buffer: a pass over the edges wrote every flux to memory for a second
+//!   pass over the elements to read back, and read the states twice.
+//! - **Connectivity in four bytes a face** ([`FaceLink`]), not through the
+//!   edge list.
 //!
 //! **Bit for bit.** Every lane performs the scalar kernel's operations in the
 //! scalar kernel's order (multiplies and adds, no fused multiply-add; `sqrt`
@@ -30,14 +48,16 @@
 //! lane. `f64::max`/`min`/`signum` become compare-and-select, which agrees
 //! with them except for NaN arguments and a tie of +0 with −0.
 //!
-//! Boundary edges stay on the scalar path; their lanes and the unused lanes
-//! of a short batch are filled with a copy of a batched one and discarded.
+//! Boundary faces take their flux from the scalar
+//! [`SplitFormSWE2D::boundary_flux`]; the unused lanes of a short batch
+//! repeat its first element and are dropped.
 
 use fearless_simd::{Level, dispatch, f64x8, mask64x8, prelude::*};
 
 use super::{ELEMENT_CHUNK, SplitFormSWE2D, SplitFormWorkspace, SurfaceFlux, VOLUME_BATCH};
 use crate::boundary::SWEBoundaryCondition2D;
-use crate::operators::AffineMetric;
+use crate::flux::SWENodeState2D;
+use crate::mesh::FaceLink;
 use crate::solver::SWEState2D;
 use crate::solver::rhs::subcells::line_node;
 use crate::types::ElementIndex;
@@ -53,25 +73,49 @@ thread_local! {
 }
 
 impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
-    /// Volume terms (times J) of the elements `ks` (at most
-    /// [`ELEMENT_CHUNK`]) into `ws.batch[j · n_nodes..]` for `ks[j]`, and the
-    /// subcell interface mass fluxes of subcell elements into
-    /// `ws.batch_mass[j · subcell_interfaces(n_1d)..]`. The elements are
-    /// sorted into the flux-differencing and the subcell kind and each kind
-    /// is evaluated [`VOLUME_BATCH`] at a time, one per lane. Bit `j` of the
-    /// result is set if `ks[j]`'s volume term is there: all of them for
-    /// P1–P4, none otherwise.
-    pub(in crate::solver::rhs) fn volume_chunk(
+    /// Whether [`Self::chunk_rhs`] evaluates the elements: P1–P4.
+    pub(in crate::solver::rhs) fn batches(&self) -> bool {
+        #[cfg(test)]
+        if UNBATCHED.with(std::cell::Cell::get) {
+            return false;
+        }
+        (2..=5).contains(&self.ops.n_1d)
+    }
+
+    /// Whether [`Self::chunk_rhs`] also evaluates the interior-face fluxes
+    /// (the hydrostatic HLL of `WetDry`), so that no face pass
+    /// ([`Self::edge_fluxes`]) is needed.
+    pub(in crate::solver::rhs) fn fuses_faces(&self) -> bool {
+        self.batches() && self.surface == SurfaceFlux::HydrostaticHll
+    }
+
+    /// [`Self::element_rhs`] (volume and surface terms) of the elements `ks`
+    /// (at most [`ELEMENT_CHUNK`]) into `ws.batch[..][j · n_nodes..]` for
+    /// `ks[j]`, the subcell interface mass fluxes of subcell elements into
+    /// `ws.batch_mass[j · subcell_interfaces(n_1d)..]` and, if `face_mass`,
+    /// the mass component of `F*` at the face nodes into
+    /// `ws.batch_face_mass[j · 4 n_1d..]`. The elements are sorted into the
+    /// flux-differencing and the subcell kind and each kind is evaluated
+    /// [`VOLUME_BATCH`] at a time, one per lane. Bit `j` of the result is
+    /// set if `ks[j]`'s terms are there: all of them for P1–P4, none
+    /// otherwise.
+    ///
+    /// `faces`: the interior-face fluxes of [`Self::edge_fluxes`] (not read
+    /// if [`Self::fuses_faces`]); `time_of(k)`: the time of element `k`'s
+    /// boundary faces. `ahead`: the elements of the chunk this thread
+    /// evaluates next, whose data is prefetched meanwhile
+    /// ([`Self::prefetch`]).
+    pub(in crate::solver::rhs) fn chunk_rhs(
         &self,
         ks: &[usize],
+        ahead: &[u32],
+        faces: &[SWEState2D],
+        time_of: &dyn Fn(usize) -> f64,
+        face_mass: bool,
         ws: &mut SplitFormWorkspace,
     ) -> u64 {
         debug_assert!(ks.len() <= ELEMENT_CHUNK && ELEMENT_CHUNK <= 64);
-        #[cfg(test)]
-        if UNBATCHED.with(std::cell::Cell::get) {
-            return 0;
-        }
-        if !(2..=5).contains(&self.ops.n_1d) || ks.is_empty() {
+        if !self.batches() || ks.is_empty() {
             return 0;
         }
         let n = self.ops.n_nodes;
@@ -90,30 +134,37 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                 n_wet += 1;
             }
         }
+        ws.batch_subcells = shore[..n_shore].iter().fold(0, |bits, &j| bits | 1 << j);
         let level = Level::new();
+        // A batch's worth of the next chunk per batch of this one
+        let n_batches = n_wet.div_ceil(L) + n_shore.div_ceil(L);
+        let mut ahead = ahead.chunks(ahead.len().div_ceil(n_batches).max(1));
         for (slots, subcells) in wet[..n_wet]
             .chunks(L)
             .map(|s| (s, false))
             .chain(shore[..n_shore].chunks(L).map(|s| (s, true)))
         {
+            for &k in ahead.next().unwrap_or_default() {
+                self.prefetch(k as usize);
+            }
             // Lanes without an element repeat the first one (and are dropped)
             let mut lanes = [ks[slots[0]]; L];
             for (lane, &j) in lanes.iter_mut().zip(slots) {
                 *lane = ks[j];
             }
+            let at = Lanes {
+                lanes: &lanes,
+                slots,
+                subcells,
+                faces,
+                time_of,
+                face_mass,
+            };
             match self.ops.n_1d {
-                2 => {
-                    dispatch!(level, simd => self.batch::<_, 2, 4>(simd, &lanes, slots, subcells, ws))
-                }
-                3 => {
-                    dispatch!(level, simd => self.batch::<_, 3, 9>(simd, &lanes, slots, subcells, ws))
-                }
-                4 => {
-                    dispatch!(level, simd => self.batch::<_, 4, 16>(simd, &lanes, slots, subcells, ws))
-                }
-                _ => {
-                    dispatch!(level, simd => self.batch::<_, 5, 25>(simd, &lanes, slots, subcells, ws))
-                }
+                2 => dispatch!(level, simd => self.batch::<_, 2, 4>(simd, &at, ws)),
+                3 => dispatch!(level, simd => self.batch::<_, 3, 9>(simd, &at, ws)),
+                4 => dispatch!(level, simd => self.batch::<_, 4, 16>(simd, &at, ws)),
+                _ => dispatch!(level, simd => self.batch::<_, 5, 25>(simd, &at, ws)),
             }
         }
         if ks.len() == 64 {
@@ -123,17 +174,56 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         }
     }
 
-    /// The volume terms of the elements `lanes` (the first `slots.len()` of
-    /// them, into `ws.batch` at `slots`): flux differencing, or the subcells.
+    /// Ask for the cache lines element `k`'s batch will read: its node
+    /// states, bed and corners, and its neighbours' face nodes.
+    ///
+    /// On an unstructured mesh an element has face neighbours far from it
+    /// in memory whatever the numbering (in Hilbert order 1 in 13 faces of
+    /// the Chiloé coastline mesh is more than 64 elements away), and a pass
+    /// of local time stepping skips through the elements, which the
+    /// hardware's stream prefetch does not follow. Asked for a chunk early,
+    /// the lines arrive before the lane loops read them one after another:
+    /// 2–3 % of the Chiloé tide's wall time on 24 threads (32.7 against
+    /// 33.2–33.8 s per half model hour).
+    #[inline]
+    fn prefetch(&self, k: usize) {
+        let n = self.ops.n_nodes;
+        let [q_h, q_hu, q_hv] = &self.q.data;
+        let bed = self.config.bathymetry.map_or(&[][..], |b| &b.data[..]);
+        let fields = [&q_h[..], q_hu, q_hv, bed];
+        for field in fields {
+            prefetch(field, k * n);
+            prefetch(field, k * n + n - 1);
+        }
+        let corners = self.geom.corners(k).as_flattened();
+        prefetch(corners, 0);
+        prefetch(corners, 7);
+        for link in self.mesh.face_links[k] {
+            // A neighbour next in memory comes with the element's own rows
+            if link.is_boundary() || link.element().abs_diff(k) <= 2 {
+                continue;
+            }
+            let nodes = &self.ops.face_nodes[link.face()];
+            let first = link.element() * n;
+            for field in fields {
+                prefetch(field, first + nodes[0]);
+                prefetch(field, first + nodes[nodes.len() - 1]);
+            }
+        }
+    }
+
+    /// The terms of the elements `at.lanes` (the first `at.slots.len()` of
+    /// them, into `ws.batch` at `at.slots`): the volume term (flux
+    /// differencing, or the subcells), the surface terms, and the division
+    /// by J.
     #[inline(always)]
     fn batch<S: Simd, const N1: usize, const NN: usize>(
         &self,
         simd: S,
-        lanes: &[usize; L],
-        slots: &[usize],
-        subcells: bool,
+        at: &Lanes<'_>,
         ws: &mut SplitFormWorkspace,
     ) {
+        let (lanes, slots, subcells) = (at.lanes, at.slots, at.subcells);
         let data = self.gather::<S, NN>(simd, lanes);
         let zero = f64x8::<S>::splat(simd, 0.0);
         let mut rhs = [[zero; NN]; 3];
@@ -143,12 +233,13 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         } else {
             self.lines::<S, N1, NN>(simd, &data, &mut rhs);
         }
-        let [rh, rhu, rhv] = &rhs;
-        for i in 0..NN {
-            let (rh, rhu, rhv) = (rh[i].as_slice(), rhu[i].as_slice(), rhv[i].as_slice());
-            for (l, &j) in slots.iter().enumerate() {
-                ws.batch[j * NN + i] = SWEState2D::new(rh[l], rhu[l], rhv[l]);
+        let face_mass = at.face_mass.then_some(&mut ws.batch_face_mass[..]);
+        self.surface::<S, N1, NN>(simd, &data, at, &mut rhs, face_mass);
+        for (rhs, batch) in rhs.iter_mut().zip(&mut ws.batch) {
+            for (r, j_inv) in rhs.iter_mut().zip(&data.j_inv) {
+                *r = *j_inv * *r;
             }
+            scatter::<S, NN>(rhs, slots, batch);
         }
         if subcells {
             let interfaces = 2 * N1 * (N1 - 1);
@@ -161,7 +252,174 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         }
     }
 
-    /// Node states, bed and contravariant vectors of the elements `lanes`.
+    /// The surface terms of [`Self::element_rhs`] for a batch, added to
+    /// `rhs` (times J) face by face in the scalar order: `LIFT sJ (F(q⁻)·n −
+    /// F*)`. `face_mass`, if given, receives the mass component of `F*` (the
+    /// workspace's `batch_face_mass`).
+    ///
+    /// `F*` of an interior face is the hydrostatic HLL flux between the
+    /// element's node and the neighbour's, evaluated here as
+    /// [`Self::edge_fluxes`] evaluates it: from the edge's left side to its
+    /// right, with the left side's normal. Both sides of a face therefore
+    /// compute the same flux, bit for bit, each from its own batch, and
+    /// exchange exactly opposite fluxes with no face buffer between them: a
+    /// face's two node states and its flux stay in one element's cache
+    /// lines. The left side's normal is minus the right side's to the bit
+    /// where they share their vertices ([`FaceLink::shares_vertices`]); a
+    /// periodic pair's is read. The other split forms take `F*` from
+    /// `at.faces`, boundary faces from the scalar [`Self::boundary_flux`].
+    #[inline(always)]
+    fn surface<S: Simd, const N1: usize, const NN: usize>(
+        &self,
+        simd: S,
+        data: &Batch<S, NN>,
+        at: &Lanes<'_>,
+        rhs: &mut [[f64x8<S>; NN]; 3],
+        mut face_mass: Option<&mut [f64]>,
+    ) {
+        let g = self.config.equation.g;
+        let h_min = self.config.equation.h_min.meters();
+        let (mesh, geom) = (self.mesh, self.geom);
+        let fused = self.surface == SurfaceFlux::HydrostaticHll;
+        let [q_h, q_hu, q_hv] = &self.q.data;
+        let bed = self.config.bathymetry.map(|b| &b.data[..]);
+        let nodes = data.nodes(simd, g);
+        let n_lanes = at.slots.len();
+        let zero = f64x8::<S>::splat(simd, 0.0);
+        let h_min_v = f64x8::<S>::splat(simd, h_min);
+        let [rh, rhu, rhv] = rhs;
+        // The left side's normal of a face node, from the stored geometry
+        let stored_normal = |k: usize, face: usize, fi: usize| {
+            let element = geom.element_geometry(k);
+            if element.affine {
+                element.faces[face].0
+            } else {
+                geom.normal(k, face, fi)
+            }
+        };
+        for face in 0..4 {
+            let links = at.lanes.map(|k| mesh.face_links[k][face]);
+            let flag = |f: fn(FaceLink) -> bool| links.map(|link| f64::from(u8::from(f(link))));
+            let interior = |f: fn(FaceLink) -> bool| links.map(|l| !l.is_boundary() && f(l));
+            let boundary = flag(FaceLink::is_boundary);
+            let left = interior(FaceLink::is_left).map(|x| f64::from(u8::from(x)));
+            // Right sides of periodic pairs: the left side's normal is read
+            let apart = interior(|link| !link.is_left() && !link.shares_vertices());
+            let any_apart = fused && apart.iter().any(|&x| x);
+            let apart = apart.map(|x| f64::from(u8::from(x)));
+            let is_boundary = f64x8::<S>::from_slice(simd, &boundary).simd_gt(zero);
+            let is_left = f64x8::<S>::from_slice(simd, &left).simd_gt(zero);
+            let is_apart = f64x8::<S>::from_slice(simd, &apart).simd_gt(zero);
+            let (nx, ny, s_j) = data.faces[face];
+            // Per face node and lane: F* of a boundary face or a buffered
+            // flux in `star`, or the neighbour's node (h, hu, hv, B) in
+            // `other`; each lane's link is read once for the face's nodes
+            let mut star = [[[0.0; L]; 3]; MAX_FACE_NODES];
+            let mut other = [[[0.0; L]; 4]; MAX_FACE_NODES];
+            let mut normal = [[[0.0; L]; 2]; MAX_FACE_NODES];
+            for l in 0..L {
+                let k = at.lanes[l];
+                let link = links[l];
+                if link.is_boundary() {
+                    // Lanes without an element repeat the first one
+                    if l < n_lanes {
+                        let k_idx = ElementIndex::new(k);
+                        let time = (at.time_of)(k);
+                        for (fi, &node) in self.ops.face_nodes[face].iter().enumerate() {
+                            let q_int = SWENodeState2D::new(
+                                &self.q.get_state(k_idx, node),
+                                self.bed(k_idx, node),
+                                h_min,
+                            );
+                            let n = stored_normal(k, face, fi);
+                            let f = self.boundary_flux(k_idx, face, node, &q_int, n, time);
+                            (star[fi][0][l], star[fi][1][l], star[fi][2][l]) = (f.h, f.hu, f.hv);
+                        }
+                    }
+                } else if fused {
+                    let (nb, nb_face) = (link.element(), link.face());
+                    let nb_nodes = &self.ops.face_nodes[nb_face][..N1];
+                    let row = nb * NN..(nb + 1) * NN;
+                    let (nb_h, nb_hu, nb_hv) =
+                        (&q_h[row.clone()], &q_hu[row.clone()], &q_hv[row.clone()]);
+                    let nb_bed = bed.map(|b| &b[row]);
+                    let read_normal = any_apart && !link.is_left() && !link.shares_vertices();
+                    for fi in 0..N1 {
+                        let nb_fi = N1 - 1 - fi;
+                        let j = nb_nodes[nb_fi];
+                        (other[fi][0][l], other[fi][1][l]) = (nb_h[j], nb_hu[j]);
+                        (other[fi][2][l], other[fi][3][l]) =
+                            (nb_hv[j], nb_bed.map_or(0.0, |b| b[j]));
+                        if read_normal {
+                            (normal[fi][0][l], normal[fi][1][l]) =
+                                stored_normal(nb, nb_face, nb_fi);
+                        }
+                    }
+                } else {
+                    let side = usize::from(!link.is_left());
+                    let first = (2 * mesh.element_edges[k][face] + side) * N1;
+                    for (fi, f) in at.faces[first..first + N1].iter().enumerate() {
+                        (star[fi][0][l], star[fi][1][l], star[fi][2][l]) = (f.h, f.hu, f.hv);
+                    }
+                }
+            }
+            for (fi, &node) in self.ops.face_nodes[face].iter().enumerate() {
+                let (star, other, normal) = (&star[fi], &other[fi], &normal[fi]);
+                let mut star = Flux {
+                    h: f64x8::<S>::from_slice(simd, &star[0]),
+                    hu: f64x8::<S>::from_slice(simd, &star[1]),
+                    hv: f64x8::<S>::from_slice(simd, &star[2]),
+                };
+                if fused {
+                    // SWENodeState2D::new of the neighbour's node
+                    let h = f64x8::<S>::from_slice(simd, &other[0]);
+                    let wet = h.simd_gt(h_min_v);
+                    let neighbour = Side {
+                        h,
+                        u: wet.select(f64x8::<S>::from_slice(simd, &other[1]) / h, zero),
+                        v: wet.select(f64x8::<S>::from_slice(simd, &other[2]) / h, zero),
+                        b: f64x8::<S>::from_slice(simd, &other[3]),
+                    };
+                    let this = data.side(node);
+                    let (a, b) = (
+                        neighbour.select(is_left, this),
+                        this.select(is_left, neighbour),
+                    );
+                    // The edge's normal is its left side's
+                    let (mut mx, mut my) = (is_left.select(nx, -nx), is_left.select(ny, -ny));
+                    if any_apart {
+                        mx = is_apart.select(f64x8::<S>::from_slice(simd, &normal[0]), mx);
+                        my = is_apart.select(f64x8::<S>::from_slice(simd, &normal[1]), my);
+                    }
+                    // surface_flux: (F_a, −F_b); boundary lanes keep their F*
+                    let (f_a, f_b) = hydrostatic_hll(simd, a, b, (mx, my), g, h_min);
+                    star = Flux {
+                        h: is_boundary.select(star.h, is_left.select(f_a.h, -f_b.h)),
+                        hu: is_boundary.select(star.hu, is_left.select(f_a.hu, -f_b.hu)),
+                        hv: is_boundary.select(star.hv, is_left.select(f_a.hv, -f_b.hv)),
+                    };
+                }
+                if let Some(face_mass) = face_mass.as_deref_mut() {
+                    let mass = star.h.as_slice();
+                    for (l, &j) in at.slots.iter().enumerate() {
+                        face_mass[j * 4 * N1 + face * N1 + fi] = mass[l];
+                    }
+                }
+                let (fh, fu, fv) = nodes.flux(node, node, nx, ny);
+                let scale = s_j * f64x8::<S>::splat(simd, self.ops.lift[face][(node, fi)]);
+                rh[node] += scale * (fh - star.h);
+                rhu[node] += scale * (fu - star.hu);
+                rhv[node] += scale * (fv - star.hv);
+            }
+        }
+    }
+
+    /// Node states and bed of the elements `lanes`, and their geometry from
+    /// their corners ([`GeometricFactors2D::corners`]): the contravariant
+    /// vectors and `1/J` at the nodes and the faces' normals and `sJ`, each
+    /// the value `GeometricFactors2D::compute` stored, operation for
+    /// operation (a parallelogram's at its node 0, as the scalar kernel
+    /// reads them).
     #[inline(always)]
     fn gather<S: Simd, const NN: usize>(&self, simd: S, lanes: &[usize; L]) -> Batch<S, NN> {
         // No closure below touches a vector: built without `target-cpu`
@@ -170,15 +428,14 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         let h_min = self.config.equation.h_min.meters();
         let [q_h, q_hu, q_hv] = &self.q.data;
         let zero = f64x8::<S>::splat(simd, 0.0);
-        let geom = self.geom;
-        let elements = lanes.map(|k| geom.element_geometry(k));
-        let nodal = [None; L];
+        let one = f64x8::<S>::splat(simd, 1.0);
+        let (geom, ops) = (self.geom, self.ops);
 
-        let h = transpose::<S, NN>(simd, lanes, q_h, nodal);
-        let hu = transpose::<S, NN>(simd, lanes, q_hu, nodal);
-        let hv = transpose::<S, NN>(simd, lanes, q_hv, nodal);
+        let h = transpose::<S, NN>(simd, lanes, q_h);
+        let hu = transpose::<S, NN>(simd, lanes, q_hu);
+        let hv = transpose::<S, NN>(simd, lanes, q_hv);
         let b = match self.config.bathymetry {
-            Some(bathymetry) => transpose::<S, NN>(simd, lanes, &bathymetry.data, nodal),
+            Some(bathymetry) => transpose::<S, NN>(simd, lanes, &bathymetry.data),
             None => [zero; NN],
         };
         // SWENodeState2D::new: zero velocity at h ≤ h_min
@@ -191,26 +448,58 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
             v[i] = wet.select(hv[i] / h[i], zero);
         }
 
-        // Contravariant vectors J∇r (r-lines) and J∇s (s-lines) at every
-        // node: `GeometricFactors2D::contravariant`, or a parallelogram's
-        // constant `AffineMetric::contravariant`, products for products
-        let constant =
-            |f: fn(&AffineMetric) -> f64| elements.map(|e| e.affine.then(|| f(&e.metric)));
-        let j = transpose::<S, NN>(simd, lanes, &geom.det_j, constant(|m| m.det_j));
-        let rx = transpose::<S, NN>(simd, lanes, &geom.rx, constant(|m| m.rx));
-        let ry = transpose::<S, NN>(simd, lanes, &geom.ry, constant(|m| m.ry));
-        let sx = transpose::<S, NN>(simd, lanes, &geom.sx, constant(|m| m.sx));
-        let sy = transpose::<S, NN>(simd, lanes, &geom.sy, constant(|m| m.sy));
-        let (mut mrx, mut mry, mut msx, mut msy) = ([zero; NN], [zero; NN], [zero; NN], [zero; NN]);
-        for i in 0..NN {
-            mrx[i] = j[i] * rx[i];
-            mry[i] = j[i] * ry[i];
-            msx[i] = j[i] * sx[i];
-            msy[i] = j[i] * sy[i];
+        let mut xy = [[0.0; L]; 8];
+        let mut affine = [0.0; L];
+        for (l, &k) in lanes.iter().enumerate() {
+            for (c, corner) in geom.corners(k).iter().enumerate() {
+                (xy[2 * c][l], xy[2 * c + 1][l]) = (corner[0], corner[1]);
+            }
+            affine[l] = f64::from(u8::from(geom.element_is_affine(k)));
         }
-        let affine = f64x8::<S>::from_slice(simd, &elements.map(|e| f64::from(u8::from(e.affine))))
-            .simd_gt(zero);
+        let affine = f64x8::<S>::from_slice(simd, &affine).simd_gt(zero);
+        let corners = Corners::new(simd, &xy);
+
+        // Contravariant vectors J∇r (r-lines) and J∇s (s-lines) and 1/J at
+        // every node: `GeometricFactors2D::contravariant` and `jacobian_inv`,
+        // or a parallelogram's `AffineMetric` (node 0's)
+        let (mut mrx, mut mry, mut msx, mut msy) = ([zero; NN], [zero; NN], [zero; NN], [zero; NN]);
+        let (mut j_inv, mut det) = ([zero; NN], [zero; NN]);
+        let at_node = |i: usize| (ops.nodes_r[i], ops.nodes_s[i]);
+        let (r0, s0) = at_node(0);
+        let (r0, s0) = (f64x8::<S>::splat(simd, r0), f64x8::<S>::splat(simd, s0));
+        for i in 0..NN {
+            let (r, s) = at_node(i);
+            let r = affine.select(r0, f64x8::<S>::splat(simd, r));
+            let s = affine.select(s0, f64x8::<S>::splat(simd, s));
+            let m = corners.at(simd, r, s);
+            let (rx, ry) = (m.y_s / m.det, -m.x_s / m.det);
+            let (sx, sy) = (-m.y_r / m.det, m.x_r / m.det);
+            mrx[i] = m.det * rx;
+            mry[i] = m.det * ry;
+            msx[i] = m.det * sx;
+            msy[i] = m.det * sy;
+            j_inv[i] = one / m.det;
+            det[i] = m.det;
+        }
+        // sJ n = the outward contravariant vector of the face, the same at
+        // every node of it
+        let mut faces = [(zero, zero, zero); 4];
+        for (face, out) in faces.iter_mut().enumerate() {
+            let (r, s) = at_node(ops.face_nodes[face][0]);
+            let m = corners.at(simd, f64x8::<S>::splat(simd, r), f64x8::<S>::splat(simd, s));
+            let (vx, vy) = match face {
+                0 => (m.y_r, -m.x_r),
+                1 => (m.y_s, -m.x_s),
+                2 => (-m.y_r, m.x_r),
+                _ => (-m.y_s, m.x_s),
+            };
+            let s_j = (vx * vx + vy * vy).sqrt();
+            *out = (vx / s_j, vy / s_j, s_j);
+        }
         Batch {
+            j_inv,
+            det,
+            faces,
             h,
             hu,
             hv,
@@ -294,13 +583,27 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
     /// The outer nodes of [`Self::outer_nodes`] for a batch: per face node
     /// (`face · N1 + fi`), the neighbour's first interior node on the GLL
     /// line through it and its distance, where the face has a neighbour.
+    ///
+    /// The distance is the ratio of the two elements' heights `J / sJ`
+    /// normal to the face. The neighbour's `J` there comes from its corners
+    /// as the element's own does ([`Self::gather`]), and its `sJ` is the
+    /// element's own where the two faces share their vertices (a periodic
+    /// pair's is read): the values [`Self::outer_node`] reads, to the bit.
     #[inline(always)]
-    fn gather_outer<S: Simd, const N1: usize>(
+    fn gather_outer<S: Simd, const N1: usize, const NN: usize>(
         &self,
         simd: S,
+        data: &Batch<S, NN>,
         lanes: &[usize; L],
     ) -> [Outer<S>; MAX_FACE_NODES * 4] {
+        let (mesh, geom, ops) = (self.mesh, self.geom, self.ops);
+        let [q_h, q_hu, q_hv] = &self.q.data;
+        let bed = self.config.bathymetry.map(|b| &b.data[..]);
         let zero = f64x8::<S>::splat(simd, 0.0);
+        let h_min = f64x8::<S>::splat(simd, self.config.equation.h_min.meters());
+        let spacing = f64x8::<S>::splat(simd, ops.nodes_1d[1] - ops.nodes_1d[0]);
+        let r0 = f64x8::<S>::splat(simd, ops.nodes_r[0]);
+        let s0 = f64x8::<S>::splat(simd, ops.nodes_s[0]);
         let empty = Outer {
             node: Side {
                 h: zero,
@@ -313,24 +616,84 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         };
         let mut outer = [empty; MAX_FACE_NODES * 4];
         for face in 0..4 {
+            let links = lanes.map(|k| mesh.face_links[k][face]);
+            // Each lane's neighbour and its face; at a boundary the element
+            // itself, whose values are then not used
+            let across: [(usize, usize); L] = std::array::from_fn(|l| {
+                if links[l].is_boundary() {
+                    (lanes[l], face)
+                } else {
+                    (links[l].element(), links[l].face())
+                }
+            });
+            let mut xy = [[0.0; L]; 8];
+            let mut flags = [[0.0; L]; 3];
+            let apart = links.map(|link| !link.is_boundary() && !link.shares_vertices());
+            let any_apart = apart.iter().any(|&x| x);
+            for l in 0..L {
+                for (c, corner) in geom.corners(across[l].0).iter().enumerate() {
+                    (xy[2 * c][l], xy[2 * c + 1][l]) = (corner[0], corner[1]);
+                }
+                flags[0][l] = f64::from(u8::from(!links[l].is_boundary()));
+                flags[1][l] = f64::from(u8::from(geom.element_is_affine(across[l].0)));
+                flags[2][l] = f64::from(u8::from(apart[l]));
+            }
+            let corners = Corners::new(simd, &xy);
+            let present = f64x8::<S>::from_slice(simd, &flags[0]).simd_gt(zero);
+            let affine = f64x8::<S>::from_slice(simd, &flags[1]).simd_gt(zero);
+            let is_apart = f64x8::<S>::from_slice(simd, &flags[2]).simd_gt(zero);
+            let s_j = data.faces[face].2;
             for fi in 0..N1 {
-                let mut t = [[0.0; L]; 6];
-                for (l, &k) in lanes.iter().enumerate() {
-                    if let Some((node, distance)) = self.outer_node(ElementIndex::new(k), face, fi)
-                    {
-                        (t[0][l], t[1][l], t[2][l], t[3][l]) = (node.h, node.u, node.v, node.b);
-                        (t[4][l], t[5][l]) = (distance, 1.0);
+                let nb_fi = N1 - 1 - fi;
+                // The neighbour's inner node (h, hu, hv, B), the reference
+                // position of its face node, and a periodic pair's sJ
+                let mut t = [[0.0; L]; 7];
+                for l in 0..L {
+                    let (e, f) = across[l];
+                    let nb_node = ops.face_nodes[f][nb_fi];
+                    // One node into the neighbour, normal to its face
+                    let inner = match f {
+                        0 => nb_node + N1,
+                        1 => nb_node - 1,
+                        2 => nb_node - N1,
+                        _ => nb_node + 1,
+                    };
+                    let j = e * NN + inner;
+                    (t[0][l], t[1][l], t[2][l]) = (q_h[j], q_hu[j], q_hv[j]);
+                    t[3][l] = bed.map_or(0.0, |b| b[j]);
+                    (t[4][l], t[5][l]) = (ops.nodes_r[nb_node], ops.nodes_s[nb_node]);
+                    if apart[l] {
+                        let element = geom.element_geometry(e);
+                        t[6][l] = if element.affine {
+                            element.faces[f].1
+                        } else {
+                            geom.surface_jacobian(e, f, nb_fi)
+                        };
                     }
                 }
+                // SWENodeState2D::new
+                let h = f64x8::<S>::from_slice(simd, &t[0]);
+                let wet = h.simd_gt(h_min);
+                let node = Side {
+                    h,
+                    u: wet.select(f64x8::<S>::from_slice(simd, &t[1]) / h, zero),
+                    v: wet.select(f64x8::<S>::from_slice(simd, &t[2]) / h, zero),
+                    b: f64x8::<S>::from_slice(simd, &t[3]),
+                };
+                // Heights J / sJ normal to the face (a parallelogram's J at
+                // its node 0)
+                let r = affine.select(r0, f64x8::<S>::from_slice(simd, &t[4]));
+                let s = affine.select(s0, f64x8::<S>::from_slice(simd, &t[5]));
+                let det = corners.at(simd, r, s).det;
+                let mut s_j_across = s_j;
+                if any_apart {
+                    s_j_across = is_apart.select(f64x8::<S>::from_slice(simd, &t[6]), s_j);
+                }
+                let own = data.det[ops.face_nodes[face][fi]] / s_j;
                 outer[face * N1 + fi] = Outer {
-                    node: Side {
-                        h: f64x8::<S>::from_slice(simd, &t[0]),
-                        u: f64x8::<S>::from_slice(simd, &t[1]),
-                        v: f64x8::<S>::from_slice(simd, &t[2]),
-                        b: f64x8::<S>::from_slice(simd, &t[3]),
-                    },
-                    distance: f64x8::<S>::from_slice(simd, &t[4]),
-                    present: f64x8::<S>::from_slice(simd, &t[5]).simd_gt(zero),
+                    node,
+                    distance: spacing * (det / s_j_across) / own,
+                    present,
                 };
             }
         }
@@ -359,7 +722,7 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         let zero = f64x8::<S>::splat(simd, 0.0);
         let half = f64x8::<S>::splat(simd, 0.5);
         let nodes = data.nodes(simd, g);
-        let outer = self.gather_outer::<S, N1>(simd, lanes);
+        let outer = self.gather_outer::<S, N1, NN>(simd, data, lanes);
         let [rh, rhu, rhv] = rhs;
 
         for line in 0..N1 {
@@ -499,6 +862,19 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
     }
 }
 
+/// Ask for the cache line of `field[i]` (nothing past the end).
+#[inline(always)]
+fn prefetch(field: &[f64], i: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(x) = field.get(i) {
+        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        // SAFETY: a prefetch reads nothing; the address is in bounds
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(x).cast()) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (field, i);
+}
+
 /// Largest per-element count of subcell interfaces, `2 N1 (N1 − 1)` at P4.
 const MAX_SUBCELL_INTERFACES: usize = 2 * MAX_FACE_NODES * (MAX_FACE_NODES - 1);
 
@@ -515,6 +891,87 @@ struct Batch<S: Simd, const NN: usize> {
     metric: [[[f64x8<S>; NN]; 2]; 2],
     /// Lanes of parallelograms
     affine: mask64x8<S>,
+    /// `1/J` at every node
+    j_inv: [f64x8<S>; NN],
+    /// `J` at every node
+    det: [f64x8<S>; NN],
+    /// Outward unit normal `(n_x, n_y)` and `sJ` of each face
+    faces: [(f64x8<S>, f64x8<S>, f64x8<S>); 4],
+}
+
+/// The corners of a batch of bilinear elements, as the differences
+/// `BilinearMetric::at` takes of them.
+struct Corners<S: Simd> {
+    /// `x₁ − x₀`, `x₂ − x₃`, and the same of `y`
+    along_r: [[f64x8<S>; 2]; 2],
+    /// `x₃ − x₀`, `x₂ − x₁`, and the same of `y`
+    along_s: [[f64x8<S>; 2]; 2],
+}
+
+/// Derivatives of the bilinear map at a reference point (`BilinearMetric`).
+struct Metric<S: Simd> {
+    x_r: f64x8<S>,
+    x_s: f64x8<S>,
+    y_r: f64x8<S>,
+    y_s: f64x8<S>,
+    det: f64x8<S>,
+}
+
+impl<S: Simd> Corners<S> {
+    /// `xy[2c]`, `xy[2c + 1]`: x and y of corner `c`, one element per lane.
+    #[inline(always)]
+    fn new(simd: S, xy: &[[f64; L]; 8]) -> Self {
+        let [x0, y0, x1, y1, x2, y2, x3, y3] = [
+            f64x8::<S>::from_slice(simd, &xy[0]),
+            f64x8::<S>::from_slice(simd, &xy[1]),
+            f64x8::<S>::from_slice(simd, &xy[2]),
+            f64x8::<S>::from_slice(simd, &xy[3]),
+            f64x8::<S>::from_slice(simd, &xy[4]),
+            f64x8::<S>::from_slice(simd, &xy[5]),
+            f64x8::<S>::from_slice(simd, &xy[6]),
+            f64x8::<S>::from_slice(simd, &xy[7]),
+        ];
+        Self {
+            along_r: [[x1 - x0, x2 - x3], [y1 - y0, y2 - y3]],
+            along_s: [[x3 - x0, x2 - x1], [y3 - y0, y2 - y1]],
+        }
+    }
+
+    /// `BilinearMetric::at(r, s)`, operation for operation.
+    #[inline(always)]
+    fn at(&self, simd: S, r: f64x8<S>, s: f64x8<S>) -> Metric<S> {
+        let one = f64x8::<S>::splat(simd, 1.0);
+        let quarter = f64x8::<S>::splat(simd, 0.25);
+        let [[x_lo, x_hi], [y_lo, y_hi]] = self.along_r;
+        let x_r = quarter * ((one - s) * x_lo + (one + s) * x_hi);
+        let y_r = quarter * ((one - s) * y_lo + (one + s) * y_hi);
+        let [[x_lo, x_hi], [y_lo, y_hi]] = self.along_s;
+        let x_s = quarter * ((one - r) * x_lo + (one + r) * x_hi);
+        let y_s = quarter * ((one - r) * y_lo + (one + r) * y_hi);
+        Metric {
+            x_r,
+            x_s,
+            y_r,
+            y_s,
+            det: x_r * y_s - x_s * y_r,
+        }
+    }
+}
+
+/// The elements of one batch and what their terms take from outside it.
+struct Lanes<'a> {
+    /// The element of each lane (unused lanes repeat the first)
+    lanes: &'a [usize; L],
+    /// The workspace slot of each used lane
+    slots: &'a [usize],
+    /// Whether the elements take the subcell volume term
+    subcells: bool,
+    /// Interior-face fluxes ([`SplitFormSWE2D::edge_fluxes`])
+    faces: &'a [SWEState2D],
+    /// The time of an element's boundary faces
+    time_of: &'a dyn Fn(usize) -> f64,
+    /// Whether the mass component of `F*` is asked for
+    face_mass: bool,
 }
 
 impl<S: Simd, const NN: usize> Batch<S, NN> {
@@ -624,32 +1081,76 @@ fn reconstruct_subcell<S: Simd>(
     )
 }
 
-/// `[node][lane]` vectors of the nodal `field` of the elements `lanes` (each
-/// element's row read contiguously), or `constant[l]` at every node of lane
-/// `l` where given.
+/// `[node][lane]` vectors of the nodal `field` of the elements `lanes`: each
+/// element's row is loaded eight nodes at a time and the eight rows are
+/// transposed in registers ([`transpose8`]); the nodes left over (one at P2)
+/// go value by value.
 #[inline(always)]
 fn transpose<S: Simd, const NN: usize>(
     simd: S,
     lanes: &[usize; L],
     field: &[f64],
-    constant: [Option<f64>; L],
 ) -> [f64x8<S>; NN] {
-    let mut t = [[0.0; L]; NN];
-    for (l, &k) in lanes.iter().enumerate() {
-        match constant[l] {
-            Some(c) => t.iter_mut().for_each(|t| t[l] = c),
-            None => {
-                for (t, &x) in t.iter_mut().zip(&field[k * NN..(k + 1) * NN]) {
-                    t[l] = x;
-                }
-            }
+    let zero = f64x8::<S>::splat(simd, 0.0);
+    let mut out = [zero; NN];
+    let whole = NN - NN % L;
+    for first in (0..whole).step_by(L) {
+        let mut rows = [zero; L];
+        for (row, &k) in rows.iter_mut().zip(lanes) {
+            *row = f64x8::<S>::from_slice(simd, &field[k * NN + first..k * NN + first + L]);
         }
+        out[first..first + L].copy_from_slice(&transpose8(rows));
     }
-    let mut out = [f64x8::<S>::splat(simd, 0.0); NN];
-    for (out, t) in out.iter_mut().zip(&t) {
-        *out = f64x8::<S>::from_slice(simd, t);
+    for (i, out) in out.iter_mut().enumerate().skip(whole) {
+        let mut t = [0.0; L];
+        for (t, &k) in t.iter_mut().zip(lanes) {
+            *t = field[k * NN + i];
+        }
+        *out = f64x8::<S>::from_slice(simd, &t);
     }
     out
+}
+
+/// The rows `slots[l] · NN..` of `rows` from the `[node][lane]` vectors
+/// `values`, lane `l` to `slots[l]`: [`transpose`] backwards.
+#[inline(always)]
+fn scatter<S: Simd, const NN: usize>(values: &[f64x8<S>; NN], slots: &[usize], rows: &mut [f64]) {
+    let whole = NN - NN % L;
+    for first in (0..whole).step_by(L) {
+        let mut nodes = [values[0]; L];
+        nodes.copy_from_slice(&values[first..first + L]);
+        for (lane, &j) in transpose8(nodes).iter().zip(slots) {
+            lane.store_slice(&mut rows[j * NN + first..j * NN + first + L]);
+        }
+    }
+    for (i, value) in values.iter().enumerate().skip(whole) {
+        let value = value.as_slice();
+        for (l, &j) in slots.iter().enumerate() {
+            rows[j * NN + i] = value[l];
+        }
+    }
+}
+
+/// The transpose of eight vectors of eight values, `out[i][l] = v[l][i]`:
+/// three rounds of interleaving each vector with the one four places on.
+#[inline(always)]
+fn transpose8<S: Simd>(v: [f64x8<S>; L]) -> [f64x8<S>; L] {
+    interleave4(interleave4(interleave4(v)))
+}
+
+/// `v[i]` interleaved with `v[i + 4]`: the low halves, then the high halves.
+#[inline(always)]
+fn interleave4<S: Simd>(v: [f64x8<S>; L]) -> [f64x8<S>; L] {
+    [
+        v[0].zip_low(v[4]),
+        v[0].zip_high(v[4]),
+        v[1].zip_low(v[5]),
+        v[1].zip_high(v[5]),
+        v[2].zip_low(v[6]),
+        v[2].zip_high(v[6]),
+        v[3].zip_low(v[7]),
+        v[3].zip_high(v[7]),
+    ]
 }
 
 /// The node states of a batch of elements for the two-point flux.
@@ -705,28 +1206,6 @@ impl<S: Simd> Side<S> {
             u: mask.select(other.u, self.u),
             v: mask.select(other.v, self.v),
             b: mask.select(other.b, self.b),
-        }
-    }
-
-    /// `SWENodeState2D::new` at the volume nodes `nodes[l]` (indices into
-    /// the nodal fields `q` and `bed`).
-    #[inline(always)]
-    fn gather(simd: S, q: [&[f64]; 3], bed: Option<&[f64]>, nodes: [usize; L], h_min: f64) -> Self {
-        let mut t = [[0.0; L]; 4];
-        for (l, &j) in nodes.iter().enumerate() {
-            (t[0][l], t[1][l], t[2][l]) = (q[0][j], q[1][j], q[2][j]);
-            t[3][l] = bed.map_or(0.0, |b| b[j]);
-        }
-        let h = f64x8::<S>::from_slice(simd, &t[0]);
-        let hu = f64x8::<S>::from_slice(simd, &t[1]);
-        let hv = f64x8::<S>::from_slice(simd, &t[2]);
-        let zero = f64x8::<S>::splat(simd, 0.0);
-        let wet = h.simd_gt(f64x8::<S>::splat(simd, h_min));
-        Self {
-            h,
-            u: wet.select(hu / h, zero),
-            v: wet.select(hv / h, zero),
-            b: f64x8::<S>::from_slice(simd, &t[3]),
         }
     }
 }
@@ -791,130 +1270,6 @@ struct Flux<S: Simd> {
 
 /// Largest face of P1–P4.
 const MAX_FACE_NODES: usize = 5;
-
-impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
-    /// [`Self::edge_fluxes`] of the `edges` (at most [`VOLUME_BATCH`]) at
-    /// once, one edge per lane, into `slots` (one per edge). Boundary edges
-    /// are left untouched, as by `edge_fluxes`. Returns false (and writes
-    /// nothing) unless the surface flux is the hydrostatic HLL of `WetDry`
-    /// and the order is P1–P4.
-    pub(in crate::solver::rhs) fn edge_fluxes_simd(
-        &self,
-        edges: &[usize],
-        slots: &mut [&mut [SWEState2D]],
-    ) -> bool {
-        debug_assert!(edges.len() <= L && slots.len() == edges.len());
-        #[cfg(test)]
-        if UNBATCHED.with(std::cell::Cell::get) {
-            return false;
-        }
-        if self.surface != SurfaceFlux::HydrostaticHll {
-            return false;
-        }
-        let mut mask = 0u8;
-        for (l, &e) in edges.iter().enumerate() {
-            if self.mesh.edges[e].right.is_some() {
-                mask |= 1 << l;
-            }
-        }
-        if mask == 0 {
-            return true;
-        }
-        // Lanes without an interior edge repeat the first one
-        let first = edges[mask.trailing_zeros() as usize];
-        let mut lanes = [first; L];
-        for (l, &e) in edges.iter().enumerate() {
-            if mask & (1 << l) != 0 {
-                lanes[l] = e;
-            }
-        }
-        let mut out = [[SWEState2D::zero(); 2 * MAX_FACE_NODES]; L];
-        let level = Level::new();
-        let done = match self.ops.n_face_nodes {
-            2 => dispatch!(level, simd => self.faces::<_, 2>(simd, &lanes, &mut out)),
-            3 => dispatch!(level, simd => self.faces::<_, 3>(simd, &lanes, &mut out)),
-            4 => dispatch!(level, simd => self.faces::<_, 4>(simd, &lanes, &mut out)),
-            5 => dispatch!(level, simd => self.faces::<_, 5>(simd, &lanes, &mut out)),
-            _ => false,
-        };
-        if !done {
-            return false;
-        }
-        let per_edge = 2 * self.ops.n_face_nodes;
-        for (l, slot) in slots.iter_mut().enumerate() {
-            if mask & (1 << l) != 0 {
-                slot.copy_from_slice(&out[l][..per_edge]);
-            }
-        }
-        true
-    }
-
-    /// The face-node loop of [`Self::edge_fluxes`] for the interior edges
-    /// `lanes` (`NF` nodes per face), lane by lane in the scalar order, into
-    /// `out[l]`: the left side's `NF` values, then the right side's.
-    #[inline(always)]
-    fn faces<S: Simd, const NF: usize>(
-        &self,
-        simd: S,
-        lanes: &[usize; L],
-        out: &mut [[SWEState2D; 2 * MAX_FACE_NODES]; L],
-    ) -> bool {
-        let n = self.ops.n_nodes;
-        let g = self.config.equation.g;
-        let h_min = self.config.equation.h_min.meters();
-        let [q_h, q_hu, q_hv] = &self.q.data;
-        let bed = self.config.bathymetry.map(|b| &b.data[..]);
-        let edges = lanes.map(|e| &self.mesh.edges[e]);
-        let lefts = edges.map(|e| e.left);
-        let rights = edges.map(|e| e.right.expect("interior edge"));
-        let left_geometry = lefts.map(|left| self.geom.element_geometry(left.element));
-
-        for fi in 0..NF {
-            let rfi = NF - 1 - fi;
-            let left = Side::gather(
-                simd,
-                [q_h, q_hu, q_hv],
-                bed,
-                lefts.map(|f| f.element * n + self.ops.face_nodes[f.face][fi]),
-                h_min,
-            );
-            let right = Side::gather(
-                simd,
-                [q_h, q_hu, q_hv],
-                bed,
-                rights.map(|f| f.element * n + self.ops.face_nodes[f.face][rfi]),
-                h_min,
-            );
-            // A parallelogram's faces are straight with a constant normal
-            let mut normal = [[0.0; L]; 2];
-            for l in 0..L {
-                (normal[0][l], normal[1][l]) = if left_geometry[l].affine {
-                    left_geometry[l].faces[lefts[l].face].0
-                } else {
-                    self.geom.normal(lefts[l].element, lefts[l].face, fi)
-                };
-            }
-            let (mx, my) = (
-                f64x8::<S>::from_slice(simd, &normal[0]),
-                f64x8::<S>::from_slice(simd, &normal[1]),
-            );
-            let (f_left, f_right) = hydrostatic_hll(simd, left, right, (mx, my), g, h_min);
-            // surface_flux: (F_a, −F_b)
-            let (r_h, r_hu, r_hv) = (-f_right.h, -f_right.hu, -f_right.hv);
-            let (lh, lhu, lhv) = (
-                f_left.h.as_slice(),
-                f_left.hu.as_slice(),
-                f_left.hv.as_slice(),
-            );
-            let (rh, rhu, rhv) = (r_h.as_slice(), r_hu.as_slice(), r_hv.as_slice());
-            for l in 0..L {
-                out[l][fi] = SWEState2D::new(lh[l], lhu[l], lhv[l]);
-                out[l][NF + rfi] = SWEState2D::new(rh[l], rhu[l], rhv[l]);
-            }
-        }
-        true
-    }
-}
 
 /// `f64::max(a, b)` for a non-NaN `b`: `a` if `a > b`, else `b` (a tie of
 /// ±0 gives `b`).
@@ -1006,8 +1361,15 @@ fn hydrostatic_hll<S: Simd>(
         let ram = (one - head / sill) * q.h * un * (two * un + (g_v * q.h).sqrt());
         (hll_dry & q.h.simd_gt(h_min_v) & sill.simd_gt(head)).select(ram, zero)
     };
-    let dp_a = half_g * (q_a.h * q_a.h - h_star_a * h_star_a) + wall(q_a, 1.0);
-    let dp_b = half_g * (q_b.h * q_b.h - h_star_b * h_star_b) + wall(q_b, -1.0);
+    // (zero in every lane unless one is dry: two divisions and a square
+    // root per side that most batches do not need)
+    let (wall_a, wall_b) = if hll_dry.any_true() {
+        (wall(q_a, 1.0), wall(q_b, -1.0))
+    } else {
+        (zero, zero)
+    };
+    let dp_a = half_g * (q_a.h * q_a.h - h_star_a * h_star_a) + wall_a;
+    let dp_b = half_g * (q_b.h * q_b.h - h_star_b * h_star_b) + wall_b;
     (
         Flux {
             h: flux.h + zero,

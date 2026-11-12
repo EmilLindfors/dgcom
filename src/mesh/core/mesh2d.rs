@@ -46,6 +46,93 @@ pub struct Edge {
     pub boundary_tag: Option<BoundaryTag>,
 }
 
+/// The other side of one face of an element, in four bytes: what the
+/// element kernels read of the connectivity, an element's four faces in one
+/// place ([`Mesh2D::face_links`]; [`Mesh2D::neighbor`] reads the same from
+/// the edge list).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaceLink(u32);
+
+impl FaceLink {
+    /// A boundary face: no other side.
+    pub const BOUNDARY: Self = Self(u32::MAX);
+    /// Most elements a mesh may have: 28 bits of a link, less the pattern
+    /// of [`Self::BOUNDARY`].
+    pub const MAX_ELEMENTS: usize = (1 << 28) - 1;
+
+    /// The face whose other side is `neighbour`; `left`: the face itself is
+    /// the left side of its edge; `shared`: the two faces have the same two
+    /// vertices (not a periodic pair).
+    fn new(neighbour: ElementFace, left: bool, shared: bool) -> Self {
+        debug_assert!(neighbour.element < Self::MAX_ELEMENTS && neighbour.face < 4);
+        // (an element index below MAX_ELEMENTS leaves a zero bit: never BOUNDARY)
+        Self(
+            (neighbour.element as u32) << 4
+                | u32::from(shared) << 3
+                | u32::from(left) << 2
+                | neighbour.face as u32,
+        )
+    }
+
+    /// Whether the face is on the boundary.
+    #[inline]
+    pub fn is_boundary(self) -> bool {
+        self == Self::BOUNDARY
+    }
+
+    /// The neighbour element (not for a boundary face).
+    #[inline]
+    pub fn element(self) -> usize {
+        (self.0 >> 4) as usize
+    }
+
+    /// Whether the two faces have the same two vertices, traversed in
+    /// opposite directions: every interior face but a periodic pair's. Their
+    /// outward normals and lengths are then equal and opposite to the bit
+    /// (not for a boundary face).
+    #[inline]
+    pub fn shares_vertices(self) -> bool {
+        self.0 & 8 != 0
+    }
+
+    /// The neighbour's face (not for a boundary face).
+    #[inline]
+    pub fn face(self) -> usize {
+        (self.0 & 3) as usize
+    }
+
+    /// Whether this face, not the neighbour's, is the left side of the edge
+    /// (not for a boundary face).
+    #[inline]
+    pub fn is_left(self) -> bool {
+        self.0 & 4 != 0
+    }
+}
+
+/// Position of the cell `(x, y)` of a `2^bits × 2^bits` grid along the
+/// Hilbert curve through it: cells next to each other on the curve share a
+/// side, and cells near each other in the plane are mostly near on the curve.
+fn hilbert_index(mut x: u32, mut y: u32, bits: u32) -> u64 {
+    let mut d = 0;
+    let mut s = 1u32 << (bits - 1);
+    while s > 0 {
+        let (rx, ry) = (x & s != 0, y & s != 0);
+        d += u64::from(s) * u64::from(s) * ((3 * u64::from(rx)) ^ u64::from(ry));
+        // The quadrant's own curve, rotated to start where this one enters it
+        x &= s - 1;
+        y &= s - 1;
+        if !ry {
+            if rx {
+                x = s - 1 - x;
+                y = s - 1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        s >>= 1;
+    }
+    d
+}
+
 impl Edge {
     /// Check if this is a boundary edge.
     pub fn is_boundary(&self) -> bool {
@@ -183,6 +270,11 @@ pub struct Mesh2D {
 
     /// Element-to-edge mapping: element_edges[k][f] = edge index for face f of element k
     pub element_edges: Vec<[usize; 4]>,
+
+    /// The other side of every face of every element, packed
+    /// (`face_links[k][f]`): the neighbours of [`Self::neighbor`] without
+    /// the edge list.
+    pub face_links: Vec<[FaceLink; 4]>,
 
     /// Number of elements
     pub n_elements: usize,
@@ -429,7 +521,23 @@ impl Mesh2D {
             edge.boundary_tag = Some(boundary_tag(edge.left));
         }
 
+        assert!(
+            n_elements <= FaceLink::MAX_ELEMENTS,
+            "a mesh holds at most {} elements",
+            FaceLink::MAX_ELEMENTS
+        );
+        let mut face_links = vec![[FaceLink::BOUNDARY; 4]; n_elements];
+        for edge in &edges {
+            if let Some(right) = edge.right {
+                let (a, b) = face_vertices(edge.left);
+                let shared = face_vertices(right) == (b, a);
+                face_links[edge.left.element][edge.left.face] = FaceLink::new(right, true, shared);
+                face_links[right.element][right.face] = FaceLink::new(edge.left, false, shared);
+            }
+        }
+
         Ok(Self {
+            face_links,
             vertex_to_elements: Self::build_vertex_to_elements(&elements, n_vertices),
             vertices,
             elements,
@@ -461,7 +569,13 @@ impl Mesh2D {
     ///         + (1+r)(1+s)/4 * x2 + (1-r)(1+s)/4 * x3
     /// ```
     pub fn reference_to_physical(&self, k: ElementIndex, r: f64, s: f64) -> [f64; 2] {
-        let verts = self.element_vertices(k);
+        Self::bilinear(&self.element_vertices(k), r, s)
+    }
+
+    /// [`Self::reference_to_physical`] in the element with corners `verts`
+    /// ([`Self::element_vertices`]), for many points of one element.
+    #[inline]
+    pub fn bilinear(verts: &[[f64; 2]; 4], r: f64, s: f64) -> [f64; 2] {
         let [x0, y0] = verts[0];
         let [x1, y1] = verts[1];
         let [x2, y2] = verts[2];
@@ -578,6 +692,59 @@ impl Mesh2D {
         let kept: Vec<usize> = (0..self.n_elements)
             .filter(|&k| keep(ElementIndex::new(k)))
             .collect();
+        (self.select_elements(&kept, new_boundary), kept)
+    }
+
+    /// The mesh with its elements numbered along a Hilbert curve through
+    /// their centroids, and, for each of its elements, the index of that
+    /// element in `self`.
+    ///
+    /// A mesh generator's numbering follows its own algorithm: Gmsh's
+    /// recombined quadrilaterals have one face neighbour next to them and
+    /// the others anywhere (on the 95,000-element Chiloé coastline mesh 44 %
+    /// of the face neighbours were more than 1000 elements apart, 39 % more
+    /// than 8000). Every face flux then reads a neighbour's state, bed and
+    /// geometry from memory that is in no cache. Along the curve 92 % are
+    /// within 64 elements and 99 % within 1024, and the same run takes 1.26×
+    /// less time (`notes/performance.md`, P2.8). The solution changes by
+    /// round-off only (sums in another order).
+    pub fn in_hilbert_order(&self) -> (Mesh2D, Vec<usize>) {
+        const BITS: u32 = 16;
+        let centroid = |k: usize| {
+            let v = self.element_vertices(ElementIndex::new(k));
+            [0, 1].map(|d| 0.25 * (v[0][d] + v[1][d] + v[2][d] + v[3][d]))
+        };
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for k in 0..self.n_elements {
+            let c = centroid(k);
+            for d in 0..2 {
+                lo[d] = lo[d].min(c[d]);
+                hi[d] = hi[d].max(c[d]);
+            }
+        }
+        // One scale for both directions: the curve's cells are squares
+        let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]);
+        let scale = if extent > 0.0 {
+            ((1u32 << BITS) - 1) as f64 / extent
+        } else {
+            0.0
+        };
+        let mut order: Vec<(u64, usize)> = (0..self.n_elements)
+            .map(|k| {
+                let c = centroid(k);
+                let [x, y] = [0, 1].map(|d| ((c[d] - lo[d]) * scale) as u32);
+                (hilbert_index(x, y, BITS), k)
+            })
+            .collect();
+        // Ties (and equal keys) keep the old order
+        order.sort();
+        let order: Vec<usize> = order.into_iter().map(|(_, k)| k).collect();
+        (self.select_elements(&order, BoundaryTag::Wall), order)
+    }
+
+    /// The mesh of the elements `kept` of `self` (distinct), in that order:
+    /// [`Self::retain_elements`] for a given list, which may also reorder.
+    fn select_elements(&self, kept: &[usize], new_boundary: BoundaryTag) -> Mesh2D {
         let mut new_element = vec![None; self.n_elements];
         for (new, &old) in kept.iter().enumerate() {
             new_element[old] = Some(new);
@@ -615,15 +782,14 @@ impl Mesh2D {
                 (face_key(edge.left) != face_key(right)).then_some(pair)
             })
             .collect();
-        let mesh = Mesh2D::from_quads(vertices, elements, &periodic, |face| {
+        Mesh2D::from_quads(vertices, elements, &periodic, |face| {
             // A boundary face of the submesh keeps its tag, or faced a
             // dropped element
             let old = ElementFace::new(kept[face.element], face.face);
             let edge = &self.edges[self.element_edges[old.element][old.face]];
             edge.boundary_tag.unwrap_or(new_boundary)
         })
-        .expect("a submesh of a valid mesh is valid");
-        (mesh, kept)
+        .expect("a submesh of a valid mesh is valid")
     }
 
     /// Build vertex-to-element connectivity from element-vertex connectivity.
@@ -1025,6 +1191,66 @@ mod tests {
         assert_eq!(sub.neighbor(k(3), 2), Some(ElementFace::new(0, 0)));
         // ... and the bottom of 2 faced the dropped top-row element 5
         assert_eq!(sub.boundary_tag(k(2), 0), Some(BoundaryTag::Open));
+    }
+
+    /// The Hilbert order is the same mesh (elements, neighbours, boundary
+    /// tags) renumbered, and on a 2ⁿ × 2ⁿ grid every element shares a face
+    /// with the next one (row-major order has neighbours a row apart).
+    #[test]
+    fn hilbert_order_is_the_same_mesh_with_neighbours_next_to_each_other() {
+        // The curve visits every cell once, moving one cell at a time
+        let mut cells: Vec<_> = (0..8u32)
+            .flat_map(|y| (0..8u32).map(move |x| (hilbert_index(x, y, 3), x, y)))
+            .collect();
+        cells.sort();
+        for (i, pair) in cells.windows(2).enumerate() {
+            assert_eq!(pair[0].0, i as u64);
+            assert_eq!(
+                pair[0].1.abs_diff(pair[1].1) + pair[0].2.abs_diff(pair[1].2),
+                1
+            );
+        }
+
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 16.0, 0.0, 16.0, 16, 16);
+        for edge in mesh.edges.iter_mut().filter(|e| e.is_boundary()) {
+            let x = 0.5 * (mesh.vertices[edge.vertices.0][0] + mesh.vertices[edge.vertices.1][0]);
+            if x == 0.0 {
+                edge.boundary_tag = Some(BoundaryTag::Open);
+            }
+        }
+        let (sorted, old) = mesh.in_hilbert_order();
+        assert_eq!(sorted.n_elements, mesh.n_elements);
+        assert_eq!(sorted.n_vertices, mesh.n_vertices);
+        assert_eq!(sorted.n_edges, mesh.n_edges);
+        assert_consistent(&sorted);
+        let mut seen = old.clone();
+        seen.sort_unstable();
+        assert!(seen.iter().copied().eq(0..mesh.n_elements), "a permutation");
+        for (new, &o) in old.iter().enumerate() {
+            assert_eq!(sorted.element_vertices(k(new)), mesh.element_vertices(k(o)));
+            for face in 0..4 {
+                match mesh.neighbor(k(o), face) {
+                    Some(nb) => {
+                        let sorted_nb = sorted.neighbor(k(new), face).unwrap();
+                        assert_eq!(
+                            (old[sorted_nb.element], sorted_nb.face),
+                            (nb.element, nb.face)
+                        );
+                    }
+                    None => assert_eq!(
+                        sorted.boundary_tag(k(new), face),
+                        mesh.boundary_tag(k(o), face)
+                    ),
+                }
+            }
+            if new + 1 < sorted.n_elements {
+                let next = (0..4).filter_map(|face| sorted.neighbor(k(new), face));
+                assert!(
+                    next.map(|nb| nb.element).any(|e| e == new + 1),
+                    "element {new}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1513,5 +1739,67 @@ mod tests {
         assert_eq!(verts[1], [1.0, 0.0]);
         assert_eq!(verts[2], [1.0, 1.0]);
         assert_eq!(verts[3], [0.0, 1.0]);
+    }
+
+    /// The packed face links say what the edge list says: the neighbour and
+    /// its face, which side of the edge the face is, and whether the two
+    /// faces share their vertices (all but the periodic pairs).
+    #[test]
+    fn face_links_are_the_neighbours_of_the_edge_list() {
+        let single = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 1, 1);
+        for (name, mesh) in [
+            (
+                "rectangle",
+                Mesh2D::uniform_rectangle(0.0, 4.0, 0.0, 3.0, 4, 3),
+            ),
+            (
+                "channel",
+                Mesh2D::channel_periodic_x(0.0, 4.0, 0.0, 3.0, 4, 3),
+            ),
+            (
+                "periodic",
+                Mesh2D::uniform_periodic(0.0, 4.0, 0.0, 3.0, 4, 3),
+            ),
+            ("one periodic element", single),
+        ] {
+            let face_vertices = |ef: ElementFace| {
+                let quad = mesh.elements[ef.element];
+                (quad[ef.face], quad[(ef.face + 1) % 4])
+            };
+            let mut apart = 0;
+            for k in 0..mesh.n_elements {
+                for face in 0..4 {
+                    let link = mesh.face_links[k][face];
+                    let Some(neighbour) = mesh.neighbor(ElementIndex::new(k), face) else {
+                        assert!(link.is_boundary(), "{name}: {k}/{face}");
+                        continue;
+                    };
+                    assert!(!link.is_boundary(), "{name}: {k}/{face}");
+                    assert_eq!(
+                        ElementFace::new(link.element(), link.face()),
+                        neighbour,
+                        "{name}: {k}/{face}"
+                    );
+                    let edge = &mesh.edges[mesh.element_edges[k][face]];
+                    assert_eq!(
+                        link.is_left(),
+                        edge.left == ElementFace::new(k, face),
+                        "{name}: {k}/{face}"
+                    );
+                    let (a, b) = face_vertices(ElementFace::new(k, face));
+                    let shared = face_vertices(neighbour) == (b, a);
+                    assert_eq!(link.shares_vertices(), shared, "{name}: {k}/{face}");
+                    apart += usize::from(!shared);
+                }
+            }
+            // Both faces of every periodic pair, and no other
+            let pairs = match name {
+                "rectangle" => 0,
+                "channel" => 3,
+                "periodic" => 3 + 4,
+                _ => 2,
+            };
+            assert_eq!(apart, 2 * pairs, "{name}");
+        }
     }
 }

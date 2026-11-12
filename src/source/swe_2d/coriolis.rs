@@ -17,6 +17,7 @@
 //! - Coriolis effects are significant for mesoscale circulation
 //! - β ≈ 1.14×10⁻¹¹ m⁻¹ s⁻¹
 
+use crate::mesh::Mesh2D;
 use crate::solver::SWEState2D;
 use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
 
@@ -152,11 +153,15 @@ impl SourceTerm2D for CoriolisSource2D {
         hu: &mut [f64],
         hv: &mut [f64],
     ) {
+        // The element's corners once, not once per node
+        let corners = (self.beta != 0.0).then(|| element.mesh.element_vertices(element.element));
         for i in 0..element.n_nodes() {
-            let f = if self.beta == 0.0 {
-                self.f0
-            } else {
-                self.f_at(element.position(i).1)
+            let f = match &corners {
+                None => self.f0,
+                Some(corners) => {
+                    let (r, s) = (element.ops.nodes_r[i], element.ops.nodes_s[i]);
+                    self.f_at(Mesh2D::bilinear(corners, r, s)[1])
+                }
             };
             let state = element.state(i);
             hu[i] += f * state.hv;
@@ -203,6 +208,14 @@ mod tests {
         let dy = EARTH_MEAN_RADIUS * 1f64.to_radians();
         let exact = coriolis_parameter(61.0) - coriolis_parameter(60.0);
         assert!((c.f_at(dy) - c.f0 - exact).abs() < 0.02 * exact);
+
+        // Southern hemisphere (Chiloé, `cases/chiloe`): f < 0, β > 0, so f
+        // grows towards 0 northwards
+        let s = CoriolisSource2D::beta_plane_at_latitude(-42.5, 0.0);
+        assert!((s.f0 + 9.853e-5).abs() < 1e-8, "{}", s.f0);
+        assert!(s.beta > 0.0 && s.f_at(dy) > s.f0);
+        let exact = coriolis_parameter(-41.5) - coriolis_parameter(-42.5);
+        assert!((s.f_at(dy) - s.f0 - exact).abs() < 0.02 * exact);
     }
 
     fn make_context(h: f64, hu: f64, hv: f64, y: f64) -> SourceContext2D {

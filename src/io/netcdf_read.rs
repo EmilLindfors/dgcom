@@ -696,14 +696,17 @@ impl OceanModelReader {
     ///
     /// - Grid: `lat`/`lon`, `latitude`/`longitude`, `lat_rho`/`lon_rho` or
     ///   `nav_lat`/`nav_lon`, 1D or 2D; `mask_rho` marks land.
-    /// - Depth: `h` (or `sea_floor_depth_below_sea_level`).
-    /// - SSH: `zeta`, `ssh`, `sea_surface_height` or `sea_surface_elevation`.
-    ///   Not `h`, which in ROMS/NorKyst files is the depth.
+    /// - Depth: `h`, `sea_floor_depth_below_sea_level` or `deptho` (Copernicus
+    ///   Marine's static bathymetry). Without one, a z-level column ends at its
+    ///   deepest valid value.
+    /// - SSH: `zeta`, `ssh`, `sea_surface_height`, `sea_surface_elevation` or
+    ///   `zos` (Copernicus Marine, above the geoid: its mean is not a tidal
+    ///   datum). Not `h`, which in ROMS/NorKyst files is the depth.
     /// - Velocity, the first pair present: the barotropic
     ///   `ubar_eastward`/`vbar_northward` or grid-relative `ubar`/`vbar`, else
-    ///   the 3D `u_eastward`/`v_northward`, `u`/`v` or
-    ///   `eastward_sea_water_velocity`/`northward_sea_water_velocity`
-    ///   averaged over the water column: on z-levels by the trapezoid rule
+    ///   the 3D `u_eastward`/`v_northward`, `u`/`v`,
+    ///   `eastward_sea_water_velocity`/`northward_sea_water_velocity` or
+    ///   `uo`/`vo` (Copernicus Marine) averaged over the water column: on z-levels by the trapezoid rule
     ///   down to the bed ([`depth_average_z`], the level axis's `positive`
     ///   attribute gives its direction; NorKyst's `depth` is positive down,
     ///   level 0 at the surface), on ROMS s-levels (`s_rho`) weighted by the
@@ -711,7 +714,14 @@ impl OceanModelReader {
     ///   `Vtransform` and `h`). Grid-relative components on u-/v-points are
     ///   averaged to ρ-points and rotated to east/north by `angle`, or by the
     ///   grid angle from the coordinates.
-    /// - Temperature and salinity: the surface level.
+    /// - Temperature and salinity: the surface level of `temperature`, `temp`,
+    ///   `sea_water_temperature` or `thetao`, and `salinity`, `salt`,
+    ///   `sea_water_salinity` or `so`.
+    ///
+    /// The names cover NorKyst-800, ROMS/CROCO output (e.g. IFOP's MOSA for
+    /// Chilean Patagonia) and Copernicus Marine's global and regional
+    /// products (`scripts/cmems_parent_subset.py` merges their datasets into
+    /// one file).
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, NetCDFError> {
         Self::read_file(path.as_ref(), false)
     }
@@ -746,7 +756,7 @@ impl OceanModelReader {
         });
         let mut depth = read_static(
             &file,
-            &["h", "sea_floor_depth_below_sea_level"],
+            &["h", "sea_floor_depth_below_sea_level", "deptho"],
             time_dim.as_deref(),
             dims,
         )?;
@@ -771,13 +781,19 @@ impl OceanModelReader {
             reader = reader.with_depth(depth);
         }
         if let Some((_, ssh)) = fields.series(
-            &["zeta", "ssh", "sea_surface_height", "sea_surface_elevation"],
+            &[
+                "zeta",
+                "ssh",
+                "sea_surface_height",
+                "sea_surface_elevation",
+                "zos",
+            ],
             Reduce::Surface,
         )? {
             reader = reader.with_ssh(to_series(n_points, &ssh));
         }
 
-        const PAIRS: [(&str, &str, Axes); 5] = [
+        const PAIRS: [(&str, &str, Axes); 6] = [
             ("ubar_eastward", "vbar_northward", Axes::EastNorth),
             ("ubar", "vbar", Axes::Grid),
             ("u_eastward", "v_northward", Axes::EastNorth),
@@ -787,6 +803,7 @@ impl OceanModelReader {
                 "northward_sea_water_velocity",
                 Axes::EastNorth,
             ),
+            ("uo", "vo", Axes::EastNorth),
         ];
         for (u_name, v_name, axes) in PAIRS {
             let (Some(u_var), Some(v_var)) = (file.variable(u_name), file.variable(v_name)) else {
@@ -855,11 +872,13 @@ impl OceanModelReader {
         }
 
         let temperature = fields.series(
-            &["temperature", "temp", "sea_water_temperature"],
+            &["temperature", "temp", "sea_water_temperature", "thetao"],
             Reduce::Surface,
         )?;
-        let salinity =
-            fields.series(&["salinity", "salt", "sea_water_salinity"], Reduce::Surface)?;
+        let salinity = fields.series(
+            &["salinity", "salt", "sea_water_salinity", "so"],
+            Reduce::Surface,
+        )?;
         let reader = reader.with_tracers(
             temperature.map(|(_, t)| to_series(n_points, &t)),
             salinity.map(|(_, s)| to_series(n_points, &s)),
@@ -881,8 +900,8 @@ impl OceanModelReader {
             }
             Ok(None)
         };
-        let temperature = profile(&["temperature", "temp", "sea_water_temperature"])?;
-        let salinity = profile(&["salinity", "salt", "sea_water_salinity"])?;
+        let temperature = profile(&["temperature", "temp", "sea_water_temperature", "thetao"])?;
+        let salinity = profile(&["salinity", "salt", "sea_water_salinity", "so"])?;
         Ok(reader.with_profiles(velocity_profiles, temperature, salinity))
     }
 }
@@ -1323,6 +1342,84 @@ mod tests {
                 .contains("averaged over depth")
         );
         assert!((reader.temperature().unwrap().get(0, 2) - 12.0).abs() < 1e-6);
+    }
+
+    /// A Copernicus Marine-like file off Chiloé (`GLOBAL_ANALYSISFORECAST_PHY_001_024`
+    /// merged by `scripts/cmems_parent_subset.py`): 1D `latitude`/`longitude`
+    /// in the southern and western hemispheres, `depth` 0.5, 10, 50 m
+    /// (`positive = "down"`), no depth variable (land and the bed by the fill
+    /// value), `zos`, `uo`/`vo`, `thetao` and `so`.
+    #[test]
+    fn copernicus_marine_names_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cmems.nc");
+        {
+            let mut file = netcdf::create(&path).unwrap();
+            file.add_dimension("time", 1).unwrap();
+            file.add_dimension("depth", 3).unwrap();
+            file.add_dimension("latitude", 2).unwrap();
+            file.add_dimension("longitude", 3).unwrap();
+            let mut lat = file.add_variable::<f32>("latitude", &["latitude"]).unwrap();
+            lat.put_values(&[-42.5_f32, -42.416_666], ..).unwrap();
+            let mut lon = file
+                .add_variable::<f32>("longitude", &["longitude"])
+                .unwrap();
+            lon.put_values(&[-74.0_f32, -73.916_666, -73.833_336], ..)
+                .unwrap();
+            let mut depth = file.add_variable::<f32>("depth", &["depth"]).unwrap();
+            depth.put_attribute("positive", "down").unwrap();
+            depth.put_values(&[0.5_f32, 10.0, 50.0], ..).unwrap();
+            let mut time = file.add_variable::<f64>("time", &["time"]).unwrap();
+            time.put_attribute("units", "hours since 1950-01-01")
+                .unwrap();
+            time.put_values(&[665_016.0], ..).unwrap(); // 2025-11-12T00:00Z
+            const FILL: f32 = 1e20;
+            let mut zos = file
+                .add_variable::<f32>("zos", &["time", "latitude", "longitude"])
+                .unwrap();
+            zos.put_attribute("_FillValue", FILL).unwrap();
+            // The first point is land
+            zos.put_values(&[FILL, 0.12, 0.12, 0.12, 0.12, 0.12], ..)
+                .unwrap();
+            let dims = &["time", "depth", "latitude", "longitude"];
+            let column = |surface: f32, mid: f32, deep: f32| {
+                // Land at the first point; the bed above 50 m at the second
+                let mut v = vec![FILL, surface, surface, surface, surface, surface];
+                v.extend([FILL, mid, mid, mid, mid, mid]);
+                v.extend([FILL, FILL, deep, deep, deep, deep]);
+                v
+            };
+            for (name, values) in [
+                ("uo", column(0.4, 0.2, 0.0)),
+                ("vo", column(-0.2, -0.2, -0.2)),
+                ("thetao", column(11.5, 10.0, 9.0)),
+                ("so", column(32.0, 33.0, 34.0)),
+            ] {
+                let mut var = file.add_variable::<f32>(name, dims).unwrap();
+                var.put_attribute("_FillValue", FILL).unwrap();
+                var.put_values(&values, ..).unwrap();
+            }
+        }
+        let reader = OceanModelReader::from_file_with_profiles(&path).unwrap();
+        assert!(!reader.is_wet(0) && reader.is_wet(1));
+        let ssh = reader.ssh().unwrap();
+        assert!((ssh.get(0, 4) - 0.12).abs() < 1e-6);
+        assert_eq!(reader.velocity_source(), Some("uo/vo averaged over depth"));
+        let (u, v) = (reader.u().unwrap(), reader.v().unwrap());
+        // A column ending at its deepest value (10 m): the surface value up
+        // to 0, then the trapezoid to 10 m
+        let expected = (0.4 * 0.5 + 0.3 * 9.5) / 10.0;
+        assert!((u.get(0, 1) - expected).abs() < 1e-6, "{}", u.get(0, 1));
+        assert!((v.get(0, 1) + 0.2).abs() < 1e-6, "{}", v.get(0, 1));
+        // The 50 m column
+        let expected = (0.4 * 0.5 + 0.3 * 9.5 + 0.1 * 40.0) / 50.0;
+        assert!((u.get(0, 2) - expected).abs() < 1e-6, "{}", u.get(0, 2));
+        assert!((reader.temperature().unwrap().get(0, 3) - 11.5).abs() < 1e-6);
+        assert!((reader.salinity().unwrap().get(0, 3) - 32.0).abs() < 1e-6);
+        assert!(reader.has_current_profiles() && reader.has_tracer_profiles());
+        // Points are located in the southern and western hemispheres
+        let state = reader.get_state(-73.9, -42.45, 0).unwrap();
+        assert!((state.ssh.unwrap() - 0.12).abs() < 1e-6);
     }
 
     /// A ROMS-like s-level file: two layers (Vtransform 2, `hc` 0, the

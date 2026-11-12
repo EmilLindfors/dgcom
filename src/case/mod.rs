@@ -368,6 +368,50 @@ lon = 8.5
         }
     }
 
+    /// `Case::coriolis_source` is where the 2D and 3D runs get their
+    /// Coriolis term: none without the key, the f-plane of a value or a
+    /// latitude, and the β-plane about the placement's latitude, in both
+    /// hemispheres (f₀ < 0 and β > 0 at Chiloé).
+    #[test]
+    fn the_coriolis_term_follows_the_placement_in_both_hemispheres() {
+        use crate::case::schema::GeoPoint;
+        use crate::source::coriolis_parameter;
+        assert!(parse(MINIMAL).unwrap().coriolis_source().is_none());
+        let with = |origin: (f64, f64), coriolis: &str| {
+            let text = MINIMAL.replace(
+                "[bathymetry]",
+                &format!(
+                    "[mesh.origin]
+lat = {}
+lon = {}
+
+[physics]
+coriolis = {coriolis}
+
+[bathymetry]",
+                    origin.0, origin.1
+                ),
+            );
+            let case = parse(&text).unwrap();
+            case.validate().unwrap();
+            case.coriolis_source().unwrap()
+        };
+        let f = with((63.7, 8.5), "{ f_plane = 1.2e-4 }");
+        assert_eq!((f.f0, f.beta), (1.2e-4, 0.0));
+        let f = with((63.7, 8.5), "{ latitude = -42.5 }");
+        assert_eq!((f.f0, f.beta), (coriolis_parameter(-42.5), 0.0));
+        let north = with((63.7, 8.5), "\"beta_plane\"");
+        assert_eq!(north.f0, coriolis_parameter(63.7));
+        assert!(north.f0 > 0.0 && north.beta > 0.0 && north.y0 == 0.0);
+        let south = with((-42.75, -73.8), "\"beta_plane\"");
+        assert_eq!(south.f0, coriolis_parameter(-42.75));
+        assert!(south.f0 < 0.0 && south.beta > 0.0);
+
+        let point = |lat, lon| GeoPoint { lat, lon }.hemispheres();
+        assert_eq!(point(-42.75, -73.8), "42.7500°S 73.8000°W");
+        assert_eq!(point(63.7, 8.5), "63.7000°N 8.5000°E");
+    }
+
     #[test]
     fn a_geographic_mesh_is_placed_about_its_centre() {
         let text = MINIMAL.replace(

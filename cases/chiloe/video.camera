@@ -1,0 +1,14 @@
+# The tide of Chiloé's inner sea in 28 s (two tidal cycles, 13 h to 37 h of the run):
+#
+#   cd viz && cargo run --release -- --replay ../cases/chiloe/output/chiloe/chiloe.dgsnap \
+#       --terrain ../data/chiloe_gebco.tif --colour elevation --scale-max 2 --water-alpha 0.85 \
+#       --camera ../cases/chiloe/video.camera --record ../output/chiloe_video --size 1080x1350
+#   ffmpeg -framerate 30 -i ../output/chiloe_video/frame_%05d.png -c:v libx264 -pix_fmt yuv420p -crf 18 chiloe.mp4
+#
+# video_s  model_h  kind   X_km  Y_km  DIST_km  BEARING  PITCH
+0          13.0     orbit  10    -10   880      0        78
+5          17.29    orbit  10    -10   880      0        78
+11         22.43    orbit  75    185   260      15       48
+17         27.57    orbit  45    238   120      40       40
+22         31.86    orbit  95    250   140      350      40
+28         37.0     orbit  55    140   480      0        62

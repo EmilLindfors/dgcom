@@ -33,7 +33,7 @@ use crate::boundary::{
     DeepReference, Nesting3D, NestingBand3D, OceanColumnsOptions, OceanModelColumns,
     ParentColumns3D, ReferenceColumns, Reflective2D, sample_columns,
 };
-use crate::case::schema::{Coriolis, Integrator, Mixing3D, ThreeDSection};
+use crate::case::schema::{Integrator, Mixing3D, ThreeDSection};
 use crate::case::{CaseError, CaseFile, Domain};
 use crate::io::Restart3D;
 use crate::physics::{
@@ -46,7 +46,7 @@ use crate::solver::{
     Probe2D, SWEPointSample, SWESolution2D, SWEState2D, TracerLimiter3DConfig, TracerLimiterType3D,
     TracerReferenceProfile,
 };
-use crate::source::{CoriolisSource2D, SpongeProfile, coriolis_parameter};
+use crate::source::{CoriolisSource2D, SpongeProfile};
 use crate::time::{ModeSplitIntegrator, SspScheme};
 use crate::types::ElementIndex;
 use crate::vertical::{MeanProfile, SigmaGrid, SongHaidvogelStretching};
@@ -227,15 +227,10 @@ impl CaseFile {
             4001,
             profile,
         ));
-        let coriolis = Arc::new(match p.coriolis {
-            Some(Coriolis::FPlane(f)) => CoriolisSource2D::f_plane(f),
-            Some(Coriolis::Latitude(lat)) => CoriolisSource2D::f_plane(coriolis_parameter(lat)),
-            Some(Coriolis::BetaPlane) => {
-                let center = case.projection_center().expect("validated: placed");
-                CoriolisSource2D::beta_plane_at_latitude(center.lat, 0.0)
-            }
-            None => CoriolisSource2D::f_plane(0.0),
-        });
+        let coriolis = Arc::new(
+            case.coriolis_source()
+                .unwrap_or_else(|| CoriolisSource2D::f_plane(0.0)),
+        );
         let mixing = match d.mixing {
             Mixing3D::KEpsilon => GlsMixing::k_epsilon(),
             Mixing3D::KOmega => GlsMixing::k_omega(),

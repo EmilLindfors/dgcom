@@ -40,14 +40,62 @@ pub(crate) fn cbrt(x: f64) -> f64 {
     if !(x >= f64::MIN_POSITIVE && x.is_finite()) {
         return x.cbrt();
     }
+    cbrt_refine(x, cbrt_guess(x))
+}
+
+/// The first guess of [`cbrt`] for a normal positive `x`, within a few
+/// percent (integer arithmetic on the bit pattern).
+#[inline(always)]
+fn cbrt_guess(x: f64) -> f64 {
     // 0x2A9F7893782DA1CE: (1023 − 1023/3) in the exponent field, with the
     // mantissa offset that minimises the guess error (Kahan)
-    let mut y = f64::from_bits(x.to_bits() / 3 + 0x2A9F_7893_782D_A1CE);
+    f64::from_bits(x.to_bits() / 3 + 0x2A9F_7893_782D_A1CE)
+}
+
+/// The Halley iterations of [`cbrt`] from the guess `y`: floating-point
+/// arithmetic without branches, so a loop over nodes vectorises.
+#[inline(always)]
+fn cbrt_refine(x: f64, mut y: f64) -> f64 {
     for _ in 0..3 {
         let y3 = y * y * y;
         y += y * ((x - y3) / (2.0 * y3 + x));
     }
     y
+}
+
+/// [`manning_rate`] of a run of nodes, `out[i]` from `g_n2(i)`, the depth
+/// `h[i]` floored at `h_min` and `speed[i]`: the same values bit for bit
+/// (zero at zero speed), with the divisions of the nodes side by side
+/// instead of one node's chain after another's.
+#[inline]
+fn manning_rates(
+    g_n2: impl Fn(usize) -> f64,
+    h_min: f64,
+    h: &[f64],
+    speed: &[f64],
+    out: &mut [f64],
+) {
+    let n = out.len();
+    let (h, speed) = (&h[..n], &speed[..n]);
+    // The guess needs normal numbers; anything else one node at a time
+    let normal = |h: f64| h >= f64::MIN_POSITIVE && h.is_finite();
+    if !h.iter().all(|&h| normal(h.max(h_min))) {
+        for i in 0..n {
+            out[i] = if speed[i] > 0.0 {
+                manning_rate(g_n2(i), h[i].max(h_min), speed[i])
+            } else {
+                0.0
+            };
+        }
+        return;
+    }
+    for i in 0..n {
+        out[i] = cbrt_guess(h[i].max(h_min));
+    }
+    for i in 0..n {
+        let h = h[i].max(h_min);
+        out[i] = g_n2(i) * speed[i] / (cbrt_refine(h, out[i]) * h);
+    }
 }
 
 /// A bottom-friction law written as a linear damping of the momentum,
@@ -66,6 +114,21 @@ pub trait BottomFriction2D: Send + Sync {
     /// ignore `node`.
     fn damping_rate(&self, node: usize, h: f64, speed: f64) -> f64;
 
+    /// [`Self::damping_rate`] of the consecutive mesh nodes from `first_node`
+    /// with depths `h > 0` and speeds `speed`, into `out` (one value per
+    /// node; zero where the speed is zero): the same values bit for bit. A
+    /// law overrides it to evaluate an element's nodes in one call, side by
+    /// side (Manning's cube roots and divisions vectorise).
+    fn damping_rates(&self, first_node: usize, h: &[f64], speed: &[f64], out: &mut [f64]) {
+        for (i, out) in out.iter_mut().enumerate() {
+            *out = if speed[i] > 0.0 {
+                self.damping_rate(first_node + i, h[i], speed[i])
+            } else {
+                0.0
+            };
+        }
+    }
+
     /// Number of mesh nodes (`K·n_nodes`) a spatially varying law was built
     /// for, so that the damping can check it against the solution; `None`
     /// for laws that do not depend on the node.
@@ -80,6 +143,11 @@ impl<F: BottomFriction2D + ?Sized> BottomFriction2D for std::sync::Arc<F> {
     #[inline]
     fn damping_rate(&self, node: usize, h: f64, speed: f64) -> f64 {
         (**self).damping_rate(node, h, speed)
+    }
+
+    #[inline]
+    fn damping_rates(&self, first_node: usize, h: &[f64], speed: &[f64], out: &mut [f64]) {
+        (**self).damping_rates(first_node, h, speed, out);
     }
 
     fn n_total_nodes(&self) -> Option<usize> {
@@ -258,6 +326,11 @@ impl BottomFriction2D for ManningFriction2D {
     #[inline]
     fn damping_rate(&self, _node: usize, h: f64, speed: f64) -> f64 {
         self.rate(h, speed)
+    }
+
+    fn damping_rates(&self, _first_node: usize, h: &[f64], speed: &[f64], out: &mut [f64]) {
+        let g_n2 = self.g * self.manning_n * self.manning_n;
+        manning_rates(|_| g_n2, self.h_min, h, speed, out);
     }
 }
 
@@ -454,6 +527,11 @@ impl BottomFriction2D for SpatiallyVaryingManning2D {
     #[inline]
     fn damping_rate(&self, node: usize, h: f64, speed: f64) -> f64 {
         manning_rate(self.g_n2[node], h.max(self.h_min), speed)
+    }
+
+    fn damping_rates(&self, first_node: usize, h: &[f64], speed: &[f64], out: &mut [f64]) {
+        let g_n2 = &self.g_n2[first_node..first_node + out.len()];
+        manning_rates(|i| g_n2[i], self.h_min, h, speed, out);
     }
 
     fn n_total_nodes(&self) -> Option<usize> {

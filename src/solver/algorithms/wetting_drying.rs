@@ -406,6 +406,86 @@ fn damp_nodes(
     dt: f64,
     damping: &ImplicitDamping2D,
 ) {
+    // Wet water under bottom friction (almost every node of a tidal run):
+    // a block of nodes at a time, see `damp_wet_block`
+    if let (Some(friction), Some(wet_dry), None) =
+        (damping.friction, damping.wet_dry, damping.cages)
+    {
+        let h_dry = wet_dry.h_dry.meters();
+        let mut start = 0;
+        while start < h.len() {
+            let r = start..(start + WET_BLOCK).min(h.len());
+            let from = (&fh[r.clone()], &fhu[r.clone()], &fhv[r.clone()]);
+            let (h, hu, hv) = (&h[r.clone()], &mut hu[r.clone()], &mut hv[r.clone()]);
+            if !damp_wet_block(friction, h_dry, h, hu, hv, from, offset + start, dt) {
+                damp_nodes_one_by_one(h, hu, hv, from, offset + start, dt, damping);
+            }
+            start = r.end;
+        }
+        return;
+    }
+    damp_nodes_one_by_one(h, hu, hv, (fh, fhu, fhv), offset, dt, damping);
+}
+
+/// Nodes per [`damp_wet_block`] (an element up to order 7 in one block).
+const WET_BLOCK: usize = 64;
+
+/// [`ImplicitDamping2D::damp_node`] with bottom friction for a block of nodes
+/// that are all deeper than `h_dry` (> 0), in the stage value and in the RHS
+/// input, without cages: then the velocity is the plain quotient and there is
+/// no thin-layer rate, and the nodes' square roots and divisions run side by
+/// side (the friction law's too, [`BottomFriction2D::damping_rates`]) instead
+/// of one node's chain after another's. The same result bit for bit. Returns
+/// false, having changed nothing, for any other block.
+#[inline]
+fn damp_wet_block(
+    friction: &dyn BottomFriction2D,
+    h_dry: f64,
+    h: &[f64],
+    hu: &mut [f64],
+    hv: &mut [f64],
+    (fh, fhu, fhv): (&[f64], &[f64], &[f64]),
+    first_node: usize,
+    dt: f64,
+) -> bool {
+    let n = h.len();
+    debug_assert!(n <= WET_BLOCK);
+    let (hu, hv) = (&mut hu[..n], &mut hv[..n]);
+    let (fh, fhu, fhv) = (&fh[..n], &fhu[..n], &fhv[..n]);
+    let wet = |h: f64| (h >= h_dry) & (h > 0.0);
+    if !h
+        .iter()
+        .zip(fh)
+        .fold(true, |all, (&h, &fh)| all & wet(h) & wet(fh))
+    {
+        return false;
+    }
+    let (mut speed, mut rate) = ([0.0; WET_BLOCK], [0.0; WET_BLOCK]);
+    for i in 0..n {
+        // |u| frozen at the RHS input keeps drag balances exact
+        let (u, v) = (fhu[i] / fh[i], fhv[i] / fh[i]);
+        speed[i] = (u * u + v * v).sqrt();
+    }
+    friction.damping_rates(first_node, h, &speed[..n], &mut rate[..n]);
+    for i in 0..n {
+        let factor = 1.0 / (1.0 + dt * rate[i]);
+        hu[i] *= factor;
+        hv[i] *= factor;
+    }
+    true
+}
+
+/// [`damp_nodes`] node by node: any depth, with cages.
+#[inline]
+fn damp_nodes_one_by_one(
+    h: &[f64],
+    hu: &mut [f64],
+    hv: &mut [f64],
+    (fh, fhu, fhv): (&[f64], &[f64], &[f64]),
+    offset: usize,
+    dt: f64,
+    damping: &ImplicitDamping2D,
+) {
     // Cursor into the sparse, node-sorted cage entries
     let cage_nodes = damping.cages.map_or(&[][..], |c| c.nodes());
     let mut next = damping.cages.map_or(0, |c| c.first_at_or_after(offset));
@@ -666,6 +746,55 @@ mod tests {
                 u > 0.0 && (u - exact).abs() < 1e-14 * u0,
                 "dt = {dt}: {u} vs {exact}"
             );
+        }
+    }
+
+    /// The block path of wet nodes gives what the node-by-node path gives,
+    /// bit for bit, in blocks that are all wet, at rest, or hold thin, dry and
+    /// tiny depths (which fall back), for both friction laws.
+    #[test]
+    fn wet_blocks_are_damped_as_node_by_node_bit_for_bit() {
+        let config = WetDryConfig::new(Depth::new(1e-3), 9.81);
+        let manning = ManningFriction2D::new(9.81, 0.025);
+        let chezy = crate::source::ChezyFriction2D::new(2.5e-3);
+        let laws: [&dyn BottomFriction2D; 2] = [&manning, &chezy];
+        let n = 5 * WET_BLOCK + 7;
+        let x = |i: usize, a: f64| (a * i as f64).sin();
+        let depth = |i: usize| match i {
+            // One block with a thin node, a dry one and a tiny depth
+            70 => 4e-4,
+            71 => 0.0,
+            72 => 1e-300,
+            _ => 3.0 + 2.9 * x(i, 0.7) + 1e3 * (x(i, 0.01) + 1.0),
+        };
+        let fill = |shift: usize| {
+            let h: Vec<f64> = (0..n).map(|i| depth(i + shift) + 1e-3).collect();
+            // Still water in one block
+            let moving = |i: usize| if (200..264).contains(&i) { 0.0 } else { 1.0 };
+            let hu: Vec<f64> = (0..n).map(|i| moving(i) * h[i] * 1.3 * x(i, 1.9)).collect();
+            let hv: Vec<f64> = (0..n).map(|i| moving(i) * h[i] * 0.4 * x(i, 2.3)).collect();
+            (h, hu, hv)
+        };
+        let (fh, fhu, fhv) = fill(0);
+        let (h, hu, hv) = fill(3);
+        for friction in laws {
+            let damping = ImplicitDamping2D {
+                friction: Some(friction),
+                cages: None,
+                wet_dry: Some(&config),
+                h_min: Depth::new(1e-6),
+            };
+            for dt in [0.3, 40.0] {
+                let (mut hu_a, mut hv_a) = (hu.clone(), hv.clone());
+                let (mut hu_b, mut hv_b) = (hu.clone(), hv.clone());
+                damp_nodes(&h, &mut hu_a, &mut hv_a, (&fh, &fhu, &fhv), 0, dt, &damping);
+                damp_nodes_one_by_one(&h, &mut hu_b, &mut hv_b, (&fh, &fhu, &fhv), 0, dt, &damping);
+                let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&hu_a), bits(&hu_b));
+                assert_eq!(bits(&hv_a), bits(&hv_b));
+                // The friction did something
+                assert!(hu_a.iter().zip(&hu).any(|(a, b)| a != b));
+            }
         }
     }
 
