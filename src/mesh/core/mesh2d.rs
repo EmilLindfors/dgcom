@@ -46,6 +46,30 @@ pub struct Edge {
     pub boundary_tag: Option<BoundaryTag>,
 }
 
+/// Position of the cell `(x, y)` of a `2^bits × 2^bits` grid along the
+/// Hilbert curve through it: cells next to each other on the curve share a
+/// side, and cells near each other in the plane are mostly near on the curve.
+fn hilbert_index(mut x: u32, mut y: u32, bits: u32) -> u64 {
+    let mut d = 0;
+    let mut s = 1u32 << (bits - 1);
+    while s > 0 {
+        let (rx, ry) = (x & s != 0, y & s != 0);
+        d += u64::from(s) * u64::from(s) * ((3 * u64::from(rx)) ^ u64::from(ry));
+        // The quadrant's own curve, rotated to start where this one enters it
+        x &= s - 1;
+        y &= s - 1;
+        if !ry {
+            if rx {
+                x = s - 1 - x;
+                y = s - 1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        s >>= 1;
+    }
+    d
+}
+
 impl Edge {
     /// Check if this is a boundary edge.
     pub fn is_boundary(&self) -> bool {
@@ -461,7 +485,13 @@ impl Mesh2D {
     ///         + (1+r)(1+s)/4 * x2 + (1-r)(1+s)/4 * x3
     /// ```
     pub fn reference_to_physical(&self, k: ElementIndex, r: f64, s: f64) -> [f64; 2] {
-        let verts = self.element_vertices(k);
+        Self::bilinear(&self.element_vertices(k), r, s)
+    }
+
+    /// [`Self::reference_to_physical`] in the element with corners `verts`
+    /// ([`Self::element_vertices`]), for many points of one element.
+    #[inline]
+    pub fn bilinear(verts: &[[f64; 2]; 4], r: f64, s: f64) -> [f64; 2] {
         let [x0, y0] = verts[0];
         let [x1, y1] = verts[1];
         let [x2, y2] = verts[2];
@@ -578,6 +608,59 @@ impl Mesh2D {
         let kept: Vec<usize> = (0..self.n_elements)
             .filter(|&k| keep(ElementIndex::new(k)))
             .collect();
+        (self.select_elements(&kept, new_boundary), kept)
+    }
+
+    /// The mesh with its elements numbered along a Hilbert curve through
+    /// their centroids, and, for each of its elements, the index of that
+    /// element in `self`.
+    ///
+    /// A mesh generator's numbering follows its own algorithm: Gmsh's
+    /// recombined quadrilaterals have one face neighbour next to them and
+    /// the others anywhere (on the 95,000-element Chiloé coastline mesh 44 %
+    /// of the face neighbours were more than 1000 elements apart, 39 % more
+    /// than 8000). Every face flux then reads a neighbour's state, bed and
+    /// geometry from memory that is in no cache. Along the curve 92 % are
+    /// within 64 elements and 99 % within 1024, and the same run takes 1.26×
+    /// less time (`notes/performance.md`, P2.8). The solution changes by
+    /// round-off only (sums in another order).
+    pub fn in_hilbert_order(&self) -> (Mesh2D, Vec<usize>) {
+        const BITS: u32 = 16;
+        let centroid = |k: usize| {
+            let v = self.element_vertices(ElementIndex::new(k));
+            [0, 1].map(|d| 0.25 * (v[0][d] + v[1][d] + v[2][d] + v[3][d]))
+        };
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for k in 0..self.n_elements {
+            let c = centroid(k);
+            for d in 0..2 {
+                lo[d] = lo[d].min(c[d]);
+                hi[d] = hi[d].max(c[d]);
+            }
+        }
+        // One scale for both directions: the curve's cells are squares
+        let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]);
+        let scale = if extent > 0.0 {
+            ((1u32 << BITS) - 1) as f64 / extent
+        } else {
+            0.0
+        };
+        let mut order: Vec<(u64, usize)> = (0..self.n_elements)
+            .map(|k| {
+                let c = centroid(k);
+                let [x, y] = [0, 1].map(|d| ((c[d] - lo[d]) * scale) as u32);
+                (hilbert_index(x, y, BITS), k)
+            })
+            .collect();
+        // Ties (and equal keys) keep the old order
+        order.sort();
+        let order: Vec<usize> = order.into_iter().map(|(_, k)| k).collect();
+        (self.select_elements(&order, BoundaryTag::Wall), order)
+    }
+
+    /// The mesh of the elements `kept` of `self` (distinct), in that order:
+    /// [`Self::retain_elements`] for a given list, which may also reorder.
+    fn select_elements(&self, kept: &[usize], new_boundary: BoundaryTag) -> Mesh2D {
         let mut new_element = vec![None; self.n_elements];
         for (new, &old) in kept.iter().enumerate() {
             new_element[old] = Some(new);
@@ -615,15 +698,14 @@ impl Mesh2D {
                 (face_key(edge.left) != face_key(right)).then_some(pair)
             })
             .collect();
-        let mesh = Mesh2D::from_quads(vertices, elements, &periodic, |face| {
+        Mesh2D::from_quads(vertices, elements, &periodic, |face| {
             // A boundary face of the submesh keeps its tag, or faced a
             // dropped element
             let old = ElementFace::new(kept[face.element], face.face);
             let edge = &self.edges[self.element_edges[old.element][old.face]];
             edge.boundary_tag.unwrap_or(new_boundary)
         })
-        .expect("a submesh of a valid mesh is valid");
-        (mesh, kept)
+        .expect("a submesh of a valid mesh is valid")
     }
 
     /// Build vertex-to-element connectivity from element-vertex connectivity.
@@ -1025,6 +1107,66 @@ mod tests {
         assert_eq!(sub.neighbor(k(3), 2), Some(ElementFace::new(0, 0)));
         // ... and the bottom of 2 faced the dropped top-row element 5
         assert_eq!(sub.boundary_tag(k(2), 0), Some(BoundaryTag::Open));
+    }
+
+    /// The Hilbert order is the same mesh (elements, neighbours, boundary
+    /// tags) renumbered, and on a 2ⁿ × 2ⁿ grid every element shares a face
+    /// with the next one (row-major order has neighbours a row apart).
+    #[test]
+    fn hilbert_order_is_the_same_mesh_with_neighbours_next_to_each_other() {
+        // The curve visits every cell once, moving one cell at a time
+        let mut cells: Vec<_> = (0..8u32)
+            .flat_map(|y| (0..8u32).map(move |x| (hilbert_index(x, y, 3), x, y)))
+            .collect();
+        cells.sort();
+        for (i, pair) in cells.windows(2).enumerate() {
+            assert_eq!(pair[0].0, i as u64);
+            assert_eq!(
+                pair[0].1.abs_diff(pair[1].1) + pair[0].2.abs_diff(pair[1].2),
+                1
+            );
+        }
+
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 16.0, 0.0, 16.0, 16, 16);
+        for edge in mesh.edges.iter_mut().filter(|e| e.is_boundary()) {
+            let x = 0.5 * (mesh.vertices[edge.vertices.0][0] + mesh.vertices[edge.vertices.1][0]);
+            if x == 0.0 {
+                edge.boundary_tag = Some(BoundaryTag::Open);
+            }
+        }
+        let (sorted, old) = mesh.in_hilbert_order();
+        assert_eq!(sorted.n_elements, mesh.n_elements);
+        assert_eq!(sorted.n_vertices, mesh.n_vertices);
+        assert_eq!(sorted.n_edges, mesh.n_edges);
+        assert_consistent(&sorted);
+        let mut seen = old.clone();
+        seen.sort_unstable();
+        assert!(seen.iter().copied().eq(0..mesh.n_elements), "a permutation");
+        for (new, &o) in old.iter().enumerate() {
+            assert_eq!(sorted.element_vertices(k(new)), mesh.element_vertices(k(o)));
+            for face in 0..4 {
+                match mesh.neighbor(k(o), face) {
+                    Some(nb) => {
+                        let sorted_nb = sorted.neighbor(k(new), face).unwrap();
+                        assert_eq!(
+                            (old[sorted_nb.element], sorted_nb.face),
+                            (nb.element, nb.face)
+                        );
+                    }
+                    None => assert_eq!(
+                        sorted.boundary_tag(k(new), face),
+                        mesh.boundary_tag(k(o), face)
+                    ),
+                }
+            }
+            if new + 1 < sorted.n_elements {
+                let next = (0..4).filter_map(|face| sorted.neighbor(k(new), face));
+                assert!(
+                    next.map(|nb| nb.element).any(|e| e == new + 1),
+                    "element {new}"
+                );
+            }
+        }
     }
 
     #[test]
