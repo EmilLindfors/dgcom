@@ -45,6 +45,15 @@
 //! Only elements in physical groups are saved once a model has any
 //! (`Mesh.SaveAll = 0`), so the domain needs a physical surface too.
 //!
+//! ## Element order
+//!
+//! The mesh comes back with its elements (and vertices) numbered along a
+//! Hilbert curve through the element centroids
+//! ([`Mesh2D::in_hilbert_order`]), not in the file's order: a generator's
+//! numbering scatters face neighbours through memory, which costs a solver
+//! a quarter of its time (`notes/performance.md`, P2.8). The geometry,
+//! connectivity and boundary tags are the file's.
+//!
 //! Not supported (error): MSH 4.0, binary MSH 2, periodic meshes
 //! (`$Periodic`), partitioned meshes. Other sections (`$NodeData`,
 //! `$Comments`, ...) are skipped.
@@ -921,7 +930,8 @@ fn build_mesh(raw: RawMesh) -> Result<Mesh2D> {
             edge.boundary_tag = tag;
         }
     }
-    Ok(mesh)
+    // In memory order: a generator's numbering scatters neighbours
+    Ok(mesh.in_hilbert_order().0)
 }
 
 // =============================================================================
@@ -1509,6 +1519,12 @@ $EndElements"#,
         write_gmsh_mesh(&mesh, file.path()).unwrap();
         let mesh2 = read_gmsh_mesh(file.path()).unwrap();
 
+        // The reader numbers the elements along the Hilbert curve
+        let mesh = mesh.in_hilbert_order().0;
+        assert_ne!(
+            mesh.elements,
+            Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 3, 2).elements
+        );
         assert_eq!(mesh.vertices, mesh2.vertices);
         assert_eq!(mesh.elements, mesh2.elements);
         assert_eq!(mesh.n_edges, mesh2.n_edges);

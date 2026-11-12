@@ -100,6 +100,19 @@ fn coincident_nodes(mesh: &Mesh2D, ops: &DGOperators2D) -> Vec<usize> {
 
 /// The nodes of a continuous field: every set of coincident nodes is one
 /// global node, and neighbours along the elements' grid lines are joined.
+///
+/// The graph is the mesh's geometry and nothing of its numbering: the
+/// global nodes are numbered by position (x, then y), and a global node's
+/// mass and depth are sums over its coincident nodes in the order of their
+/// values. The sweeps over [`Self::pairs`] and [`Self::element_pairs`]
+/// ([`Bathymetry2D::smooth_rx0`], [`Bathymetry2D::smooth_element_slopes`])
+/// are Gauss–Seidel, so their result depends on the pairs' order: numbered
+/// by first appearance in the elements, the same mesh with its elements in
+/// another order had another bed (Frøya's coastline mesh in Hilbert order:
+/// 3132 sweeps for 2320, a station 25.7 m deep for 23.0 m;
+/// `notes/geometry-mesh.md`). Global nodes at one position that the
+/// connectivity keeps apart (the two sides of a slit) are ordered by their
+/// first node.
 struct NodeGraph {
     /// Global node of every `k·n_nodes + i`
     global: Vec<usize>,
@@ -107,23 +120,68 @@ struct NodeGraph {
     area: Vec<f64>,
     /// Neighbouring global nodes along the grid lines, each pair once
     pairs: Vec<[usize; 2]>,
+    /// The nodes `k·n_nodes + i` by global node: those of global node `g`
+    /// are `members[first_member[g]..first_member[g + 1]]`
+    members: Vec<usize>,
+    first_member: Vec<usize>,
 }
 
 impl NodeGraph {
     fn new(mesh: &Mesh2D, ops: &DGOperators2D, geom: &GeometricFactors2D) -> Self {
         let group = coincident_nodes(mesh, ops);
-        let mut index = vec![usize::MAX; group.len()];
-        let mut global = Vec::with_capacity(group.len());
-        let mut area = Vec::new();
-        for (node, &g) in group.iter().enumerate() {
-            if index[g] == usize::MAX {
-                index[g] = area.len();
-                area.push(0.0);
+        let n = ops.n_nodes;
+        // A set's position: the least of its nodes' (each element maps its
+        // own, equal to round-off)
+        let mut position = vec![[f64::INFINITY; 2]; group.len()];
+        for k in 0..mesh.n_elements {
+            let corners = mesh.element_vertices(ElementIndex::new(k));
+            for i in 0..n {
+                let at = Mesh2D::bilinear(&corners, ops.nodes_r[i], ops.nodes_s[i]);
+                let least = &mut position[group[k * n + i]];
+                if at[0]
+                    .total_cmp(&least[0])
+                    .then(at[1].total_cmp(&least[1]))
+                    .is_lt()
+                {
+                    *least = at;
+                }
             }
-            global.push(index[g]);
-            area[index[g]] += geom.mass[node];
         }
-        let (n, n_1d) = (ops.n_nodes, ops.n_1d);
+        let mut sets: Vec<usize> = (0..group.len()).filter(|&g| group[g] == g).collect();
+        sets.sort_by(|&a, &b| {
+            let (p, q) = (position[a], position[b]);
+            p[0].total_cmp(&q[0])
+                .then(p[1].total_cmp(&q[1]))
+                .then(a.cmp(&b))
+        });
+        let mut index = vec![usize::MAX; group.len()];
+        for (rank, &g) in sets.iter().enumerate() {
+            index[g] = rank;
+        }
+        let global: Vec<usize> = group.iter().map(|&g| index[g]).collect();
+        let mut first_member = vec![0; sets.len() + 1];
+        for &g in &global {
+            first_member[g + 1] += 1;
+        }
+        for g in 0..sets.len() {
+            first_member[g + 1] += first_member[g];
+        }
+        let mut next = first_member.clone();
+        let mut members = vec![0; global.len()];
+        for (node, &g) in global.iter().enumerate() {
+            members[next[g]] = node;
+            next[g] += 1;
+        }
+        let mut graph = Self {
+            global,
+            area: Vec::new(),
+            pairs: Vec::new(),
+            members,
+            first_member,
+        };
+        graph.area = graph.sums(|node| geom.mass[node]);
+        let global = &graph.global;
+        let n_1d = ops.n_1d;
         let mut pairs = Vec::with_capacity(2 * group.len());
         for k in 0..mesh.n_elements {
             for i in 0..n {
@@ -141,20 +199,34 @@ impl NodeGraph {
         // Face lines are shared by two elements
         pairs.sort_unstable();
         pairs.dedup();
-        Self {
-            global,
-            area,
-            pairs,
-        }
+        graph.pairs = pairs;
+        graph
+    }
+
+    /// `Σ term(node)` over the coincident nodes of every global node, added
+    /// in the order of the terms' values: the same sum to the last bit
+    /// however the elements are numbered.
+    fn sums(&self, term: impl Fn(usize) -> f64) -> Vec<f64> {
+        let mut terms = Vec::new();
+        self.first_member
+            .windows(2)
+            .map(|range| {
+                terms.clear();
+                terms.extend(
+                    self.members[range[0]..range[1]]
+                        .iter()
+                        .map(|&node| term(node)),
+                );
+                terms.sort_unstable_by(f64::total_cmp);
+                terms.iter().sum()
+            })
+            .collect()
     }
 
     /// Still-water depth −B of every global node (the mass-weighted mean
     /// over its coincident nodes).
     fn depths(&self, bed: &[f64], geom: &GeometricFactors2D) -> Vec<f64> {
-        let mut depth = vec![0.0; self.area.len()];
-        for (node, &g) in self.global.iter().enumerate() {
-            depth[g] -= geom.mass[node] * bed[node];
-        }
+        let mut depth = self.sums(|node| -geom.mass[node] * bed[node]);
         for (d, a) in depth.iter_mut().zip(&self.area) {
             *d /= a;
         }
@@ -2614,6 +2686,41 @@ mod tests {
             }
         );
         assert_eq!(capped.data, original.data);
+    }
+
+    /// The smoothed bed is the mesh's geometry and nothing of its numbering:
+    /// the same elements in another order get the same bed to the last bit.
+    /// (The sweeps are Gauss–Seidel; over pairs in the order the elements
+    /// listed them, Frøya's coastline mesh in Hilbert order had another bed
+    /// by metres.)
+    #[test]
+    fn test_smoothing_does_not_depend_on_the_numbering_of_the_elements() {
+        let bound = ElementSlopeBound::for_pycnocline(19.0);
+        for order in 1..=3 {
+            let (mesh, ops, geom, bathy) = shoal_bed(order);
+            let (renumbered, old) = mesh.in_hilbert_order();
+            assert_ne!(old, (0..mesh.n_elements).collect::<Vec<_>>());
+            let renumbered_geom = GeometricFactors2D::compute(&renumbered, &ops);
+
+            let mut slopes = bathy.clone();
+            let report = slopes.smooth_element_slopes(&mesh, &ops, &geom, bound, 3.0);
+            let mut other = bathy.select_elements(&old);
+            let other_report =
+                other.smooth_element_slopes(&renumbered, &ops, &renumbered_geom, bound, 3.0);
+            assert!(report.changed > 0, "N = {order}: {report:?}");
+            assert_eq!(report.sweeps, other_report.sweeps, "N = {order}");
+            assert_eq!(report.changed, other_report.changed, "N = {order}");
+            assert_eq!(other.data, slopes.select_elements(&old).data, "N = {order}");
+
+            let mut rx0 = bathy.clone();
+            let report = rx0.smooth_rx0(&mesh, &ops, &geom, 0.2, 3.0);
+            let mut other = bathy.select_elements(&old);
+            let other_report = other.smooth_rx0(&renumbered, &ops, &renumbered_geom, 0.2, 3.0);
+            assert!(report.changed > 0, "N = {order}: {report:?}");
+            assert_eq!(report.sweeps, other_report.sweeps, "N = {order}");
+            assert_eq!(report.changed, other_report.changed, "N = {order}");
+            assert_eq!(other.data, rx0.select_elements(&old).data, "N = {order}");
+        }
     }
 
     #[test]
