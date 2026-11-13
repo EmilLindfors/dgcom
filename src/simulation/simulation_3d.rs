@@ -249,8 +249,16 @@ where
                 return stopped;
             }
 
-            // Compute time step (3D CFL): the coarse step of the levels
-            // with local time stepping
+            // The end time or the next landing time
+            let slack = super::runner::LANDING_SLACK;
+            let target = self.landing_interval.map_or(t_end, |interval| {
+                let next = (t / interval + slack).floor() + 1.0;
+                (next * interval).min(t_end)
+            });
+
+            // Compute time step (3D CFL). With local time stepping, the
+            // coarse step of the levels, fitted to the time to land on:
+            // equal steps to it, each with the levels of its own length
             let ssp = self.integrator.baroclinic_scheme().ssp_coefficient();
             let mut dt = crate::profiling::scope("step: compute_dt", || {
                 if self.integrator.baroclinic_levels() == 0 {
@@ -266,6 +274,7 @@ where
                     &self.physics.mesh,
                     &stencils,
                     self.config.dt_max,
+                    Some(target - t),
                 )
             });
             if dt.is_nan() || dt <= 0.0 {
@@ -294,11 +303,6 @@ where
             // Don't overshoot the end time or the next landing time, or leave
             // a sliver of it (see `Simulation::run_with_callback`): the steps
             // up to it are made equal
-            let slack = super::runner::LANDING_SLACK;
-            let target = self.landing_interval.map_or(t_end, |interval| {
-                let next = (t / interval + slack).floor() + 1.0;
-                (next * interval).min(t_end)
-            });
             let steps_left = ((target - t) / dt * (1.0 - slack)).ceil().max(1.0);
             let landed = steps_left == 1.0;
             dt = if landed {
@@ -2336,9 +2340,15 @@ mod tests {
     /// drag, implicit vertical advection, and a vertical reference relaxing
     /// towards the state over an hour. `bed_shift` moves the bed (m).
     fn restart_case(bed_shift: f64) -> (RestartPhysics, Solution3D) {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 200.0, 10, 2);
+        restart_case_on(mesh, bed_shift)
+    }
+
+    /// [`restart_case`] on `mesh`, a rectangle 1000 m long.
+    fn restart_case_on(mesh: Mesh2D, bed_shift: f64) -> (RestartPhysics, Solution3D) {
         use crate::physics::GlsMixing;
         let length = 1000.0;
-        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 200.0, 10, 2));
+        let mesh = Arc::new(mesh);
         let ops = Arc::new(DGOperators2D::new(2));
         let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
         let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
@@ -2472,6 +2482,7 @@ mod tests {
                 &physics.mesh,
                 &stencils,
                 None,
+                None,
             );
             assert_eq!(dt, 10.0);
             integrator.step(&mut state, &physics, dt, t);
@@ -2600,6 +2611,74 @@ mod tests {
         }
     }
 
+    /// On local time steps a run's coarse step is the cap where the cap is
+    /// what binds, and the time to a landing over the fewest such steps, on
+    /// the levels of that step. (A power of two times the smallest element
+    /// step, cut at the landing, takes four steps to the first landing here
+    /// for three, with every element that could step at the cap at two
+    /// thirds of it.) The steps after the first follow the shore's elements
+    /// as they flood.
+    #[test]
+    fn local_time_steps_take_the_cap_and_equal_steps_to_a_landing() {
+        // The beach on columns of elements 250 m wide offshore to 20 m at
+        // the shore, so that their steps differ by several times
+        let xs = [
+            0.0, 250.0, 500.0, 650.0, 750.0, 820.0, 870.0, 910.0, 940.0, 960.0, 980.0, 1e3,
+        ];
+        let nx = xs.len() - 1;
+        let vertices = [0.0, 200.0]
+            .iter()
+            .flat_map(|&y| xs.iter().map(move |&x| [x, y]))
+            .collect();
+        let elements = (0..nx)
+            .map(|i| [i, i + 1, i + 1 + nx + 1, i + nx + 1])
+            .collect();
+        let mesh = Mesh2D::from_quads(vertices, elements, &[], |_| BoundaryTag::Wall).unwrap();
+        let (physics, mut state) = restart_case_on(mesh, 0.0);
+        let scheme = SspScheme::Rk43;
+        let cfl = 0.5;
+        let mut element_dt = vec![0.0; physics.mesh.n_elements];
+        physics.element_steps_into(&state, cfl, scheme.ssp_coefficient(), &mut element_dt);
+        let finite = || element_dt.iter().copied().filter(|dt| dt.is_finite());
+        let smallest = finite().fold(f64::INFINITY, f64::min);
+        let largest = finite().fold(0.0, f64::max);
+        // A cap between two and four of the smallest step, below the
+        // largest, and a landing two and a half caps away
+        let cap = 3.0 * smallest;
+        assert!(largest > cap, "steps of {smallest} to {largest} s");
+        let interval = 2.5 * cap;
+
+        let integrator = ModeSplitIntegrator::new()
+            .with_baroclinic_scheme(scheme)
+            .with_baroclinic_levels(3);
+        let mut sim = Simulation3D::new(physics, integrator)
+            .with_cfl(cfl)
+            .with_dt_max(cap)
+            .with_landing_interval(interval);
+        let mut times = vec![];
+        let result = sim.run_with_callback(&mut state, 0.0, 2.0 * interval, |_, t| times.push(t));
+        assert!(result.success, "{:?}", result.error);
+        for landing in [interval, 2.0 * interval] {
+            assert!(
+                times.contains(&landing),
+                "no step landed on {landing} s: {times:?}"
+            );
+        }
+        // The first step: a third of the way, where 2 × the smallest step
+        // would take four
+        assert_eq!(times[1], interval / 3.0, "{times:?}");
+        for w in times.windows(2) {
+            assert!(
+                w[1] - w[0] <= cap * (1.0 + 1e-9),
+                "a step over the cap: {times:?}"
+            );
+        }
+        // The smallest element stepped at a quarter of the coarse step (5/6
+        // of a cap: 0.625 of its own step), not at half of it
+        let stats = sim.integrator().baroclinic_multirate_stats().unwrap();
+        assert!(stats.finest_level >= 2, "{stats:?}");
+    }
+
     /// TODO P5.3 gate: a restart does not continue on another bed or another
     /// σ-grid.
     #[test]
@@ -2671,6 +2750,7 @@ mod tests {
                 element_dt,
                 &physics.mesh,
                 &stencils,
+                None,
                 None,
             );
             integrator.step(state, physics, dt, t);
@@ -4584,6 +4664,7 @@ mod tests {
                     element_dt,
                     &physics.mesh,
                     &stencils,
+                    None,
                     None,
                 ),
                 None => dt,

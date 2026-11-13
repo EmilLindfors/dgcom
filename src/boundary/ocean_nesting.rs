@@ -125,6 +125,9 @@ pub enum NestingError {
     /// No mesh face has the boundary tag.
     #[error("no boundary face is tagged {0:?}")]
     NoBoundary(BoundaryTag),
+    /// No boundary tag was given to nest at.
+    #[error("no boundary tag to nest at")]
+    NoTags,
     /// An open-boundary node the parent cannot serve.
     #[error(
         "open-boundary node at (x, y) = ({x:.0}, {y:.0}) m (lat {lat:.4}, lon {lon:.4}) has no wet \

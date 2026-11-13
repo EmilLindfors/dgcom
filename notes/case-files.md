@@ -312,7 +312,7 @@ Each is a `TODO.md` line under its area; the context:
 - **3D stations (P8.1)** are recorded at the first step on or after their times, so their series are irregular by up to a step; the 2D run's land exactly.
 - **The example's duplicated drivers (P8.2).** With every mode in case files, `froya_real_data`'s `tidal_run`, `tidal_run_3d`, `coupled_waves` and the farm's runs duplicate the case runner. Its diagnostics (`debug_3d=`, `profile=`, `waves=N`, the farm's report) are worth keeping as tools over case files; the rest can go with its options.
 - **The cut-dependent bed (P1.6)**, above.
-- **`Nesting3D::new` panics on no tags (P4.2)** although it returns a `Result`; the case guards it for closed basins.
+- **`Nesting3D::new` panics on no tags (P4.2)** although it returns a `Result`; the case guards it for closed basins. Fixed 2026-11-13: it returns `NestingError::NoTags`, and the case takes either error (no tags, no face with one) as a closed basin; gate `nesting_without_open_faces_is_an_error`.
 - **The slope drift at rest (P4.2):** 2e-7 m/s in 2 h over a 30 → 10 m slope, open or closed, against 1e-14 flat (stage 3's gate). Running it with mixing off would split the physical diffusion-driven flow from the pressure gradient's error as the profile leaves its reference.
 - **`GriddedAtmosphere2D` configuration panics once cloned (P6):** `split_for_3d` needs sole ownership, so a case's domain splits the weather before the waves, the boundary's level or anything else can hold it. Switches per handle would remove the build order.
 - **The farm's analysis (F.1) and particles (F.2)** as case-level tools, and **waves with 3D (F.4)**, which case files refuse as the example does not couple them.

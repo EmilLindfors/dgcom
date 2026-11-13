@@ -61,8 +61,9 @@
 //! face neighbours (`LocalTimeStepping::element_dt`). The coarse step is
 //! 2^L times the smallest element time step, with L the most levels (up to the
 //! maximum) that keep it at most the largest one (and the module's bound,
-//! below; a run that must land on a time takes a shorter one, further below). Neighbouring levels are then
-//! made to differ by at most one, refining the coarser side. Together these
+//! below; a run that must land on a time takes a shorter one, further below).
+//! Neighbouring levels are then made to differ by at most one, refining the
+//! coarser side. Together these
 //! keep water that floods in from a neighbour within one substep from
 //! outrunning an element's time step (a nearly dry element otherwise gets an
 //! enormous one). Levels are reassigned every coarse step.
@@ -83,6 +84,14 @@
 //! shrink every level with it, and a 9 s step to an output would cost what an
 //! 84 s one does: on the Chiloé tide, with eight steps to each ten-minute
 //! output where 7.1 fit, an eighth of the run.
+//!
+//! The same holds for a cap on the step that lies below most elements' own
+//! steps (a 3D run's `dt_max` of a minute where the internal waves allow
+//! minutes): a power of two times the smallest element step is anywhere
+//! between half the cap and the cap, and every element that could step at
+//! the cap steps at that. [`MultirateStepper::with_longest_coarse_step`]
+//! takes the longest coarse step the cap, the largest element step and the
+//! level count allow, with that step's levels.
 //!
 //! **Cost.** An element's RHS reads the state of its stencil
 //! ([`LocalTimeStepping::stencil`]: its face neighbours for the fluxes, and
@@ -776,6 +785,9 @@ pub struct MultirateStepper<S> {
     stable_step: f64,
     /// Whether the rates of line-local elements are spread node by node
     line_rates: bool,
+    /// Whether the coarse step is the longest the bounds allow, not a power
+    /// of two times the smallest element step
+    longest_step: bool,
     /// The line-local elements of the current coarse step, and two buffers of
     /// node rates for their spreading
     line_local: Vec<bool>,
@@ -809,6 +821,7 @@ impl<S: Integrable> MultirateStepper<S> {
             inverse_dt_sum: 0.0,
             stable_step: f64::INFINITY,
             line_rates: true,
+            longest_step: false,
             line_local: Vec::new(),
             node_rate: [Vec::new(), Vec::new()],
             values: Vec::new(),
@@ -825,6 +838,18 @@ impl<S: Integrable> MultirateStepper<S> {
     /// node-by-node rates would have reused to the bit.
     pub fn with_line_local_rates(mut self, on: bool) -> Self {
         self.line_rates = on;
+        self
+    }
+
+    /// Take the longest coarse step the bounds allow: the cap, the largest
+    /// element step and `2^max_levels` times the smallest one, whichever is
+    /// least, with every element on the coarsest level of that step it can
+    /// take. Off (the default), the coarse step is a power of two times the
+    /// smallest element step ([`assign_levels`]), which a cap leaves anywhere
+    /// between half of itself and itself: where most elements could step at
+    /// the cap or longer, they then step at up to half of it.
+    pub fn with_longest_coarse_step(mut self, on: bool) -> Self {
+        self.longest_step = on;
         self
     }
 
@@ -875,11 +900,12 @@ impl<S: Integrable> MultirateStepper<S> {
         mesh: &Mesh2D,
         stencils: &[RhsStencil],
         dt_cap: Option<f64>,
+        landing: Option<f64>,
     ) -> f64 {
-        self.assign(element_dt, mesh, stencils, dt_cap, None, None)
+        self.assign(element_dt, mesh, stencils, dt_cap, landing, None)
     }
 
-    /// The coarse step the elements allowed at the last
+    /// The coarse step the elements (and the cap) allowed at the last
     /// [`Self::assign_levels`], before it was fitted to a `landing`.
     pub fn stable_step(&self) -> f64 {
         self.stable_step
@@ -905,6 +931,23 @@ impl<S: Integrable> MultirateStepper<S> {
         );
         let (mut dt, mut finest) =
             assign_levels(element_dt, self.max_levels, dt_cap, &mut self.level);
+        // The longest step the bounds allow, with its own levels: the finest
+        // of them still steps at most the smallest element step
+        if self.longest_step && dt.is_finite() {
+            let largest = element_dt
+                .iter()
+                .copied()
+                .filter(|dt| dt.is_finite())
+                .fold(0.0, f64::max);
+            let smallest = dt / (1u64 << finest) as f64;
+            let longest = (smallest * (1u64 << self.max_levels) as f64)
+                .min(largest)
+                .min(dt_cap.unwrap_or(f64::INFINITY));
+            if longest > dt {
+                dt = longest;
+                finest = levels_for_step(element_dt, dt, self.max_levels, &mut self.level);
+            }
+        }
         self.stable_step = dt;
         // Equal steps to the time to land on, each with its own levels (one
         // level has nothing to gain: its steps cost what they span)
@@ -1298,13 +1341,13 @@ mod tests {
         let mesh = Mesh2D::uniform_rectangle(0.0, 8.0, 0.0, 1.0, 8, 1);
         let element_dt = [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 2.0];
         let mut one = MultirateStepper::<crate::solver::DGSolution2D>::new(2, SspScheme::Rk3);
-        one.assign_levels_from(&element_dt, &mesh, &[RhsStencil::Faces], None);
+        one.assign_levels_from(&element_dt, &mesh, &[RhsStencil::Faces], None, None);
         assert_eq!(one.levels(), [0, 0, 0, 0, 0, 0, 0, 1]);
         assert_eq!(one.rates(0), [0, 0, 0, 0, 0, 0, 1, 1]);
         assert_eq!(one.rates(2), [0, 0, 0, 0, 1, 1, 1, 1]);
         let mut two = MultirateStepper::<crate::solver::DGSolution2D>::new(2, SspScheme::Rk3);
         let stencils = [RhsStencil::Faces, RhsStencil::Faces];
-        two.assign_levels_from(&element_dt, &mesh, &stencils, None);
+        two.assign_levels_from(&element_dt, &mesh, &stencils, None, None);
         assert_eq!(two.rates(0), [0, 0, 0, 0, 0, 1, 1, 1]);
         assert_eq!(two.rates(2), [0, 1, 1, 1, 1, 1, 1, 1]);
         // 3 stages × 8 elements × 2 finest substeps against the evaluations
@@ -1472,6 +1515,76 @@ mod tests {
         let dt = stepper.assign_levels(&steps, &mesh, &state, 1.0, None, Some(8.0));
         assert_eq!(dt, 8.0);
         assert_eq!(stepper.levels(), [0, 0, 0, 0, 1, 2, 3, 3]);
+    }
+
+    /// A cap below most elements' steps is the coarse step itself with
+    /// [`MultirateStepper::with_longest_coarse_step`], and a landing is
+    /// fitted to it: every element steps at the longest power-of-two
+    /// fraction of the coarse step it can take, none longer than its own.
+    #[test]
+    fn the_longest_coarse_step_is_the_cap_where_it_binds() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 16.0, 0.0, 1.0, 16, 1);
+        // Twelve elements that could step at minutes and one at 19 s, under
+        // a cap of 60 s
+        let mut element_dt = vec![300.0; 12];
+        element_dt.extend([120.0, 70.0, 70.0, 19.0]);
+        let faces = [RhsStencil::Faces];
+        let work = |stepper: &MultirateStepper<Field>, dt: f64| stepper.planned_work(dt).1;
+        let levels = |coarse: usize, fine: &[u8]| [vec![0; coarse], fine.to_vec()].concat();
+
+        // A power of two times the smallest: 38 s, everything else at 38 s
+        let mut stepper = MultirateStepper::<Field>::new(3, SspScheme::Rk3);
+        let dt = stepper.assign_levels_from(&element_dt, &mesh, &faces, Some(60.0), None);
+        assert_eq!(dt, 38.0);
+        assert_eq!(stepper.levels(), levels(15, &[1]));
+        let power_of_two = work(&stepper, dt);
+        assert_eq!(power_of_two, 3.0 * 17.0 / 38.0);
+
+        // The cap: 60 s, the 19 s element at 15 s and its neighbour, a level
+        // from it, at 30 s
+        let mut stepper = stepper.with_longest_coarse_step(true);
+        let dt = stepper.assign_levels_from(&element_dt, &mesh, &faces, Some(60.0), None);
+        assert_eq!(dt, 60.0);
+        assert_eq!(stepper.stable_step(), 60.0);
+        assert_eq!(stepper.levels(), levels(14, &[1, 2]));
+        let longest = work(&stepper, dt);
+        assert_eq!(longest, 3.0 * 20.0 / 60.0);
+        assert!(longest < 0.8 * power_of_two);
+
+        // 100 s to an output: two steps of 50 s, on the levels of 50 s
+        let dt = stepper.assign_levels_from(&element_dt, &mesh, &faces, Some(60.0), Some(100.0));
+        assert_eq!(dt, 50.0);
+        assert_eq!(stepper.stable_step(), 60.0);
+        assert_eq!(stepper.levels(), levels(14, &[1, 2]));
+
+        // No cap, or one out of reach: as far as the levels go, 2³ × 19 s
+        for cap in [None, Some(1e3)] {
+            let dt = stepper.assign_levels_from(&element_dt, &mesh, &faces, cap, None);
+            assert_eq!(dt, 152.0);
+            assert_eq!(stepper.levels(), levels(12, &[1, 2, 2, 3]));
+        }
+        // Fewer levels than the cap needs: 2² × 19 s
+        let mut two =
+            MultirateStepper::<Field>::new(2, SspScheme::Rk3).with_longest_coarse_step(true);
+        let dt = two.assign_levels_from(&element_dt, &mesh, &faces, Some(100.0), None);
+        assert_eq!(dt, 76.0);
+        assert_eq!(two.levels(), levels(13, &[1, 1, 2]));
+
+        // The largest element step where it is what binds: 70 s for 2 × 19 s
+        let dt = stepper.assign_levels_from(
+            &[70.0, 70.0, 30.0, 19.0],
+            &Mesh2D::uniform_rectangle(0.0, 4.0, 0.0, 1.0, 4, 1),
+            &faces,
+            None,
+            None,
+        );
+        assert_eq!(dt, 70.0);
+        assert_eq!(stepper.levels(), [0, 1, 2, 2]);
+
+        // Every element at one step: that step, on one level
+        let dt = stepper.assign_levels_from(&[7.0; 16], &mesh, &faces, Some(60.0), None);
+        assert_eq!(dt, 7.0);
+        assert_eq!(stepper.finest_level(), 0);
     }
 
     /// The module's bound on the coarse step takes levels off the coarse end:

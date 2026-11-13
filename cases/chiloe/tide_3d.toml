@@ -9,10 +9,12 @@
 #
 #   dgcom run cases/chiloe/tide_3d.toml --set run.duration_hours=0.25
 #
-# 17.0 M points (94,431 elements × 9 nodes × 20 levels), 12.6 GB. From rest
-# on 24 threads (HX 370, 2026-11-13): a quarter hour in 163 s with the local
-# time steps below, 271 s on global steps (`levels_lts = 0`,
-# `barotropic_levels = 2`). `DG_PROFILE=1` prints where a step goes.
+# 17.0 M points (94,431 elements × 9 nodes × 20 levels), 17 GB (22 GB
+# resumed). On 24 threads (HX 370, 2026-11-13) with the local time steps
+# below: 460 s per model hour under the tide (hours 3 to 6, steps of 60 s,
+# `dt_max_s`'s default; 361 s with `dt_max_s = 120`). From rest, global steps
+# (`levels_lts = 0`, `barotropic_levels = 2`) take 1085 s per model hour.
+# `DG_PROFILE=1` prints where a step goes.
 
 [run]
 name = "chiloe_3d"

@@ -4454,6 +4454,7 @@ fn tidal_run_3d<'a>(
                                         &domain.mesh,
                                         stencils,
                                         None,
+                                        None,
                                     );
                                     format!("{:.2}", stepper.planned_speedup())
                                 })
