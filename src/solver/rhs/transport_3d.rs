@@ -1381,6 +1381,39 @@ pub fn to_inventory(
     );
 }
 
+/// [`to_inventory`] of the concentrations `values` into `q`, on `elements`:
+/// the bits of copying them there first, in one pass.
+pub(crate) fn inventory_of(
+    q: &mut [f64],
+    values: &[f64],
+    eta: &[f64],
+    d_sigma: &[f64],
+    bathymetry: &Bathymetry2D,
+    elements: Blocks,
+) {
+    let (nn, nl) = (bathymetry.n_nodes, d_sigma.len());
+    let n_elements = bathymetry.n_elements;
+    for_each_block(
+        elements,
+        [&mut q[..n_elements * nn * nl]],
+        || (),
+        |_, k, [block]| {
+            let nodes = k * nn..(k + 1) * nn;
+            let values = &values[k * nn * nl..(k + 1) * nn * nl];
+            for (((column, values), &e), &b) in block
+                .chunks_exact_mut(nl)
+                .zip(values.chunks_exact(nl))
+                .zip(&eta[nodes.clone()])
+                .zip(&bathymetry.data[nodes])
+            {
+                for ((q, &c), &ds) in column.iter_mut().zip(values).zip(d_sigma) {
+                    *q = c * layer_volume_of(e - b, ds);
+                }
+            }
+        },
+    );
+}
+
 /// [`to_inventory`] of `values` into `q` at the nodes with (almost) no water
 /// only, shallower than `DRY_DEPTH`, where [`from_inventory`] keeps the last
 /// value: their inventories become that value's, the rest are left alone
@@ -1394,19 +1427,24 @@ pub(crate) fn dry_inventories(
     elements: Blocks,
 ) {
     let (nl, nn) = (d_sigma.len(), bathymetry.n_nodes);
-    for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
-        let depth = eta[idx] - bathymetry.data[idx];
-        if depth < DRY_DEPTH {
-            let column = idx * nl..(idx + 1) * nl;
-            for ((q, &c), &ds) in q[column.clone()]
-                .iter_mut()
-                .zip(&values[column])
-                .zip(d_sigma)
-            {
-                *q = c * layer_volume_of(depth, ds);
+    let n_elements = bathymetry.n_elements;
+    for_each_block(
+        elements,
+        [&mut q[..n_elements * nn * nl]],
+        || (),
+        |_, k, [block]| {
+            for (i, column) in block.chunks_exact_mut(nl).enumerate() {
+                let idx = k * nn + i;
+                let depth = eta[idx] - bathymetry.data[idx];
+                if depth < DRY_DEPTH {
+                    let values = &values[idx * nl..(idx + 1) * nl];
+                    for ((q, &c), &ds) in column.iter_mut().zip(values).zip(d_sigma) {
+                        *q = c * layer_volume_of(depth, ds);
+                    }
+                }
             }
-        }
-    }
+        },
+    );
 }
 
 /// Inventory `q = H_z C` → concentration, written to `out`, for cells of
@@ -1447,6 +1485,36 @@ pub fn from_inventory(
     out: &mut [f64],
     elements: Blocks,
 ) {
+    let keep = |_: usize, _: &mut [f64]| {};
+    from_inventory_after(
+        q,
+        eta,
+        d_sigma,
+        bathymetry,
+        geom,
+        element_means,
+        out,
+        elements,
+        keep,
+    );
+}
+
+/// [`from_inventory`] with the last values written by `last(k, out_k)`
+/// into element `k`'s block of `out` first (a copy from another buffer,
+/// say): the bits of writing them to `out` before the call, in one pass
+/// over the field.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn from_inventory_after(
+    q: &[f64],
+    eta: &[f64],
+    d_sigma: &[f64],
+    bathymetry: &Bathymetry2D,
+    geom: &GeometricFactors2D,
+    element_means: &[bool],
+    out: &mut [f64],
+    elements: Blocks,
+    last: impl Fn(usize, &mut [f64]) + Sync + Send,
+) {
     let nl = d_sigma.len();
     let nn = bathymetry.n_nodes;
     let n_elements = bathymetry.n_elements;
@@ -1455,6 +1523,7 @@ pub fn from_inventory(
         [&mut out[..n_elements * nn * nl]],
         || (),
         |_, k, [out_k]| {
+            last(k, out_k);
             let bed = bathymetry.element(ElementIndex::new(k));
             let eta_k = &eta[k * nn..(k + 1) * nn];
             let q_k = &q[k * nn * nl..(k + 1) * nn * nl];
@@ -4365,6 +4434,97 @@ mod tests {
                     "{got} vs {expected}"
                 );
             }
+        }
+    }
+
+    /// The one-pass conversions give the bits of their two passes, on all
+    /// elements and on a list: the last values written per element before
+    /// the conversion ([`from_inventory_after`]), a copy then the product
+    /// ([`inventory_of`]); and [`dry_inventories`] sets the dry nodes of the
+    /// listed elements only.
+    #[test]
+    fn one_pass_conversions_equal_their_two_passes() {
+        let case = Case::closed();
+        let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
+        let n_el = case.mesh.n_elements;
+        let d_sigma = case.sigma.d_sigma();
+        // As in `inventory_conversion_keeps_element_inventories`: dry nodes,
+        // a dry element, marked elements
+        let mut eta = case.state.eta.data.clone();
+        eta[0] = case.bathymetry.data[0];
+        eta[nn..2 * nn].copy_from_slice(&case.bathymetry.data[nn..2 * nn]);
+        eta[3 * nn] = case.bathymetry.data[3 * nn];
+        let mut marked = vec![false; n_el];
+        marked[1..4].fill(true);
+        let concentration = case.state.temp.clone();
+        let len = concentration.len();
+        let block = |k: usize| k * nn * nl..(k + 1) * nn * nl;
+        let mut inventory = concentration.clone();
+        to_inventory(&mut inventory, &eta, d_sigma, &case.bathymetry, n_el.into());
+        let last: Vec<f64> = (0..len).map(|i| 0.5 + 1e-3 * i as f64).collect();
+        let listed = [0u32, 1, 3];
+        for elements in [Blocks::All(n_el), Blocks::list(n_el, &listed)] {
+            let mut two = vec![7.0; len];
+            for k in elements.iter() {
+                two[block(k)].copy_from_slice(&concentration[block(k)]);
+            }
+            to_inventory(&mut two, &eta, d_sigma, &case.bathymetry, elements);
+            let mut one = vec![7.0; len];
+            inventory_of(
+                &mut one,
+                &concentration,
+                &eta,
+                d_sigma,
+                &case.bathymetry,
+                elements,
+            );
+            assert_eq!(one, two);
+
+            let mut two = vec![-1.0; len];
+            for k in elements.iter() {
+                two[block(k)].copy_from_slice(&last[block(k)]);
+            }
+            from_inventory(
+                &inventory,
+                &eta,
+                d_sigma,
+                &case.bathymetry,
+                &case.geom,
+                &marked,
+                &mut two,
+                elements,
+            );
+            let mut one = vec![-1.0; len];
+            from_inventory_after(
+                &inventory,
+                &eta,
+                d_sigma,
+                &case.bathymetry,
+                &case.geom,
+                &marked,
+                &mut one,
+                elements,
+                |k, out_k| out_k.copy_from_slice(&last[block(k)]),
+            );
+            assert_eq!(one, two);
+
+            let mut q = inventory.clone();
+            dry_inventories(&mut q, &last, &eta, d_sigma, &case.bathymetry, elements);
+            let mut dry_nodes = 0;
+            for idx in 0..n_el * nn {
+                let depth = eta[idx] - case.bathymetry.data[idx];
+                let dry = depth < DRY_DEPTH && elements.iter().any(|k| k == idx / nn);
+                dry_nodes += usize::from(dry);
+                for (l, &ds) in d_sigma.iter().enumerate() {
+                    let expected = if dry {
+                        last[idx * nl + l] * layer_volume_of(depth, ds)
+                    } else {
+                        inventory[idx * nl + l]
+                    };
+                    assert_eq!(q[idx * nl + l], expected, "node {idx} level {l}");
+                }
+            }
+            assert!(dry_nodes > nn, "{dry_nodes} dry nodes");
         }
     }
 

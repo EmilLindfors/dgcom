@@ -6,6 +6,16 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **A 3D step on local time steps converts its stages in one pass per field (`notes/performance.md` P2.9, 2026-11-13).** Hours 3 → 3.25 of the Chiloé tide in 3D take 110.0 s against 114.5 s (two alternating pairs, 24 threads): the 3D stages 4.16 s a step against 4.45 s. Every value is the same bit for bit (the restarts at 3.25 h are the same file but for the run's name).
+  - **The stage hook** copied the last stage's six fields and its density, restored the thin columns it had put at rest, and then converted the inventories over the copy; it took the dry nodes' inventories and masked the thin columns in serial loops over every column. The last values are now copied inside the conversion, element by element (`from_inventory_after`), the density is not copied (the pass sets it), the tracers go back to inventories in one pass (`inventory_of`), and the dry nodes and the mask run over the elements in parallel.
+  - **Also in parallel:** Ω at the layer centres for output, and the step's scan for non-finite values.
+  - **API:** `StageStash::mask(state, elements, thin)` replaces `StageStash::keep`.
+- **`dgcom run` says what the run held and what its barotropic pass did (`notes/performance.md` P2.9; `notes/case-files.md`).**
+  - **Memory:** a `memory: at most 20.6 GB in memory (25.1 GB committed)` line after every run (`profiling::peak_memory`: the peak working set and commit charge on Windows, the peak resident set on Linux).
+  - **A 3D run's notes** give the work of the barotropic pass on local time steps as they do the 3D stages' (`barotropic_multirate_stats`): on Chiloé 2.46× that of every element at its own step, the levels ×1.53 and the stage rates' spreading ×1.61.
+  - **The progress line reads the water at least 1 m deep** (`Progress::DEPTH`; the wet nodes where none is that deep). Its highest water was a film of millimetres on a beach node at +3 to +4 m, constant through the ebb, and in 3D its largest speed a film's. The films' largest speed is `Progress::max_film_speed`, printed beside the other where it is the larger (TODO P8.13).
+  - **`cases/chiloe/tide_3d.toml`** states the memory measured: 20.6 GB, not 12.6.
+
 - **A 3D run on local time steps takes its step cap as the coarse step (`notes/performance.md` P2.9, 2026-11-13).** The Chiloé tide in 3D (`cases/chiloe/tide_3d.toml`, hour 3 → 4 on 24 threads) takes 450 s per model hour against 559, and hours 3 → 6 1381 s against 1736 (1.26×): steps of 60 s for 40.9 s. At 6 h the fields differ from the earlier steps' by 0.1 mm of η and 0.1 mm/s of depth-mean current rms in water 10 m deep or more (0.4 mm/s at the surface). With `dt_max_s = 120` the three hours take 1084 s.
   - **The cap.** The coarse step was a power of two times the smallest element step, which a cap (`three_d.dt_max_s`, 60 s) leaves between half of itself and itself, and 98 % of that mesh's elements could step past the cap (the internal waves allow minutes offshore). `MultirateStepper::with_longest_coarse_step` takes the longest coarse step the cap, the largest element step and the level count allow, with every element on the coarsest level of that step it can take; the 3D stages use it, the barotropic pass and the 2D runner keep theirs.
   - **Steps to an output.** `Simulation3D` hands the time left to its next landing to the levels, as the 2D runner does: equal steps on the levels of their own length, where every level used to shrink with a shortened step.
@@ -62,6 +72,8 @@ All notable changes to this project should be documented in this file.
   - **Messages:** nine strings had lost a line continuation and carried a run of spaces: the 3D blow-up message, the gmsh mesh errors, the parent-datum error, and some test and example output.
 
 ### Added
+
+- **A heap profile of a run (`notes/performance.md` P2.9, "Heap profile").** A `dgcom` built with `--features dhat-heap` writes `dhat-heap.json` to the run's output directory: every allocation site's bytes at the peak and at the run's last output, and its blocks in all. `scripts/dhat_top.py` lists the sites by each. The first use: a 3D Chiloé run on local time steps holds 20.5 GB at 20 levels, 12 GB of it the stages' eleven copies of the state, a resumed run holds what a run from rest does, and the steps allocate nothing.
 
 - **Rivers from a parent model enter from land (TODO P1.6; `notes/inputs-forcing.md`).** NorKyst-800 puts a river on a face of its 800 m grid. On a finer mesh that face can be open water, hundreds of metres off the shore the river reaches: river 853's water entered in the middle of its bay.
   - **Land side:** `RiverForcing` now keeps each river's land cell, the ρ-point the transport flows from across the face, read from the transport's sign (`RomsSource`, `roms_source`, `RiverMouth::inland`). `norkyst_river_subset` writes it as `river_inland_lon`, `river_inland_lat`.

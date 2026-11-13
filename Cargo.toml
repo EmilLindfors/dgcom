@@ -19,6 +19,12 @@ parquet = ["dep:parquet", "dep:arrow"]
 # Use with: cargo build --release --features mimalloc
 mimalloc = ["dep:mimalloc"]
 
+# Heap profile of a `dgcom run` (DHAT): where the bytes are at the peak and at
+# the run's last output, and what allocates during the steps
+# (`notes/performance.md`, "Heap profile"). It replaces the allocator and
+# takes a backtrace per allocation: not for timing.
+dhat-heap = ["dep:dhat"]
+
 # Burn GPU acceleration features
 burn = ["dep:burn"]
 burn-cuda = ["burn", "burn/cuda", "dep:burn-cuda"]   # NVIDIA CUDA backend (primary target)
@@ -45,6 +51,8 @@ burn-wgpu = { version = "0.20", optional = true, default-features = false }
 
 # High-performance allocator (alternative to system allocator)
 mimalloc = { version = "0.1", optional = true, default-features = false }
+# Heap profiling (feature = "dhat-heap")
+dhat = { version = "0.3", optional = true }
 
 # NorKyst grid parquet ingest (feature = "parquet")
 parquet = { version = "58.0", optional = true }
