@@ -849,6 +849,10 @@ impl SourceTerm2D for NestingRelaxation2D {
         }
     }
 
+    fn is_node_local(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "nesting_relaxation_2d"
     }

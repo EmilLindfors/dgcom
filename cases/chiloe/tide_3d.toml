@@ -1,0 +1,75 @@
+# Chiloé and the Chilean Inland Sea in 3D: `case.toml`'s tide under 20
+# σ-layers, for the cost of a 3D run on this mesh (`notes/performance.md`
+# P2.9). Not a validated case: the water starts from one idealised spring
+# profile everywhere (no parent, no rivers, no weather), so the inner sea's
+# estuarine stratification is not in it, and the 3D bed is smoothed with
+# Frøya's defaults (`[bathymetry.slopes_3d]`: on this mesh 300,000 nodes
+# move, by up to 1200 m on the continental slope). The inputs are
+# `case.toml`'s.
+#
+#   dgcom run cases/chiloe/tide_3d.toml --set run.duration_hours=0.25
+#
+# 17.0 M points (94,431 elements × 9 nodes × 20 levels), 12.6 GB. From rest
+# on 24 threads (HX 370, 2026-11-13): a quarter hour in 163 s with the local
+# time steps below, 271 s on global steps (`levels_lts = 0`,
+# `barotropic_levels = 2`). `DG_PROFILE=1` prints where a step goes.
+
+[run]
+name = "chiloe_3d"
+start = "2025-11-12T00:00:00Z"
+duration_hours = 24.84          # two M2 periods
+
+[mesh]
+order = 2
+gmsh = "../../data/chiloe_coast_500.msh"
+origin = { lat = -43.95, lon = -74.1 }
+
+[bathymetry.raster]
+file = "../../data/chiloe_gebco.tif"
+kind = "topobathy"
+land_elevation_m = 10.0
+
+[physics]
+coriolis = "beta_plane"         # the bed friction is [three_d]'s drag
+
+[[boundary]]
+tag = "open"
+[boundary.atlas]
+file = "../../data/chiloe_boundary_tides.txt"
+ramp_hours = 3.0
+correction = "minors"
+
+[three_d]
+levels = 20
+# The mesh's elements are 84 m to 4 km wide: the 3D stages and the
+# barotropic substeps on local time steps
+levels_lts = 3
+barotropic_levels = 6
+# An idealised November profile (z in m, T in °C, S): a fresher, warmer
+# surface layer over shelf water
+profile = [
+    [0.0, 12.5, 31.5],
+    [-30.0, 11.0, 32.8],
+    [-100.0, 10.0, 33.5],
+    [-500.0, 6.0, 34.3],
+    [-2000.0, 2.5, 34.6],
+]
+
+[output]
+interval_minutes = 60.0
+station_interval_minutes = 10.0
+
+[[output.station]]
+name = "Puerto Montt"
+lat = -41.4850
+lon = -72.9608
+
+[[output.station]]
+name = "Ancud"
+lat = -41.8674
+lon = -73.8329
+
+[[output.station]]
+name = "Melinka"
+lat = -43.8983
+lon = -73.7483

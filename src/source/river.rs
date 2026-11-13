@@ -949,6 +949,10 @@ impl SourceTerm2D for RiverSources {
         self.add_volume_rates(element.element.as_usize(), element.time, h);
     }
 
+    fn is_node_local(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "rivers"
     }

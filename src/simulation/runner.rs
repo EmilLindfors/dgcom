@@ -130,9 +130,7 @@ impl SimulationResult {
 // Simulation Runner
 // =============================================================================
 
-/// Relative slack in landing on a target time: a step that ends within this
-/// fraction of itself before the target is stretched to land on it.
-pub(crate) const LANDING_SLACK: f64 = 1e-9;
+pub(crate) use crate::time::multirate::LANDING_SLACK;
 
 /// High-level simulation runner.
 ///
@@ -365,16 +363,23 @@ where
             }
 
             // Compute time step (with local time stepping, assign the levels
-            // and take the coarse step, which respects dt_max)
-            let mut dt = match multirate.as_mut() {
-                Some((local, stepper)) => stepper.assign_levels(
-                    *local,
-                    self.physics.mesh(),
-                    state,
-                    cfl,
-                    self.config.dt_max,
-                ),
-                None => self.physics.compute_dt_ssp(state, cfl, scheme),
+            // and take the coarse step, which respects dt_max and is fitted
+            // to the time to land on: equal steps to it, each with the
+            // levels of its own length)
+            let target = next_callback(callbacks_done).map_or(t_end, |c| c.min(t_end));
+            let (mut dt, fitted) = match multirate.as_mut() {
+                Some((local, stepper)) => {
+                    let fitted = stepper.assign_levels(
+                        *local,
+                        self.physics.mesh(),
+                        state,
+                        cfl,
+                        self.config.dt_max,
+                        Some(target - t),
+                    );
+                    (stepper.stable_step(), Some(fitted))
+                }
+                None => (self.physics.compute_dt_ssp(state, cfl, scheme), None),
             };
 
             // Apply dt limits
@@ -404,7 +409,9 @@ where
             // (ten steps of 0.1 to 1.0) accumulate round-off, and the sliver
             // would cost a whole step. Landing stretches the step by at most
             // LANDING_SLACK of itself.
-            let target = next_callback(callbacks_done).map_or(t_end, |c| c.min(t_end));
+            if let Some(fitted) = fitted {
+                dt = dt.min(fitted);
+            }
             let landed = t + dt * (1.0 + LANDING_SLACK) >= target;
             if landed {
                 dt = target - t;
@@ -466,11 +473,7 @@ where
             println!("  dt range: [{:.2e}, {:.2e}]", dt_min_used, dt_max_used);
             if let Some((_, stepper)) = &multirate {
                 let stats = stepper.stats();
-                println!(
-                    "  Local time stepping: time-step ratio up to 2^{}, {:.2}x less RHS work than global steps",
-                    stats.finest_level,
-                    stats.speedup()
-                );
+                println!("  {}", stats.describe(self.physics.mesh().n_elements));
             }
         }
 
@@ -563,6 +566,12 @@ impl SimulationResult {
                 element_evaluations: a.element_evaluations + b.element_evaluations,
                 global_evaluations: a.global_evaluations + b.global_evaluations,
                 finest_level: a.finest_level.max(b.finest_level),
+                model_seconds: a.model_seconds + b.model_seconds,
+                ideal_evaluations: a.ideal_evaluations + b.ideal_evaluations,
+                level_evaluations: a.level_evaluations + b.level_evaluations,
+                line_local_elements: a.line_local_elements + b.line_local_elements,
+                // The physics module's count, which runs on
+                line_local_breaks: a.line_local_breaks.max(b.line_local_breaks),
             }),
             (a, b) => a.or(b),
         };

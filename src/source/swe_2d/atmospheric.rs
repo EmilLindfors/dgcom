@@ -381,6 +381,10 @@ impl SourceTerm2D for AtmosphericPressure2D {
         SWEState2D::new(0.0, s_hu, s_hv)
     }
 
+    fn is_node_local(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "atmospheric_pressure_2d"
     }

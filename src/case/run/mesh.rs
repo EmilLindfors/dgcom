@@ -35,6 +35,10 @@ pub struct MeshReport {
     /// With local time stepping, the number of elements at each level
     /// (level ℓ takes 2^ℓ steps per coarse step)
     pub elements_per_level: Vec<usize>,
+    /// With local time stepping, the element evaluations per second of
+    /// model time at rest ([`MultirateStepper::planned_work`]): every
+    /// element at its own step, at its level's step, and as scheduled
+    pub lts_work: Option<(f64, f64, f64)>,
 }
 
 impl CaseFile {
@@ -86,9 +90,11 @@ impl CaseFile {
             let levels = numerics.local_time_stepping_levels;
             if levels > 0 {
                 let mut stepper = MultirateStepper::new(levels, scheme);
-                let coarse = stepper.assign_levels(local, &domain.mesh, &q, cfl, numerics.dt_max_s);
+                let coarse =
+                    stepper.assign_levels(local, &domain.mesh, &q, cfl, numerics.dt_max_s, None);
                 if coarse.is_finite() {
                     report.step_s = Some(coarse);
+                    report.lts_work = Some(stepper.planned_work(coarse));
                 }
                 let level = stepper.levels();
                 let finest = level.iter().copied().max().unwrap_or(0) as usize;

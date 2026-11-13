@@ -2443,6 +2443,56 @@ mod tests {
         }
     }
 
+    /// A run on local time steps of the 3D stages starts a prognostic closure
+    /// from rest. The closure allocates its turbulence at its first call, the
+    /// end of a substep: with two levels that is inside the first step, after
+    /// the stages' buffers were sized without it, and the next stage's
+    /// turbulence advection indexed an empty tendency (the Chiloé tide under
+    /// `three_d.levels_lts`; a run from a restart, which holds the
+    /// turbulence, did not see it).
+    #[test]
+    fn local_time_steps_start_a_prognostic_closure_from_rest() {
+        let (physics, mut state) = restart_case(0.0);
+        assert!(state.tke.is_empty(), "the run starts without turbulence");
+        // The deep half of the beach on half the step of the shore's, from
+        // the first step on
+        let element_dt: Vec<f64> = (0..physics.mesh.n_elements)
+            .map(|k| if k % 10 < 5 { 5.0 } else { 10.0 })
+            .collect();
+        let mut integrator = ModeSplitIntegrator::new()
+            .with_baroclinic_scheme(SspScheme::Rk43)
+            .with_baroclinic_levels(3);
+        let stencils = physics.stage_stencils();
+        let mut t = 0.0;
+        for _ in 0..6 {
+            physics.update_density(&mut state);
+            let dt = integrator.assign_baroclinic_levels(
+                &state,
+                &element_dt,
+                &physics.mesh,
+                &stencils,
+                None,
+            );
+            assert_eq!(dt, 10.0);
+            integrator.step(&mut state, &physics, dt, t);
+            physics.post_process(&mut state);
+            t += dt;
+        }
+        let stats = integrator
+            .baroclinic_multirate_stats()
+            .expect("local time steps were taken");
+        assert_eq!(stats.finest_level, 1, "{stats:?}");
+        let n_w = state.n_elements * state.n_nodes * (state.n_levels + 1);
+        assert_eq!((state.tke.len(), state.gls.len()), (n_w, n_w));
+        // (The advection may leave a value below zero at a shore, which the
+        // closure takes as no turbulence at its next call)
+        assert!(state.tke.iter().chain(&state.gls).all(|x| x.is_finite()));
+        let k_max = max_or_nan(state.tke.iter().copied());
+        assert!(k_max > 1e-3, "the wind made no turbulence: k ≤ {k_max:e}");
+        let speed = max_or_nan(state.u.iter().chain(&state.v).map(|x| x.abs()));
+        assert!(speed.is_finite() && speed < 5.0, "{speed:e} m/s");
+    }
+
     /// TODO P5.3 gate: a 3D run restarted halfway, from a file, in a new
     /// simulation, ends bit for bit where the uninterrupted run does
     /// (`restart_case`: wetting and drying, GLS, implicit vertical advection, a

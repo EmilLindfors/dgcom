@@ -12,7 +12,12 @@
 //!   second order.
 //! - A wave running up a beach across several levels keeps h ≥ 0 without a
 //!   single negative-mean clip, and conserves mass; SSP-RK(4,3) at twice
-//!   SSP-RK3's positivity-capped step.
+//!   SSP-RK3's positivity-capped step. The film of the first flooded element
+//!   does not stretch the coarse step (the run to 500 s).
+//! - Line-local elements: a stage value reads exactly the nodes the stage
+//!   rates are spread by (one node of the input perturbed at a time, bit for
+//!   bit), and a run on node-by-node rates is the run on whole-element rates
+//!   bit for bit, with fewer evaluations.
 //! - With horizontal viscosity (a two-hop stencil): one level is still
 //!   SSP-RK3 bit for bit; several levels conserve mass and momentum to
 //!   rounding and converge to the global solution.
@@ -32,7 +37,8 @@ use dgcom::solver::{
 };
 use dgcom::source::{HorizontalViscosity2D, ManningFriction2D, SourceContext2D, SourceTerm2D};
 use dgcom::time::{
-    IntegratorInfo, Multirate, MultirateSSPRK3, SSPRK3, SspScheme, StandardIntegrator,
+    ElementStage, IntegratorInfo, Multirate, MultirateSSPRK3, MultirateStepper, SSPRK3, SspScheme,
+    StandardIntegrator,
 };
 use dgcom::types::{Depth, ElementIndex};
 
@@ -150,6 +156,10 @@ impl SourceTerm2D for OscillatingForce {
     fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D {
         let force = self.amplitude * (self.omega * ctx.time).cos();
         SWEState2D::new(0.0, 0.0, ctx.state.h * force)
+    }
+
+    fn is_node_local(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -614,19 +624,37 @@ fn runup_keeps_positivity_across_levels() {
 
     let mut coarse_steps = Vec::new();
     for base in BASES {
-        // A linear CFL above both positivity bounds, so they set the steps
-        let sim = Simulation::new(physics(), multirate(base, 8)).with_cfl(2.0);
-        let mut q = q0.clone();
-        let mut min_h = f64::INFINITY;
-        let result = sim.run_with_callback(&mut q, 0.0, 300.0, |q, _| {
-            min_h = min_h.min(min_depth(q));
-        });
-        assert!(result.success);
-        let stats = result.local_time_stepping.unwrap();
-        println!("runup, {}: {stats:?}, {:.2}x", base.name(), stats.speedup());
-        assert!(stats.finest_level >= 2, "{stats:?}");
-        check(base.name(), &q, min_h, sim.physics().negative_depth_clips());
-        coarse_steps.push(stats.steps);
+        // To 300 s, and to 500 s: once the first film is on the beach (at
+        // 104 s) its own time step, minutes long, must not become the coarse
+        // step. It did: the run to 300 s got by on a last step cut to less
+        // than half its levels' length, and the run to 500 s blew up.
+        for t_end in [300.0, 500.0] {
+            // A linear CFL above both positivity bounds, so they set the steps
+            let sim = Simulation::new(physics(), multirate(base, 8)).with_cfl(2.0);
+            let mut q = q0.clone();
+            let mut min_h = f64::INFINITY;
+            let result = sim.run_with_callback(&mut q, 0.0, t_end, |q, _| {
+                min_h = min_h.min(min_depth(q));
+            });
+            assert!(result.success, "{} to {t_end} s", base.name());
+            let stats = result.local_time_stepping.unwrap();
+            println!(
+                "runup to {t_end} s, {}: {stats:?}, {:.2}x",
+                base.name(),
+                stats.speedup()
+            );
+            assert!(stats.finest_level >= 2, "{stats:?}");
+            assert!(result.dt_max < 30.0, "a coarse step of {} s", result.dt_max);
+            // A wave of 1.5 m on a beach: no element marked line-local (1 m
+            // of water over its shallowest node) runs shallow within a
+            // coarse step
+            assert!(stats.line_local_elements > 0, "{stats:?}");
+            assert_eq!(stats.line_local_breaks, 0, "{stats:?}");
+            check(base.name(), &q, min_h, sim.physics().negative_depth_clips());
+            if t_end == 300.0 {
+                coarse_steps.push(stats.steps);
+            }
+        }
     }
     // The doubled positivity bound halves the steps (up to the levels'
     // rounding)
@@ -912,4 +940,215 @@ fn finishing_a_stage_by_element_matches_the_whole_state() {
         );
     }
     assert_eq!(physics.negative_depth_clips(), 2 * whole_clips, "clips");
+}
+
+// =============================================================================
+// Line-local elements: stage rates node by node
+// =============================================================================
+
+/// A beach under a graded mesh with every stage component of a tidal run:
+/// the `WetDry` split form with its wet/dry correction, implicit Manning
+/// friction, Coriolis on a β-plane and a time-dependent force. 80 m of
+/// water under the small elements on the left, a beach under the large ones
+/// on the right: element time steps from 1 to 30 s.
+fn line_local_setup() -> (Setup, SWEPhysics2D<Reflective2D>, SWESolution2D) {
+    let setup = Setup::new(graded_mesh(6_000.0, 1_500.0, 12, 3, 1.3), 2);
+    let bed = |x: f64, y: f64| -80.0 + 83.0 * (x / 6_000.0).powi(2) + 0.5 * (y / 400.0).sin();
+    let physics = setup
+        .builder()
+        .with_bathymetry(setup.bathymetry(bed))
+        .with_wet_dry(WetDryConfig::default())
+        .with_implicit_friction(ManningFriction2D::new(G, 0.025))
+        .with_source(dgcom::source::CoriolisSource2D::beta_plane(
+            1.2e-4, 1.5e-11, 0.0,
+        ))
+        .with_source(OscillatingForce {
+            amplitude: 1e-3,
+            omega: 2.0 * std::f64::consts::PI / 600.0,
+        })
+        .build();
+    let mut q = setup.fill(at_rest(bed, |x, y| {
+        0.5 * gaussian(x, y, (2_000.0, 700.0), 800.0)
+    }));
+    // Some motion, different at every node
+    let [h, hu, hv] = &mut q.data;
+    for (i, ((hu, hv), &h)) in hu.iter_mut().zip(hv.iter_mut()).zip(h.iter()).enumerate() {
+        *hu = h * 0.3 * (0.37 * i as f64).sin();
+        *hv = h * 0.2 * (0.23 * i as f64).cos();
+    }
+    (setup, physics, q)
+}
+
+/// What `LocalTimeStepping::line_local` promises is what the stage kernel
+/// does: perturb one node of a stage's input and compare every stage value
+/// bit for bit. A line-local element changes only on the GLL lines through
+/// the node, or at the node coinciding with it across a face; any other
+/// element only if the node is its own, or on the shared face of a neighbour
+/// or one in from it. The stage rates of local time stepping are spread by
+/// exactly these sets (`spread_over_lines`): a kernel that read more would
+/// leave stage values a substep behind.
+#[test]
+fn a_stage_value_reads_what_line_local_says() {
+    let (setup, physics, q) = line_local_setup();
+    let (mesh, ops) = (&setup.mesh, &setup.ops);
+    let (n_elements, nn, n1) = (mesh.n_elements, ops.n_nodes, ops.n_1d);
+    let local = physics.local_time_stepping().expect("SWE supports LTS");
+    let mut line_local = vec![false; n_elements];
+    let lines = local
+        .line_local(&q, &mut line_local)
+        .expect("the wet/dry split form has line-local elements");
+    assert_eq!((lines.n_1d, lines.face_nodes), (n1, &ops.face_nodes));
+    let n_line_local = line_local.iter().filter(|&&l| l).count();
+    assert!(
+        n_line_local >= n_elements / 3 && n_line_local < n_elements,
+        "{n_line_local} of {n_elements} line-local: both kinds are needed"
+    );
+
+    // A stage with every term: ¾ base + ¼ (input + Δt F), then the damping
+    // and the wet/dry correction
+    let elements: Vec<u32> = (0..n_elements as u32).collect();
+    let plan = |_: usize| ElementStage {
+        time: 40.0,
+        a: 0.75,
+        b: 0.25,
+        c: 0.25 * 0.2,
+        accumulate: None,
+    };
+    let stage = |input: &SWESolution2D| {
+        let mut out = SWESolution2D::new(n_elements, nn);
+        local.stage_where(&q, input, &elements, &plan, &mut out, None);
+        out
+    };
+    // The input differs from the base, to tell their weights apart
+    let mut input = q.clone();
+    for data in &mut input.data {
+        for (i, v) in data.iter_mut().enumerate() {
+            *v *= 1.0 + 1e-3 * (0.11 * i as f64).sin();
+        }
+    }
+    let reference = stage(&input);
+
+    // The node one in from `node` of `face`
+    let inner = |face: usize, node: usize| match face {
+        0 => node + n1,
+        1 => node - 1,
+        2 => node - n1,
+        _ => node + 1,
+    };
+    let (mut changed_own, mut changed_across) = (0, 0);
+    for j in 0..n_elements {
+        for m in 0..nn {
+            let mut perturbed = input.clone();
+            for data in &mut perturbed.data {
+                data[j * nn + m] = data[j * nn + m] * 1.01 + 1e-3;
+            }
+            let out = stage(&perturbed);
+            for k in 0..n_elements {
+                // The nodes of k that may read node m of j
+                let mut may = vec![false; nn];
+                if k == j {
+                    for n in 0..nn {
+                        may[n] = !line_local[k] || n / n1 == m / n1 || n % n1 == m % n1;
+                    }
+                }
+                for face in 0..4 {
+                    let Some(nb) = mesh.neighbor(ElementIndex::new(k), face) else {
+                        continue;
+                    };
+                    if nb.element != j {
+                        continue;
+                    }
+                    for (fi, &node) in ops.face_nodes[face].iter().enumerate() {
+                        let across = ops.face_nodes[nb.face][n1 - 1 - fi];
+                        if line_local[k] {
+                            may[node] |= across == m;
+                        } else if across == m || inner(nb.face, across) == m {
+                            may.fill(true);
+                        }
+                    }
+                }
+                for n in 0..nn {
+                    let i = k * nn + n;
+                    let differs = (0..3)
+                        .any(|var| out.data[var][i].to_bits() != reference.data[var][i].to_bits());
+                    assert!(
+                        !differs || may[n],
+                        "node {n} of element {k} (line-local: {}) read node {m} of element {j}",
+                        line_local[k]
+                    );
+                    if differs && k == j {
+                        changed_own += 1;
+                    } else if differs {
+                        changed_across += 1;
+                    }
+                }
+            }
+        }
+    }
+    // The test sees the dependence it rules on
+    assert!(changed_own > 4 * n_elements * nn && changed_across > n_elements * nn);
+}
+
+/// The node-by-node stage rates leave out only evaluations whose result
+/// would have been the same: a run on them is the run on whole-element
+/// rates, here bit for bit, with fewer evaluations and the same mass, and no
+/// line-local element left the form within a coarse step.
+///
+/// (An element's substep result is the mean of its last stage's values over
+/// the substep. The whole-element rates take it over more values, equal in
+/// twos or fours where the node-by-node rates take one: sums of up to four
+/// equal terms are exact, so three levels as here give the same bits; from
+/// eight on the two may differ in the last place.)
+#[test]
+fn line_local_rates_are_the_whole_element_rates_bit_for_bit() {
+    let (setup, physics, q0) = line_local_setup();
+    let mesh = &setup.mesh;
+    let local = physics.local_time_stepping().expect("SWE supports LTS");
+    let mass0 = setup.mass(&q0);
+    for scheme in [SspScheme::Rk3, SspScheme::Rk43] {
+        let run = |line_rates: bool| {
+            let mut stepper = MultirateStepper::new(8, scheme).with_line_local_rates(line_rates);
+            let (mut q, mut t) = (q0.clone(), 0.0);
+            for _ in 0..12 {
+                let dt = stepper.assign_levels(local, mesh, &q, 1.0, None, None);
+                stepper.step(local, &mut q, t, dt);
+                t += dt;
+            }
+            (q, t, stepper.stats())
+        };
+        let (whole, t_whole, whole_stats) = run(false);
+        let (lines, t_lines, line_stats) = run(true);
+        println!("{scheme:?}: whole {whole_stats:?}\n  lines {line_stats:?}");
+        assert_eq!(whole_stats.finest_level, 2, "{whole_stats:?}");
+        assert_eq!(whole_stats.line_local_elements, 0);
+        assert!(line_stats.line_local_elements > 0);
+        assert_eq!(line_stats.line_local_breaks, 0);
+        // Fewer evaluations for the same levels
+        assert_eq!(line_stats.level_evaluations, whole_stats.level_evaluations);
+        assert!(
+            (line_stats.element_evaluations as f64) < 0.97 * whole_stats.element_evaluations as f64,
+            "{} against {}",
+            line_stats.element_evaluations,
+            whole_stats.element_evaluations
+        );
+
+        // The same run
+        assert_eq!(t_lines, t_whole);
+        assert!(setup.l2_difference(&whole, &q0) > 0.0);
+        for var in 0..3 {
+            assert!(
+                lines.data[var]
+                    .iter()
+                    .zip(&whole.data[var])
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{scheme:?}, variable {var}: {:e}",
+                setup.l2_difference(&lines, &whole)
+            );
+        }
+        for (name, q) in [("whole", &whole), ("lines", &lines)] {
+            let drift = (setup.mass(q) - mass0).abs() / mass0;
+            assert!(drift < 1e-13, "{scheme:?}, {name}: mass drift {drift:e}");
+        }
+        assert_eq!(physics.negative_depth_clips(), 0);
+    }
 }

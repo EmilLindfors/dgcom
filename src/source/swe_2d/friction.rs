@@ -339,6 +339,10 @@ impl SourceTerm2D for ManningFriction2D {
         self.explicit_source(&ctx.state, ctx.h_min)
     }
 
+    fn is_node_local(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "manning_friction_2d"
     }
@@ -404,6 +408,10 @@ impl BottomFriction2D for ChezyFriction2D {
 impl SourceTerm2D for ChezyFriction2D {
     fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D {
         self.explicit_source(&ctx.state)
+    }
+
+    fn is_node_local(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -582,6 +590,10 @@ impl SourceTerm2D for SpatiallyVaryingManning2D {
             hu[i] -= rate * qx;
             hv[i] -= rate * qy;
         }
+    }
+
+    fn is_node_local(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {

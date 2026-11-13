@@ -333,6 +333,10 @@ impl SourceTerm2D for WindStress2D {
         SWEState2D::new(0.0, tau_x / self.rho_water, tau_y / self.rho_water)
     }
 
+    fn is_node_local(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "wind_stress_2d"
     }

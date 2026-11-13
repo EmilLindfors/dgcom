@@ -91,6 +91,10 @@ impl SourceTerm2D for BathymetrySource2D {
         }
     }
 
+    fn is_node_local(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "bathymetry_source_2d"
     }

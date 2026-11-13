@@ -465,6 +465,14 @@ pub trait ModeSplitPhysics {
         false
     }
 
+    /// The initial `[k, ψ]` of a turbulence closure with prognostic
+    /// turbulence (`Solution3D::tke`, `gls`), `None` (the default) without
+    /// one. [`Self::vertical_implicit`] allocates the turbulence at its
+    /// first call; a step on local time steps allocates it at its start.
+    fn initial_turbulence(&self) -> Option<[f64; 2]> {
+        None
+    }
+
     /// Implicit vertical terms over `[t, t + dt]` in the columns of
     /// `elements`: vertical diffusion, with the surface and bottom stresses
     /// as its boundary fluxes, the bottom drag `r·u_b` at the new time if
@@ -954,6 +962,8 @@ impl BarotropicFilter {
 /// stage buffers of [`MultirateStepper::schedule`].
 struct BarotropicMultirate {
     stepper: MultirateStepper<SWESolution2D>,
+    /// The elements' time steps of the current pass
+    element_dt: Vec<f64>,
     /// The stage values the next stages read (all stages but the last)
     values: Vec<SWESolution2D>,
     /// The last stage's value, and the substeps' results
@@ -993,6 +1003,7 @@ impl BarotropicMultirate {
     fn new(max_levels: usize, scheme: SspScheme, like: &SWESolution2D, n_rivers: usize) -> Self {
         Self {
             stepper: MultirateStepper::new(max_levels, scheme),
+            element_dt: Vec::new(),
             values: vec![like.clone(); scheme.n_stages() - 1],
             last: like.clone(),
             acc: like.clone(),
@@ -1032,6 +1043,7 @@ impl BarotropicMultirate {
             last,
             acc,
             river_terms,
+            ..
         } = self;
         let schedule: &MultirateStepper<SWESolution2D> = stepper;
         schedule.schedule(step.t, step.dt, |pass| match pass {
@@ -1203,7 +1215,7 @@ impl BarotropicMultirate {
                 profiling::stop("bt lts: finish", finish_scope);
             }
         });
-        stepper.count_step();
+        stepper.count_step(step.dt);
         clips.into_inner()
     }
 }
@@ -1857,6 +1869,21 @@ impl ModeSplitIntegrator {
         let barotropic = physics.barotropic();
         let rivers = physics.rivers();
         let n_rivers = rivers.map_or(0, RiverSources::len);
+        // A prognostic closure's turbulence, from the first step on local
+        // time steps. The closure allocates it at its first call, the end of
+        // a substep: with several levels that is inside the step, for the
+        // elements of one level, after the stages' buffers were sized
+        // without it (a run from rest then read an empty tendency). One
+        // level keeps the closure's own first call, and its bits.
+        if self.baroclinic_levels > 0
+            && let Some([k0, psi0]) = physics.initial_turbulence()
+        {
+            let n_w = state.n_elements * state.n_nodes * (state.n_levels + 1);
+            if state.tke.len() != n_w {
+                state.tke = vec![k0; n_w];
+                state.gls = vec![psi0; n_w];
+            }
+        }
         let Buffers {
             rhs_n,
             element_means,
@@ -1946,12 +1973,22 @@ impl ModeSplitIntegrator {
                 let multirate = self
                     .multirate
                     .get_or_insert_with(|| BarotropicMultirate::new(levels, scheme, q, n_rivers));
-                // Its coarse step
-                let dt_coarse = multirate.stepper.assign_levels(
-                    local,
+                // Its coarse step, from the element steps alone: at most
+                // Δt over the fewest substeps, so the module's own bound on
+                // a coarse step has nothing to add, and whole-element stage
+                // rates (the pass finishes its stages itself and counts no
+                // line-local breaks: TODO P2.5)
+                let BarotropicMultirate {
+                    stepper,
+                    element_dt,
+                    ..
+                } = &mut *multirate;
+                element_dt.resize(barotropic.mesh().n_elements, 0.0);
+                local.element_dt(q, self.barotropic_cfl, scheme, element_dt);
+                let dt_coarse = stepper.assign_levels_from(
+                    element_dt,
                     barotropic.mesh(),
-                    q,
-                    self.barotropic_cfl,
+                    &[local.stencil()],
                     Some(dt / self.min_substeps as f64),
                 );
                 (Some(multirate), dt_coarse)
@@ -2506,7 +2543,7 @@ impl ModeSplitIntegrator {
                 }
             }
         });
-        stepper.count_step();
+        stepper.count_step(dt);
         profiling::stop("split: 3D stages", stage_time);
         // The last stage's values unmasked (the final conversion keeps them
         // where there is no water), and their density the state's
