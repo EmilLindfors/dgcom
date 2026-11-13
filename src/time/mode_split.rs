@@ -1377,7 +1377,7 @@ impl Stages3D {
             (n_stages, n_stages + 1)
         };
         Self {
-            stepper: MultirateStepper::new(max_levels, scheme),
+            stepper: MultirateStepper::new(max_levels, scheme).with_longest_coarse_step(true),
             assigned: false,
             one_level,
             inventories: (0..n_inventories).map(|_| inventories()).collect(),
@@ -1784,8 +1784,16 @@ impl ModeSplitIntegrator {
     /// rates of each stage spread over what a stage value reads, `stencils`
     /// ([`ModeSplitPhysics::stage_stencils`]), and return the coarse step:
     /// `2^L` times the smallest element step, at most the largest one and
-    /// `dt_cap` (see [`MultirateStepper::assign_levels_from`]). The step
-    /// may then be taken shorter (all levels shrink with it).
+    /// `dt_cap` (see [`MultirateStepper::assign_levels_from`]).
+    ///
+    /// The coarse step is the longest these allow, with its own levels
+    /// ([`MultirateStepper::with_longest_coarse_step`]): a 3D run's cap is
+    /// often below most elements' steps (the internal waves allow minutes
+    /// offshore), and they then step at the cap, not at a power of two
+    /// times the smallest step. With `landing`, the time left to a time the
+    /// run must reach, it is that time over the fewest equal steps, with
+    /// the levels of that step. A step taken shorter than the one returned
+    /// shrinks all levels with it.
     pub fn assign_baroclinic_levels(
         &mut self,
         state: &Solution3D,
@@ -1793,6 +1801,7 @@ impl ModeSplitIntegrator {
         mesh: &Mesh2D,
         stencils: &[RhsStencil],
         dt_cap: Option<f64>,
+        landing: Option<f64>,
     ) -> f64 {
         assert!(
             self.baroclinic_levels > 0,
@@ -1805,7 +1814,7 @@ impl ModeSplitIntegrator {
         stages.assigned = true;
         stages
             .stepper
-            .assign_levels_from(element_dt, mesh, stencils, dt_cap)
+            .assign_levels_from(element_dt, mesh, stencils, dt_cap, landing)
     }
 
     /// Work counts of the 3D stages' local time stepping so far (`None`
@@ -1990,6 +1999,7 @@ impl ModeSplitIntegrator {
                     barotropic.mesh(),
                     &[local.stencil()],
                     Some(dt / self.min_substeps as f64),
+                    None,
                 );
                 (Some(multirate), dt_coarse)
             }

@@ -264,7 +264,9 @@ struct Columns {
 
 impl Nesting3D {
     /// Nest `parent` at the open faces tagged `tags` of `mesh` (with `ops`'s
-    /// nodes and `n_levels` layers), relaxing within `band`.
+    /// nodes and `n_levels` layers), relaxing within `band`. An error
+    /// without tags, or where no face of the mesh has one of them (a closed
+    /// basin).
     pub fn new(
         parent: Arc<dyn ParentColumns3D>,
         mesh: &Mesh2D,
@@ -273,7 +275,7 @@ impl Nesting3D {
         tags: &[BoundaryTag],
         band: &NestingBand3D,
     ) -> Result<Self, NestingError> {
-        let tag = *tags.first().expect("at least one boundary tag to nest");
+        let tag = *tags.first().ok_or(NestingError::NoTags)?;
         let distance =
             boundary_distances(mesh, ops, tags, band.width).ok_or(NestingError::NoBoundary(tag))?;
         let rate = |timescale: Option<f64>, weight: f64| {
@@ -657,6 +659,29 @@ mod tests {
         )
         .unwrap();
         (mesh, ops, nesting)
+    }
+
+    /// TODO P4.2 gate: nesting at no tags, or at a tag no face has, is an
+    /// error (the first was a panic).
+    #[test]
+    fn nesting_without_open_faces_is_an_error() {
+        let (mesh, ops, _) = setup(NestingBand3D::default());
+        let nest = |tags: &[BoundaryTag]| {
+            Nesting3D::new(
+                Arc::new(Profile),
+                &mesh,
+                &ops,
+                4,
+                tags,
+                &NestingBand3D::default(),
+            )
+            .err()
+        };
+        assert!(matches!(nest(&[]), Some(NestingError::NoTags)));
+        assert!(matches!(
+            nest(&[BoundaryTag::River]),
+            Some(NestingError::NoBoundary(BoundaryTag::River))
+        ));
     }
 
     /// The band covers the boundary nodes and those within its width, the

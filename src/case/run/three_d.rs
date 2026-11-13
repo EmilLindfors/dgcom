@@ -201,9 +201,7 @@ impl CaseFile {
         };
         let tags: Vec<_> = domain.open_tags.iter().map(|t| t.boundary_tag()).collect();
         // None without open faces (a closed basin)
-        let nesting = (!tags.is_empty())
-            .then(|| Nesting3D::new(relaxed_to, mesh, ops, nl, &tags, &band).ok())
-            .flatten();
+        let nesting = Nesting3D::new(relaxed_to, mesh, ops, nl, &tags, &band).ok();
         let band_text = format!("over a {band_km} km band, {band_minutes} min");
         notes.push(match (&nesting, &columns) {
             (None, _) => "open faces: none".into(),
@@ -471,13 +469,25 @@ impl CaseFile {
             sim.integrator().last_substeps(),
             sim.physics().swe_physics.negative_depth_clips()
         ));
-        // The 3D stages' work on local time steps
+        // The 3D stages' work on local time steps, and the steps the
+        // elements could take at the end: what global steps, more levels or
+        // another cap would cost
         if let Some(stats) = sim.integrator().baroclinic_multirate_stats() {
             notes.push(format!(
                 "3D stages: {}",
                 stats.describe(domain.mesh.n_elements)
             ));
         }
+        let mut steps = vec![0.0; domain.mesh.n_elements];
+        let scheme = ssp(d.scheme).ssp_coefficient();
+        sim.physics()
+            .element_steps_into(&state, d.cfl(), scheme, &mut steps);
+        notes.extend(describe_element_steps(&steps, d.dt_max_s).map(|steps| {
+            format!(
+                "3D element steps at {:.2} h: {steps}",
+                result.final_time / 3600.0
+            )
+        }));
         Ok(RunReport {
             final_time_s: result.final_time,
             n_steps: result.n_steps,
@@ -488,6 +498,31 @@ impl CaseFile {
             notes,
         })
     }
+}
+
+/// The elements' own 3D steps `steps` (s; infinite where nothing bounds
+/// one) in a line: the smallest, which global steps take, the 1 %, 5 % and
+/// median steps, and the share of the elements that could step past `cap`
+/// (`three_d.dt_max_s`), which the levels of local time stepping cannot
+/// use. Nothing where no element has a bound.
+fn describe_element_steps(steps: &[f64], cap: f64) -> Option<String> {
+    let mut bounded: Vec<f64> = steps.iter().copied().filter(|dt| dt.is_finite()).collect();
+    bounded.sort_by(f64::total_cmp);
+    let smallest = *bounded.first()?;
+    // Of all elements: an unbounded one is past every step
+    let quantile = |q: f64| {
+        let i = ((steps.len() - 1) as f64 * q) as usize;
+        bounded.get(i).copied().unwrap_or(f64::INFINITY)
+    };
+    let over = steps.iter().filter(|&&dt| dt > cap).count();
+    Some(format!(
+        "smallest {smallest:.1} s, 1 % under {:.1} s, 5 % under {:.1} s, median {:.1} s; \
+         {:.0} % over the {cap} s cap (three_d.dt_max_s)",
+        quantile(0.01),
+        quantile(0.05),
+        quantile(0.5),
+        100.0 * over as f64 / steps.len() as f64
+    ))
 }
 
 /// The depth-mean state of `s` at `probe`, as [`Probe2D::sample_swe`] reads
@@ -539,5 +574,24 @@ fn interpolate(a: &SWEPointSample, b: &SWEPointSample, w: f64) -> SWEPointSample
         eta: mix(a.eta, b.eta),
         u: mix(a.u, b.u),
         v: mix(a.v, b.v),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The run's note on the elements' own steps: quantiles over all
+    /// elements, the unbounded ones past every step.
+    #[test]
+    fn element_steps_are_described_by_their_quantiles_and_the_cap() {
+        let mut steps: Vec<f64> = (1..=100).map(|k| k as f64).collect();
+        steps.extend([f64::INFINITY; 100]);
+        assert_eq!(
+            describe_element_steps(&steps, 60.0).unwrap(),
+            "smallest 1.0 s, 1 % under 2.0 s, 5 % under 10.0 s, median 100.0 s; \
+             70 % over the 60 s cap (three_d.dt_max_s)"
+        );
+        assert_eq!(describe_element_steps(&[f64::INFINITY; 4], 60.0), None);
     }
 }
