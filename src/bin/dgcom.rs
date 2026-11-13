@@ -170,9 +170,30 @@ fn run(file: &CaseFile) -> Result<(), String> {
         case.output.interval_minutes,
         file.output_dir().display()
     );
+    // The heap profile (`--features dhat-heap`) ends at the run's last
+    // output, with the run's state still held: its "at end" is what the run
+    // holds, its "at t-gmax" the peak (the start, or a resume)
+    #[cfg(feature = "dhat-heap")]
+    let mut profiler = Some(
+        dhat::Profiler::builder()
+            .file_name(file.output_dir().join("dhat-heap.json"))
+            .trim_backtraces(Some(16))
+            .build(),
+    );
     let mut report = |p: &Progress| {
+        #[cfg(feature = "dhat-heap")]
+        if p.time_s >= p.end_s - 1e-6 {
+            profiler.take();
+        }
+        // The water at least `Progress::DEPTH` deep; the films' speed where
+        // it is the larger
+        let films = if p.max_film_speed > p.max_speed {
+            format!(" (films {:.3})", p.max_film_speed)
+        } else {
+            String::new()
+        };
         println!(
-            "  {:7.2} h / {:.2} h   η {:+.3} to {:+.3} m   |u| ≤ {:.3} m/s{}",
+            "  {:7.2} h / {:.2} h   η {:+.3} to {:+.3} m   |u| ≤ {:.3} m/s{films}{}",
             p.time_s / 3600.0,
             p.end_s / 3600.0,
             p.eta_range.0,
@@ -211,6 +232,9 @@ fn run(file: &CaseFile) -> Result<(), String> {
     );
     for line in &done.notes {
         println!("  {line}");
+    }
+    if let Some(peak) = dgcom::profiling::peak_memory() {
+        println!("  memory: at most {}", peak.describe());
     }
     // The phase timers of `DG_PROFILE=1`
     if dgcom::profiling::enabled() {

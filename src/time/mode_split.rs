@@ -107,7 +107,8 @@ use crate::solver::rhs::ElementRhsMassThen;
 use crate::solver::rhs::subcells::subcell_interfaces;
 use crate::solver::rhs::{
     BarotropicFlux, MetricForm, from_inventory, subcell_divergence_element, to_inventory,
-    transport_3d::dry_inventories, transport_divergence_element, w_cell_thicknesses,
+    transport_3d::{dry_inventories, from_inventory_after, inventory_of},
+    transport_divergence_element, w_cell_thicknesses,
 };
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
@@ -537,7 +538,7 @@ pub trait ModeSplitPhysics {
     /// Change a stage's values (velocities and concentrations) where no
     /// stage RHS would see the difference, to spare the RHS work (thin
     /// columns at rest, as the kernels see them), keeping what was there in
-    /// `stash` ([`StageStash::keep`]; the splitter restores it,
+    /// `stash` ([`StageStash::mask`]; the splitter restores it,
     /// [`StageStash::restore_into`]). On the columns of `elements`. By
     /// default nothing.
     fn mask_stage(&self, _state: &mut Solution3D, _elements: Blocks, _stash: &mut StageStash) {}
@@ -556,10 +557,17 @@ pub struct StageStash {
 }
 
 impl StageStash {
-    /// Keep column `idx` of `state` and mark it masked (the caller then
-    /// changes it).
-    pub fn keep(&mut self, state: &Solution3D, idx: usize) {
-        let (n, nl) = (state.eta.data.len(), state.n_levels);
+    /// Put the columns of `elements` that `thin(idx, η)` accepts (a column
+    /// `[element][node]` and its surface elevation) at rest in `state`: keep
+    /// their `u`, `v`, `ū` and `v̄`, mark them masked and set them to zero.
+    /// The columns must not be masked already ([`Self::forget`] first).
+    pub fn mask(
+        &mut self,
+        state: &mut Solution3D,
+        elements: Blocks,
+        thin: impl Fn(usize, f64) -> bool + Sync + Send,
+    ) {
+        let (n, nn, nl) = (state.eta.data.len(), state.n_nodes, state.n_levels);
         if self.masked.len() != n {
             self.masked = vec![false; n];
             self.ubar = vec![0.0; n];
@@ -567,12 +575,45 @@ impl StageStash {
             self.u = vec![0.0; n * nl];
             self.v = vec![0.0; n * nl];
         }
-        let column = idx * nl..(idx + 1) * nl;
-        self.masked[idx] = true;
-        self.u[column.clone()].copy_from_slice(&state.u[column.clone()]);
-        self.v[column.clone()].copy_from_slice(&state.v[column]);
-        self.ubar[idx] = state.ubar.data[idx];
-        self.vbar[idx] = state.vbar.data[idx];
+        let eta: &[f64] = &state.eta.data;
+        for_each_block(
+            elements,
+            [&mut self.masked[..]],
+            || (),
+            |_, k, [masked]| {
+                for (i, masked) in masked.iter_mut().enumerate() {
+                    let idx = k * nn + i;
+                    if thin(idx, eta[idx]) {
+                        *masked = true;
+                    }
+                }
+            },
+        );
+        let masked: &[bool] = &self.masked;
+        // Each field with its copy: the kept values, then at rest
+        for (field, kept, len) in [
+            (&mut state.u[..], &mut self.u[..], nl),
+            (&mut state.v[..], &mut self.v[..], nl),
+            (&mut state.ubar.data[..], &mut self.ubar[..], 1),
+            (&mut state.vbar.data[..], &mut self.vbar[..], 1),
+        ] {
+            for_each_block(
+                elements,
+                [field, kept],
+                || (),
+                |_, k, [field, kept]| {
+                    let masked = &masked[k * nn..(k + 1) * nn];
+                    if !masked.contains(&true) {
+                        return;
+                    }
+                    let columns = field.chunks_exact_mut(len).zip(kept.chunks_exact_mut(len));
+                    for ((field, kept), _) in columns.zip(masked).filter(|&(_, &masked)| masked) {
+                        kept.copy_from_slice(field);
+                        field.fill(0.0);
+                    }
+                },
+            );
+        }
     }
 
     /// The kept values of the masked columns of `elements` into `state`
@@ -583,15 +624,48 @@ impl StageStash {
         if self.masked.is_empty() {
             return;
         }
-        let (nn, nl) = (state.n_nodes, state.n_levels);
-        for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
-            if self.masked[idx] {
-                let column = idx * nl..(idx + 1) * nl;
-                state.u[column.clone()].copy_from_slice(&self.u[column.clone()]);
-                state.v[column.clone()].copy_from_slice(&self.v[column]);
-                state.ubar.data[idx] = self.ubar[idx];
-                state.vbar.data[idx] = self.vbar[idx];
-            }
+        let nn = state.n_nodes;
+        for (field, kept) in [
+            (&mut state.u[..], &self.u[..]),
+            (&mut state.v[..], &self.v[..]),
+            (&mut state.ubar.data[..], &self.ubar[..]),
+            (&mut state.vbar.data[..], &self.vbar[..]),
+        ] {
+            for_each_block(
+                elements,
+                [field],
+                || (),
+                |_, k, [field]| self.restore_element(k, nn, kept, field),
+            );
+        }
+    }
+
+    /// [`Self::restore_into`] for element `k`'s block `field` of one of the
+    /// kept fields, `kept` (`[element][node][…]`, `nn` nodes an element).
+    fn restore_element(&self, k: usize, nn: usize, kept: &[f64], field: &mut [f64]) {
+        let masked = &self.masked[k * nn..(k + 1) * nn];
+        if !masked.contains(&true) {
+            return;
+        }
+        let len = field.len() / nn;
+        let kept = &kept[k * nn * len..(k + 1) * nn * len];
+        let columns = field.chunks_exact_mut(len).zip(kept.chunks_exact(len));
+        for ((field, kept), _) in columns.zip(masked).filter(|&(_, &masked)| masked) {
+            field.copy_from_slice(kept);
+        }
+    }
+
+    /// Element `k`'s block `out` of inventory field `field` (0: `u`,
+    /// 1: `v`) with its masked columns restored, as [`Self::restore_into`]
+    /// does; nothing for the fields that are never masked.
+    fn restore_velocity(&self, field: usize, k: usize, nn: usize, out: &mut [f64]) {
+        if self.masked.is_empty() {
+            return;
+        }
+        match field {
+            0 => self.restore_element(k, nn, &self.u, out),
+            1 => self.restore_element(k, nn, &self.v, out),
+            _ => {}
         }
     }
 
@@ -2243,6 +2317,44 @@ impl ModeSplitIntegrator {
                 }
             }
         };
+        // The values of the inventories `inv` in `out`, unmasked, on
+        // `elements`. Where there is no water a value is the last one: the
+        // RHS argument's, unmasked (`from`'s, or `out`'s own in place).
+        // `out`'s density is left to the caller (`post_stage` and
+        // `end_density` both set it on all of `elements`)
+        let values_of = |inv: &Solution3D,
+                         out: &mut StageValues,
+                         from: Option<&StageValues>,
+                         elements: Blocks| {
+            let StageValues { values, stash } = out;
+            let Some(from) = from else {
+                stash.restore_into(values, elements);
+                copy_barotropic_rows(inv, values, elements);
+                to_values(inv, values, elements);
+                return;
+            };
+            // Each field in one pass, element by element: the last values
+            // (copied, the masked columns' velocities restored), then the
+            // conversion. `ū` and `v̄` are the inventories' own
+            let (eta, nn) = (&inv.eta.data, inv.n_nodes);
+            let fields = inventory_fields(inv)
+                .into_iter()
+                .zip(inventory_fields(&from.values))
+                .zip(inventory_fields_mut(values));
+            for (field, ((q, last), out)) in fields.enumerate() {
+                if q.is_empty() {
+                    continue;
+                }
+                let len = last.len() / inv.n_elements;
+                let last = |k: usize, out_k: &mut [f64]| {
+                    out_k.copy_from_slice(&last[k * len..(k + 1) * len]);
+                    from.stash.restore_velocity(field, k, nn, out_k);
+                };
+                let cells = cells_of(field);
+                from_inventory_after(q, eta, cells, bathymetry, geom, means, out, elements, last);
+            }
+            copy_barotropic_rows(inv, values, elements);
+        };
         // A stage's values from its inventories `inv` (the combination's,
         // after the implicit vertical advection) and its RHS argument's
         // values `from`, then limited (`post_stage`; only the density at
@@ -2254,24 +2366,8 @@ impl ModeSplitIntegrator {
                             elements: Blocks,
                             end: bool| {
             let convert = profiling::start();
-            // Where there is no water a value is the last one, the RHS
-            // argument's (unmasked, `from`'s or `out`'s own in place)
+            values_of(inv, out, from, elements);
             let StageValues { values, stash } = out;
-            match from {
-                Some(from) => {
-                    for (to, from) in inventory_fields_mut(values)
-                        .into_iter()
-                        .zip(inventory_fields(&from.values))
-                    {
-                        copy_rows(to, from, elements);
-                    }
-                    copy_rows(&mut values.rho, &from.values.rho, elements);
-                    from.stash.restore_into(values, elements);
-                }
-                None => stash.restore_into(values, elements),
-            }
-            copy_barotropic_rows(inv, values, elements);
-            to_values(inv, values, elements);
             profiling::stop("3d: hook conversions", convert);
             if end {
                 profiling::scope("3d: density", || physics.end_density(values, elements));
@@ -2280,8 +2376,7 @@ impl ModeSplitIntegrator {
             }
             let convert = profiling::start();
             for (q, c) in [(&mut inv.temp, &values.temp), (&mut inv.salt, &values.salt)] {
-                copy_rows(q, c, elements);
-                to_inventory(q, &inv.eta.data, sigma.d_sigma(), bathymetry, elements);
+                inventory_of(q, c, &inv.eta.data, sigma.d_sigma(), bathymetry, elements);
             }
             // Where a node has (almost) no water its value is the last one:
             // its inventory is that value's, as for T and S, so that it wets
@@ -2495,18 +2590,9 @@ impl ModeSplitIntegrator {
                 if finished < substeps {
                     let t_end = t + finished as f64 * dt / substeps as f64;
                     let (from, to) = read_write(values, last_values, start_slot);
-                    let StageValues { values, stash } = to;
                     let convert = profiling::start();
-                    for (to, from) in inventory_fields_mut(values)
-                        .into_iter()
-                        .zip(inventory_fields(&from.values))
-                    {
-                        copy_rows(to, from, elements);
-                    }
-                    copy_rows(&mut values.rho, &from.values.rho, elements);
-                    from.stash.restore_into(values, elements);
-                    copy_barotropic_rows(state, values, elements);
-                    to_values(state, values, elements);
+                    values_of(state, to, Some(from), elements);
+                    let StageValues { values, stash } = to;
                     profiling::stop("3d: hook conversions", convert);
                     physics.end_density(values, elements);
                     let levels = stepper.levels();
@@ -2543,8 +2629,7 @@ impl ModeSplitIntegrator {
                         .zip(inventory_fields(values));
                     for (field, (q, c)) in fields.enumerate() {
                         if !q.is_empty() {
-                            copy_rows(q, c, elements);
-                            to_inventory(q, &eta.data, cells_of(field), bathymetry, elements);
+                            inventory_of(q, c, &eta.data, cells_of(field), bathymetry, elements);
                         }
                     }
                     stash.forget(elements);
@@ -3166,6 +3251,92 @@ mod tests {
     use super::*;
     use crate::time::Integrable;
     use crate::time::{StageWorkspace, TimeIntegrator};
+
+    /// A stage stash puts the columns it is told at rest and gives them
+    /// back, on all elements and on a list, the other columns untouched.
+    #[test]
+    fn a_stage_stash_masks_columns_and_restores_them() {
+        let (ne, nn, nl) = (4, 3, 2);
+        let mut state = Solution3D::new(ne, nn, nl);
+        for (i, eta) in state.eta.data.iter_mut().enumerate() {
+            *eta = 0.25 * i as f64;
+        }
+        for i in 0..ne * nn {
+            state.ubar.data[i] = 10.0 + i as f64;
+            state.vbar.data[i] = 20.0 + i as f64;
+        }
+        for i in 0..ne * nn * nl {
+            state.u[i] = 1.0 + i as f64;
+            state.v[i] = -1.0 - i as f64;
+        }
+        let fields = |s: &Solution3D| {
+            (
+                s.u.clone(),
+                s.v.clone(),
+                s.ubar.data.clone(),
+                s.vbar.data.clone(),
+            )
+        };
+        let original = fields(&state);
+        // Every other column, told by its index and its surface
+        let thin = |idx: usize, eta: f64| {
+            assert_eq!(eta, 0.25 * idx as f64);
+            idx % 2 == 1
+        };
+        let mut stash = StageStash::default();
+        // Nothing kept yet
+        stash.restore_into(&mut state, Blocks::All(ne));
+        stash.forget(Blocks::All(ne));
+        assert_eq!(fields(&state), original);
+
+        let listed = [1u32, 2];
+        for elements in [Blocks::list(ne, &listed), Blocks::All(ne)] {
+            let masked = |idx: usize| idx % 2 == 1 && elements.iter().any(|k| k == idx / nn);
+            stash.mask(&mut state, elements, thin);
+            for idx in 0..ne * nn {
+                assert_eq!(stash.is_masked(idx), masked(idx), "column {idx}");
+                let keep = if masked(idx) { 0.0 } else { 1.0 };
+                assert_eq!(state.ubar.data[idx], keep * original.2[idx]);
+                assert_eq!(state.vbar.data[idx], keep * original.3[idx]);
+                for i in idx * nl..(idx + 1) * nl {
+                    assert_eq!(state.u[i], keep * original.0[i]);
+                    assert_eq!(state.v[i], keep * original.1[i]);
+                }
+            }
+            // Into another buffer: the masked columns' values, nothing else
+            let mut other = Solution3D::new(ne, nn, nl);
+            stash.restore_into(&mut other, Blocks::All(ne));
+            for idx in 0..ne * nn {
+                let kept = if masked(idx) { 1.0 } else { 0.0 };
+                assert_eq!(other.ubar.data[idx], kept * original.2[idx]);
+                for i in idx * nl..(idx + 1) * nl {
+                    assert_eq!(other.u[i], kept * original.0[i]);
+                    assert_eq!(other.v[i], kept * original.1[i]);
+                }
+            }
+            // One element's block of a velocity; no other field is kept
+            let k = 2;
+            let mut block = vec![-7.0; nn * nl];
+            stash.restore_velocity(1, k, nn, &mut block);
+            for (i, &got) in block.iter().enumerate() {
+                let idx = k * nn + i / nl;
+                let expected = if masked(idx) {
+                    original.1[k * nn * nl + i]
+                } else {
+                    -7.0
+                };
+                assert_eq!(got, expected);
+            }
+            let before = block.clone();
+            stash.restore_velocity(2, k, nn, &mut block);
+            assert_eq!(block, before);
+
+            stash.restore_into(&mut state, elements);
+            assert_eq!(fields(&state), original);
+            stash.forget(elements);
+            assert!((0..ne * nn).all(|idx| !stash.is_masked(idx)));
+        }
+    }
 
     /// Moments of the filter about `tⁿ⁺¹`, in units of the baroclinic step.
     fn central_moment(filter: &BarotropicFilter, k: i32) -> f64 {

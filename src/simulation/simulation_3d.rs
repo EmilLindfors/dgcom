@@ -409,10 +409,21 @@ fn non_finite_field(state: &Solution3D) -> Option<NonFinite> {
         ("T", &state.temp, layer),
         ("S", &state.salt, layer),
     ];
+    // Every step scans these: in parallel
+    let all_finite = |values: &[f64]| {
+        let finite = |chunk: &[f64]| chunk.iter().all(|x| x.is_finite());
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            values.par_chunks(1 << 16).all(finite)
+        }
+        #[cfg(not(feature = "parallel"))]
+        finite(values)
+    };
     fields
         .into_iter()
         .filter_map(|(field, values, per_element)| {
-            if values.iter().all(|x| x.is_finite()) {
+            if all_finite(values) {
                 return None;
             }
             let bad: Vec<usize> = values

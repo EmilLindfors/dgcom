@@ -26,9 +26,14 @@
 //! - `mimalloc`: High-performance allocator (5-15% speedup)
 
 // Use mimalloc as the global allocator when the feature is enabled
-#[cfg(feature = "mimalloc")]
+#[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// The heap profiler's allocator in its place (`dgcom run` starts the profile)
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 pub mod analysis;
 pub mod basis;

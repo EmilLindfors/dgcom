@@ -469,9 +469,15 @@ impl CaseFile {
             sim.integrator().last_substeps(),
             sim.physics().swe_physics.negative_depth_clips()
         ));
-        // The 3D stages' work on local time steps, and the steps the
-        // elements could take at the end: what global steps, more levels or
-        // another cap would cost
+        // The work of the barotropic pass and of the 3D stages on local time
+        // steps, and the steps the elements could take at the end: what
+        // global steps, more levels or another cap would cost
+        if let Some(stats) = sim.integrator().barotropic_multirate_stats() {
+            notes.push(format!(
+                "barotropic pass: {}",
+                stats.describe(domain.mesh.n_elements)
+            ));
+        }
         if let Some(stats) = sim.integrator().baroclinic_multirate_stats() {
             notes.push(format!(
                 "3D stages: {}",

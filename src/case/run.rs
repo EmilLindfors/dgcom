@@ -50,12 +50,49 @@ pub struct Progress {
     pub time_s: f64,
     /// End of the run (s)
     pub end_s: f64,
-    /// Lowest and highest surface elevation over the wet nodes (m)
+    /// Lowest and highest surface elevation (m) over the nodes at least
+    /// [`Self::DEPTH`] deep (over the wet nodes where none is)
     pub eta_range: (f64, f64),
-    /// Largest depth-averaged speed (m/s)
+    /// Largest depth-averaged speed (m/s) over the same nodes
     pub max_speed: f64,
+    /// Largest depth-averaged speed (m/s) over the wet nodes shallower than
+    /// [`Self::DEPTH`]
+    pub max_film_speed: f64,
     /// Largest significant wave height (m), with `[waves]`
     pub max_hs: Option<f64>,
+}
+
+impl Progress {
+    /// Depth (m) from which a node counts in [`Self::eta_range`] and
+    /// [`Self::max_speed`]. Shallower water is a film on a beach or a drying
+    /// flat, whose level is its bed's and says nothing of the tide (1–50 mm
+    /// of water on land at +3 to +4 m through an ebb, on Chiloé), and whose
+    /// speed is a film's (`notes/case-files.md`, P8.13).
+    pub const DEPTH: f64 = 1.0;
+
+    /// The progress at `time_s` of a run to `end_s`, of the nodes'
+    /// `(depth, surface elevation, speed)` (m, m, m/s).
+    fn of(nodes: impl Iterator<Item = (f64, f64, f64)>, time_s: f64, end_s: f64) -> Self {
+        // Lowest and highest surface and largest speed: [deeper, films]
+        let mut seen = [(f64::INFINITY, f64::NEG_INFINITY, 0.0_f64); 2];
+        for (h, eta, speed) in nodes {
+            if h > H_VELOCITY {
+                let s = &mut seen[usize::from(h < Self::DEPTH)];
+                *s = (s.0.min(eta), s.1.max(eta), s.2.max(speed));
+            }
+        }
+        let [deeper, films] = seen;
+        // No node that deep (a flume, a flat): the wet nodes
+        let of = if deeper.0 <= deeper.1 { deeper } else { films };
+        Self {
+            time_s,
+            end_s,
+            eta_range: (of.0, of.1),
+            max_speed: of.2,
+            max_film_speed: films.2,
+            max_hs: None,
+        }
+    }
 }
 
 /// What a station recorded.
@@ -736,25 +773,16 @@ fn volume(domain: &Domain, q: &SWESolution2D) -> f64 {
 }
 
 fn summarize(domain: &Domain, q: &SWESolution2D, t: f64, t_end: f64) -> Progress {
-    let (mut lo, mut hi, mut speed) = (f64::INFINITY, f64::NEG_INFINITY, 0.0_f64);
-    for k in ElementIndex::iter(domain.mesh.n_elements) {
-        for i in 0..domain.ops.n_nodes {
+    let nn = domain.ops.n_nodes;
+    let nodes = ElementIndex::iter(domain.mesh.n_elements)
+        .flat_map(|k| (0..nn).map(move |i| (k, i)))
+        .map(|(k, i)| {
             let s = q.get_state(k, i);
-            if s.h > H_VELOCITY {
-                let eta = s.h + domain.bathymetry.get(k, i);
-                lo = lo.min(eta);
-                hi = hi.max(eta);
-                speed = speed.max(s.hu.hypot(s.hv) / s.h);
-            }
-        }
-    }
-    Progress {
-        time_s: t,
-        end_s: t_end,
-        eta_range: (lo, hi),
-        max_speed: speed,
-        max_hs: None,
-    }
+            let eta = s.h + domain.bathymetry.get(k, i);
+            // A dry node's speed is not read
+            (s.h, eta, s.hu.hypot(s.hv) / s.h.max(H_VELOCITY))
+        });
+    Progress::of(nodes, t, t_end)
 }
 
 /// A case snapshot's header metadata: the run and the build that made it,
@@ -1240,5 +1268,40 @@ impl<'a> Output<'a> {
     /// The stations' records; the writers flush every frame as it is written.
     fn finish(self) -> Vec<StationSeries> {
         self.stations
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The progress line reads the water at least `Progress::DEPTH` deep: a
+    /// film on a beach sets neither its range nor its largest speed, and is
+    /// reported beside it. Where no node is that deep, the wet nodes.
+    #[test]
+    fn progress_is_of_the_deeper_water_and_names_the_films() {
+        // (depth, surface, speed): the tide, a film high on a beach, a dry node
+        let nodes = [
+            (40.0, -0.2, 0.6),
+            (1.0, 0.3, 0.1),
+            (0.02, 3.5, 0.97),
+            (0.999, -0.5, 0.2),
+            (0.0, 9.0, 50.0),
+        ];
+        let p = Progress::of(nodes.into_iter(), 3600.0, 7200.0);
+        assert_eq!((p.time_s, p.end_s), (3600.0, 7200.0));
+        assert_eq!(p.eta_range, (-0.2, 0.3));
+        assert_eq!((p.max_speed, p.max_film_speed), (0.6, 0.97));
+        assert!(p.max_hs.is_none());
+
+        // A flat: the films are the water
+        let flat = Progress::of(nodes[2..].iter().copied(), 0.0, 1.0);
+        assert_eq!(flat.eta_range, (-0.5, 3.5));
+        assert_eq!((flat.max_speed, flat.max_film_speed), (0.97, 0.97));
+
+        // Dry everywhere: an empty range, no speed
+        let dry = Progress::of(nodes[4..].iter().copied(), 0.0, 1.0);
+        assert!(dry.eta_range.0 > dry.eta_range.1);
+        assert_eq!((dry.max_speed, dry.max_film_speed), (0.0, 0.0));
     }
 }

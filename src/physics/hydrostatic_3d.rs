@@ -1915,13 +1915,17 @@ where
         assert_eq!(out.len(), ne, "one step per element");
         let order_factor = (self.ops.order as f64 + 1.0).powi(2);
         let explicit_vertical = self.implicit_vertical_advection.is_none();
+        // Each element's rates once: its advective bound, and its vertical
+        // rate for the pass below
+        let mut vertical = vec![0.0; ne];
         for_each_block(
             ne,
-            [&mut out[..]],
+            [&mut out[..], &mut vertical[..]],
             || (),
-            |_, k, [dt]| {
+            |_, k, [dt, vertical]| {
                 let rates = self.element_rates(state, k);
                 dt[0] = cfl / rates.wave / order_factor;
+                vertical[0] = rates.vertical;
             },
         );
         // The advective bound over the face neighbours too, then the
@@ -1951,8 +1955,7 @@ where
                 } else {
                     Self::LOCAL_STEP_IMPLICIT_COURANT
                 };
-                let rates = self.element_rates(state, k);
-                dt[0] = bound.min(courant * ssp * (1.0 / rates.vertical));
+                dt[0] = bound.min(courant * ssp * (1.0 / vertical[k]));
             },
         );
         if !self.horizontal_viscosity.is_zero() {
@@ -2146,16 +2149,22 @@ where
             .expect("Failed to lock transport_scratch");
         let transport = &mut *transport_guard;
         self.layer_advection(state, transport, scratch);
-        let nl = state.n_levels;
-        for (w_col, omega_col) in state
-            .w
-            .chunks_exact_mut(nl)
-            .zip(transport.omega.chunks_exact(nl + 1))
-        {
-            for (l, w) in w_col.iter_mut().enumerate() {
-                *w = 0.5 * (omega_col[l] + omega_col[l + 1]);
-            }
-        }
+        let (ne, nl) = (state.n_elements, state.n_levels);
+        let omega: &[f64] = &transport.omega;
+        let len = omega.len() / ne.max(1);
+        for_each_block(
+            ne,
+            [&mut state.w[..]],
+            || (),
+            |_, k, [w]| {
+                let omega = &omega[k * len..(k + 1) * len];
+                for (w_col, omega_col) in w.chunks_exact_mut(nl).zip(omega.chunks_exact(nl + 1)) {
+                    for (l, w) in w_col.iter_mut().enumerate() {
+                        *w = 0.5 * (omega_col[l] + omega_col[l + 1]);
+                    }
+                }
+            },
+        );
     }
 
     /// `Σ_l A_l(u)` of `state` into `scratch` (the columns advected with
@@ -2569,17 +2578,9 @@ where
     /// stage's RHS need not copy the state to mask them,
     /// [`Self::with_thin_columns_at_rest`]); their values into `stash`.
     fn mask_stage(&self, state: &mut Solution3D, elements: Blocks, stash: &mut StageStash) {
-        let (nn, nl) = (state.n_nodes, state.n_levels);
-        for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
-            if self.is_thin(state, idx) {
-                stash.keep(state, idx);
-                let column = idx * nl..(idx + 1) * nl;
-                state.u[column.clone()].fill(0.0);
-                state.v[column].fill(0.0);
-                state.ubar.data[idx] = 0.0;
-                state.vbar.data[idx] = 0.0;
-            }
-        }
+        let (bed, thin) = (&self.bathymetry.data, self.min_column_depth);
+        // As `Self::is_thin`
+        stash.mask(state, elements, |idx, eta| eta - bed[idx] < thin);
     }
 }
 
