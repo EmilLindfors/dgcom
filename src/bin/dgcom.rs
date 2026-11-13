@@ -143,6 +143,16 @@ fn mesh(file: &CaseFile) -> Result<(), String> {
         if !levels.is_empty() {
             println!("  local time stepping: {}", levels.join(", "));
         }
+        if let Some((ideal, levels, scheduled)) = report.lts_work {
+            println!(
+                "  element evaluations per model second at rest: {scheduled:.0}; {:.2}× the \
+                 {ideal:.0} of every element at its own step (levels ×{:.2}, the stage rates' \
+                 spreading ×{:.2})",
+                scheduled / ideal,
+                levels / ideal,
+                scheduled / levels
+            );
+        }
     }
     for path in &report.files {
         println!("wrote {}", path.display());
@@ -201,6 +211,10 @@ fn run(file: &CaseFile) -> Result<(), String> {
     );
     for line in &done.notes {
         println!("  {line}");
+    }
+    // The phase timers of `DG_PROFILE=1`
+    if dgcom::profiling::enabled() {
+        print!("{}", dgcom::profiling::report());
     }
     for s in &done.stations {
         let Some(g) = &s.gauge else { continue };

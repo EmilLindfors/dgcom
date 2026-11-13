@@ -307,6 +307,10 @@ impl SourceTerm2D for TidalPotential {
         }
     }
 
+    fn is_node_local(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "tidal_potential"
     }

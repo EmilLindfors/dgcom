@@ -254,6 +254,10 @@ impl SourceTerm2D for WaveForce2D {
         }
     }
 
+    fn is_node_local(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "wave_force_2d"
     }

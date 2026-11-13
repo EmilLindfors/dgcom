@@ -2485,6 +2485,10 @@ where
         );
     }
 
+    fn initial_turbulence(&self) -> Option<[f64; 2]> {
+        self.mixing.initial_turbulence()
+    }
+
     /// The vertical diffusion with the surface stress and fluxes at the
     /// middle of the step, `t + dt/2` (the fluxes over the surface layer at
     /// `t`).

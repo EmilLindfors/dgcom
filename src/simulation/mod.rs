@@ -21,7 +21,7 @@
 //!     .run(&mut state, 0.0, 100.0);
 //! ```
 
-mod runner;
+pub(crate) mod runner;
 mod simulation_3d;
 
 pub use runner::{Simulation, SimulationConfig, SimulationResult};

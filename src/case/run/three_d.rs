@@ -471,6 +471,13 @@ impl CaseFile {
             sim.integrator().last_substeps(),
             sim.physics().swe_physics.negative_depth_clips()
         ));
+        // The 3D stages' work on local time steps
+        if let Some(stats) = sim.integrator().baroclinic_multirate_stats() {
+            notes.push(format!(
+                "3D stages: {}",
+                stats.describe(domain.mesh.n_elements)
+            ));
+        }
         Ok(RunReport {
             final_time_s: result.final_time,
             n_steps: result.n_steps,

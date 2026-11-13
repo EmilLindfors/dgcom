@@ -177,6 +177,10 @@ impl SourceTerm2D for CoriolisSource2D {
         }
     }
 
+    fn is_node_local(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "coriolis_2d"
     }

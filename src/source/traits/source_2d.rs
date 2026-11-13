@@ -187,6 +187,17 @@ pub trait SourceTerm2D: Send + Sync {
         false
     }
 
+    /// Whether the source at a node reads, of the state, that node only
+    /// (and whatever is not the state: time, position, bed, forcing). The
+    /// default [`Self::add_element`] does, node by node; an override must
+    /// keep to it to say so. Local time stepping then re-evaluates an
+    /// element only when the nodes its kernel reads have changed
+    /// ([`crate::time::LocalTimeStepping::line_local`]); `false` (the
+    /// default) keeps every element of the run on whole-element stage rates.
+    fn is_node_local(&self) -> bool {
+        false
+    }
+
     /// Whether this source term discretizes the bed-slope force `−g h ∇B`.
     ///
     /// The split-form formulations (`SWEFormulation2D::EntropyStable` and
@@ -275,6 +286,10 @@ impl<'a> SourceTerm2D for CombinedSource2D<'a> {
         }
     }
 
+    fn is_node_local(&self) -> bool {
+        self.sources.iter().all(|s| s.is_node_local())
+    }
+
     fn name(&self) -> &'static str {
         "combined_2d"
     }
@@ -345,6 +360,10 @@ impl SourceTerm2D for SourceTerms2D {
         for source in &self.sources {
             source.add_element(element, h, hu, hv);
         }
+    }
+
+    fn is_node_local(&self) -> bool {
+        self.sources.iter().all(|s| s.is_node_local())
     }
 
     fn name(&self) -> &'static str {

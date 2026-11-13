@@ -5,8 +5,8 @@
 //! domain, fjord arms, deep channels next to shallow banks), global explicit
 //! stepping lets the few smallest or fastest elements set the time step of
 //! all. Here element k gets a level ℓₖ ∈ 0..=L and takes 2^ℓₖ substeps of
-//! Δt_ℓ = Δt/2^ℓ per (coarse) step Δt, with Δt_L the smallest element time
-//! step.
+//! Δt_ℓ = Δt/2^ℓ per (coarse) step Δt, with Δt_L at most the smallest element
+//! time step.
 //!
 //! # Scheme
 //!
@@ -60,11 +60,29 @@
 //! An element's time step comes from its own wave speeds and those of its
 //! face neighbours (`LocalTimeStepping::element_dt`). The coarse step is
 //! 2^L times the smallest element time step, with L the most levels (up to the
-//! maximum) that keep it at most the largest one. Neighbouring levels are then
+//! maximum) that keep it at most the largest one (and the module's bound,
+//! below; a run that must land on a time takes a shorter one, further below). Neighbouring levels are then
 //! made to differ by at most one, refining the coarser side. Together these
 //! keep water that floods in from a neighbour within one substep from
 //! outrunning an element's time step (a nearly dry element otherwise gets an
 //! enormous one). Levels are reassigned every coarse step.
+//!
+//! The levels are those of the coarse step's start, and they hold only while
+//! the element time steps do. A film of water on an element that has just
+//! flooded has an enormous time step of its own (its waves are slow), and
+//! as the largest one it would stretch the coarse step to the most levels
+//! allowed, minutes on a beach whose water steps in seconds, with the levels
+//! frozen while the front runs up it. So the module bounds the coarse step
+//! ([`LocalTimeStepping::coarse_step_bound`]: the largest step of an element
+//! in water, not in a film).
+//!
+//! A run that must reach a time (an output, the end) takes equal coarse steps
+//! to it, with the levels of that step ([`MultirateStepper::assign_levels`]'s
+//! `landing`): an element's level is the coarsest whose step it can take,
+//! whatever the coarse step is. Shortening the last coarse step alone would
+//! shrink every level with it, and a 9 s step to an output would cost what an
+//! 84 s one does: on the Chiloé tide, with eight steps to each ten-minute
+//! output where 7.1 fit, an eighth of the run.
 //!
 //! **Cost.** An element's RHS reads the state of its stencil
 //! ([`LocalTimeStepping::stencil`]: its face neighbours for the fluxes, and
@@ -75,6 +93,22 @@
 //! interface the coarse side pays up to one stencil width per stage (three
 //! for SSP-RK3, four for SSP-RK(4,3)) at the finer rate; elsewhere every
 //! element runs at its own level.
+//!
+//! **Line-local elements.** One stencil step per stage is the most a stage
+//! can spread, not what a DGSEM stage does. On GLL nodes with the diagonal
+//! LIFT, a face's flux enters only the face's own nodes, and the volume term
+//! of a node reads the two GLL lines through it. A finer neighbour therefore
+//! changes a coarse element's first stage value on the shared face only, the
+//! whole element one stage later, and the element behind it (through the
+//! opposite face, whose nodes the first stage left alone) only in the stage
+//! after that: two stages per element across a level interface, not one.
+//! Where the physics module marks such elements
+//! ([`LocalTimeStepping::line_local`]) the rates are spread node by node
+//! (`spread_over_lines`), and an element's stage follows the finest rate
+//! any of its nodes reads. Normal to an interface SSP-RK(4,3)'s four stages
+//! then cost 1 + 1 + 2 + 2 element evaluations at the finer rate, against
+//! 1 + 2 + 3 + 4. The evaluations left out are the ones whose inputs are the
+//! same to the bit.
 //!
 //! A reused RHS is the one the element would compute again: its inputs,
 //! including its substep's stage time, are unchanged. So the flux through a
@@ -131,6 +165,31 @@ pub enum RhsStencil {
     VertexPatches,
 }
 
+/// The tensor-product node layout of the elements, for the stage rates of
+/// [line-local](LocalTimeStepping::line_local) elements.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeLines<'a> {
+    /// Nodes per GLL line (at least 2): node `j·n_1d + i` lies on r-line `j`
+    /// and s-line `i`.
+    pub n_1d: usize,
+    /// The nodes of the four faces (`DGOperators2D::face_nodes`): node `fi`
+    /// of a face coincides with node `n_1d − 1 − fi` of the neighbour's.
+    pub face_nodes: &'a [Vec<usize>; 4],
+}
+
+impl NodeLines<'_> {
+    /// The node one in from `node` of `face`, normal to the face.
+    #[inline]
+    fn inner(&self, face: usize, node: usize) -> usize {
+        match face {
+            0 => node + self.n_1d,
+            1 => node - 1,
+            2 => node - self.n_1d,
+            _ => node + 1,
+        }
+    }
+}
+
 /// The element-subset operations that local time stepping needs from a
 /// physics module (see
 /// [`PhysicsModule::local_time_stepping`](crate::physics::PhysicsModule::local_time_stepping)).
@@ -152,6 +211,46 @@ pub trait LocalTimeStepping<S>: Sync {
         RhsStencil::Faces
     }
 
+    /// Marks the *line-local* elements of the coming coarse step, which
+    /// starts from `state`, in `out` (one flag per mesh element, all `false`
+    /// on entry) and returns the elements' node layout; `None` (the default)
+    /// if no element is. Asked only with the [`RhsStencil::Faces`] stencil.
+    ///
+    /// The stage value of a line-local element at one of its nodes reads, of
+    /// the stage's input, the element's own nodes on the two GLL lines
+    /// through the node and, at a face node, the neighbour's coincident node;
+    /// nothing else (the base value and the time are the element's own).
+    /// That is flux differencing on GLL nodes with a diagonal LIFT and a
+    /// pointwise interface flux, finished node by node (stage combination,
+    /// damping, post-processing). Every other element may read all of its
+    /// own nodes and, of each face neighbour, the nodes of the shared face
+    /// and the nodes one in from it. The flags must hold for every stage of
+    /// the coarse step: the stage rates are spread by them
+    /// (see the [module documentation](self)).
+    fn line_local(&self, _state: &S, _out: &mut [bool]) -> Option<NodeLines<'_>> {
+        None
+    }
+
+    /// The longest coarse step for which the levels assigned from `state`
+    /// (its element time steps `element_dt`) hold; `∞` (the default) if
+    /// nothing bounds it beyond the element time steps themselves.
+    ///
+    /// The levels are frozen for a coarse step, so it must stay short
+    /// against the time in which the element time steps change: with
+    /// wetting and drying, the time a front takes to flood an element.
+    fn coarse_step_bound(&self, _state: &S, _element_dt: &[f64]) -> f64 {
+        f64::INFINITY
+    }
+
+    /// Stage values so far that broke [`Self::line_local`]'s promise: of an
+    /// element marked line-local that was not by the time of the stage (a
+    /// node fell through the depth where its kernel changes within the
+    /// coarse step). Each may have left a neighbour's stage one substep
+    /// behind; the count belongs in the run's report and should be zero.
+    fn line_local_breaks(&self) -> u64 {
+        0
+    }
+
     /// Whether the element operations below work in this configuration
     /// (e.g. not with a limiter that reads the neighbours' means). `false`
     /// makes `Simulation` run global steps through the whole-state stages
@@ -162,7 +261,10 @@ pub trait LocalTimeStepping<S>: Sync {
 
     /// One stage for every listed element k, with stage `plan(k)` (see
     /// [`ElementStage`]): its RHS from `input`, which may read the values
-    /// of its [`Self::stencil`], nothing further away; the new stage value
+    /// of its [`Self::stencil`], nothing further away (and, where
+    /// [`Self::line_local`] marks elements, no more than it says: the nodes
+    /// of the shared faces and one in from them, less for a line-local
+    /// element); the new stage value
     /// into its rows of `out`, and its sum into `acc` when the stage
     /// accumulates (`acc` must then be given). `plan` may also be called for
     /// the face neighbours of the listed elements (their stage time, e.g. for
@@ -356,6 +458,30 @@ pub fn assign_levels(
     (dt, finest)
 }
 
+/// Levels of the elements for a coarse step `dt` that the finest of
+/// `max_levels` levels can take: `levels[k]` the smallest ℓ with
+/// `dt/2^ℓ ≤ element_dt[k]` (at most `max_levels`). Returns the finest level
+/// used.
+fn levels_for_step(element_dt: &[f64], dt: f64, max_levels: usize, levels: &mut [u8]) -> usize {
+    let mut finest = 0;
+    for (level, &dt_k) in levels.iter_mut().zip(element_dt) {
+        let (mut l, mut dt_l) = (0, dt);
+        while l < max_levels && dt_l > dt_k {
+            dt_l *= 0.5;
+            l += 1;
+        }
+        *level = l as u8;
+        finest = finest.max(l);
+    }
+    finest
+}
+
+/// Relative slack in landing on a target time: a step that ends within this
+/// fraction of itself before the target is stretched to land on it (ten
+/// steps of 0.1 to 1.0 accumulate round-off, and the sliver left would cost
+/// a whole step).
+pub(crate) const LANDING_SLACK: f64 = 1e-9;
+
 /// `to[k] = max(from[k], from[j] − drop)` over the face neighbours j of k;
 /// whether any `to[k]` differs from `from[k]`.
 fn spread_to_neighbours(mesh: &Mesh2D, from: &[u8], to: &mut [u8], drop: u8) -> bool {
@@ -435,6 +561,78 @@ fn spread_over_stencil(mesh: &Mesh2D, from: &[u8], to: &mut [u8], stencil: RhsSt
     }
 }
 
+/// One stage's spreading of the node rates: `to` = the finest level each
+/// node's new stage value follows, from the node rates `from` of the stage's
+/// input (`n_1d²` per element), and `rate[k]` = the finest of element k's
+/// nodes, the rate of its RHS in this stage.
+///
+/// A node of a [line-local](LocalTimeStepping::line_local) element reads its
+/// two GLL lines and, on a face, the neighbour's coincident node; any other
+/// element reads all of its own nodes and each neighbour's face nodes and the
+/// nodes one in from them, and all its nodes follow.
+fn spread_over_lines(
+    mesh: &Mesh2D,
+    lines: NodeLines<'_>,
+    line_local: &[bool],
+    from: &[u8],
+    to: &mut [u8],
+    rate: &mut [u8],
+) {
+    let n1 = lines.n_1d;
+    let nn = n1 * n1;
+    let element = |(k, (to, rate)): (usize, (&mut [u8], &mut u8))| {
+        let own = &from[k * nn..(k + 1) * nn];
+        let links = &mesh.face_links[k];
+        if !line_local[k] {
+            let mut finest = own.iter().copied().fold(0, u8::max);
+            for link in links.iter().filter(|link| !link.is_boundary()) {
+                let other = &from[link.element() * nn..][..nn];
+                for &node in &lines.face_nodes[link.face()] {
+                    finest = finest
+                        .max(other[node])
+                        .max(other[lines.inner(link.face(), node)]);
+                }
+            }
+            to.fill(finest);
+            *rate = finest;
+            return;
+        }
+        for (to, own) in to.chunks_exact_mut(n1).zip(own.chunks_exact(n1)) {
+            to.fill(own.iter().copied().fold(0, u8::max));
+        }
+        for i in 0..n1 {
+            let finest = (0..n1).map(|j| own[j * n1 + i]).fold(0, u8::max);
+            for j in 0..n1 {
+                to[j * n1 + i] = to[j * n1 + i].max(finest);
+            }
+        }
+        for (face, link) in links.iter().enumerate() {
+            if link.is_boundary() {
+                continue;
+            }
+            let other = &from[link.element() * nn..][..nn];
+            let other_nodes = &lines.face_nodes[link.face()];
+            for (fi, &node) in lines.face_nodes[face].iter().enumerate() {
+                to[node] = to[node].max(other[other_nodes[n1 - 1 - fi]]);
+            }
+        }
+        *rate = to.iter().copied().fold(0, u8::max);
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        to.par_chunks_exact_mut(nn)
+            .zip(rate.par_iter_mut())
+            .enumerate()
+            .for_each(element);
+    }
+    #[cfg(not(feature = "parallel"))]
+    to.chunks_exact_mut(nn)
+        .zip(rate.iter_mut())
+        .enumerate()
+        .for_each(element);
+}
+
 /// Raise levels until face neighbours differ by at most one (the coarser
 /// side is refined; smaller steps stay stable). An element then sees at most
 /// two neighbour substeps per substep of its own, so water from a neighbour
@@ -489,12 +687,59 @@ pub struct MultirateStats {
     pub global_evaluations: u64,
     /// Finest level used (the largest time-step ratio is 2^this).
     pub finest_level: usize,
+    /// Model time stepped (s).
+    pub model_seconds: f64,
+    /// Element RHS evaluations had every element stepped at its own stable
+    /// step (`element_dt`): the least an explicit scheme of these stages
+    /// needs.
+    pub ideal_evaluations: f64,
+    /// Element RHS evaluations had every element stepped at its level's step
+    /// (power-of-two fractions of the coarse step, neighbours at most one
+    /// level apart) and nothing else: what the stage rates' spreading at
+    /// level interfaces adds is `element_evaluations` over this.
+    pub level_evaluations: f64,
+    /// [Line-local](LocalTimeStepping::line_local) elements, summed over
+    /// the coarse steps.
+    pub line_local_elements: u64,
+    /// [`LocalTimeStepping::line_local_breaks`] at the last step.
+    pub line_local_breaks: u64,
 }
 
 impl MultirateStats {
     /// Saving in RHS work against global stepping at the finest time step.
     pub fn speedup(&self) -> f64 {
         self.global_evaluations as f64 / self.element_evaluations.max(1) as f64
+    }
+
+    /// The run's work in a line: the element evaluations per second of
+    /// model time, what of them the power-of-two levels and the stage rates'
+    /// spreading at level interfaces add to every element stepping at its
+    /// own step, and the line-local elements.
+    pub fn describe(&self, n_elements: usize) -> String {
+        let seconds = self.model_seconds.max(f64::MIN_POSITIVE);
+        let scheduled = self.element_evaluations as f64;
+        let mut line = format!(
+            "local time stepping: {:.0} element evaluations per model second, {:.2}× less than \
+             global steps (time-step ratio up to 2^{}); {:.2}× the {:.0} of every element at its \
+             own step (levels ×{:.2}, the stage rates' spreading ×{:.2})",
+            scheduled / seconds,
+            self.speedup(),
+            self.finest_level,
+            scheduled / self.ideal_evaluations.max(f64::MIN_POSITIVE),
+            self.ideal_evaluations / seconds,
+            self.level_evaluations / self.ideal_evaluations.max(f64::MIN_POSITIVE),
+            scheduled / self.level_evaluations.max(f64::MIN_POSITIVE),
+        );
+        if self.line_local_elements > 0 {
+            let share = self.line_local_elements as f64
+                / (self.steps.max(1) as f64 * n_elements.max(1) as f64);
+            line.push_str(&format!(
+                "; {:.0} % of the elements line-local, {} of their stage values broke it",
+                100.0 * share,
+                self.line_local_breaks
+            ));
+        }
+        line
     }
 }
 
@@ -510,8 +755,9 @@ pub struct MultirateStepper<S> {
     /// A rate's spreading buffer
     scratch: Vec<u8>,
     /// `rate[s][k]`: the level whose substeps element k's stage-(s + 1) RHS
-    /// follows, the finest level within s + 1 steps of the RHS stencil (one
-    /// per stage)
+    /// follows, the finest level any of its inputs follows: within s + 1
+    /// steps of the RHS stencil, or less far where the rates are spread node
+    /// by node (one per stage)
     rate: Vec<Vec<u8>>,
     /// `active[s][d]`: the elements with `rate[s] ≥ d`, the active elements of
     /// stage s at a finest substep of depth d; `ending[d]`: those with a
@@ -521,6 +767,19 @@ pub struct MultirateStepper<S> {
     ending: Vec<Vec<u32>>,
     /// Element RHS evaluations of one coarse step with the current levels
     evaluations_per_step: u64,
+    /// The same without the stage rates' spreading (every stage at the
+    /// element's level)
+    level_evaluations_per_step: u64,
+    /// Σ 1/element_dt over the elements with a finite step
+    inverse_dt_sum: f64,
+    /// The coarse step the elements allow (before fitting it to a landing)
+    stable_step: f64,
+    /// Whether the rates of line-local elements are spread node by node
+    line_rates: bool,
+    /// The line-local elements of the current coarse step, and two buffers of
+    /// node rates for their spreading
+    line_local: Vec<bool>,
+    node_rate: [Vec<u8>; 2],
     /// Stage values 1 to s − 1 (the RHS arguments of stages 2 to s)
     values: Vec<S>,
     /// The last stage's value in the current finest substep
@@ -546,6 +805,12 @@ impl<S: Integrable> MultirateStepper<S> {
             active: vec![Vec::new(); n_stages],
             ending: Vec::new(),
             evaluations_per_step: 0,
+            level_evaluations_per_step: 0,
+            inverse_dt_sum: 0.0,
+            stable_step: f64::INFINITY,
+            line_rates: true,
+            line_local: Vec::new(),
+            node_rate: [Vec::new(), Vec::new()],
             values: Vec::new(),
             last: None,
             acc: None,
@@ -553,10 +818,26 @@ impl<S: Integrable> MultirateStepper<S> {
         }
     }
 
+    /// Whether the stage rates of the module's
+    /// [line-local](LocalTimeStepping::line_local) elements are spread node
+    /// by node (the default). Without it every element's rate spreads one
+    /// stencil per stage: more evaluations, each of whose results the
+    /// node-by-node rates would have reused to the bit.
+    pub fn with_line_local_rates(mut self, on: bool) -> Self {
+        self.line_rates = on;
+        self
+    }
+
     /// Assign levels from the current element time steps at the linear CFL
     /// `cfl` (with the forward-Euler bounds of `local` for the scheme), and
     /// return the coarse step (see [`assign_levels`]; at
     /// most `dt_cap`). Call it before every [`Self::step`].
+    ///
+    /// `landing`: the time left to a time the run must reach. The coarse
+    /// step is then that time over the fewest equal steps the elements allow,
+    /// and the levels are that step's (see the
+    /// [module documentation](self)); [`Self::stable_step`] stays the step
+    /// the elements allow.
     pub fn assign_levels(
         &mut self,
         local: &dyn LocalTimeStepping<S>,
@@ -564,12 +845,24 @@ impl<S: Integrable> MultirateStepper<S> {
         state: &S,
         cfl: f64,
         dt_cap: Option<f64>,
+        landing: Option<f64>,
     ) -> f64 {
         let mut element_dt = std::mem::take(&mut self.element_dt);
         element_dt.resize(mesh.n_elements, 0.0);
         local.element_dt(state, cfl, self.scheme, &mut element_dt);
-        let dt = self.assign_levels_from(&element_dt, mesh, &[local.stencil()], dt_cap);
-        self.element_dt = element_dt;
+        let mut line_local = std::mem::take(&mut self.line_local);
+        line_local.clear();
+        line_local.resize(mesh.n_elements, false);
+        let stencil = local.stencil();
+        let lines = (self.line_rates && stencil == RhsStencil::Faces)
+            .then(|| local.line_local(state, &mut line_local))
+            .flatten()
+            .filter(|lines| lines.n_1d >= 2);
+        let lines = lines.map(|lines| (lines, &line_local[..]));
+        let bound = local.coarse_step_bound(state, &element_dt);
+        let dt_cap = Some(dt_cap.map_or(bound, |cap| cap.min(bound))).filter(|cap| cap.is_finite());
+        let dt = self.assign(&element_dt, mesh, &[stencil], dt_cap, landing, lines);
+        (self.element_dt, self.line_local) = (element_dt, line_local);
         dt
     }
 
@@ -583,14 +876,52 @@ impl<S: Integrable> MultirateStepper<S> {
         stencils: &[RhsStencil],
         dt_cap: Option<f64>,
     ) -> f64 {
+        self.assign(element_dt, mesh, stencils, dt_cap, None, None)
+    }
+
+    /// The coarse step the elements allowed at the last
+    /// [`Self::assign_levels`], before it was fitted to a `landing`.
+    pub fn stable_step(&self) -> f64 {
+        self.stable_step
+    }
+
+    /// [`Self::assign_levels_from`]; with `lines` (the node layout and the
+    /// [line-local](LocalTimeStepping::line_local) elements) the rates are
+    /// spread node by node over the face stencil instead of over `stencils`.
+    fn assign(
+        &mut self,
+        element_dt: &[f64],
+        mesh: &Mesh2D,
+        stencils: &[RhsStencil],
+        dt_cap: Option<f64>,
+        landing: Option<f64>,
+        lines: Option<(NodeLines<'_>, &[bool])>,
+    ) -> f64 {
         let n = mesh.n_elements;
         assert_eq!(element_dt.len(), n, "one time step per element");
         assert!(
             !stencils.is_empty(),
             "a stage reads at least its RHS stencil"
         );
-        let (dt, finest) = assign_levels(element_dt, self.max_levels, dt_cap, &mut self.level);
+        let (mut dt, mut finest) =
+            assign_levels(element_dt, self.max_levels, dt_cap, &mut self.level);
+        self.stable_step = dt;
+        // Equal steps to the time to land on, each with its own levels (one
+        // level has nothing to gain: its steps cost what they span)
+        if let Some(left) = landing.filter(|&left| finest > 0 && left > 0.0 && dt.is_finite()) {
+            let steps = (left / (dt * (1.0 + LANDING_SLACK))).ceil().max(1.0);
+            let fitted = left / steps;
+            if fitted < dt {
+                dt = fitted;
+                finest = levels_for_step(element_dt, dt, self.max_levels, &mut self.level);
+            }
+        }
         self.finest = finest;
+        self.inverse_dt_sum = element_dt
+            .iter()
+            .filter(|dt| dt.is_finite())
+            .map(|dt| 1.0 / dt)
+            .sum();
 
         for rate in &mut self.rate {
             rate.resize(n, 0);
@@ -598,19 +929,51 @@ impl<S: Integrable> MultirateStepper<S> {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.resize(n, 0);
         limit_level_jumps(mesh, &mut self.level, &mut self.rate[0]);
-        for s in 0..self.rate.len() {
-            let (done, rest) = self.rate.split_at_mut(s);
-            let from = if s == 0 { &self.level } else { &done[s - 1] };
-            let to = &mut rest[0];
-            to.copy_from_slice(from);
-            for &stencil in stencils {
-                spread_over_stencil(mesh, to, &mut scratch, stencil);
-                std::mem::swap(to, &mut scratch);
+        self.level_evaluations_per_step =
+            self.rate.len() as u64 * self.level.iter().map(|&l| 1u64 << l).sum::<u64>();
+        if let Some((lines, line_local)) = lines {
+            assert_eq!(line_local.len(), n, "one flag per element");
+            let nn = lines.n_1d * lines.n_1d;
+            let [mut from, mut to] = std::mem::take(&mut self.node_rate);
+            from.resize(n * nn, 0);
+            to.resize(n * nn, 0);
+            // The substep start follows the element's own level at every node
+            for (nodes, &level) in from.chunks_exact_mut(nn).zip(&self.level) {
+                nodes.fill(level);
+            }
+            for rate in &mut self.rate {
+                spread_over_lines(mesh, lines, line_local, &from, &mut to, rate);
+                std::mem::swap(&mut from, &mut to);
+            }
+            self.node_rate = [from, to];
+        } else {
+            for s in 0..self.rate.len() {
+                let (done, rest) = self.rate.split_at_mut(s);
+                let from = if s == 0 { &self.level } else { &done[s - 1] };
+                let to = &mut rest[0];
+                to.copy_from_slice(from);
+                for &stencil in stencils {
+                    spread_over_stencil(mesh, to, &mut scratch, stencil);
+                    std::mem::swap(to, &mut scratch);
+                }
             }
         }
         self.scratch = scratch;
         self.sort_by_rates();
         dt
+    }
+
+    /// Element RHS evaluations per second of model time for a coarse step
+    /// of `dt` with the levels of the last [`Self::assign_levels`], as
+    /// `(ideal, levels, scheduled)`: every element at its own stable step;
+    /// at its level's step; and what the stage rates schedule
+    /// (see [`MultirateStats`]).
+    pub fn planned_work(&self, dt: f64) -> (f64, f64, f64) {
+        (
+            self.rate.len() as f64 * self.inverse_dt_sum,
+            self.level_evaluations_per_step as f64 / dt,
+            self.evaluations_per_step as f64 / dt,
+        )
     }
 
     /// Element RHS evaluations of a global step of the scheme at the finest
@@ -633,6 +996,8 @@ impl<S: Integrable> MultirateStepper<S> {
             rate.clear();
             rate.resize(n_elements, 0);
         }
+        self.level_evaluations_per_step = (self.rate.len() * n_elements) as u64;
+        self.inverse_dt_sum = 0.0;
         self.sort_by_rates();
     }
 
@@ -667,7 +1032,8 @@ impl<S: Integrable> MultirateStepper<S> {
 
     /// The finest level whose substeps the stage-`stage` RHS of every element
     /// follows (0-based stages): its own level, refined by its RHS stencil's
-    /// within `stage + 1` steps. An evaluation of element k's stage `stage`
+    /// within `stage + 1` steps (by the levels its nodes read, where the
+    /// rates are spread node by node). An evaluation of element k's stage `stage`
     /// stands for `2^(L − rates(stage)[k])` of the `2^L` finest substeps.
     pub fn rates(&self, stage: usize) -> &[u8] {
         &self.rate[stage]
@@ -774,16 +1140,22 @@ impl<S: Integrable> MultirateStepper<S> {
             MultiratePass::Finish { elements } => local.finish_where(state, &acc, elements),
         });
         (self.values, self.last, self.acc) = (values, Some(last), Some(acc));
-        self.count_step();
+        self.count_step(dt);
+        self.stats.line_local_breaks = local.line_local_breaks();
     }
 
-    /// Count one coarse step of a [`Self::schedule`] run by the caller.
-    pub fn count_step(&mut self) {
+    /// Count one coarse step of `dt` of a [`Self::schedule`] run by the
+    /// caller.
+    pub fn count_step(&mut self, dt: f64) {
         let n_stages = self.scheme.n_stages() as u64;
         self.stats.steps += 1;
         self.stats.element_evaluations += self.evaluations_per_step;
         self.stats.global_evaluations += n_stages * self.level.len() as u64 * (1u64 << self.finest);
         self.stats.finest_level = self.stats.finest_level.max(self.finest);
+        self.stats.model_seconds += dt;
+        self.stats.ideal_evaluations += n_stages as f64 * self.inverse_dt_sum * dt;
+        self.stats.level_evaluations += self.level_evaluations_per_step as f64;
+        self.stats.line_local_elements += self.line_local.iter().filter(|&&l| l).count() as u64;
     }
 }
 
@@ -938,6 +1310,192 @@ mod tests {
         // 3 stages × 8 elements × 2 finest substeps against the evaluations
         assert_eq!(one.planned_speedup(), 48.0 / (3.0 * 8.0 + 2.0 + 3.0 + 4.0));
         assert_eq!(two.planned_speedup(), 48.0 / (3.0 * 8.0 + 3.0 + 5.0 + 7.0));
+    }
+
+    /// The node rates of a row of 6 P2 elements whose last is on level 2,
+    /// stage by stage: the elements each stage evaluates at the finer rate.
+    fn line_rates(line_local: [bool; 6]) -> [[u8; 6]; 4] {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 6.0, 0.0, 1.0, 6, 1);
+        let ops = crate::operators::DGOperators2D::new(2);
+        let lines = NodeLines {
+            n_1d: ops.n_1d,
+            face_nodes: &ops.face_nodes,
+        };
+        let level = [0u8, 0, 0, 0, 0, 2];
+        let mut from: Vec<u8> = level.iter().flat_map(|&l| [l; 9]).collect();
+        let mut to = vec![0; from.len()];
+        let mut rates = [[0; 6]; 4];
+        for rate in &mut rates {
+            spread_over_lines(&mesh, lines, &line_local, &from, &mut to, rate);
+            std::mem::swap(&mut from, &mut to);
+        }
+        rates
+    }
+
+    /// A finer neighbour changes a line-local element's shared face in one
+    /// stage and the rest of it in the next, so the finer rate crosses an
+    /// element in two stages: 1 + 1 + 2 + 2 evaluations normal to a level
+    /// interface over four stages, against 1 + 2 + 3 + 4.
+    #[test]
+    fn line_local_rates_cross_an_element_in_two_stages() {
+        assert_eq!(
+            line_rates([true; 6]),
+            [
+                [0, 0, 0, 0, 2, 2],
+                [0, 0, 0, 0, 2, 2],
+                [0, 0, 0, 2, 2, 2],
+                [0, 0, 0, 2, 2, 2]
+            ]
+        );
+    }
+
+    /// With no line-local element the node rates are the face stencil's.
+    #[test]
+    fn rates_of_whole_elements_spread_one_face_per_stage() {
+        assert_eq!(
+            line_rates([false; 6]),
+            [
+                [0, 0, 0, 0, 2, 2],
+                [0, 0, 0, 2, 2, 2],
+                [0, 0, 2, 2, 2, 2],
+                [0, 2, 2, 2, 2, 2]
+            ]
+        );
+    }
+
+    /// An element that is not line-local (a shoreline on its subcells)
+    /// follows whole and at once, and reads its neighbours one node in.
+    #[test]
+    fn whole_elements_among_line_local_ones() {
+        // Element 4, beside the fine one, is whole: all of it follows in
+        // the first stage, so element 3's face does in the second
+        assert_eq!(
+            line_rates([true, true, true, true, false, true]),
+            [
+                [0, 0, 0, 0, 2, 2],
+                [0, 0, 0, 2, 2, 2],
+                [0, 0, 0, 2, 2, 2],
+                [0, 0, 2, 2, 2, 2]
+            ]
+        );
+        // Element 3 is whole: of element 4 it reads the shared face and the
+        // nodes one in from it, which follow from the second stage on
+        assert_eq!(
+            line_rates([true, true, true, false, true, true]),
+            [
+                [0, 0, 0, 0, 2, 2],
+                [0, 0, 0, 0, 2, 2],
+                [0, 0, 0, 2, 2, 2],
+                [0, 0, 2, 2, 2, 2]
+            ]
+        );
+    }
+
+    /// Element time steps without a physics module, for the stepper's level
+    /// assignment.
+    struct Steps {
+        element_dt: Vec<f64>,
+        bound: f64,
+    }
+
+    type Field = crate::solver::DGSolution2D;
+
+    impl LocalTimeStepping<Field> for Steps {
+        fn element_dt(&self, _: &Field, _: f64, _: SspScheme, out: &mut [f64]) {
+            out.copy_from_slice(&self.element_dt);
+        }
+
+        fn coarse_step_bound(&self, _: &Field, _: &[f64]) -> f64 {
+            self.bound
+        }
+
+        fn stage_where(
+            &self,
+            _: &Field,
+            _: &Field,
+            _: &[u32],
+            _: &(dyn Fn(usize) -> ElementStage + Sync),
+            _: &mut Field,
+            _: Option<&mut Field>,
+        ) {
+            unreachable!()
+        }
+
+        fn finish_where(&self, _: &mut Field, _: &Field, _: &[u32]) {
+            unreachable!()
+        }
+    }
+
+    /// A run that must land on a time takes equal coarse steps to it, each
+    /// with the levels of its own length: an element is on the coarsest
+    /// level whose step it can take, whatever the coarse step is. (Cutting
+    /// the last coarse step instead shrinks every level with it: a short
+    /// step at the cost of a whole one.)
+    #[test]
+    fn a_landing_takes_equal_steps_with_their_own_levels() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 8.0, 0.0, 1.0, 8, 1);
+        let state = Field::new(8, 4);
+        let steps = Steps {
+            element_dt: vec![8.0, 8.0, 8.0, 8.0, 4.0, 2.0, 1.0, 1.0],
+            bound: f64::INFINITY,
+        };
+        let mut stepper = MultirateStepper::<Field>::new(8, SspScheme::Rk3);
+
+        // Free: 2³ times the smallest step
+        let dt = stepper.assign_levels(&steps, &mesh, &state, 1.0, None, None);
+        assert_eq!(dt, 8.0);
+        assert_eq!(stepper.levels(), [0, 0, 0, 0, 1, 2, 3, 3]);
+        let (ideal, by_level, _) = stepper.planned_work(8.0);
+        assert_eq!(ideal, 3.0 * 3.25);
+        assert_eq!(by_level, ideal);
+
+        // 20 s to go: three steps of 20/3 s, and the levels of 20/3 s
+        let dt = stepper.assign_levels(&steps, &mesh, &state, 1.0, None, Some(20.0));
+        assert_eq!(dt, 20.0 / 3.0);
+        assert_eq!(stepper.stable_step(), 8.0);
+        assert_eq!(stepper.levels(), [0, 0, 0, 0, 1, 2, 3, 3]);
+        for (&l, &dt_k) in stepper.levels().iter().zip(&steps.element_dt) {
+            assert!(dt / (1 << l) as f64 <= dt_k);
+        }
+
+        // 3 s to go: one step of 3 s, which the 4 s element takes whole and
+        // the 1 s elements in four: 5 + 2 + 2·4 = 15 element steps, where the
+        // 8 s step's levels, shrunk, take 4 + 2 + 4 + 16 = 26
+        let dt = stepper.assign_levels(&steps, &mesh, &state, 1.0, None, Some(3.0));
+        assert_eq!(dt, 3.0);
+        assert_eq!(stepper.levels(), [0, 0, 0, 0, 0, 1, 2, 2]);
+        assert_eq!(stepper.finest_level(), 2);
+        let (_, by_level, _) = stepper.planned_work(3.0);
+        assert_eq!(by_level * 3.0, 3.0 * 15.0);
+
+        // Exactly a step to go: that step
+        let dt = stepper.assign_levels(&steps, &mesh, &state, 1.0, None, Some(8.0));
+        assert_eq!(dt, 8.0);
+        assert_eq!(stepper.levels(), [0, 0, 0, 0, 1, 2, 3, 3]);
+    }
+
+    /// The module's bound on the coarse step takes levels off the coarse end:
+    /// the smallest step and every element's own are as they were.
+    #[test]
+    fn the_modules_bound_caps_the_coarse_step() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 4.0, 0.0, 1.0, 4, 1);
+        let state = Field::new(4, 4);
+        // A film's 500 s beside water that steps at 1 to 4 s
+        let steps = Steps {
+            element_dt: vec![500.0, 4.0, 2.0, 1.0],
+            bound: 4.0,
+        };
+        let mut stepper = MultirateStepper::<Field>::new(8, SspScheme::Rk3);
+        let dt = stepper.assign_levels(&steps, &mesh, &state, 1.0, None, None);
+        assert_eq!(dt, 4.0);
+        assert_eq!(stepper.levels(), [0, 0, 1, 2]);
+        // Without it the film's step makes the coarse step 2⁸ s
+        let free = Steps {
+            bound: f64::INFINITY,
+            ..steps
+        };
+        let dt = stepper.assign_levels(&free, &mesh, &state, 1.0, None, None);
+        assert_eq!(dt, 256.0);
     }
 
     #[test]

@@ -636,6 +636,10 @@ impl SourceTerm2D for GriddedAtmosphere2D {
         });
     }
 
+    fn is_node_local(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "gridded_atmosphere_2d"
     }

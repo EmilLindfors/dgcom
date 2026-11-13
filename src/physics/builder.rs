@@ -3,7 +3,7 @@
 //! This module provides builder patterns for constructing physics modules.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::equations::ShallowWater2D;
@@ -13,8 +13,8 @@ use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::disjoint::DisjointChunks;
 use crate::solver::{
-    ImplicitDamping2D, Limiter2D, LimiterContext2D, PositivityBound, SWEFormulation2D,
-    SWESolution2D, StandardLimiter2D, WetDryConfig, positivity_cfl_swe_2d,
+    ImplicitDamping2D, Limiter2D, LimiterContext2D, PositivityBound, SUBCELL_CAP_DEPTH_FACTOR,
+    SWEFormulation2D, SWESolution2D, StandardLimiter2D, WetDryConfig, positivity_cfl_swe_2d,
 };
 #[cfg(not(feature = "parallel"))]
 use crate::solver::{
@@ -33,7 +33,7 @@ use crate::solver::{
 use crate::source::{
     BottomFriction2D, CageDrag2D, HorizontalViscosity2D, SourceTerm2D, SourceTerms2D,
 };
-use crate::time::multirate::{ElementStage, RhsStencil};
+use crate::time::multirate::{ElementStage, NodeLines, RhsStencil};
 use crate::time::{LocalTimeStepping, SspScheme};
 use crate::types::ElementIndex;
 
@@ -126,7 +126,26 @@ pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     /// Every element's viscous time step at CFL 1 for the current viscosity,
     /// reused between steps
     viscous_dt: Mutex<ViscousDt>,
+    /// The line-local elements of local time stepping's current coarse step
+    /// ([`LocalTimeStepping::line_local`]) and the depth a node of theirs
+    /// must keep (`line_local_depth`), kept to count the stage values that
+    /// break the promise. They hold from one call of `line_local` to the
+    /// next
+    line_local: RwLock<(Vec<bool>, f64)>,
+    line_local_breaks: AtomicUsize,
 }
+
+/// Depth (m) an element's shallowest node keeps above the depth where its
+/// kernel stops being line-local (the subcells', the positivity limiter's)
+/// to be marked [line-local](LocalTimeStepping::line_local) for a coarse
+/// step of local time stepping: the water a node may lose within one.
+///
+/// A tide falls by millimetres in a coarse step, and a node that lost this
+/// much in one would be counted
+/// ([`LocalTimeStepping::line_local_breaks`]). The elements in between are
+/// a band along the shore, where the rates are spread element by element
+/// as before.
+pub const LINE_LOCAL_HEADROOM: f64 = 1.0;
 
 /// Buffers of [`SWEPhysics2D`]'s viscous time step.
 #[derive(Default)]
@@ -263,6 +282,43 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
             self.negative_depth_clips
                 .fetch_add(clips, Ordering::Relaxed);
         }
+    }
+
+    /// The depth below which a node takes its element's stage out of the
+    /// line-local form ([`LocalTimeStepping::line_local`]): the `WetDry`
+    /// subcells' depth and the wet/dry correction's `h_dry` (an element with
+    /// a node below either is evaluated or limited as a whole), a positivity
+    /// limiter's own threshold, `−∞` if nothing depends on the depth.
+    /// `None` if no element is line-local in this configuration: a
+    /// formulation that is not a split form on GLL lines, horizontal
+    /// viscosity, a limiter of more than the element, or a source term that
+    /// reads beyond its node.
+    fn line_local_depth(&self) -> Option<f64> {
+        let split_form = matches!(
+            self.formulation,
+            SWEFormulation2D::WetDry
+                | SWEFormulation2D::EntropyStable
+                | SWEFormulation2D::EntropyConservative
+        );
+        let node_local_sources = self.source.as_deref().is_none_or(|s| s.is_node_local());
+        let limiter = match self.limiter {
+            StandardLimiter2D::None => Some(f64::NEG_INFINITY),
+            StandardLimiter2D::Positivity(h_dry) => Some(h_dry.max(0.0)),
+            _ => None,
+        }?;
+        if !split_form || !node_local_sources || self.viscosity.is_some() || self.ops.n_1d < 2 {
+            return None;
+        }
+        let config = self.rhs_config();
+        let subcells = match self.formulation {
+            SWEFormulation2D::WetDry => config.subcell_depth.unwrap_or(config.h_dry),
+            _ => f64::NEG_INFINITY,
+        };
+        let wet_dry = self
+            .wet_dry
+            .as_ref()
+            .map_or(f64::NEG_INFINITY, |config| config.h_dry.meters());
+        Some(limiter.max(subcells).max(wet_dry))
     }
 
     fn damping(&self) -> ImplicitDamping2D<'_> {
@@ -502,6 +558,75 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
         }
     }
 
+    /// The elements whose every node is [`LINE_LOCAL_HEADROOM`] deeper than
+    /// the depth where the kernel changes (`line_local_depth`): fully wet
+    /// split-form elements, whose stage is flux differencing along GLL
+    /// lines, pointwise interface fluxes through a diagonal LIFT, and a
+    /// stage combination, damping and wet/dry correction node by node.
+    fn line_local(&self, state: &SWESolution2D, out: &mut [bool]) -> Option<NodeLines<'_>> {
+        let mut kept = self.line_local.write().expect("line_local lock");
+        kept.0.clear();
+        let shallow = self.line_local_depth()?;
+        kept.1 = shallow;
+        let depth = if shallow == f64::NEG_INFINITY {
+            shallow
+        } else {
+            shallow + LINE_LOCAL_HEADROOM
+        };
+        let n = self.ops.n_nodes;
+        let mark = |(flag, h): (&mut bool, &[f64])| *flag = h.iter().all(|&h| h > depth);
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            out.par_iter_mut()
+                .zip(state.data[0].par_chunks_exact(n))
+                .for_each(mark);
+        }
+        #[cfg(not(feature = "parallel"))]
+        out.iter_mut()
+            .zip(state.data[0].chunks_exact(n))
+            .for_each(mark);
+        kept.0.extend_from_slice(out);
+        Some(NodeLines {
+            n_1d: self.ops.n_1d,
+            face_nodes: &self.ops.face_nodes,
+        })
+    }
+
+    fn line_local_breaks(&self) -> u64 {
+        self.line_local_breaks.load(Ordering::Relaxed) as u64
+    }
+
+    /// With wetting and drying, the largest time step of an element in
+    /// water: every node deeper than [`SUBCELL_CAP_DEPTH_FACTOR`] times
+    /// `h_dry`, the band of [`PositivityBound`]'s subcell cap. A film's own
+    /// step is enormous (10 cm of water carries waves at 1 m/s, 1 mm at
+    /// 0.1 m/s) and says nothing of how long the levels hold: a front floods
+    /// the element at the speed of the water behind it.
+    ///
+    /// Where no element is that deep (a laboratory basin of centimetres at
+    /// the default `h_dry`), the largest step of an element without a dry
+    /// node; with none of those either, no bound.
+    fn coarse_step_bound(&self, state: &SWESolution2D, element_dt: &[f64]) -> f64 {
+        let Some(bound) = self.positivity_bound(None) else {
+            return f64::INFINITY;
+        };
+        let n = self.ops.n_nodes;
+        let longest = |shallow: f64| {
+            element_dt
+                .iter()
+                .zip(state.data[0].chunks_exact(n))
+                .filter(|(dt, h)| dt.is_finite() && h.iter().all(|&h| h > shallow))
+                .map(|(&dt, _)| dt)
+                .fold(0.0, f64::max)
+        };
+        [SUBCELL_CAP_DEPTH_FACTOR * bound.h_dry, bound.h_dry]
+            .into_iter()
+            .map(longest)
+            .find(|&dt| dt > 0.0)
+            .unwrap_or(f64::INFINITY)
+    }
+
     fn element_dt(&self, state: &SWESolution2D, cfl: f64, scheme: SspScheme, out: &mut [f64]) {
         element_dt_swe_2d(
             state,
@@ -537,6 +662,9 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
         let damping = self.damping();
         let n = self.ops.n_nodes;
         let clips = AtomicUsize::new(0);
+        let line_local = self.line_local.read().expect("line_local lock");
+        let (line_local, shallow) = (&line_local.0[..], line_local.1);
+        let breaks = AtomicUsize::new(0);
         let then = |k: usize, [h, hu, hv]: [&mut [f64]; 3], sum: Option<[&mut [f64]; 3]>| {
             let stage = plan(k);
             let nodes = k * n..(k + 1) * n;
@@ -560,6 +688,14 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
             }
             let from = [0, 1, 2].map(|var| &input.data[var][nodes.clone()]);
             damping.damp_element(k, [&mut *h, &mut *hu, &mut *hv], from, stage.c);
+            // A stage value the next stage reads (the last stage's is read
+            // through the substep's result, which `finish_where` checks)
+            if stage.accumulate.is_none()
+                && line_local.get(k).is_some_and(|&l| l)
+                && h.iter().any(|&h| h < shallow)
+            {
+                breaks.fetch_add(1, Ordering::Relaxed);
+            }
             match (stage.accumulate, sum) {
                 (Some((w, keep)), Some(sum)) => {
                     for (row, sum) in [&*h, &*hu, &*hv].into_iter().zip(sum) {
@@ -594,6 +730,10 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
             &then,
         );
         self.count_clips(clips.into_inner());
+        let breaks = breaks.into_inner();
+        if breaks > 0 {
+            self.line_local_breaks.fetch_add(breaks, Ordering::Relaxed);
+        }
     }
 
     fn finish_where(&self, state: &mut SWESolution2D, acc: &SWESolution2D, elements: &[u32]) {
@@ -604,12 +744,18 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
             DisjointChunks::new(hu, n),
             DisjointChunks::new(hv, n),
         ];
+        let line_local = self.line_local.read().expect("line_local lock");
+        let (line_local, shallow) = (&line_local.0[..], line_local.1);
+        let breaks = AtomicUsize::new(0);
         let element = |&k: &u32| {
             let k = k as usize;
             // SAFETY: the listed elements are distinct
             let mut rows = rows.each_ref().map(|r| unsafe { r.chunk(k) });
             for (var, row) in rows.iter_mut().enumerate() {
                 row.copy_from_slice(&acc.data[var][k * n..(k + 1) * n]);
+            }
+            if line_local.get(k).is_some_and(|&l| l) && rows[0].iter().any(|&h| h < shallow) {
+                breaks.fetch_add(1, Ordering::Relaxed);
             }
             self.post_process_element(k, rows)
         };
@@ -623,6 +769,10 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
         #[cfg(not(feature = "parallel"))]
         let clips = elements.iter().map(element).sum();
         self.count_clips(clips);
+        let breaks = breaks.into_inner();
+        if breaks > 0 {
+            self.line_local_breaks.fetch_add(breaks, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1028,6 +1178,8 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             negative_depth_clips: AtomicUsize::new(0),
             unit_viscous_dt: OnceLock::new(),
             viscous_dt: Mutex::default(),
+            line_local: RwLock::default(),
+            line_local_breaks: AtomicUsize::new(0),
         }
     }
 }

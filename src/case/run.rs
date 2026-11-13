@@ -272,7 +272,7 @@ impl CaseFile {
             }),
             _ => None,
         };
-        let result = match numerics.local_time_stepping_levels {
+        let (result, clips) = match numerics.local_time_stepping_levels {
             0 => drive(
                 Simulation::new(physics, stepper),
                 cfl,
@@ -314,6 +314,10 @@ impl CaseFile {
                 .map_or(Vec::new(), |f| f.at(result.final_time));
             output.write(result.final_time, &q, true, &fields)?;
         }
+        if let Some(stats) = &result.local_time_stepping {
+            notes.push(stats.describe(domain.mesh.n_elements));
+        }
+        notes.push(format!("{clips} negative-depth clips"));
         if let Some(waves) = &waves {
             let stats = waves.stats();
             notes.push(format!(
@@ -522,7 +526,7 @@ fn drive<BC, I>(
     (t_start, t_end): (f64, f64),
     exchange: Option<WaveExchange<'_, '_>>,
     callback: impl FnMut(&SWESolution2D, f64),
-) -> SimulationResult
+) -> (SimulationResult, usize)
 where
     BC: SWEBoundaryCondition2D,
     I: TimeIntegrator<SWESolution2D>,
@@ -534,7 +538,7 @@ where
     if let Some(dt) = dt_max {
         sim = sim.with_dt_max(dt);
     }
-    match exchange {
+    let result = match exchange {
         None => sim.run_with_callback(q, t_start, t_end, callback),
         // The waves exchange with the run every interval, their sea state
         // kept at the interval's ends
@@ -563,7 +567,8 @@ where
             },
             callback,
         ),
-    }
+    };
+    (result, sim.physics().negative_depth_clips())
 }
 
 /// The coupled waves, their exchange interval (s), their sea states and the
