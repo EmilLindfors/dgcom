@@ -83,9 +83,7 @@ use crate::physics::vertical_diffusion::{
 };
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
-use crate::solver::core::blocks::{
-    Blocks, Neighbourhood, Pooled, for_each_block, reduce_blocks, update_with,
-};
+use crate::solver::core::blocks::{Blocks, Pooled, for_each_block, reduce_blocks, update_with};
 use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::rhs::{
     AdvectedTracer, BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D,
@@ -200,8 +198,9 @@ where
     implicit_split: Mutex<ImplicitSplit>,
     /// The bounds of the last [`Self::compute_dt`].
     last_time_step_limits: Mutex<Option<TimeStepLimits>>,
-    /// Buffers of the turbulence's advection (allocated on first use).
-    turbulence_scratch: Mutex<Option<TurbulenceScratch>>,
+    /// The w-cells' σ-thicknesses of the turbulence's advection
+    /// ([`w_cell_thicknesses`], sized on first use).
+    w_cell_d_sigma: Mutex<Vec<f64>>,
     /// Buffers of the slow forcing (allocated on the first step).
     slow_forcing_scratch: Mutex<Option<SlowForcingScratch>>,
     /// `state` with the velocity of thin columns zeroed, for the momentum
@@ -402,7 +401,7 @@ where
             transport_scratch,
             implicit_split: Mutex::new(ImplicitSplit::default()),
             last_time_step_limits: Mutex::new(None),
-            turbulence_scratch: Mutex::new(None),
+            w_cell_d_sigma: Mutex::new(Vec::new()),
             slow_forcing_scratch: Mutex::new(None),
             masked_scratch: Mutex::new(None),
             viscosity_scratch: Mutex::new(None),
@@ -1616,13 +1615,15 @@ where
     /// The bed and surface w-points hold the closure's boundary values
     /// (`k = u*²/(c_μ⁰)²` and the length `κ z₀` of the wall itself), which
     /// nothing reads and the closure overwrites every step; they are not
-    /// means over the half-layers of their w-cells. They are advected as
-    /// their interior neighbours' values (zero gradient), so that what flows
-    /// through the end layers' centres is the interior's turbulence. Carried
-    /// in instead, the surface's centimetre length cut the top interior
+    /// means over the half-layers of their w-cells. The vertical
+    /// reconstruction takes them as their interior neighbours' values (zero
+    /// gradient, [`apply_w_point_transport_3d`]), so that what flows through
+    /// the end layers' centres is the interior's turbulence. Carried in
+    /// instead, the surface's centimetre length cut the top interior
     /// w-point's viscosity to the background wherever Ω pointed down, and
     /// decoupled the surface layer from the water below (`profile_3d`: the
     /// wind-driven surface current 0.10 against 0.087 m/s after one step).
+    /// Their own tendencies are the closure's to discard.
     fn turbulence_transport_rhs(
         &self,
         state: &Solution3D,
@@ -1646,43 +1647,13 @@ where
             );
             return;
         };
-        let mut guard = self
-            .turbulence_scratch
+        let mut d_sigma_w = self
+            .w_cell_d_sigma
             .lock()
-            .expect("Failed to lock turbulence_scratch");
-        let TurbulenceScratch {
-            d_sigma_w,
-            advected,
-            near,
-        } = guard.get_or_insert_with(|| TurbulenceScratch {
-            d_sigma_w: vec![0.0; state.n_levels + 1],
-            advected: [vec![0.0; state.tke.len()], vec![0.0; state.tke.len()]],
-            near: Neighbourhood::default(),
-        });
-        w_cell_thicknesses(&transport.d_sigma, d_sigma_w);
-        let nl = state.n_levels;
-        let n_elements = self.mesh.n_elements;
-        let len = state.tke.len() / n_elements;
-        let [tke, gls] = advected;
-        let copy = crate::profiling::start();
-        // The advection reads the face neighbours' values
-        for_each_block(
-            near.faces(&self.mesh, elements),
-            [&mut tke[..], &mut gls[..]],
-            || (),
-            |_, k, advected| {
-                for (advected, field) in advected.into_iter().zip([&state.tke, &state.gls]) {
-                    advected.copy_from_slice(&field[k * len..(k + 1) * len]);
-                    if nl >= 2 {
-                        for column in advected.chunks_exact_mut(nl + 1) {
-                            column[0] = column[1];
-                            column[nl] = column[nl - 1];
-                        }
-                    }
-                }
-            },
-        );
-        crate::profiling::stop("turb: copy", copy);
+            .expect("Failed to lock w_cell_d_sigma");
+        d_sigma_w.resize(state.n_levels + 1, 0.0);
+        w_cell_thicknesses(&transport.d_sigma, &mut d_sigma_w);
+        let (tke, gls) = (&state.tke, &state.gls);
         crate::profiling::scope("turb: kernel", || {
             apply_w_point_transport_3d(
                 [
@@ -1699,18 +1670,18 @@ where
             )
         });
         let sources = crate::profiling::start();
-        for (out, advected) in [(&mut rhs.tke, &*tke), (&mut rhs.gls, &*gls)] {
+        for (out, field) in [(&mut rhs.tke, tke), (&mut rhs.gls, gls)] {
             // River water brings the column's own turbulence: its volume
             // source must not dilute it; nor the 2D module's
             if let Some(rivers) = barotropic.rivers {
-                rivers.add_w_point_sources_at_own_value(out, advected, state.n_nodes, elements);
+                rivers.add_w_point_sources_at_own_value(out, field, state.n_nodes, elements);
             }
             // Each w-cell averages its two layers' continuity, sources
             // included
             transport.add_volume_sources(
                 out,
-                advected,
-                d_sigma_w,
+                field,
+                &d_sigma_w,
                 &state.eta.data,
                 &self.bathymetry,
                 &self.geom,
@@ -2581,16 +2552,6 @@ where
         // As `Self::is_thin`
         stash.mask(state, elements, |idx, eta| eta - bed[idx] < thin);
     }
-}
-
-/// Buffers of [`Hydrostatic3D`]'s advection of the turbulence.
-struct TurbulenceScratch {
-    /// The w-cells' σ-thicknesses ([`w_cell_thicknesses`]).
-    d_sigma_w: Vec<f64>,
-    /// `k` and `ψ` as advected: the end w-points at their neighbours' values.
-    advected: [Vec<f64>; 2],
-    /// The elements of a call on a list and their face neighbours.
-    near: Neighbourhood,
 }
 
 /// Buffers of [`Hydrostatic3D`]'s slow forcing.

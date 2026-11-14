@@ -1665,6 +1665,14 @@ pub fn apply_tracer_transport_3d<const N: usize>(
 /// without the bound of [`LayerTransport::dt_over_depth`]. Each element's
 /// w-cells are built as the kernel reaches it, from its layers' block: no
 /// second copy of the transports.
+///
+/// The bed and surface w-points hold boundary values (the closure's, which
+/// it sets again after every step), not means over their w-cells: with
+/// three w-points or more the vertical reconstruction takes them as their
+/// interior neighbours' (zero gradient), so that what flows through the end
+/// layers' centres is the interior's. They are read as they are everywhere
+/// else, so their own tendencies are not those of their neighbours' values;
+/// nothing else in a column depends on them.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_w_point_transport_3d<const N: usize>(
     fields: [AdvectedTracer; N],
@@ -1776,9 +1784,19 @@ fn advect_fields<const N: usize>(
                 }
             }
 
+            let ends_from_neighbours = cells == Cells::WPoints;
             for (rhs_k, &(tracer, reference, _, _, range)) in rhs_k.iter_mut().zip(&fields) {
                 subtract_vertical_flux(
-                    rhs_k, tracer, reference, range, transport, k, nn, vertical, scratch,
+                    rhs_k,
+                    tracer,
+                    reference,
+                    range,
+                    transport,
+                    k,
+                    nn,
+                    vertical,
+                    ends_from_neighbours,
+                    scratch,
                 );
             }
         },
@@ -1787,7 +1805,9 @@ fn advect_fields<const N: usize>(
 
 /// Subtract `δ(Ω φ)`, with `φ` at the σ-surfaces reconstructed by `scheme`,
 /// from `rhs_k` (element `k`'s block, `[node][level]`) in every column of
-/// element `k`.
+/// element `k`. With `ends_from_neighbours` (and three cells or more) the
+/// reconstruction takes each column's end values as their neighbours'.
+#[allow(clippy::too_many_arguments)]
 fn subtract_vertical_flux(
     rhs_k: &mut [f64],
     field: &[f64],
@@ -1797,19 +1817,28 @@ fn subtract_vertical_flux(
     k: usize,
     nn: usize,
     scheme: VerticalAdvection,
+    ends_from_neighbours: bool,
     scratch: &mut TransportScratch,
 ) {
     let nl = transport.n_levels;
+    let ends_from_neighbours = ends_from_neighbours && nl >= 3;
     let TransportScratch {
         vertical: flux,
         slope,
         reference_surface,
+        column: own,
         ..
     } = scratch;
     for i in 0..nn {
         let idx = k * nn + i;
         let omega = &transport.omega[i * (nl + 1)..(i + 1) * (nl + 1)];
-        let column = &field[idx * nl..(idx + 1) * nl];
+        let mut column = &field[idx * nl..(idx + 1) * nl];
+        if ends_from_neighbours {
+            own.copy_from_slice(column);
+            own[0] = own[1];
+            own[nl - 1] = own[nl - 2];
+            column = own;
+        }
         let shed = EndLayerShed {
             range,
             dt_over_depth: transport.dt_over_depth[i],
@@ -2313,7 +2342,7 @@ pub fn apply_momentum_transport_3d(
             }
             for (rhs_k, field) in rhs_k.iter_mut().zip([u, v]) {
                 subtract_vertical_flux(
-                    rhs_k, field, None, UNBOUNDED, transport, k, nn, vertical, scratch,
+                    rhs_k, field, None, UNBOUNDED, transport, k, nn, vertical, false, scratch,
                 );
             }
         },
@@ -2637,6 +2666,9 @@ struct TransportScratch {
     slope: Vec<f64>,
     /// The surface values of a column's reference (`[level]`, bed first)
     reference_surface: Vec<f64>,
+    /// A column's values, its end values replaced
+    /// ([`apply_w_point_transport_3d`])
+    column: Vec<f64>,
     /// Every level's face fluxes, `[face node][level]`, and divergence,
     /// `[node][level]`, of up to [`MAX_FIELDS`] fields
     /// ([`LayerContext::flux_divergence_levels`])
@@ -2673,6 +2705,7 @@ impl TransportScratch {
             vertical: vec![0.0; n_levels + 1],
             slope: vec![0.0; n_levels],
             reference_surface: vec![0.0; n_levels + 1],
+            column: vec![0.0; n_levels],
             face_levels: vec![0.0; MAX_FIELDS * 4 * ops.n_face_nodes * n_levels],
             div_levels: vec![0.0; MAX_FIELDS * ops.n_nodes * n_levels],
             levels: LevelScratch::new(ops.n_nodes, n_levels),
@@ -4907,9 +4940,18 @@ mod tests {
             let rhs = case.w_point_rhs(&layers, &field);
 
             // The w-cells built per element are those of a whole staggered
-            // copy of the transports, advected as layers, to the bit; also
-            // with two elements moving their layers through the subcell
-            // interfaces (fluxes of no pattern: only the kernels are compared)
+            // copy of the transports, advected as layers, to the bit at the
+            // interior w-points when the copy's field has its end values
+            // replaced by their neighbours' (as the turbulence's advection
+            // did before the reconstruction took them so): the ends reach
+            // the interior through nothing else. Also with two elements
+            // moving their layers through the subcell interfaces (fluxes of
+            // no pattern: only the kernels are compared)
+            let mut ends_replaced = field.clone();
+            for column in ends_replaced.chunks_exact_mut(nw) {
+                column[0] = column[1];
+                column[nw - 1] = column[nw - 2];
+            }
             let mut thin = case.transport();
             for k in [0, 5] {
                 thin.subcell_elements[k] = true;
@@ -4938,13 +4980,20 @@ mod tests {
                         all[k * len..k * len + own.len()].copy_from_slice(own);
                     }
                 }
-                let staggered = case.tracer_rhs(&copy, &field, &ExtrapolationTracerBC3D);
+                let staggered = case.tracer_rhs(&copy, &ends_replaced, &ExtrapolationTracerBC3D);
                 let fused = case.w_point_rhs(layers, &field);
+                for (fused, staggered) in fused.chunks_exact(nw).zip(staggered.chunks_exact(nw)) {
+                    for j in 1..nw - 1 {
+                        assert_eq!(fused[j].to_bits(), staggered[j].to_bits(), "w-point {j}");
+                    }
+                }
+                // Advected as it is, the field's ends would reach the interior
+                let raw = case.tracer_rhs(&copy, &field, &ExtrapolationTracerBC3D);
                 assert!(
                     fused
-                        .iter()
-                        .zip(&staggered)
-                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                        .chunks_exact(nw)
+                        .zip(raw.chunks_exact(nw))
+                        .any(|(a, b)| a[1] != b[1] || a[nw - 2] != b[nw - 2])
                 );
             }
 

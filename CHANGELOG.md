@@ -6,6 +6,8 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **The turbulence's advection reads `k` and `ψ` without copying them (`notes/3d-mixing.md` P4.4, 2026-11-14).** The end w-points, which hold the closure's boundary values, were replaced by their neighbours' in a copy of both fields every stage; `apply_w_point_transport_3d`'s vertical reconstruction takes them so itself now. On Chiloé's quarter hour the steps take 1.9 % less (94.9 s against 96.7) and the peak is 0.3 GB lower (19.8 GB in memory, 23.6 committed). Every value the closure keeps is the same bit for bit (a quarter hour's snapshots compared); the end w-points' own tendencies, which the closure discards, now carry their own values horizontally.
+
 - **The turbulence's advection averages the layer transports to the w-cells element by element, in its kernel (`notes/3d-mixing.md` P4.4, 2026-11-13).** It staggered a whole second `LayerTransport` every stage (≈ 0.8 GB on the Chiloé 3D case, 12 ms a call there). On Chiloé's quarter hour the steps take 4.5 % less (95.6 s against 100.1) and the run's peak is 0.8 GB lower (20.1 GB in memory, 23.9 committed). Every value is the same bit for bit (a quarter hour's snapshots compared).
   - **API:** `apply_w_point_transport_3d` advects fields at the w-points with the layers' transports; `LayerTransport::stagger_from` is gone.
 
