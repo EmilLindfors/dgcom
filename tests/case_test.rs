@@ -1518,6 +1518,15 @@ fn an_atlas_walls_the_open_faces_it_does_not_cover() {
     // The faces of 1 km along the mouth whose nodes lie within 1.5 km of a
     // point at y ≤ 500 m: y ∈ [0, 2000] m
     assert_eq!(open, 2, "{:?}", domain.notes);
+    // The share closed is by length
+    assert!(
+        domain
+            .notes
+            .iter()
+            .any(|n| n.contains("6 of 8") && n.contains("(6.0 of 8.0 km, 75.0 %)")),
+        "{:?}",
+        domain.notes
+    );
 }
 
 /// A year's hourly gauge record (2025) of M2 and S2 (amplitudes, lags) at

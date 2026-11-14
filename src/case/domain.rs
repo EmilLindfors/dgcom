@@ -221,13 +221,14 @@ impl CaseFile {
             })?;
             notes.push(format!(
                 "tidal atlas {} ({} constituents{}): {closed} of {} {:?} faces farther than \
-                 {:.1} km from it made walls",
+                 {:.1} km from it made walls ({})",
                 path.display(),
                 atlas.names().len(),
                 correction,
                 coverage.n_faces(),
                 b.tag.name(),
-                spec.coverage_m / 1000.0
+                spec.coverage_m / 1000.0,
+                closed_length(&coverage)
             ));
             atlases.push((b.tag, atlas));
         }
@@ -913,10 +914,11 @@ impl CaseFile {
             ))
         })?;
         notes.push(format!(
-            "parent {}: {closed} of {} {:?} faces without parent water made walls",
+            "parent {}: {closed} of {} {:?} faces without parent water made walls ({})",
             path.display(),
             coverage.n_faces(),
-            tag.name()
+            tag.name(),
+            closed_length(&coverage)
         ));
         let clock = self
             .case
@@ -1423,6 +1425,17 @@ fn read_parent(path: &std::path::Path, _profiles: bool) -> Result<OceanModelRead
 
 /// The longitude/latitude box around a placed mesh, with a margin of 2 % of
 /// its size.
+/// The length made walls against the boundary's, as the notes give it
+/// (`max_closed` is a share of the length).
+fn closed_length(coverage: &BoundaryCoverage) -> String {
+    format!(
+        "{:.1} of {:.1} km, {:.1} %",
+        coverage.uncovered_length() / 1000.0,
+        coverage.length() / 1000.0,
+        100.0 * coverage.uncovered_fraction()
+    )
+}
+
 fn mesh_window(mesh: &Mesh2D, projection: &LocalProjection) -> GeoBoundingBox {
     let (mut lat_min, mut lat_max) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut lon_min, mut lon_max) = (f64::INFINITY, f64::NEG_INFINITY);
