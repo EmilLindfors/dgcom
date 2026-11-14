@@ -10,8 +10,9 @@
 //! sea level, wall the open faces a tidal atlas does not cover, and nest
 //! in a parent model: wall the faces it has no water at, blend the bed to
 //! its across the relaxation band, and correct its tide. Last, the stations
-//! are placed, in open water as the example's are
-//! (`Probe2D::in_open_water`).
+//! are placed: their surface in open water as the example's are
+//! (`Probe2D::in_open_water`), their current where the bed is that deep
+//! (`Probe2D::nearest_at_depth`).
 
 use std::sync::Arc;
 
@@ -130,16 +131,26 @@ impl ParentWavePoints {
     }
 }
 
-/// Where a `[[output.station]]` samples the model.
+/// Where a `[[output.station]]` samples the model: the surface in an element
+/// that stays under water (`Probe2D::in_open_water`), the depth-mean
+/// current, the depth and the sea state where the bed itself is that deep
+/// (`Probe2D::nearest_at_depth`), so the current is sampled at a point that
+/// does not move with the mesh and the order. Both are at the station where
+/// it is in open water, and with `open_water_depth_m = 0`.
 #[derive(Clone, Debug)]
 pub struct StationProbe {
     /// Its name
     pub name: String,
-    /// The sampling point
-    pub probe: Probe2D,
-    /// How far the point is from the station's position (m): 0 unless it
-    /// was moved into open water
-    pub offset_m: f64,
+    /// Where the surface is sampled
+    pub level: Probe2D,
+    /// How far `level` is from the station's position (m)
+    pub level_offset_m: f64,
+    /// Where the current, the depth and the sea state are sampled
+    pub current: Probe2D,
+    /// How far `current` is from the station's position (m)
+    pub current_offset_m: f64,
+    /// The station's position (x, y in m)
+    pub position: [f64; 2],
     /// The tide gauge it is scored against, read and fitted
     pub gauge: Option<GaugeRecord>,
 }
@@ -624,11 +635,13 @@ impl CaseFile {
             let (depth, reach) = (s.open_water_depth_m, s.max_offset_m);
             let at = Probe2D::at(&locator, ops, [x, y]);
             let found = if depth > 0.0 {
-                Probe2D::in_open_water(&locator, ops, bathymetry, [x, y], depth, reach)
+                Probe2D::in_open_water(&locator, ops, bathymetry, [x, y], depth, reach).zip(
+                    Probe2D::nearest_at_depth(&locator, ops, bathymetry, [x, y], depth, reach),
+                )
             } else {
-                at.clone().map(|probe| (probe, 0.0))
+                at.clone().map(|probe| ((probe.clone(), 0.0), (probe, 0.0)))
             };
-            let Some((probe, offset_m)) = found else {
+            let Some(((level, level_offset_m), (current, current_offset_m))) = found else {
                 return Err(CaseError::Invalid(match at {
                     None => format!(
                         "station {:?} at ({x:.1}, {y:.1}) m is outside the mesh{}",
@@ -646,12 +659,15 @@ impl CaseFile {
                     ),
                 }));
             };
-            if offset_m > 0.0 {
-                let bed = probe.evaluate(bathymetry.element(probe.element()));
+            if level_offset_m > 0.0 || current_offset_m > 0.0 {
+                let bed = |p: &Probe2D| -p.evaluate(bathymetry.element(p.element()));
                 notes.push(format!(
-                    "station {:?} sampled {offset_m:.0} m from its position, in the nearest \
-                     element at least {depth} m deep ({:.1} m deep there)",
-                    s.name, -bed
+                    "station {:?} sampled its surface {level_offset_m:.0} m from its position, \
+                     in the nearest element at least {depth} m deep ({:.1} m deep there), and \
+                     its current {current_offset_m:.0} m from it, {:.1} m deep",
+                    s.name,
+                    bed(&level),
+                    bed(&current)
                 ));
             }
             let gauge = match &s.gauge {
@@ -690,8 +706,11 @@ impl CaseFile {
             };
             stations.push(StationProbe {
                 name: s.name.clone(),
-                probe,
-                offset_m,
+                level,
+                level_offset_m,
+                current,
+                current_offset_m,
+                position: [x, y],
                 gauge,
             });
         }

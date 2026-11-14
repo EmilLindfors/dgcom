@@ -26,8 +26,8 @@
 use std::sync::Arc;
 
 use super::{
-    H_VELOCITY, Output, Progress, RunReport, boundary_conditions, restart, score_gauges, summarize,
-    volume,
+    H_VELOCITY, Output, Progress, RunReport, StationSample, boundary_conditions, restart,
+    score_gauges, summarize, volume,
 };
 use crate::boundary::{
     DeepReference, Nesting3D, NestingBand3D, OceanColumnsOptions, OceanModelColumns,
@@ -368,7 +368,7 @@ impl CaseFile {
         let mut failure = None;
         let mut restarts = restart::RestartSchedule::new(self, t_start);
         let mut nodes = vec![0.0; 3 * nn];
-        let mut previous: Option<(f64, Vec<SWEPointSample>)> = None;
+        let mut previous: Option<(f64, Vec<StationSample>)> = None;
         // A resumed run's first call is at the restart's time, which the
         // stopped run wrote out: its samples are the next interpolation's
         // start only
@@ -383,10 +383,15 @@ impl CaseFile {
                 (n - n.round()).abs() < 1e-6 || t >= t_end - 1e-6
             };
             let on_field = field_time && !first;
-            let now: Vec<SWEPointSample> = domain
+            let now: Vec<StationSample> = domain
                 .stations
                 .iter()
-                .map(|st| sample_depth_mean(&st.probe, s, bed, &mut nodes))
+                .map(|st| {
+                    StationSample::of(
+                        &sample_depth_mean(&st.level, s, bed, &mut nodes),
+                        &sample_depth_mean(&st.current, s, bed, &mut nodes),
+                    )
+                })
                 .collect();
             let written = (|| -> Result<(), CaseError> {
                 while next_station <= t + 1e-6 {
@@ -395,11 +400,8 @@ impl CaseFile {
                     } else {
                         let (t0, before) = previous.as_ref().expect("time 0 is a station time");
                         let w = (next_station - t0) / (t - t0);
-                        let between: Vec<SWEPointSample> = before
-                            .iter()
-                            .zip(&now)
-                            .map(|(a, b)| interpolate(a, b, w))
-                            .collect();
+                        let between: Vec<StationSample> =
+                            before.iter().zip(&now).map(|(a, b)| a.mix(b, w)).collect();
                         output.record_samples(next_station, &between, None)?;
                     }
                     next_station += station_every;
@@ -566,20 +568,6 @@ fn sample_depth_mean(
         eta: h + bed,
         u,
         v,
-    }
-}
-
-/// `a` and `b` mixed linearly, `w` of the way from `a` to `b`.
-fn interpolate(a: &SWEPointSample, b: &SWEPointSample, w: f64) -> SWEPointSample {
-    let mix = |x: f64, y: f64| x + w * (y - x);
-    SWEPointSample {
-        h: mix(a.h, b.h),
-        hu: mix(a.hu, b.hu),
-        hv: mix(a.hv, b.hv),
-        bed: mix(a.bed, b.bed),
-        eta: mix(a.eta, b.eta),
-        u: mix(a.u, b.u),
-        v: mix(a.v, b.v),
     }
 }
 
