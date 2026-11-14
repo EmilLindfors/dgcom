@@ -184,6 +184,236 @@ impl Probe2D {
             .min_by(|a, b| a.0.total_cmp(&b.0))?;
         Some((Self::new(mesh, ops, point), distance))
     }
+
+    /// A probe at `p` if the bed there is at least `min_depth` (m) below
+    /// mean sea level, else at the nearest point where it is, no farther
+    /// than `max_offset` (m) from `p`, with its distance from `p` (m). `None`
+    /// if there is none.
+    ///
+    /// # Why
+    ///
+    /// [`Self::in_open_water`] moves a station into the nearest element whose
+    /// every node is that deep, which is right for the surface (see there)
+    /// but depends on the elements: the nearer such element is farther out on
+    /// a coarser mesh, so a station's current there is sampled in deeper
+    /// water (Melinka 4.4 to 14.5 m deep over meshes and orders), and differs
+    /// between them by as much as the current. The depth-mean current needs
+    /// no wet element, only water: `hu` and `h` are 0 at a dry node, and
+    /// their ratio is the element's transport-weighted velocity. So the
+    /// current is sampled where the bed polynomial itself reaches the depth,
+    /// a point that converges with the bed, not with the elements.
+    ///
+    /// # How
+    ///
+    /// Each element within `max_offset` of `p` is sampled on a grid of
+    /// reference points no coarser than about 10 m and `2/(4N)` in `r` and
+    /// `s`. From the nearest deep grid points, nearest first, a 9 × 9 grid
+    /// over a window about the nearest deep point so far, halved each time
+    /// down to 1e-12 in `r` and `s`, closes in on the nearest point of the
+    /// element where the bed is that deep: on the contour of the bed
+    /// polynomial at `−min_depth`, wherever the elements' edges are. The
+    /// search is over every element, once per station.
+    pub fn nearest_at_depth(
+        locator: &PointLocator2D,
+        ops: &DGOperators2D,
+        bathymetry: &Bathymetry2D,
+        p: [f64; 2],
+        min_depth: f64,
+        max_offset: f64,
+    ) -> Option<(Self, f64)> {
+        /// The largest spacing of the search grid (m)
+        const SPACING: f64 = 10.0;
+        /// The most grid points along an element's side
+        const MAX_POINTS: usize = 801;
+
+        let mesh = locator.mesh();
+        // The bed polynomial of element k at (r, s); orders up to 15
+        let bed_at = |k: ElementIndex, r: f64, s: f64| -> f64 {
+            let mut weights = [0.0; 256];
+            let weights = &mut weights[..ops.n_nodes];
+            ops.interpolation_weights_into(r, s, weights);
+            weights
+                .iter()
+                .zip(bathymetry.element(k))
+                .map(|(w, b)| w * b)
+                .sum()
+        };
+        let deep = |b: f64| b <= -min_depth;
+        if let Some(probe) = Self::at(locator, ops, p)
+            && deep(probe.evaluate(bathymetry.element(probe.element())))
+        {
+            return Some((probe, 0.0));
+        }
+        let distance = |k: ElementIndex, r: f64, s: f64| {
+            let [x, y] = mesh.reference_to_physical(k, r, s);
+            (x - p[0]).hypot(y - p[1])
+        };
+        // Each element's nearest deep grid point: (distance, element, r, s,
+        // the grid's spacing in r and s, its spacing in metres at most)
+        let mut candidates = Vec::new();
+        for k in ElementIndex::iter(mesh.n_elements) {
+            let corners = mesh.element_vertices(k);
+            let axis = |d: usize| corners.map(|c| c[d]);
+            let lo = [0, 1].map(|d| axis(d).into_iter().fold(f64::INFINITY, f64::min));
+            let hi = [0, 1].map(|d| axis(d).into_iter().fold(f64::NEG_INFINITY, f64::max));
+            // No point of the element is nearer than its bounding box
+            let gap = |d: usize| (lo[d] - p[d]).max(p[d] - hi[d]).max(0.0);
+            if gap(0).hypot(gap(1)) > max_offset {
+                continue;
+            }
+            let side = (hi[0] - lo[0]).max(hi[1] - lo[1]);
+            // An odd count, so the grid holds the element's centre lines
+            let m = ((side / SPACING).ceil() as usize + 1)
+                .max(4 * ops.order + 1)
+                .min(MAX_POINTS)
+                | 1;
+            let step = 2.0 / (m - 1) as f64;
+            let mut nearest: Option<(f64, f64, f64)> = None;
+            for i in 0..m {
+                for j in 0..m {
+                    let (r, s) = (-1.0 + i as f64 * step, -1.0 + j as f64 * step);
+                    if !deep(bed_at(k, r, s)) {
+                        continue;
+                    }
+                    let d = distance(k, r, s);
+                    if nearest.is_none_or(|(e, _, _)| d < e) {
+                        nearest = Some((d, r, s));
+                    }
+                }
+            }
+            // The grid's spacing in metres, at most
+            let spacing = 0.5 * side * step;
+            let narrow = (hi[0] - lo[0]).min(hi[1] - lo[1]);
+            if let Some((d, r, s)) = nearest
+                && d <= max_offset + 2.0 * spacing
+            {
+                candidates.push((d, k, r, s, spacing, narrow));
+            }
+        }
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut best: Option<(f64, MeshPoint)> = None;
+        for (d, k, r, s, spacing, narrow) in candidates {
+            // The nearest point of an element is within a grid cell of a
+            // deep grid point: no nearer than this one less two spacings
+            if best.is_some_and(|(e, _)| d - 2.0 * spacing > e) {
+                break;
+            }
+            // The grid's nearest point may be this far along the contour
+            // from the element's nearest point (in r and s): where the
+            // distance has grown by a spacing
+            let reach = ((2.0 * d * spacing).sqrt() + 2.0 * spacing) * 2.0 / narrow;
+            let (d, [r, s]) = along_the_contour(
+                &|r, s| r.abs() <= 1.0 && s.abs() <= 1.0 && deep(bed_at(k, r, s)),
+                &|r, s| bed_at(k, r, s),
+                &|r, s| distance(k, r, s),
+                (d, [r, s]),
+                reach.min(2.0),
+            );
+            if d <= max_offset && best.is_none_or(|(e, _)| d < e) {
+                best = Some((d, MeshPoint { element: k, r, s }));
+            }
+        }
+        let (distance, point) = best?;
+        Some((Self::new(mesh, ops, point), distance))
+    }
+}
+
+/// The nearest point to a station along the boundary of the `deep` set near
+/// `start` (its distance and its reference coordinates), for
+/// [`Probe2D::nearest_at_depth`]: `start` is a deep point at distance
+/// `start.0`, `bed` the bed polynomial and `distance` the distance from the
+/// station, all in the element's reference coordinates.
+///
+/// The distance changes only to second order along the contour near its
+/// nearest point, so a grid finds that point's distance well and its
+/// position poorly (a 10 m grid 550 m from the station leaves it ≈ 100 m
+/// along the shore). Here the contour is followed instead: the point `τ`
+/// along the bed's level line at `start`, moved across it to the last deep
+/// point (by bisection, so it is deep however the bed rounds on the
+/// contour), and the distance minimised over `τ ∈ [−reach, reach]` by golden
+/// section. The nearest of the points seen and `start` is returned.
+fn along_the_contour(
+    deep: &dyn Fn(f64, f64) -> bool,
+    bed: &dyn Fn(f64, f64) -> f64,
+    distance: &dyn Fn(f64, f64) -> f64,
+    start: (f64, [f64; 2]),
+    reach: f64,
+) -> (f64, [f64; 2]) {
+    let (_, [r0, s0]) = start;
+    // Across the contour: the direction the bed rises in at the start
+    let h = 1e-6;
+    let g = [
+        (bed(r0 + h, s0) - bed(r0 - h, s0)) / (2.0 * h),
+        (bed(r0, s0 + h) - bed(r0, s0 - h)) / (2.0 * h),
+    ];
+    let norm = g[0].hypot(g[1]);
+    if norm.is_nan() || norm == 0.0 {
+        return start;
+    }
+    let across = [g[0] / norm, g[1] / norm];
+    let along = [-across[1], across[0]];
+    let on_contour = |tau: f64| -> Option<[f64; 2]> {
+        let at = |l: f64| {
+            [
+                r0 + tau * along[0] + l * across[0],
+                s0 + tau * along[1] + l * across[1],
+            ]
+        };
+        let deep_at = |l: f64| {
+            let [r, s] = at(l);
+            deep(r, s)
+        };
+        let mut lo = if deep_at(0.0) {
+            0.0
+        } else if deep_at(-reach) {
+            -reach
+        } else {
+            return None;
+        };
+        let mut hi = reach;
+        if deep_at(hi) {
+            return Some(at(hi));
+        }
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if deep_at(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(at(lo))
+    };
+    let mut best = start;
+    let mut cost = |tau: f64| -> f64 {
+        let Some([r, s]) = on_contour(tau) else {
+            return f64::INFINITY;
+        };
+        let d = distance(r, s);
+        if d < best.0 {
+            best = (d, [r, s]);
+        }
+        d
+    };
+    let golden = 0.5 * (5.0_f64.sqrt() - 1.0);
+    let (mut a, mut b) = (-reach, reach);
+    let (mut x1, mut x2) = (b - golden * (b - a), a + golden * (b - a));
+    let (mut f1, mut f2) = (cost(x1), cost(x2));
+    cost(0.0);
+    for _ in 0..80 {
+        if f1 < f2 {
+            b = x2;
+            (x2, f2) = (x1, f1);
+            x1 = b - golden * (b - a);
+            f1 = cost(x1);
+        } else {
+            a = x1;
+            (x1, f1) = (x2, f2);
+            x2 = a + golden * (b - a);
+            f2 = cost(x2);
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -366,5 +596,109 @@ mod tests {
         assert_eq!((offset, stays.element().as_usize()), (0.0, 1));
         assert!(Probe2D::in_open_water(&locator, &ops, &bed, shore, 3.0, 200.0).is_none());
         assert!(Probe2D::in_open_water(&locator, &ops, &bed, shore, 20.0, 1e6).is_none());
+    }
+
+    /// A station on a sloping shore: the point at a depth is where the bed
+    /// reaches it, the same on every mesh and order, while the nearest
+    /// element that deep everywhere moves out with the element size.
+    #[test]
+    fn the_point_at_a_depth_does_not_move_with_the_mesh() {
+        // The bed rises 1 cm per metre to the shore at x = 2000 m: 3 m deep
+        // at x = 1700 m, land beyond
+        let slope = |x: f64, _y: f64| 0.01 * (x - 2000.0);
+        let station = [2250.0, 500.0];
+        let mut open_water = Vec::new();
+        for (nx, ny, order, distorted) in [
+            (4, 1, 1, false),
+            (8, 2, 2, false),
+            (6, 3, 3, false),
+            (12, 5, 2, true),
+            (16, 4, 4, false),
+        ] {
+            let mesh = if distorted {
+                distorted_mesh(nx, ny, 4000.0, 1000.0)
+            } else {
+                Mesh2D::uniform_rectangle(0.0, 4000.0, 0.0, 1000.0, nx, ny)
+            };
+            let ops = DGOperators2D::new(order);
+            let geom = GeometricFactors2D::compute(&mesh, &ops);
+            let bed = Bathymetry2D::from_function(&mesh, &ops, &geom, slope);
+            let locator = PointLocator2D::new(&mesh);
+            let (probe, offset) =
+                Probe2D::nearest_at_depth(&locator, &ops, &bed, station, 3.0, 3000.0).unwrap();
+            let [x, y] = probe.position();
+            let depth = -probe.evaluate(bed.element(probe.element()));
+            println!(
+                "{nx}×{ny} P{order}{}: ({x:.2}, {y:.2}), {offset:.3} m off, {depth:.6} m deep",
+                if distorted { " distorted" } else { "" }
+            );
+            assert!((depth - 3.0).abs() < 1e-6, "{depth}");
+            assert!((x - 1700.0).abs() < 1e-6 && (y - 500.0).abs() < 1e-3);
+            assert!((offset - 550.0).abs() < 1e-6, "{offset}");
+            let (level, _) =
+                Probe2D::in_open_water(&locator, &ops, &bed, station, 3.0, 3000.0).unwrap();
+            open_water.push(level.position()[0]);
+
+            // In deep enough water it stays; with no water that deep within
+            // reach there is none
+            let (stays, offset) =
+                Probe2D::nearest_at_depth(&locator, &ops, &bed, [1200.0, 300.0], 3.0, 10.0)
+                    .unwrap();
+            assert_eq!(offset, 0.0);
+            assert!((stays.position()[0] - 1200.0).abs() < 1e-9);
+            assert!(Probe2D::nearest_at_depth(&locator, &ops, &bed, station, 3.0, 500.0).is_none());
+            assert!(Probe2D::nearest_at_depth(&locator, &ops, &bed, station, 25.0, 1e6).is_none());
+        }
+        // The whole-element rule samples 1000 m from the shore on the 1 km
+        // mesh and 500 m on the 500 m one
+        assert!((open_water[0] - 1000.0).abs() < 1e-9 && (open_water[1] - 1500.0).abs() < 1e-9);
+    }
+
+    /// A basin whose 3 m contour is a circle (the bed is biquadratic, which
+    /// Q2 and above hold exactly, on distorted elements too): the point is
+    /// where the station's ray from the centre crosses it, on any mesh.
+    #[test]
+    fn the_point_at_a_depth_follows_a_curved_contour() {
+        let (centre, curvature) = ([2000.0, 500.0], 1e-5);
+        let bowl = |x: f64, y: f64| {
+            -20.0 + curvature * ((x - centre[0]).powi(2) + (y - centre[1]).powi(2))
+        };
+        let radius = (17.0 / curvature).sqrt();
+        let station = [3800.0, 900.0];
+        let (dx, dy) = (station[0] - centre[0], station[1] - centre[1]);
+        let reach = dx.hypot(dy);
+        let expected = [
+            centre[0] + radius * dx / reach,
+            centre[1] + radius * dy / reach,
+        ];
+        for (nx, ny, order, distorted) in [
+            (4, 1, 2, false),
+            (8, 2, 3, false),
+            (12, 5, 2, true),
+            (10, 3, 4, true),
+        ] {
+            let mesh = if distorted {
+                distorted_mesh(nx, ny, 4000.0, 1000.0)
+            } else {
+                Mesh2D::uniform_rectangle(0.0, 4000.0, 0.0, 1000.0, nx, ny)
+            };
+            let ops = DGOperators2D::new(order);
+            let geom = GeometricFactors2D::compute(&mesh, &ops);
+            let bed = Bathymetry2D::from_function(&mesh, &ops, &geom, bowl);
+            let locator = PointLocator2D::new(&mesh);
+            let (probe, offset) =
+                Probe2D::nearest_at_depth(&locator, &ops, &bed, station, 3.0, 3000.0).unwrap();
+            let [x, y] = probe.position();
+            println!(
+                "{nx}×{ny} P{order}: ({x:.3}, {y:.3}) against ({:.3}, {:.3}), {offset:.4} m off",
+                expected[0], expected[1]
+            );
+            assert!(
+                (x - expected[0]).hypot(y - expected[1]) < 1e-3,
+                "{nx}×{ny} P{order}"
+            );
+            assert!((offset - (reach - radius)).abs() < 1e-6, "{offset}");
+            assert!(bowl(x, y) <= -3.0 + 1e-9);
+        }
     }
 }

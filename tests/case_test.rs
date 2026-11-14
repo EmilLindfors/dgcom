@@ -187,7 +187,8 @@ fn a_resumed_case_run_ends_bit_for_bit_where_the_uninterrupted_one_does() {
     };
     assert_eq!(outputs(&a), outputs(&b));
     // 9 VTK frames at 0, 15, …, 120 minutes, a snapshot file, stations.csv
-    assert_eq!(outputs(&a).len(), 11, "{:?}", outputs(&a));
+    // and station_points.csv
+    assert_eq!(outputs(&a).len(), 12, "{:?}", outputs(&a));
     for name in outputs(&a) {
         assert!(a[&name] == b[&name], "{name} differs");
     }
@@ -1294,14 +1295,30 @@ fn a_gauge_on_land_beside_the_water_is_moved_into_open_water() {
     let file = bay_case(dir.path(), quay).unwrap();
     let domain = file.build_domain().unwrap();
     let moved = &domain.stations[1];
-    println!("quay: sampled {:.0} m from its position", moved.offset_m);
-    assert!(
-        moved.offset_m > 1000.0 && moved.offset_m < 3000.0,
-        "{}",
-        moved.offset_m
+    println!(
+        "quay: surface sampled {:.0} m from its position, current {:.0} m",
+        moved.level_offset_m, moved.current_offset_m
     );
+    assert!(
+        moved.level_offset_m > 1000.0 && moved.level_offset_m < 3000.0,
+        "{}",
+        moved.level_offset_m
+    );
+    // The current is where the bed is 3 m deep, no farther than the nearest
+    // element that deep everywhere
+    assert!(
+        moved.current_offset_m > 0.0 && moved.current_offset_m <= moved.level_offset_m,
+        "{}",
+        moved.current_offset_m
+    );
+    let current_bed = moved
+        .current
+        .evaluate(domain.bathymetry.element(moved.current.element()));
+    assert!(current_bed <= -3.0, "{current_bed}");
+    let bay = &domain.stations[0];
     assert_eq!(
-        domain.stations[0].offset_m, 0.0,
+        (bay.level_offset_m, bay.current_offset_m),
+        (0.0, 0.0),
         "the bay's is in open water"
     );
     assert!(
@@ -1311,6 +1328,25 @@ fn a_gauge_on_land_beside_the_water_is_moved_into_open_water() {
     );
     let report = file.run_on(&domain, &mut |_| {}).unwrap();
     assert!(report.stations[1].eta_m.iter().all(|e| e.abs() < 1e-9));
+    assert!(report.stations[1].depth_m.iter().all(|&h| h >= 3.0 - 1e-6));
+    // Where each station sampled, with the offset and the bed's depth
+    let points = std::fs::read_to_string(file.output_dir().join("station_points.csv")).unwrap();
+    let rows: Vec<Vec<&str>> = points
+        .lines()
+        .skip(1)
+        .map(|l| l.split(',').collect())
+        .collect();
+    assert_eq!(rows.len(), 4, "{points}");
+    let quay_current = rows
+        .iter()
+        .find(|r| r[0] == "quay" && r[1] == "current")
+        .unwrap();
+    let offset: f64 = quay_current[6].parse().unwrap();
+    let depth: f64 = quay_current[7].parse().unwrap();
+    assert!(
+        (offset - moved.current_offset_m).abs() < 0.01 && depth >= 3.0 - 1e-3,
+        "{points}"
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let file = bay_case(dir.path(), &format!("{quay}open_water_depth_m = 0\n")).unwrap();

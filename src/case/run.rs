@@ -95,6 +95,40 @@ impl Progress {
     }
 }
 
+/// What a station records at one time: the surface at its `level` point, the
+/// depth-mean current and the water depth at its `current` point
+/// ([`super::StationProbe`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StationSample {
+    eta: f64,
+    u: f64,
+    v: f64,
+    depth: f64,
+}
+
+impl StationSample {
+    /// The surface of `level`, the rest of `current`.
+    fn of(level: &SWEPointSample, current: &SWEPointSample) -> Self {
+        Self {
+            eta: level.eta,
+            u: current.u,
+            v: current.v,
+            depth: current.h,
+        }
+    }
+
+    /// `self` and `other` mixed linearly, `w` of the way to `other`.
+    fn mix(&self, other: &Self, w: f64) -> Self {
+        let mix = |x: f64, y: f64| x + w * (y - x);
+        Self {
+            eta: mix(self.eta, other.eta),
+            u: mix(self.u, other.u),
+            v: mix(self.v, other.v),
+            depth: mix(self.depth, other.depth),
+        }
+    }
+}
+
 /// What a station recorded.
 #[derive(Clone, Debug, Default)]
 pub struct StationSeries {
@@ -102,13 +136,14 @@ pub struct StationSeries {
     pub name: String,
     /// Output times (s)
     pub time_s: Vec<f64>,
-    /// Surface elevation (m)
+    /// Surface elevation (m), at the station's `level` point
+    /// ([`super::StationProbe`])
     pub eta_m: Vec<f64>,
-    /// Depth-averaged velocity along x (m/s)
+    /// Depth-averaged velocity along x (m/s), at its `current` point
     pub u_m_s: Vec<f64>,
-    /// Depth-averaged velocity along y (m/s)
+    /// Depth-averaged velocity along y (m/s), at its `current` point
     pub v_m_s: Vec<f64>,
-    /// Water depth (m)
+    /// Water depth (m), at its `current` point
     pub depth_m: Vec<f64>,
     /// With `[waves]`, the sea state at the station at the same times
     /// (empty without waves): the significant wave height (m), the peak
@@ -798,7 +833,7 @@ fn snapshot_metadata(name: &str, domain: &Domain) -> Vec<(&'static str, String)>
         ("build", crate::provenance::describe()),
     ];
     for s in &domain.stations {
-        let [x, y] = s.probe.position();
+        let [x, y] = s.level.position();
         metadata.push(("station", format!("{},{x:.1},{y:.1}", s.name)));
     }
     // Where each river's water enters, the centre of its element, the largest
@@ -842,6 +877,34 @@ fn snapshot_metadata(name: &str, domain: &Domain) -> Vec<(&'static str, String)>
         }
     }
     metadata
+}
+
+/// `station_points.csv`: where each station samples the model, its surface
+/// (`level`) and its current, depth and sea state (`current`): the point,
+/// its distance from the station's position and the depth of the bed there
+/// below mean sea level (`domain`'s `StationProbe`s). A station's current is
+/// comparable between runs whose `current` rows agree.
+fn write_station_points(path: &std::path::Path, domain: &Domain) -> Result<(), CaseError> {
+    use crate::io::CoordinateProjection;
+    let mut text = String::from("station,sample,x_m,y_m,lon,lat,offset_m,bed_depth_m\n");
+    for s in &domain.stations {
+        for (sample, probe, offset) in [
+            ("level", &s.level, s.level_offset_m),
+            ("current", &s.current, s.current_offset_m),
+        ] {
+            let [x, y] = probe.position();
+            let (lat, lon) = domain
+                .projection
+                .as_ref()
+                .map_or((f64::NAN, f64::NAN), |p| p.xy_to_geo(x, y));
+            let depth = -probe.evaluate(domain.bathymetry.element(probe.element()));
+            text += &format!(
+                "{},{sample},{x:.2},{y:.2},{lon:.6},{lat:.6},{offset:.2},{depth:.3}\n",
+                s.name
+            );
+        }
+    }
+    fs::write(path, text).map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))
 }
 
 /// The sea state at `probe` from the `surface` fields
@@ -1025,6 +1088,7 @@ impl<'a> Output<'a> {
         let csv = if stations.is_empty() {
             None
         } else {
+            write_station_points(&dir.join("station_points.csv"), domain)?;
             let path = dir.join("stations.csv");
             let mut csv = BufWriter::new(
                 File::create(&path).map_err(|e| io(&path.display().to_string(), &e))?,
@@ -1081,17 +1145,23 @@ impl<'a> Output<'a> {
         surface: &[&[f32]],
     ) -> Result<(), CaseError> {
         let domain = self.domain;
-        let samples: Vec<SWEPointSample> = domain
+        let bed = Some(&*domain.bathymetry);
+        let samples: Vec<StationSample> = domain
             .stations
             .iter()
-            .map(|s| s.probe.sample_swe(q, Some(&domain.bathymetry), H_VELOCITY))
+            .map(|s| {
+                StationSample::of(
+                    &s.level.sample_swe(q, bed, H_VELOCITY),
+                    &s.current.sample_swe(q, bed, H_VELOCITY),
+                )
+            })
             .collect();
         let sea: Option<Vec<[f64; 3]>> =
             self.wave_east.filter(|_| surface.len() >= 4).map(|east| {
                 domain
                     .stations
                     .iter()
-                    .map(|s| sea_state_at(&s.probe, surface, east))
+                    .map(|s| sea_state_at(&s.current, surface, east))
                     .collect()
             });
         self.record_samples(t, &samples, sea.as_deref())
@@ -1102,7 +1172,7 @@ impl<'a> Output<'a> {
     fn record_samples(
         &mut self,
         t: f64,
-        samples: &[SWEPointSample],
+        samples: &[StationSample],
         sea: Option<&[[f64; 3]]>,
     ) -> Result<(), CaseError> {
         let io = |what: &str, e: &dyn std::fmt::Display| CaseError::Io(format!("{what}: {e}"));
@@ -1111,7 +1181,7 @@ impl<'a> Output<'a> {
             series.eta_m.push(s.eta);
             series.u_m_s.push(s.u);
             series.v_m_s.push(s.v);
-            series.depth_m.push(s.h);
+            series.depth_m.push(s.depth);
             let waves = match sea.map(|sea| sea[j]) {
                 Some([hs, tp, from]) => {
                     series.hs_m.push(hs);
@@ -1125,7 +1195,7 @@ impl<'a> Output<'a> {
                 writeln!(
                     csv,
                     "{},{t},{},{},{},{}{waves}",
-                    series.name, s.eta, s.u, s.v, s.h
+                    series.name, s.eta, s.u, s.v, s.depth
                 )
                 .map_err(|e| io("stations.csv", &e))?;
             }
