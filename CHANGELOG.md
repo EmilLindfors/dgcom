@@ -6,6 +6,9 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **The turbulence's advection averages the layer transports to the w-cells element by element, in its kernel (`notes/3d-mixing.md` P4.4, 2026-11-13).** It staggered a whole second `LayerTransport` every stage (≈ 0.8 GB on the Chiloé 3D case, 12 ms a call there). On Chiloé's quarter hour the steps take 4.5 % less (95.6 s against 100.1) and the run's peak is 0.8 GB lower (20.1 GB in memory, 23.9 committed). Every value is the same bit for bit (a quarter hour's snapshots compared).
+  - **API:** `apply_w_point_transport_3d` advects fields at the w-points with the layers' transports; `LayerTransport::stagger_from` is gone.
+
 - **A 3D step on local time steps converts its stages in one pass per field (`notes/performance.md` P2.9, 2026-11-13).** Hours 3 → 3.25 of the Chiloé tide in 3D take 110.0 s against 114.5 s (two alternating pairs, 24 threads): the 3D stages 4.16 s a step against 4.45 s. Every value is the same bit for bit (the restarts at 3.25 h are the same file but for the run's name).
   - **The stage hook** copied the last stage's six fields and its density, restored the thin columns it had put at rest, and then converted the inventories over the copy; it took the dry nodes' inventories and masked the thin columns in serial loops over every column. The last values are now copied inside the conversion, element by element (`from_inventory_after`), the density is not copied (the pass sets it), the tracers go back to inventories in one pass (`inventory_of`), and the dry nodes and the mask run over the elements in parallel.
   - **Also in parallel:** Ω at the layer centres for output, and the step's scan for non-finite values.

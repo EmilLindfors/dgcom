@@ -267,7 +267,7 @@ impl ElementColumns<'_> {
     /// Add `weight` times the upward and downward fluxes through the
     /// surfaces of node `i`'s `n_cells` cells to `up` and `down`: the layers'
     /// `Ω_i`, or for the w-cells (one more) the mean of each layer's two, as
-    /// [`crate::solver::rhs::LayerTransport::stagger_from`] has it.
+    /// [`crate::solver::rhs::apply_w_point_transport_3d`] has it.
     fn add_fluxes(&self, i: usize, n_cells: usize, weight: f64, up: &mut [f64], down: &mut [f64]) {
         let omega = self.omega_at(i);
         let staggered = n_cells > self.n_levels;

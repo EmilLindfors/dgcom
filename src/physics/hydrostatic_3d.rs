@@ -92,7 +92,7 @@ use crate::solver::rhs::{
     ExtrapolationTracerBC3D, HorizontalViscosity3D, LayerTransport, MetricForm,
     MomentumAdvectionForm, PressureGradientForm, Rhs3DConfig, TracerBoundaryCondition3D,
     VerticalAdvection, ViscosityScratch3D, apply_coriolis_3d, apply_horizontal_viscosity_3d,
-    apply_momentum_transport_3d, apply_tracer_transport_3d, compute_momentum_rhs_3d,
+    apply_momentum_transport_3d, apply_w_point_transport_3d, compute_momentum_rhs_3d,
     compute_transport_rhs_3d, element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
     w_cell_thicknesses,
 };
@@ -201,7 +201,7 @@ where
     /// The bounds of the last [`Self::compute_dt`].
     last_time_step_limits: Mutex<Option<TimeStepLimits>>,
     /// Buffers of the turbulence's advection (allocated on first use).
-    w_transport_scratch: Mutex<Option<TurbulenceScratch>>,
+    turbulence_scratch: Mutex<Option<TurbulenceScratch>>,
     /// Buffers of the slow forcing (allocated on the first step).
     slow_forcing_scratch: Mutex<Option<SlowForcingScratch>>,
     /// `state` with the velocity of thin columns zeroed, for the momentum
@@ -402,7 +402,7 @@ where
             transport_scratch,
             implicit_split: Mutex::new(ImplicitSplit::default()),
             last_time_step_limits: Mutex::new(None),
-            w_transport_scratch: Mutex::new(None),
+            turbulence_scratch: Mutex::new(None),
             slow_forcing_scratch: Mutex::new(None),
             masked_scratch: Mutex::new(None),
             viscosity_scratch: Mutex::new(None),
@@ -801,7 +801,7 @@ where
     ///
     /// The turbulence is carried through the 3D stages as inventories over
     /// the control volumes of the w-points, with the layer transports
-    /// averaged to them ([`LayerTransport::stagger_from`]): a uniform `k`
+    /// averaged to them ([`crate::solver::rhs::apply_w_point_transport_3d`]): a uniform `k`
     /// stays uniform under any flow, and its inventory changes only through
     /// open faces. Upwind horizontally; at open faces the inflow carries the
     /// interior's value (zero gradient), and river water the column's own.
@@ -1647,22 +1647,19 @@ where
             return;
         };
         let mut guard = self
-            .w_transport_scratch
+            .turbulence_scratch
             .lock()
-            .expect("Failed to lock w_transport_scratch");
+            .expect("Failed to lock turbulence_scratch");
         let TurbulenceScratch {
-            w_cells,
+            d_sigma_w,
             advected,
             near,
         } = guard.get_or_insert_with(|| TurbulenceScratch {
-            w_cells: LayerTransport::new(self.mesh.n_elements, &self.ops, state.n_levels + 1)
-                .with_metric(self.metric_form()),
+            d_sigma_w: vec![0.0; state.n_levels + 1],
             advected: [vec![0.0; state.tke.len()], vec![0.0; state.tke.len()]],
             near: Neighbourhood::default(),
         });
-        crate::profiling::scope("turb: stagger", || {
-            w_cells.stagger_from(transport, elements)
-        });
+        w_cell_thicknesses(&transport.d_sigma, d_sigma_w);
         let nl = state.n_levels;
         let n_elements = self.mesh.n_elements;
         let len = state.tke.len() / n_elements;
@@ -1687,12 +1684,12 @@ where
         );
         crate::profiling::stop("turb: copy", copy);
         crate::profiling::scope("turb: kernel", || {
-            apply_tracer_transport_3d(
+            apply_w_point_transport_3d(
                 [
                     AdvectedTracer::new(&mut rhs.tke, tke, &ExtrapolationTracerBC3D),
                     AdvectedTracer::new(&mut rhs.gls, gls, &ExtrapolationTracerBC3D),
                 ],
-                w_cells,
+                transport,
                 &self.mesh,
                 &self.ops,
                 &self.geom,
@@ -1708,10 +1705,12 @@ where
             if let Some(rivers) = barotropic.rivers {
                 rivers.add_w_point_sources_at_own_value(out, advected, state.n_nodes, elements);
             }
-            w_cells.add_volume_sources(
+            // Each w-cell averages its two layers' continuity, sources
+            // included
+            transport.add_volume_sources(
                 out,
                 advected,
-                &w_cells.d_sigma,
+                d_sigma_w,
                 &state.eta.data,
                 &self.bathymetry,
                 &self.geom,
@@ -2586,8 +2585,8 @@ where
 
 /// Buffers of [`Hydrostatic3D`]'s advection of the turbulence.
 struct TurbulenceScratch {
-    /// The w-cells of the layer transports.
-    w_cells: LayerTransport,
+    /// The w-cells' σ-thicknesses ([`w_cell_thicknesses`]).
+    d_sigma_w: Vec<f64>,
     /// `k` and `ψ` as advected: the end w-points at their neighbours' values.
     advected: [Vec<f64>; 2],
     /// The elements of a call on a list and their face neighbours.

@@ -1113,86 +1113,33 @@ impl LayerTransport {
         self.surface_residual = residual.max(0.0);
     }
 
-    /// The transports of the control volumes around the w-points of `layers`
-    /// (the w-cells), for advecting a field that lives at the w-points (the
-    /// turbulence of [`crate::physics::GlsMixing`]; ROMS `gls_corstep`).
-    /// `self` must have one level more than `layers`.
-    ///
-    /// The w-cell of an interior w-point spans from the centre of the layer
-    /// below to the centre of the layer above; those of the bed and the
-    /// surface are the lower half of the bed layer and the upper half of the
-    /// top layer ([`w_cell_thicknesses`]). Each carries half of the
-    /// horizontal transport of the two layers it overlaps, nodally and on
-    /// the faces, and passes the mean of the layer's two `Ω` through a layer
-    /// centre (none through the bed and the surface). Averaging the
-    /// continuity of the two layers gives the w-cell's, so a field advected
-    /// with these fluxes keeps the constancy and conservation of
-    /// [`apply_tracer_transport_3d`].
-    pub fn stagger_from(&mut self, layers: &LayerTransport, elements: Blocks) {
-        let nl = layers.n_levels;
-        assert_eq!(self.n_levels, nl + 1, "w-cells of {nl} layers");
-        let nw = nl + 1;
-        self.metric = layers.metric;
-        self.subcell_elements
-            .copy_from_slice(&layers.subcell_elements);
+    /// Element `k`'s block of every field the transport kernels read.
+    fn element(&self, k: usize) -> ElementTransport<'_> {
+        // Every field is `[element][…]`
         let n_elements = self.subcell_elements.len();
-        // Every field is `[element][…][level]`: element `k`'s block of the
-        // w-cells' is made from its block of the layers'
-        fn block(values: &[f64], k: usize, n_elements: usize) -> &[f64] {
+        let block = |values: &'_ [f64]| {
             let len = values.len() / n_elements;
-            &values[k * len..(k + 1) * len]
+            k * len..(k + 1) * len
+        };
+        ElementTransport {
+            n_levels: self.n_levels,
+            hu: &self.hu[block(&self.hu)],
+            hv: &self.hv[block(&self.hv)],
+            face: &self.face[block(&self.face)],
+            subcell: &self.subcell[block(&self.subcell)],
+            subcell_element: self.subcell_elements[k],
+            omega: &self.omega[block(&self.omega)],
+            dt_over_depth: &self.dt_over_depth[block(&self.dt_over_depth)],
+            d_sigma: &self.d_sigma,
+            metric: self.metric,
         }
-        for_each_block(
-            elements,
-            [
-                &mut self.hu[..],
-                &mut self.hv[..],
-                &mut self.face[..],
-                &mut self.subcell[..],
-                &mut self.omega[..],
-            ],
-            || (),
-            |_, k, [hu, hv, face, subcell, omega]| {
-                for (w_cells, layer_values) in [
-                    (hu, &layers.hu),
-                    (hv, &layers.hv),
-                    (face, &layers.face),
-                    (subcell, &layers.subcell),
-                ] {
-                    for (w, l) in w_cells
-                        .chunks_exact_mut(nw)
-                        .zip(block(layer_values, k, n_elements).chunks_exact(nl))
-                    {
-                        w[0] = 0.5 * l[0];
-                        for j in 1..nl {
-                            w[j] = 0.5 * (l[j - 1] + l[j]);
-                        }
-                        w[nl] = 0.5 * l[nl - 1];
-                    }
-                }
-                for (w, omega) in omega
-                    .chunks_exact_mut(nw + 1)
-                    .zip(block(&layers.omega, k, n_elements).chunks_exact(nl + 1))
-                {
-                    w[0] = 0.0;
-                    for l in 0..nl {
-                        w[l + 1] = 0.5 * (omega[l] + omega[l + 1]);
-                    }
-                    w[nw] = 0.0;
-                }
-            },
-        );
-        w_cell_thicknesses(&layers.d_sigma, &mut self.d_sigma);
-        // Each w-cell averages its two layers' continuity, sources included
-        self.volume_source.copy_from_slice(&layers.volume_source);
-        self.surface_residual = layers.surface_residual;
     }
 
     /// Add the inventory tendency of [`Self::volume_source`]'s water to
     /// `rhs` (`∂(H C)/∂t` of a field `field` over cells of σ-thickness
     /// `cells`: the layers' `Δσ_l`, or the w-cells' of
-    /// [`w_cell_thicknesses`], whose sources these transports' are, see
-    /// [`Self::stagger_from`]): `Δσ_c s C`, the water at the concentration
+    /// [`w_cell_thicknesses`], whose sources are the layers', averaged, see
+    /// [`apply_w_point_transport_3d`]): `Δσ_c s C`, the water at the concentration
     /// it joins, so the source changes no concentration (constancy) and
     /// adds exactly what its volume holds (conservation).
     ///
@@ -1258,7 +1205,7 @@ impl LayerTransport {
 
 /// σ-thicknesses of the w-cells of layers of σ-thickness `d_sigma` into
 /// `out` (one more): half the bed layer, the mean of each pair of adjacent
-/// layers, half the top layer (see [`LayerTransport::stagger_from`]). They
+/// layers, half the top layer (see [`apply_w_point_transport_3d`]). They
 /// sum to one, and a w-cell's thickness is `D` times its value.
 pub fn w_cell_thicknesses(d_sigma: &[f64], out: &mut [f64]) {
     let nl = d_sigma.len();
@@ -1682,6 +1629,7 @@ impl<'a> AdvectedTracer<'a> {
 /// Up to two tracers go through each element together, sharing
 /// its transports; each tracer's tendency is what it would be alone, to the
 /// bit.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_tracer_transport_3d<const N: usize>(
     tracers: [AdvectedTracer; N],
     transport: &LayerTransport,
@@ -1692,9 +1640,75 @@ pub fn apply_tracer_transport_3d<const N: usize>(
     vertical: VerticalAdvection,
     elements: Blocks,
 ) {
-    let (nn, nl) = (ops.n_nodes, transport.n_levels);
+    let cells = Cells::Layers;
+    advect_fields(
+        tracers, transport, cells, mesh, ops, geom, boundaries, vertical, elements,
+    );
+}
+
+/// [`apply_tracer_transport_3d`] of fields that live at the w-points
+/// (`n_levels + 1` per column, bed first: the turbulence of
+/// [`crate::physics::GlsMixing`]; ROMS `gls_corstep`), over the control
+/// volumes around them (the w-cells) and with the transports of the layers
+/// `layers`, averaged to them.
+///
+/// The w-cell of an interior w-point spans from the centre of the layer
+/// below to the centre of the layer above; those of the bed and the surface
+/// are the lower half of the bed layer and the upper half of the top layer
+/// ([`w_cell_thicknesses`]). Each carries half of the horizontal transport
+/// of the two layers it overlaps, nodally and on the faces, and passes the
+/// mean of the layer's two `Ω` through a layer centre (none through the bed
+/// and the surface). Averaging the continuity of the two layers gives the
+/// w-cell's (its volume source is the layers', [`LayerTransport::volume_source`]
+/// over [`w_cell_thicknesses`]), so these fields keep the constancy and
+/// conservation of [`apply_tracer_transport_3d`]. The end w-cells shed
+/// without the bound of [`LayerTransport::dt_over_depth`]. Each element's
+/// w-cells are built as the kernel reaches it, from its layers' block: no
+/// second copy of the transports.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_w_point_transport_3d<const N: usize>(
+    fields: [AdvectedTracer; N],
+    layers: &LayerTransport,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    boundaries: &Boundaries3D,
+    vertical: VerticalAdvection,
+    elements: Blocks,
+) {
+    let cells = Cells::WPoints;
+    advect_fields(
+        fields, layers, cells, mesh, ops, geom, boundaries, vertical, elements,
+    );
+}
+
+/// The control volumes a field is advected over: the layers, or the
+/// w-cells between their centres ([`apply_w_point_transport_3d`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cells {
+    Layers,
+    WPoints,
+}
+
+/// [`apply_tracer_transport_3d`] and [`apply_w_point_transport_3d`].
+#[allow(clippy::too_many_arguments)]
+fn advect_fields<const N: usize>(
+    tracers: [AdvectedTracer; N],
+    transport: &LayerTransport,
+    cells: Cells,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    boundaries: &Boundaries3D,
+    vertical: VerticalAdvection,
+    elements: Blocks,
+) {
+    let nn = ops.n_nodes;
+    let nl = match cells {
+        Cells::Layers => transport.n_levels,
+        Cells::WPoints => transport.n_levels + 1,
+    };
     let context = LayerContext {
-        transport,
         mesh,
         ops,
         geom,
@@ -1707,8 +1721,16 @@ pub fn apply_tracer_transport_3d<const N: usize>(
     for_each_block(
         elements,
         tracers.map(|t| &mut t.rhs[..n]),
-        || TransportScratch::take(ops, nl),
-        |scratch, k, mut rhs_k| {
+        || {
+            let w_cells = (cells == Cells::WPoints).then(WCellBlock::take);
+            (TransportScratch::take(ops, nl), w_cells)
+        },
+        |(scratch, w_cells), k, mut rhs_k| {
+            let transport = match w_cells {
+                Some(w_cells) => w_cells.stagger(transport, k),
+                None => transport.element(k),
+            };
+            let transport = &transport;
             let inflow = |t: usize, f, fi, node, tag, interior, flux, l| {
                 let (_, _, bc, exterior, _) = fields[t];
                 exterior
@@ -1725,8 +1747,9 @@ pub fn apply_tracer_transport_3d<const N: usize>(
                         })
                     })
             };
-            if context.levels_at_once(k, true) {
+            if levels_at_once(transport, true) {
                 let div = context.flux_divergence_levels(
+                    transport,
                     k,
                     fields.map(|(tracer, ..)| tracer),
                     inflow,
@@ -1743,7 +1766,9 @@ pub fn apply_tracer_transport_3d<const N: usize>(
                         let inflow = |f, fi, node, tag, interior, flux| {
                             inflow(t, f, fi, node, tag, interior, flux, l)
                         };
-                        let div = context.flux_divergence(k, l, fields[t].0, true, inflow, scratch);
+                        let field = fields[t].0;
+                        let div =
+                            context.flux_divergence(transport, k, l, field, true, inflow, scratch);
                         for (i, &d) in div.iter().enumerate() {
                             rhs_k[i * nl + l] = -d;
                         }
@@ -1768,7 +1793,7 @@ fn subtract_vertical_flux(
     field: &[f64],
     reference: Option<&[f64]>,
     range: (f64, f64),
-    transport: &LayerTransport,
+    transport: &ElementTransport,
     k: usize,
     nn: usize,
     scheme: VerticalAdvection,
@@ -1783,13 +1808,13 @@ fn subtract_vertical_flux(
     } = scratch;
     for i in 0..nn {
         let idx = k * nn + i;
-        let omega = &transport.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
+        let omega = &transport.omega[i * (nl + 1)..(i + 1) * (nl + 1)];
         let column = &field[idx * nl..(idx + 1) * nl];
         let shed = EndLayerShed {
             range,
-            dt_over_depth: transport.dt_over_depth[idx],
+            dt_over_depth: transport.dt_over_depth[i],
         };
-        scheme.surface_values(column, omega, &transport.d_sigma, shed, slope, flux);
+        scheme.surface_values(column, omega, transport.d_sigma, shed, slope, flux);
         if let Some(reference) = reference {
             let reference = &reference[idx * nl..(idx + 1) * nl];
             let unbounded = EndLayerShed {
@@ -1799,7 +1824,7 @@ fn subtract_vertical_flux(
             scheme.surface_values(
                 reference,
                 omega,
-                &transport.d_sigma,
+                transport.d_sigma,
                 unbounded,
                 slope,
                 reference_surface,
@@ -2245,7 +2270,6 @@ pub fn apply_momentum_transport_3d(
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
     let split = form == MomentumAdvectionForm::Split;
     let context = LayerContext {
-        transport,
         mesh,
         ops,
         geom,
@@ -2258,6 +2282,7 @@ pub fn apply_momentum_transport_3d(
         [&mut rhs_u[..n], &mut rhs_v[..n]],
         || TransportScratch::take(ops, nl),
         |scratch, k, [rhs_u, rhs_v]| {
+            let transport = &transport.element(k);
             let exterior = [exterior_u, exterior_v];
             let inflow = |t: usize, _, _, node, tag, interior, _, l| {
                 exterior[t]
@@ -2265,8 +2290,8 @@ pub fn apply_momentum_transport_3d(
                     .unwrap_or(interior)
             };
             let mut rhs_k = [rhs_u, rhs_v];
-            if context.levels_at_once(k, split) {
-                let div = context.flux_divergence_levels(k, [u, v], inflow, scratch);
+            if levels_at_once(transport, split) {
+                let div = context.flux_divergence_levels(transport, k, [u, v], inflow, scratch);
                 for (rhs_k, div) in rhs_k.iter_mut().zip(div.chunks_exact(nn * nl)) {
                     for (r, &d) in rhs_k.iter_mut().zip(div) {
                         *r -= d;
@@ -2278,7 +2303,8 @@ pub fn apply_momentum_transport_3d(
                         let inflow = |f, fi, node, tag, interior, flux| {
                             inflow(t, f, fi, node, tag, interior, flux, l)
                         };
-                        let div = context.flux_divergence(k, l, field, split, inflow, scratch);
+                        let div =
+                            context.flux_divergence(transport, k, l, field, split, inflow, scratch);
                         for (i, &d) in div.iter().enumerate() {
                             rhs_k[i * nl + l] -= d;
                         }
@@ -2294,9 +2320,120 @@ pub fn apply_momentum_transport_3d(
     );
 }
 
-/// What the horizontal flux divergence of a layer needs.
+/// One element's block of a [`LayerTransport`] (or of its w-cells,
+/// [`WCellBlock`]): what the transport kernels read of element `k`, indexed
+/// from the element's first node.
+struct ElementTransport<'a> {
+    n_levels: usize,
+    /// `[node][level]`
+    hu: &'a [f64],
+    hv: &'a [f64],
+    /// `[face · n_face_nodes + face node][level]`
+    face: &'a [f64],
+    /// `[subcell interface][level]`
+    subcell: &'a [f64],
+    subcell_element: bool,
+    /// `[node][level + 1]`
+    omega: &'a [f64],
+    /// `[node]`
+    dt_over_depth: &'a [f64],
+    d_sigma: &'a [f64],
+    metric: MetricForm,
+}
+
+/// One element's w-cells of a [`LayerTransport`]
+/// ([`apply_w_point_transport_3d`]), built as the kernel reaches it.
+#[derive(Default)]
+struct WCellBlock {
+    hu: Vec<f64>,
+    hv: Vec<f64>,
+    face: Vec<f64>,
+    /// Empty unless the element is a subcell element
+    subcell: Vec<f64>,
+    omega: Vec<f64>,
+    /// Zero: the end w-cells' outflow is not bounded
+    dt_over_depth: Vec<f64>,
+    d_sigma: Vec<f64>,
+}
+
+impl WCellBlock {
+    /// Buffers from this thread's cache (they take their sizes in
+    /// [`Self::stagger`]).
+    fn take() -> Pooled<Self> {
+        Pooled::take(|_: &Self| true, Self::default)
+    }
+
+    /// Element `k`'s w-cells of `layers` (see [`apply_w_point_transport_3d`]).
+    fn stagger<'a>(&'a mut self, layers: &'a LayerTransport, k: usize) -> ElementTransport<'a> {
+        let element = layers.element(k);
+        let nl = element.n_levels;
+        let nw = nl + 1;
+        // Only a subcell element reads its subcell fluxes
+        let subcell = if element.subcell_element {
+            element.subcell
+        } else {
+            &[]
+        };
+        for (w_cells, layer_values) in [
+            (&mut self.hu, element.hu),
+            (&mut self.hv, element.hv),
+            (&mut self.face, element.face),
+            (&mut self.subcell, subcell),
+        ] {
+            w_cells.resize(layer_values.len() / nl * nw, 0.0);
+            for (w, l) in w_cells
+                .chunks_exact_mut(nw)
+                .zip(layer_values.chunks_exact(nl))
+            {
+                w[0] = 0.5 * l[0];
+                for j in 1..nl {
+                    w[j] = 0.5 * (l[j - 1] + l[j]);
+                }
+                w[nl] = 0.5 * l[nl - 1];
+            }
+        }
+        self.omega
+            .resize(element.omega.len() / (nl + 1) * (nw + 1), 0.0);
+        for (w, omega) in self
+            .omega
+            .chunks_exact_mut(nw + 1)
+            .zip(element.omega.chunks_exact(nl + 1))
+        {
+            w[0] = 0.0;
+            for l in 0..nl {
+                w[l + 1] = 0.5 * (omega[l] + omega[l + 1]);
+            }
+            w[nw] = 0.0;
+        }
+        // Never written: stays zero
+        self.dt_over_depth.resize(element.dt_over_depth.len(), 0.0);
+        self.d_sigma.resize(nw, 0.0);
+        w_cell_thicknesses(element.d_sigma, &mut self.d_sigma);
+        ElementTransport {
+            n_levels: nw,
+            hu: &self.hu,
+            hv: &self.hv,
+            face: &self.face,
+            subcell: &self.subcell,
+            subcell_element: element.subcell_element,
+            omega: &self.omega,
+            dt_over_depth: &self.dt_over_depth,
+            d_sigma: &self.d_sigma,
+            metric: element.metric,
+        }
+    }
+}
+
+/// Whether [`LayerContext::flux_divergence_levels`] takes the element of
+/// `transport` (in split form, unless its layers move through the subcell
+/// interfaces).
+fn levels_at_once(transport: &ElementTransport, split: bool) -> bool {
+    split && !transport.subcell_element
+}
+
+/// What the horizontal flux divergence of a layer needs besides the
+/// element's transports.
 struct LayerContext<'a> {
-    transport: &'a LayerTransport,
     mesh: &'a Mesh2D,
     ops: &'a DGOperators2D,
     geom: &'a GeometricFactors2D,
@@ -2304,7 +2441,8 @@ struct LayerContext<'a> {
 }
 
 impl LayerContext<'_> {
-    /// `∇·(Q_l φ)` on element `k`, layer `l`, of the field `φ` (layout of
+    /// `∇·(Q_l φ)` on element `k` (whose transports are `transport`), layer
+    /// `l`, of the field `φ` (layout of
     /// [`Solution3D`]): in the element in split form
     /// ([`advective_divergence_element`]) if `split`, else conservative
     /// ([`transport_divergence_element`] of `Q_l φ`); face flux `F_l φ↑`
@@ -2312,8 +2450,10 @@ impl LayerContext<'_> {
     /// `inflow(face, face_node, node, tag, interior value, F_l)`, with `node`
     /// the face node's `[element][node]` index. Written to (and returned
     /// from) `scratch.div`.
+    #[allow(clippy::too_many_arguments)]
     fn flux_divergence<'s>(
         &self,
+        transport: &ElementTransport,
         k: usize,
         l: usize,
         field: &[f64],
@@ -2321,7 +2461,7 @@ impl LayerContext<'_> {
         inflow: impl Fn(usize, usize, usize, BoundaryTag, f64, f64) -> f64,
         scratch: &'s mut TransportScratch,
     ) -> &'s [f64] {
-        let (ops, transport) = (self.ops, self.transport);
+        let ops = self.ops;
         let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, transport.n_levels);
         let TransportScratch {
             hu,
@@ -2335,17 +2475,15 @@ impl LayerContext<'_> {
             ..
         } = scratch;
         for i in 0..nn {
-            let idx = (k * nn + i) * nl + l;
-            hu[i] = transport.hu[idx];
-            hv[i] = transport.hv[idx];
-            phi[i] = field[idx];
+            hu[i] = transport.hu[i * nl + l];
+            hv[i] = transport.hv[i * nl + l];
+            phi[i] = field[(k * nn + i) * nl + l];
         }
         let el = ElementIndex::new(k);
         for f in 0..4 {
             let exterior = self.boundaries.exterior(self.mesh, el, f);
             for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                let slot = (k * 4 + f) * nfn + fi;
-                let flux = transport.face[slot * nl + l];
+                let flux = transport.face[(f * nfn + fi) * nl + l];
                 let interior = field[(k * nn + node) * nl + l];
                 let upwind = match exterior {
                     _ if flux >= 0.0 => interior,
@@ -2360,18 +2498,17 @@ impl LayerContext<'_> {
                 face[f * nfn + fi] = flux * upwind;
             }
         }
-        if transport.subcell_elements[k] {
+        if transport.subcell_element {
             // Through the subcell interfaces the 2D wet/dry kernel moves the
             // water through, with the central value: no diffusion along
             // σ-levels that cut steeply through the stratification (upwind
             // moved a steep shore's stratification by 8e-3 °C)
             let n1 = ops.n_1d;
-            let n_sub = subcell_interfaces(n1);
             for dir in 0..2 {
                 for line in 0..n1 {
                     for a in 0..n1 - 1 {
                         let slot = subcell_slot(n1, dir, line, a);
-                        let flux = transport.subcell[(k * n_sub + slot) * nl + l];
+                        let flux = transport.subcell[slot * nl + l];
                         let (ia, ib) =
                             (line_node(n1, dir, line, a), line_node(n1, dir, line, a + 1));
                         sub[slot] = flux * 0.5 * (phi[ia] + phi[ib]);
@@ -2396,27 +2533,22 @@ impl LayerContext<'_> {
         div
     }
 
-    /// Whether [`Self::flux_divergence_levels`] takes element `k` (in split
-    /// form, unless its layers move through the subcell interfaces).
-    fn levels_at_once(&self, k: usize, split: bool) -> bool {
-        split && !self.transport.subcell_elements[k]
-    }
-
     /// [`Self::flux_divergence`] in split form of every layer of element `k`
     /// at once, for `N` (at most [`MAX_FIELDS`]) fields
     /// ([`advective_divergence_levels`], the same to the bit), into (and
     /// returned from) `scratch.div_levels`: field `t`'s `[node][level]` block
     /// at `t · n_nodes · n_levels`. `inflow` takes the field's index first and
-    /// the level last. Only where [`Self::levels_at_once`].
+    /// the level last. Only where [`levels_at_once`].
     fn flux_divergence_levels<'s, const N: usize>(
         &self,
+        transport: &ElementTransport,
         k: usize,
         fields: [&[f64]; N],
         inflow: impl Fn(usize, usize, usize, usize, BoundaryTag, f64, f64, usize) -> f64,
         scratch: &'s mut TransportScratch,
     ) -> &'s [f64] {
         const { assert!(N <= MAX_FIELDS, "the scratch holds MAX_FIELDS fields") };
-        let (ops, transport) = (self.ops, self.transport);
+        let ops = self.ops;
         let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, transport.n_levels);
         let TransportScratch {
             face_levels,
@@ -2430,7 +2562,7 @@ impl LayerContext<'_> {
         for f in 0..4 {
             let exterior = self.boundaries.exterior(self.mesh, el, f);
             for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                let slot = (k * 4 + f) * nfn + fi;
+                let slot = f * nfn + fi;
                 let fluxes = &transport.face[slot * nl..(slot + 1) * nl];
                 for (t, field) in fields.iter().enumerate() {
                     let interior = &field[(k * nn + node) * nl..(k * nn + node + 1) * nl];
@@ -2474,8 +2606,8 @@ impl LayerContext<'_> {
             self.geom,
             transport.metric,
             k,
-            &transport.hu[block.clone()],
-            &transport.hv[block.clone()],
+            transport.hu,
+            transport.hv,
             fields.map(|field| &field[block.clone()]),
             [(); N].map(|()| faces.next().expect("a face block per field")),
             [(); N].map(|()| divs.next().expect("a divergence block per field")),
@@ -2743,6 +2875,27 @@ mod tests {
                     range: UNBOUNDED,
                 }],
                 transport,
+                &self.mesh,
+                &self.ops,
+                &self.geom,
+                &self.boundaries,
+                VerticalAdvection::default(),
+                self.mesh.n_elements.into(),
+            );
+            rhs
+        }
+
+        /// [`Self::tracer_rhs`] of a field at the w-points
+        /// ([`apply_w_point_transport_3d`]).
+        fn w_point_rhs(&self, layers: &LayerTransport, field: &[f64]) -> Vec<f64> {
+            let mut rhs = vec![f64::NAN; field.len()];
+            apply_w_point_transport_3d(
+                [AdvectedTracer::new(
+                    &mut rhs,
+                    field,
+                    &ExtrapolationTracerBC3D,
+                )],
+                layers,
                 &self.mesh,
                 &self.ops,
                 &self.geom,
@@ -4676,7 +4829,7 @@ mod tests {
         assert_eq!(w[6], 0.5 * d[5]);
     }
 
-    /// The w-cells of the layer transports ([`LayerTransport::stagger_from`])
+    /// The w-cells of the layer transports ([`apply_w_point_transport_3d`])
     /// carry the layers' water: their fluxes add up to the layers', `Ω`
     /// vanishes at the bed and the surface, a uniform field at the w-points
     /// changes its inventory exactly as its w-cell's thickness,
@@ -4696,29 +4849,45 @@ mod tests {
                 case.sigma.n_levels(),
             );
             let nw = nl + 1;
-            let mut w_cells = LayerTransport::new(ne, &case.ops, nw);
-            w_cells.stagger_from(&layers, layers.subcell_elements.len().into());
-            for (cells, layer) in [
-                (&w_cells.hu, &layers.hu),
-                (&w_cells.hv, &layers.hv),
-                (&w_cells.face, &layers.face),
-            ] {
-                for (w, l) in cells.chunks_exact(nw).zip(layer.chunks_exact(nl)) {
-                    let (sum_w, sum_l) = (w.iter().sum::<f64>(), l.iter().sum::<f64>());
-                    assert!((sum_w - sum_l).abs() <= 1e-14 * sum_l.abs().max(1.0));
+            let mut block = WCellBlock::default();
+            let mut hu_scale = 0.0_f64;
+            for k in 0..ne {
+                let layer = layers.element(k);
+                let w_cells = block.stagger(&layers, k);
+                assert_eq!(w_cells.n_levels, nw);
+                let subcell = if layer.subcell_element {
+                    layer.subcell
+                } else {
+                    &[]
+                };
+                for (cells, layer) in [
+                    (w_cells.hu, layer.hu),
+                    (w_cells.hv, layer.hv),
+                    (w_cells.face, layer.face),
+                    (w_cells.subcell, subcell),
+                ] {
+                    assert_eq!(cells.len() / nw, layer.len() / nl);
+                    for (w, l) in cells.chunks_exact(nw).zip(layer.chunks_exact(nl)) {
+                        let (sum_w, sum_l) = (w.iter().sum::<f64>(), l.iter().sum::<f64>());
+                        assert!((sum_w - sum_l).abs() <= 1e-14 * sum_l.abs().max(1.0));
+                    }
                 }
+                for omega in w_cells.omega.chunks_exact(nw + 1) {
+                    assert_eq!((omega[0], omega[nw]), (0.0, 0.0));
+                }
+                assert!(w_cells.dt_over_depth.iter().all(|&d| d == 0.0));
+                hu_scale = hu_scale.max(max_abs(w_cells.hu.iter().copied()));
             }
-            for omega in w_cells.omega.chunks_exact(nw + 1) {
-                assert_eq!((omega[0], omega[nw]), (0.0, 0.0));
-            }
+            let mut d_sigma_w = vec![0.0; nw];
+            w_cell_thicknesses(&layers.d_sigma, &mut d_sigma_w);
 
             let c = 0.37;
             let n = ne * nn * nw;
-            let rhs = case.tracer_rhs(&w_cells, &vec![c; n], &ExtrapolationTracerBC3D);
+            let rhs = case.w_point_rhs(&layers, &vec![c; n]);
             let scale = c * max_abs(case.eta_rate.iter().copied());
             for idx in 0..ne * nn {
                 for j in 0..nw {
-                    let expected = c * w_cells.d_sigma[j] * case.eta_rate[idx];
+                    let expected = c * d_sigma_w[j] * case.eta_rate[idx];
                     let got = rhs[idx * nw + j];
                     assert!(
                         (got - expected).abs() < 1e-12 * scale,
@@ -4727,19 +4896,62 @@ mod tests {
                 }
             }
 
-            if !closed {
-                continue;
-            }
             // A field that varies in x, y and z, upwind horizontally and
-            // limited-Akima vertically: the inventory tendency integrates to
-            // zero
+            // limited-Akima vertically
             let field: Vec<f64> = (0..n)
                 .map(|m| {
                     let (idx, j) = (m / nw, m % nw);
                     case.state.temp[idx * nl + j.min(nl - 1)] + 0.5 * j as f64
                 })
                 .collect();
-            let rhs = case.tracer_rhs(&w_cells, &field, &ExtrapolationTracerBC3D);
+            let rhs = case.w_point_rhs(&layers, &field);
+
+            // The w-cells built per element are those of a whole staggered
+            // copy of the transports, advected as layers, to the bit; also
+            // with two elements moving their layers through the subcell
+            // interfaces (fluxes of no pattern: only the kernels are compared)
+            let mut thin = case.transport();
+            for k in [0, 5] {
+                thin.subcell_elements[k] = true;
+                let len = thin.subcell.len() / ne;
+                for (j, flux) in thin.subcell[k * len..(k + 1) * len].iter_mut().enumerate() {
+                    *flux = ((j as f64 + 0.3) * 12.9898).sin();
+                }
+            }
+            for layers in [&layers, &thin] {
+                let mut copy = LayerTransport::new(ne, &case.ops, nw).with_metric(layers.metric);
+                copy.subcell_elements
+                    .copy_from_slice(&layers.subcell_elements);
+                w_cell_thicknesses(&layers.d_sigma, &mut copy.d_sigma);
+                for k in 0..ne {
+                    let w_cells = block.stagger(layers, k);
+                    for (all, own) in [
+                        (&mut copy.hu, w_cells.hu),
+                        (&mut copy.hv, w_cells.hv),
+                        (&mut copy.face, w_cells.face),
+                        (&mut copy.subcell, w_cells.subcell),
+                        (&mut copy.omega, w_cells.omega),
+                    ] {
+                        // A subcell block of an element that does not read
+                        // it is empty; the copy's stays zero
+                        let len = all.len() / ne;
+                        all[k * len..k * len + own.len()].copy_from_slice(own);
+                    }
+                }
+                let staggered = case.tracer_rhs(&copy, &field, &ExtrapolationTracerBC3D);
+                let fused = case.w_point_rhs(layers, &field);
+                assert!(
+                    fused
+                        .iter()
+                        .zip(&staggered)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+            }
+
+            if !closed {
+                continue;
+            }
+            // The inventory tendency integrates to zero
             let integral = |values: &[f64]| -> f64 {
                 (0..ne)
                     .map(|k| {
@@ -4750,7 +4962,6 @@ mod tests {
                     })
                     .sum()
             };
-            let hu_scale = max_abs(w_cells.hu.iter().copied());
             let scale = integral(&vec![hu_scale / 1000.0; n]) * max_abs(field.iter().copied());
             let tendency = integral(&rhs);
             assert!(
