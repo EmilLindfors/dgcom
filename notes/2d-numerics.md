@@ -143,7 +143,7 @@ The first step of #231: uniform P1–P4 at about equal unknowns on the Mausund s
   | 800 m, P4 | 1,203,275 | 3,766 | 18.9 cm, +11 min | 4.1 cm | 6.4 cm | 1.2 / 2.6 / 0.7 cm |
   | 500 m, P3 (reference) | 1,514,832 | 3,530 | 18.5 cm, +9 min | 3.9 cm | 6.5 cm | – |
 
-  The 667 m and 800 m runs needed `boundary.atlas.max_closed = 0.08`: 11 of 203 and 9 of 173 open faces lie outside the atlas, over the 5 % limit the 500 m mesh stays under.
+  The 667 m and 800 m runs needed `boundary.atlas.max_closed = 0.08`: 11 of 203 and 9 of 173 open faces lie outside the atlas, over the 5 % limit the 500 m mesh stays under. By length (since 2026-11-14) all three meshes leave 1.2–1.3 % uncovered and need no override (`notes/case-files.md`, "`max_closed` by length").
 - **Elements that hold a dry node in some frame after 3 h** (depth ≤ 1 mm at a node, 10 min frames; permanently part-dry shore elements count): Chiloé 17.6 % at P1 on 333 m, 22.1 % at P2 on 500 m, 26.5 % at P3 on 667 m, 28.9 % at P4 on 800 m, holding 1.7, 2.4, 3.1 and 3.7 % of the area. Mausund 38 % (P1, 133 m), 48 % (P2, 200 m), 51 % (P3, 267 m), 54 % (P4, 300 m), holding 18, 23, 29 and 39 % of the area.
 - **Read.**
   - P2 is converged for the tide at the gauges. On Chiloé it is within 1–3 cm of P3 on the same mesh, and no run of P2 or above moves a gauge score by more than 1 cm: what is left (Puerto Montt's 19 cm, its range 12 % over) is the bed and the basin, not the order (`notes/case-files.md`, Chiloé). At Mausund P2 to P4 on one mesh is 5.2 to 4.7 cm for 5 × the wall time.

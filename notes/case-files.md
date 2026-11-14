@@ -155,7 +155,7 @@ stations = "stations.toml"
 - **`[boundary.atlas]`:** a `TidalAtlas` file (the text format of `norkyst_boundary_tides`) projected onto the tag's boundary nodes (`TidalAtlas::boundary_tides`), nodal-corrected from `run.start`, ramped over `ramp_hours`.
   - It needs a placed mesh and `run.start`, since atlas lags are Greenwich lags. Validation refuses it without them.
   - An atlas with currents gives the external velocity. One without them takes `boundary.velocity`.
-- **Coverage:** before the boundary is built, `BoundaryCoverage::of_atlas` walls the open faces with a node farther than `coverage_m` (default 5 km, `froya_real_data`'s `ATLAS_COVERAGE`) from an atlas point. More than `max_closed` (default 0.05, the example's `max_closed`) of the tag's faces is an error, as in the example. The domain's notes record how many faces were closed.
+- **Coverage:** before the boundary is built, `BoundaryCoverage::of_atlas` walls the open faces with a node farther than `coverage_m` (default 5 km, `froya_real_data`'s `ATLAS_COVERAGE`) from an atlas point. More than `max_closed` (default 0.05, the example's `max_closed`) of the tag's faces is an error, as in the example. The domain's notes record how many faces were closed. Since 2026-11-14 the share is of the boundary's length, not of its faces ("`max_closed` by length" below).
 - **Options:** `correction = "theory"` (`TidalAtlas::infer_from_theory`: K2 and P1 at their equilibrium ratios, the minor semidiurnals by admittance) and `transport_scaling` (`BoundaryTides::with_transport_scaling`, the example's `tide_transport`). The gauge correction, the example's default `gauge_gains`/`gauge_ratios` from a gauge record and a station atlas, is not in yet.
 - **Stage 1 of P8.2, bit for bit:** `cases/froya` with the atlas against `froya_real_data gauge_gains= gauge_ratios= hours=1 snapshot_minutes=10 station_minutes=10 rest_hours=0` gives **0 values differing** in all 7 frames: 12 constituents at 1,139 boundary nodes, 0 of 381 faces closed, 1,740 steps each.
 - **`cases/bodo`:**
@@ -166,6 +166,14 @@ stations = "stations.toml"
   - An atlas holding one tide (M2, S2, K1) at every point forces the same tide as `tide` with those constants: the largest difference at the stations over 6 h is 7e-15 m on a tide of up to 0.39 m. This checks that the two routes share the nodal corrections and the Greenwich-lag convention.
   - An atlas covering the lower quarter of a mouth walls the rest, leaving 2 open faces, when `max_closed` allows it, and is refused at the default.
   - A unit test checks that an atlas needs a placed mesh and a start.
+
+### `max_closed` by length (2026-11-14)
+
+- **Before:** `max_closed` was a share of the tag's faces. An open boundary across the sea has fewer faces on a coarser mesh, while the uncovered stretches are fjord arms and sounds at the coast, whose faces stay small. So the same atlas missed 4.8 % of Chiloé's faces at 500 m, 5.0 % at 667 m and 5.2 % at 833 m, and the coarser meshes needed `max_closed = 0.08` (the #231 sweep, `notes/2d-numerics.md`).
+- **Now** `BoundaryCoverage` sums the faces' lengths, and `uncovered_fraction`, `close` and `max_closed` (atlas and nesting) take the share of the length. The error gives both counts and lengths, and the domain's notes add "(9.6 of 782.7 km, 1.2 %)".
+- **Chiloé:** 12 of 252 faces, 9.6 of 782.7 km (1.2 %) at 500 m; 10 of 202, 10.4 of 783.5 km (1.3 %) at 667 m; 9 of 173, 9.4 of 782.5 km (1.2 %) at 833 m. No override is needed now.
+- **Shipped cases:** every one with an atlas or a parent (`dgcom check`) closes the same faces as before (0 everywhere but Chiloé's 12), so no run changes.
+- **Gates:** `the_uncovered_share_is_by_length_not_by_faces`. The box's east side uncovered is 6 of 24 faces on one mesh and 12 of 30 on another, but a quarter of the length on both: refused at 0.2, accepted at 0.3 on both, where the face share (0.40) would refuse the second. `an_atlas_walls_the_open_faces_it_does_not_cover` checks the note's lengths.
 
 ## P8.1, fourth part: the gauge correction (2026-11-07)
 

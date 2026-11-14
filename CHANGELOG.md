@@ -6,6 +6,10 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **`max_closed` (atlas and nesting) is a share of the open boundary's length, not of its faces (`notes/case-files.md`, P8.1, 2026-11-14).** The uncovered stretches are fjord arms at the coast, whose faces stay small while a coarser mesh has fewer faces across the sea. So the same atlas missed 4.8–5.2 % of Chiloé's faces on its 500, 667 and 833 m meshes, but only 1.2–1.3 % of the length on all three, and the coarser two no longer need `max_closed = 0.08`. Every shipped case closes the same faces as before.
+  - **API:** `BoundaryCoverage::length` and `uncovered_length`. `uncovered_fraction` and `close` take the share of the length. `CoverageError` carries `length` and `uncovered_length`.
+  - **The domain's notes** give the length closed: "(9.6 of 782.7 km, 1.2 %)".
+
 - **The turbulence's advection reads `k` and `ψ` without copying them (`notes/3d-mixing.md` P4.4, 2026-11-14).** The end w-points, which hold the closure's boundary values, were replaced by their neighbours' in a copy of both fields every stage; `apply_w_point_transport_3d`'s vertical reconstruction takes them so itself now. On Chiloé's quarter hour the steps take 1.9 % less (94.9 s against 96.7) and the peak is 0.3 GB lower (19.8 GB in memory, 23.6 committed). Every value the closure keeps is the same bit for bit (a quarter hour's snapshots compared); the end w-points' own tendencies, which the closure discards, now carry their own values horizontally.
 
 - **The turbulence's advection averages the layer transports to the w-cells element by element, in its kernel (`notes/3d-mixing.md` P4.4, 2026-11-13).** It staggered a whole second `LayerTransport` every stage (≈ 0.8 GB on the Chiloé 3D case, 12 ms a call there). On Chiloé's quarter hour the steps take 4.5 % less (95.6 s against 100.1) and the run's peak is 0.8 GB lower (20.1 GB in memory, 23.9 committed). Every value is the same bit for bit (a quarter hour's snapshots compared).

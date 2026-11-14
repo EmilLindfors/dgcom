@@ -1393,9 +1393,10 @@ pub struct Nesting {
     /// velocity by (default 3; 1 keeps the parent's velocity).
     #[serde(default = "default_transport_ratio")]
     pub transport_scaling: f64,
-    /// Largest fraction of the tag's open faces that may become walls where
-    /// the parent has no water (default 0.05); more is an error, since a
-    /// parent cut for another domain would close the boundary.
+    /// Largest share of the tag's open boundary, by length, that may become
+    /// walls where the parent has no water (default 0.05); more is an
+    /// error, since a parent cut for another domain would close the
+    /// boundary.
     #[serde(default = "default_max_closed")]
     pub max_closed: f64,
     /// The parent is ramped up from rest over this time (hours, default 1).
@@ -1478,9 +1479,9 @@ pub struct Atlas {
     /// source does not resolve has no tide to force.
     #[serde(default = "default_coverage_m")]
     pub coverage_m: f64,
-    /// Largest fraction of the tag's open faces that may become walls for
-    /// lack of coverage (default 0.05); more is an error, since an atlas
-    /// made for another domain would close the boundary.
+    /// Largest share of the tag's open boundary, by length, that may become
+    /// walls for lack of coverage (default 0.05); more is an error, since an
+    /// atlas made for another domain would close the boundary.
     #[serde(default = "default_max_closed")]
     pub max_closed: f64,
     /// Correct the atlas before use (default `"none"`).

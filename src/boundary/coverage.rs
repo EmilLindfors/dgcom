@@ -10,7 +10,13 @@
 //! sub-domain closed 120 of its 223 open faces and halved the M2 current
 //! (TODO P1.3, `notes/geometry-mesh.md`). [`BoundaryCoverage`] finds the
 //! uncovered faces, and [`BoundaryCoverage::close`] makes walls of them only
-//! while they stay below a given share.
+//! while they stay below a given share of the boundary's length.
+//!
+//! The share is by length, not by face count: the same uncovered stretch is
+//! more of the faces on a coarser mesh, whose open boundary has fewer faces
+//! than its coast has elements (Chiloé's atlas misses under 5 % of the
+//! faces at 500 m, 11 of 203 at 667 m and 9 of 173 at 800 m;
+//! `notes/2d-numerics.md`, mixed order).
 //!
 //! A face is covered when every one of its nodes is: for a parent, the node
 //! lies in a parent cell with a wet corner or within `max_snap` of a wet
@@ -28,8 +34,12 @@ use crate::types::ElementIndex;
 /// More of the boundary is uncovered than [`BoundaryCoverage::close`] allows.
 #[derive(Debug, Error, PartialEq)]
 #[error(
-    "{uncovered} of {faces} boundary faces tagged {tag:?} are not covered by the forcing \
-     (more than {max_fraction} of them)"
+    "{uncovered} of {faces} boundary faces tagged {tag:?} are not covered by the forcing: \
+     {:.1} of {:.1} km, {:.1} % of the length (more than {:.1} %)",
+    uncovered_length / 1000.0,
+    length / 1000.0,
+    100.0 * uncovered_length / length,
+    100.0 * max_fraction
 )]
 pub struct CoverageError {
     /// The boundary tag checked
@@ -38,7 +48,11 @@ pub struct CoverageError {
     pub faces: usize,
     /// Faces with a node the source does not cover
     pub uncovered: usize,
-    /// The largest share allowed
+    /// Length of the faces with that tag (m)
+    pub length: f64,
+    /// Length of the uncovered faces (m)
+    pub uncovered_length: f64,
+    /// The largest share of the length allowed
     pub max_fraction: f64,
 }
 
@@ -48,6 +62,10 @@ pub struct BoundaryCoverage {
     tag: BoundaryTag,
     faces: usize,
     uncovered: Vec<usize>,
+    /// Length of the faces with the tag (m)
+    length: f64,
+    /// Length of the uncovered ones (m)
+    uncovered_length: f64,
 }
 
 impl BoundaryCoverage {
@@ -62,11 +80,19 @@ impl BoundaryCoverage {
     ) -> Self {
         let mut faces = 0;
         let mut uncovered = Vec::new();
+        let (mut length, mut uncovered_length) = (0.0, 0.0);
         for (e, edge) in mesh.edges.iter().enumerate() {
             if edge.right.is_some() || edge.boundary_tag != Some(tag) {
                 continue;
             }
             faces += 1;
+            // The faces are straight: the distance between their vertices
+            let ([x0, y0], [x1, y1]) = (
+                mesh.vertices[edge.vertices.0],
+                mesh.vertices[edge.vertices.1],
+            );
+            let face_length = (x1 - x0).hypot(y1 - y0);
+            length += face_length;
             let (k, face) = (ElementIndex::new(edge.left.element), edge.left.face);
             let missed = ops.face_nodes[face].iter().any(|&i| {
                 let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
@@ -75,12 +101,15 @@ impl BoundaryCoverage {
             });
             if missed {
                 uncovered.push(e);
+                uncovered_length += face_length;
             }
         }
         Self {
             tag,
             faces,
             uncovered,
+            length,
+            uncovered_length,
         }
     }
 
@@ -136,24 +165,37 @@ impl BoundaryCoverage {
         &self.uncovered
     }
 
-    /// Share of the faces that are uncovered (0 with no faces).
+    /// Length of the faces with the tag (m).
+    pub fn length(&self) -> f64 {
+        self.length
+    }
+
+    /// Length of the uncovered faces (m).
+    pub fn uncovered_length(&self) -> f64 {
+        self.uncovered_length
+    }
+
+    /// Share of the boundary's length that is uncovered (0 with no faces).
     pub fn uncovered_fraction(&self) -> f64 {
-        if self.faces == 0 {
-            0.0
+        if self.length > 0.0 {
+            self.uncovered_length / self.length
         } else {
-            self.uncovered.len() as f64 / self.faces as f64
+            0.0
         }
     }
 
     /// Make walls of the uncovered faces of `mesh` (the mesh the coverage
     /// was computed on) and return how many, or refuse, leaving the mesh
-    /// unchanged, when more than `max_fraction` of the faces are uncovered.
+    /// unchanged, when more than `max_fraction` of the boundary's length is
+    /// uncovered.
     pub fn close(&self, mesh: &mut Mesh2D, max_fraction: f64) -> Result<usize, CoverageError> {
         if self.uncovered_fraction() > max_fraction {
             return Err(CoverageError {
                 tag: self.tag,
                 faces: self.faces,
                 uncovered: self.uncovered.len(),
+                length: self.length,
+                uncovered_length: self.uncovered_length,
                 max_fraction,
             });
         }
@@ -229,6 +271,8 @@ mod tests {
         );
         assert_eq!(coverage.n_faces(), 24);
         assert_eq!(coverage.uncovered().len(), 4, "{:?}", coverage.uncovered());
+        assert!((coverage.length() - 120_000.0).abs() < 1e-6);
+        assert!((coverage.uncovered_length() - 20_000.0).abs() < 1e-6);
         for &e in coverage.uncovered() {
             let edge = &mesh.edges[e];
             let k = ElementIndex::new(edge.left.element);
@@ -278,5 +322,47 @@ mod tests {
         // centre, the middle two of each side (nodes 15 and 15.8 km away)
         assert_eq!(of(16_000.0).uncovered().len(), 16);
         assert_eq!(of(14_000.0).uncovered_fraction(), 1.0);
+    }
+
+    /// The same uncovered stretch, the box's east side, is a quarter of the
+    /// boundary's length on any mesh: 6 of 24 faces of 5 km elements, but 12
+    /// of 30 faces when the east and west sides are cut into 2.5 km faces
+    /// and the north and south into 10 km ones, which a share of the faces
+    /// (0.40) would refuse at 0.3.
+    #[test]
+    fn the_uncovered_share_is_by_length_not_by_faces() {
+        let projection = LocalProjection::new(63.5, 8.5);
+        let ops = DGOperators2D::new(2);
+        // Every node of the east side but its two corners
+        let covered = |lon: f64, lat: f64| {
+            let (x, y) = projection.geo_to_xy(lat, lon);
+            !(x > 14_900.0 && y.abs() < 14_900.0)
+        };
+        for (nx, ny, uncovered_faces, faces) in [(6, 6, 6, 24), (3, 12, 12, 30)] {
+            let mut mesh = Mesh2D::uniform_rectangle_with_bc(
+                -15_000.0,
+                15_000.0,
+                -15_000.0,
+                15_000.0,
+                nx,
+                ny,
+                BoundaryTag::Open,
+            );
+            let coverage =
+                BoundaryCoverage::of(&mesh, &ops, &projection, BoundaryTag::Open, covered);
+            assert_eq!(
+                (coverage.uncovered().len(), coverage.n_faces()),
+                (uncovered_faces, faces)
+            );
+            assert!((coverage.uncovered_fraction() - 0.25).abs() < 1e-9);
+            let error = coverage.close(&mut mesh.clone(), 0.2).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("30.0 of 120.0 km, 25.0 % of the length"),
+                "{error}"
+            );
+            assert_eq!(coverage.close(&mut mesh, 0.3), Ok(uncovered_faces));
+        }
     }
 }
