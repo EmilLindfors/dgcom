@@ -1740,12 +1740,16 @@ pub struct Station {
     /// Latitude (degrees north)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lat: Option<f64>,
-    /// Sample in open water (m, default 3): at the station if every node of
-    /// its element is at least this deep below mean sea level, else at the
-    /// nearest point of such an element within `max_offset_m`
-    /// (`Probe2D::in_open_water`). A tide gauge at the shore is often in an
+    /// Sample in open water (m, default 3). The surface: at the station if
+    /// every node of its element is at least this deep below mean sea level,
+    /// else at the nearest point of such an element within `max_offset_m`
+    /// (`Probe2D::in_open_water`); a tide gauge at the shore is often in an
     /// element that is partly land, whose surface mixes in the land's bed.
-    /// 0 samples at the station as it is.
+    /// The current, the depth and the sea state: at the station if the bed
+    /// is this deep there, else at the nearest point where it is
+    /// (`Probe2D::nearest_at_depth`), which does not move with the mesh and
+    /// the order. `station_points.csv` lists both points. 0 samples at the
+    /// station as it is.
     #[serde(default = "default_open_water_depth")]
     pub open_water_depth_m: f64,
     /// How far a station may be moved into open water (m, default 3000).

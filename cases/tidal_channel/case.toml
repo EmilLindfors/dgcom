@@ -69,7 +69,8 @@ y_m = 2000.0
 name = "head"
 x_m = 34000.0
 y_m = 2000.0
-# A station samples in open water: where it is if its element is at least
-# `open_water_depth_m` deep (3 m by default), else in the nearest such element.
-# The head is 2.8 m deep and stays wet through the tide.
+# A station samples in open water: its surface where it is if its element is
+# at least `open_water_depth_m` deep (3 m by default), else in the nearest such
+# element; its current where the bed is that deep (`station_points.csv` lists
+# both points). The head is 2.8 m deep and stays wet through the tide.
 open_water_depth_m = 1.0
