@@ -1903,7 +1903,7 @@ mod tests {
     }
 
     /// TODO P4.4 gate: the turbulence at the w-points is advected with the
-    /// water of the layers (over the w-cells, `LayerTransport::stagger_from`):
+    /// water of the layers (over the w-cells, `apply_w_point_transport_3d`):
     /// under the tide over the sloping bed a uniform `k` stays uniform, with
     /// and without a river, and a varying `ψ` keeps its inventory while it
     /// moves. The constant mixing leaves the turbulence fields alone, so they
