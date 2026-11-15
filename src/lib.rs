@@ -146,22 +146,12 @@ pub use solver::{
     compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel, compute_rhs_swe_2d_parallel_into,
 };
 
-// Burn GPU acceleration exports
-#[cfg(feature = "burn")]
-pub use solver::burn::{
-    BurnConnectivity, BurnError, BurnOperators2D, BurnSWESolution2D, compute_rhs_swe_2d_burn,
-    hll_flux_batched,
-    rhs::{BurnGeometricFactors2D, BurnRhsConfig},
-    roe_flux_batched,
-};
 pub use source::{
     AtmosphericPressure2D, CombinedSource2D, CoriolisSource2D, DragCoefficient,
     GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress, HorizontalViscosity2D,
     HydrostaticReconstruction2D, P_STANDARD, RectangularBoundary, SourceContext2D, SourceTerm2D,
     SpongeLayer2D, SpongeProfile, TidalPotential, TidalPotentialConstituent, WindStress2D,
 };
-#[cfg(feature = "burn")]
-pub use time::{BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn};
 pub use time::{
     // Coupled SWE + tracer integration
     run_advection_2d,

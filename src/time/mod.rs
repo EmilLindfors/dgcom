@@ -25,9 +25,6 @@ mod ssp_rk3_2d;
 mod ssp_rk3_swe;
 mod ssp_rk3_swe_2d;
 
-#[cfg(feature = "burn")]
-mod burn_ssp_rk3;
-
 pub use clock::ModelClock;
 pub use mode_split::{
     BarotropicFilter, BarotropicPhysics, BarotropicTransport, MIN_BAROTROPIC_SUBSTEPS,
@@ -53,7 +50,3 @@ pub use integrator::{
     BoxedIntegratorInfo, ForwardEuler, Integrable, IntegratorInfo, SSPRK3, SSPRK43, ShuOsherStage,
     SspScheme, StageWorkspace, StandardIntegrator, TimeIntegrator, create_integrator_info,
 };
-
-// Burn GPU time integration exports
-#[cfg(feature = "burn")]
-pub use burn_ssp_rk3::{BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn};

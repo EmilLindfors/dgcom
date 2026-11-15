@@ -365,7 +365,7 @@ impl GeometricFactors2D {
     }
 
     /// The constant metric of element `k`, for kernels that still assume
-    /// parallelogram elements (the batched SIMD and Burn prototypes). Their
+    /// parallelogram elements (the batched SIMD kernels). Their
     /// callers must check [`Self::is_affine`] (see [`Self::assert_affine`]);
     /// on other elements it is the value at node 0.
     #[inline]
@@ -390,8 +390,8 @@ impl GeometricFactors2D {
         assert!(
             self.affine,
             "{component} assumes parallelogram (affine) elements, but the mesh has general \
-             quadrilaterals; the 2D and 3D model kernels support them, the batched SIMD and \
-             Burn prototypes not yet (TODO P1.3)"
+             quadrilaterals; the 2D and 3D model kernels support them, the batched SIMD \
+             kernels not yet (TODO P1.3)"
         );
     }
 }

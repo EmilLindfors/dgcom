@@ -332,35 +332,6 @@ pub trait Mesh2DGeometry:
 }
 
 // =============================================================================
-// GPU Data Access Trait
-// =============================================================================
-
-/// Trait for meshes providing contiguous data arrays for GPU kernels.
-///
-/// This is an optional trait for meshes optimized for GPU computation.
-/// Data is pre-computed and laid out for coalesced memory access.
-pub trait MeshGPUData: MeshTopology {
-    /// Jacobian determinants as a contiguous slice `[n_elements]`.
-    fn jacobians(&self) -> &[f64];
-
-    /// Inverse Jacobian determinants `[n_elements]`.
-    fn jacobians_inv(&self) -> &[f64];
-
-    /// Neighbor element indices, packed `[n_elements * FACES_PER_ELEMENT]`.
-    ///
-    /// Uses `usize::MAX` to indicate boundary faces.
-    fn neighbor_indices(&self) -> &[usize];
-
-    /// Neighbor face indices, packed `[n_elements * FACES_PER_ELEMENT]`.
-    fn neighbor_faces(&self) -> &[usize];
-
-    /// Boundary tags as integers, packed `[n_elements * FACES_PER_ELEMENT]`.
-    ///
-    /// Uses 0 for interior faces, >0 for boundary tag values.
-    fn boundary_tags_packed(&self) -> &[u32];
-}
-
-// =============================================================================
 // Iteration Helpers
 // =============================================================================
 

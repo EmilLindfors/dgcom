@@ -11,7 +11,7 @@ pub mod mesh_traits;
 pub mod point;
 
 pub use mesh_traits::{
-    FaceConnection, Mesh1DGeometry, Mesh2DGeometry, MeshCFL, MeshGPUData, MeshGeometry,
-    MeshGeometryExt, MeshIter, MeshTopology, Neighbor,
+    FaceConnection, Mesh1DGeometry, Mesh2DGeometry, MeshCFL, MeshGeometry, MeshGeometryExt,
+    MeshIter, MeshTopology, Neighbor,
 };
 pub use point::Point;
