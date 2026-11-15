@@ -19,6 +19,7 @@ use std::sync::Arc;
 use super::schema::{
     AtlasCorrection, AtmosphereSection, BathymetrySection, BedFor3D, Case, FarmSection,
     GaugeCorrection, MeshSection, Nesting, RasterKind, RiversSection, Sampling, SideTag, Slopes3D,
+    Station,
 };
 use super::{CaseError, CaseFile};
 use crate::analysis::{GaugeRecord, HarmonicAnalysis, TideGaugeStation};
@@ -187,46 +188,29 @@ impl CaseFile {
             self.mesh_and_bed(&case.mesh, projection.as_ref(), &mut notes)?;
 
         // What the boundaries' tides carry, for the fit of a station's record
-        let mut tide_constituents: Vec<&'static str> = Vec::new();
-        let mut carry = |names: &[&'static str]| {
-            for name in names {
-                if !tide_constituents.contains(name) {
-                    tide_constituents.push(name);
-                }
-            }
-        };
-        for tide in case.boundaries.iter().filter_map(|b| b.tide.as_ref()) {
-            let names: Vec<&'static str> = tide
-                .constituents
-                .iter()
-                .filter_map(|c| canonical_name(&c.name))
-                .collect();
-            carry(&names);
-        }
+        let tide_constituents = self.tide_constituents()?;
 
         // Tidal atlases: the open faces they do not cover become walls
         let mut atlases = Vec::new();
         for b in &case.boundaries {
             let Some(spec) = &b.atlas else { continue };
             let path = self.resolve(&spec.file);
-            let mut atlas = TidalAtlas::read(&path)
-                .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
-            let invalid = |e| CaseError::Invalid(format!("{}: {e}", path.display()));
+            let mut atlas = read_atlas(&path)?;
+            let (inferred, changes) =
+                self.force_atlas(&mut atlas, &path, spec.correction, spec.gauge.as_ref())?;
             let correction = match spec.correction {
                 AtlasCorrection::None => String::new(),
-                AtlasCorrection::Theory => {
-                    atlas.infer_from_theory().map_err(invalid)?;
-                    ", corrected from theory".into()
-                }
+                AtlasCorrection::Theory => ", corrected from theory".into(),
                 AtlasCorrection::Minors => {
-                    let added = atlas.infer_missing_minors().map_err(invalid)?;
-                    format!(", {} of them inferred: {}", added.len(), added.join(" "))
+                    format!(
+                        ", {} of them inferred: {}",
+                        inferred.len(),
+                        inferred.join(" ")
+                    )
                 }
             };
-            if let Some(gauge) = &spec.gauge {
-                for change in self.correct_at_gauge(&mut atlas, gauge)? {
-                    notes.push(format!("tidal atlas {}: {change}", path.display()));
-                }
+            for change in changes {
+                notes.push(format!("tidal atlas {}: {change}", path.display()));
             }
             let projection = projection.as_ref().expect("validated: placed");
             let coverage = BoundaryCoverage::of_atlas(
@@ -255,7 +239,6 @@ impl CaseFile {
                 spec.coverage_m / 1000.0,
                 closed_length(&coverage)
             ));
-            carry(&atlas.names());
             atlases.push((b.tag, atlas));
         }
         Self::check_3d_bed_tide(case, &atlases, &mut notes);
@@ -267,7 +250,7 @@ impl CaseFile {
         for b in &case.boundaries {
             let Some(spec) = &b.nesting else { continue };
             let projection = projection.as_ref().expect("validated: placed");
-            let (parent, reader, carried) = self.nest(
+            let (parent, reader) = self.nest(
                 b.tag,
                 spec,
                 &mut mesh,
@@ -277,8 +260,6 @@ impl CaseFile {
                 projection,
                 &mut notes,
             )?;
-            carry(&HarmonicAnalysis::MAJOR);
-            carry(&carried);
             parents.push((b.tag, parent));
             parent_reader = Some(reader);
         }
@@ -706,40 +687,10 @@ impl CaseFile {
                     bed(&current)
                 ));
             }
-            let gauge = match &s.gauge {
-                Some(file) => {
-                    let path = self.resolve(file);
-                    let record = read_tide_gauge_file(&path)
-                        .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
-                    let station = record.station.clone().unwrap_or_else(|| {
-                        TideGaugeStation::new(
-                            s.name.clone(),
-                            s.lon.unwrap_or(f64::NAN),
-                            s.lat.unwrap_or(f64::NAN),
-                        )
-                    });
-                    let gauge = GaugeRecord::new(
-                        station,
-                        record.time_series.times(),
-                        record.time_series.values(),
-                    );
-                    notes.push(format!(
-                        "station {:?}: gauge record of {:.0} days, {}",
-                        s.name,
-                        gauge.days(),
-                        match &gauge.fit {
-                            Ok(fit) => format!(
-                                "{} constituents fitted (R² {:.4})",
-                                fit.constants.len(),
-                                fit.r_squared
-                            ),
-                            Err(e) => format!("no fit ({e}): skill against the observations only"),
-                        }
-                    ));
-                    Some(gauge)
-                }
-                None => None,
-            };
+            let gauge = self.station_gauge(s)?.map(|(gauge, note)| {
+                notes.push(note);
+                gauge
+            });
             stations.push(StationProbe {
                 name: s.name.clone(),
                 level,
@@ -903,7 +854,7 @@ impl CaseFile {
         bathymetry: &mut Bathymetry2D,
         projection: &LocalProjection,
         notes: &mut Vec<String>,
-    ) -> Result<(OceanModelState, Arc<OceanModelReader>, Vec<&'static str>), CaseError> {
+    ) -> Result<(OceanModelState, Arc<OceanModelReader>), CaseError> {
         let path = self.resolve(&spec.file);
         let reader = Arc::new(read_parent(&path, self.case.three_d.is_some())?);
         notes.push(format!("parent {}: {}", path.display(), reader.summary()));
@@ -914,12 +865,12 @@ impl CaseFile {
             .as_ref()
             .map(|a| {
                 let a = self.resolve(a);
-                TidalAtlas::read(&a).map_err(|e| CaseError::Io(format!("{}: {e}", a.display())))
+                read_atlas(&a).map(|atlas| (atlas, a))
             })
             .transpose()?;
 
         // The parent's ζ has no datum: its mean comes off
-        let atlas_mean = atlas.as_ref().and_then(TidalAtlas::mean_level);
+        let atlas_mean = atlas.as_ref().and_then(|(a, _)| a.mean_level());
         let (datum, datum_source) = match (spec.level_m, atlas_mean) {
             (Some(level), _) => (ParentDatum::Shift(level), "level_m"),
             (None, Some(mean)) => (ParentDatum::Shift(-mean), "minus the atlas's mean level"),
@@ -994,25 +945,20 @@ impl CaseFile {
 
         // The parent's tide corrected by (corrected − raw) atlas: the atlas
         // is the parent's own harmonic fit, so its residual flow stays
-        let mut carried = atlas.as_ref().map(TidalAtlas::names).unwrap_or_default();
         let parent = match atlas {
-            Some(raw) if spec.correction != AtlasCorrection::None || spec.gauge.is_some() => {
+            Some((raw, atlas_path))
+                if spec.correction != AtlasCorrection::None || spec.gauge.is_some() =>
+            {
                 let mut corrected = raw.clone();
-                match spec.correction {
-                    AtlasCorrection::None => {}
-                    AtlasCorrection::Theory => {
-                        corrected.infer_from_theory().map_err(|e| invalid(&e))?
-                    }
-                    AtlasCorrection::Minors => {
-                        corrected.infer_missing_minors().map_err(|e| invalid(&e))?;
-                    }
+                let (_, changes) = self.force_atlas(
+                    &mut corrected,
+                    &atlas_path,
+                    spec.correction,
+                    spec.gauge.as_ref(),
+                )?;
+                for change in changes {
+                    notes.push(format!("parent's tide: {change}"));
                 }
-                if let Some(gauge) = &spec.gauge {
-                    for change in self.correct_at_gauge(&mut corrected, gauge)? {
-                        notes.push(format!("parent's tide: {change}"));
-                    }
-                }
-                carried = corrected.names();
                 let correction = corrected.difference(&raw).map_err(|e| invalid(&e))?;
                 let keeps = |name: &str| {
                     correction.points.iter().all(|p| {
@@ -1068,7 +1014,114 @@ impl CaseFile {
                 invalid(&e)
             }
         })?;
-        Ok((parent, reader, carried))
+        Ok((parent, reader))
+    }
+
+    /// The tidal constituents the boundaries carry, as
+    /// [`Domain::tide_constituents`] holds them: each `[boundary.tide]`'s,
+    /// then each atlas's as the run forces with it, then for each parent
+    /// model the eight major ones and its atlas's; each once, in that order.
+    /// It reads the atlases and the gauges that correct them, not the mesh.
+    pub fn tide_constituents(&self) -> Result<Vec<&'static str>, CaseError> {
+        let boundaries = &self.case.boundaries;
+        let mut carried: Vec<&'static str> = Vec::new();
+        let mut carry = |names: &[&'static str]| {
+            for name in names {
+                if !carried.contains(name) {
+                    carried.push(name);
+                }
+            }
+        };
+        for tide in boundaries.iter().filter_map(|b| b.tide.as_ref()) {
+            let names: Vec<&'static str> = tide
+                .constituents
+                .iter()
+                .filter_map(|c| canonical_name(&c.name))
+                .collect();
+            carry(&names);
+        }
+        let forced = |file: &std::path::Path, correction, gauge| {
+            let path = self.resolve(file);
+            let mut atlas = read_atlas(&path)?;
+            self.force_atlas(&mut atlas, &path, correction, gauge)?;
+            Ok::<_, CaseError>(atlas.names())
+        };
+        for spec in boundaries.iter().filter_map(|b| b.atlas.as_ref()) {
+            carry(&forced(&spec.file, spec.correction, spec.gauge.as_ref())?);
+        }
+        for spec in boundaries.iter().filter_map(|b| b.nesting.as_ref()) {
+            carry(&HarmonicAnalysis::MAJOR);
+            if let Some(file) = &spec.atlas {
+                carry(&forced(file, spec.correction, spec.gauge.as_ref())?);
+            }
+        }
+        Ok(carried)
+    }
+
+    /// `atlas` (read from `path`) as the run forces with it: `correction`
+    /// applied, then corrected at `gauge`'s record. The constituents the
+    /// correction inferred (`Minors`'), and what the gauge changed.
+    fn force_atlas(
+        &self,
+        atlas: &mut TidalAtlas,
+        path: &std::path::Path,
+        correction: AtlasCorrection,
+        gauge: Option<&GaugeCorrection>,
+    ) -> Result<(Vec<&'static str>, Vec<GaugeAdjustment>), CaseError> {
+        let invalid = |e| CaseError::Invalid(format!("{}: {e}", path.display()));
+        let inferred = match correction {
+            AtlasCorrection::None => Vec::new(),
+            AtlasCorrection::Theory => {
+                atlas.infer_from_theory().map_err(invalid)?;
+                Vec::new()
+            }
+            AtlasCorrection::Minors => atlas.infer_missing_minors().map_err(invalid)?,
+        };
+        let changes = match gauge {
+            Some(gauge) => self.correct_at_gauge(atlas, gauge)?,
+            None => Vec::new(),
+        };
+        Ok((inferred, changes))
+    }
+
+    /// The tide gauge record of a `[[output.station]]`, read and fitted, and
+    /// what the log says of it; `None` if it has no `gauge`.
+    pub(super) fn station_gauge(
+        &self,
+        s: &Station,
+    ) -> Result<Option<(GaugeRecord, String)>, CaseError> {
+        let Some(file) = &s.gauge else {
+            return Ok(None);
+        };
+        let path = self.resolve(file);
+        let record = read_tide_gauge_file(&path)
+            .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
+        let station = record.station.clone().unwrap_or_else(|| {
+            TideGaugeStation::new(
+                s.name.clone(),
+                s.lon.unwrap_or(f64::NAN),
+                s.lat.unwrap_or(f64::NAN),
+            )
+        });
+        let gauge = GaugeRecord::new(
+            station,
+            record.time_series.times(),
+            record.time_series.values(),
+        );
+        let note = format!(
+            "station {:?}: gauge record of {:.0} days, {}",
+            s.name,
+            gauge.days(),
+            match &gauge.fit {
+                Ok(fit) => format!(
+                    "{} constituents fitted (R² {:.4})",
+                    fit.constants.len(),
+                    fit.r_squared
+                ),
+                Err(e) => format!("no fit ({e}): skill against the observations only"),
+            }
+        );
+        Ok(Some((gauge, note)))
     }
 
     /// Correct `atlas` at the gauge of `spec`; what changed.
@@ -1421,6 +1474,11 @@ fn read_rivers(path: &std::path::Path) -> Result<crate::io::RiverForcing, CaseEr
          default)",
         path.display()
     )))
+}
+
+/// The tidal atlas at `path`.
+fn read_atlas(path: &std::path::Path) -> Result<TidalAtlas, CaseError> {
+    TidalAtlas::read(path).map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))
 }
 
 /// The weather files `paths`, joined in time.

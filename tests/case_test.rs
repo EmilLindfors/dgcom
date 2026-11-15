@@ -418,36 +418,9 @@ fn stations_can_be_recorded_more_often_than_the_fields() {
 #[test]
 fn a_station_is_scored_against_its_gauge() {
     let hours = 15.0;
-    let dir = tempfile::tempdir().unwrap();
-    let plain = example(dir.path(), hours).run(&mut |_| {}).unwrap();
+    let (gauged, plain) = gauged_example(hours);
     let mouth = &plain.stations[0];
-
-    // 2025-06-15T00:00:00Z, the example's run.start
-    let start_unix = 1_749_945_600.0;
-    let mut record = String::from(
-        "# station: mouth\n# longitude: 8.5\n# latitude: 63.5\n# columns: time(s) water_level(m)\n",
-    );
-    for h in -720..=744 {
-        let t = 3600.0 * f64::from(h);
-        let level = match mouth.time_s.iter().position(|&s| (s - t).abs() < 1e-6) {
-            Some(i) => mouth.eta_m[i] + 0.1,
-            None => 0.8 * (2.0 * std::f64::consts::PI * t / (12.420_601 * 3600.0)).cos(),
-        };
-        record += &format!("{} {level}\n", start_unix + t);
-    }
-    let gauge = dir.path().join("gauge.txt");
-    std::fs::write(&gauge, record).unwrap();
-
-    let dir = tempfile::tempdir().unwrap();
-    let file = CaseFile::read(
-        Path::new(EXAMPLE),
-        &[
-            format!("run.duration_hours={hours}"),
-            format!("output.directory={:?}", dir.path().display().to_string()),
-            format!("output.station.0.gauge={:?}", gauge.display().to_string()),
-        ],
-    )
-    .unwrap();
+    let (file, dir) = (&gauged.file, &gauged.output);
     assert_eq!(file.case.spinup_hours(), 2.0);
     let report = file.run(&mut |_| {}).unwrap();
     // The gauge changes nothing in the run
@@ -481,6 +454,145 @@ fn a_station_is_scored_against_its_gauge() {
     );
     let constants = std::fs::read_to_string(dir.path().join("gauge_constituents.csv")).unwrap();
     assert_eq!(constants.lines().count(), 1 + names.len(), "{constants}");
+}
+
+/// The example's case for `hours`, its mouth station scored against a gauge
+/// (the run's own surface 10 cm high at its output hours, a pure M2 for a
+/// month on either side), writing to a directory of its own; and the run
+/// without the gauge.
+struct GaugedExample {
+    file: CaseFile,
+    /// The gauge's record and the run without it
+    _inputs: tempfile::TempDir,
+    /// The case's output directory
+    output: tempfile::TempDir,
+}
+
+impl GaugedExample {
+    /// The case read with `overrides` besides the gauge's.
+    fn read(&self, overrides: &[&str]) -> Result<CaseFile, dgcom::case::CaseError> {
+        let mut all = vec![
+            format!("run.duration_hours={}", self.file.case.run.duration_hours),
+            format!(
+                "output.directory={:?}",
+                self.output.path().display().to_string()
+            ),
+            format!(
+                "output.station.0.gauge={:?}",
+                self.file.case.output.stations[0]
+                    .gauge
+                    .as_ref()
+                    .unwrap()
+                    .display()
+                    .to_string()
+            ),
+        ];
+        all.extend(overrides.iter().map(|o| o.to_string()));
+        CaseFile::read(Path::new(EXAMPLE), &all)
+    }
+}
+
+fn gauged_example(hours: f64) -> (GaugedExample, dgcom::case::RunReport) {
+    let inputs = tempfile::tempdir().unwrap();
+    let plain = example(inputs.path(), hours).run(&mut |_| {}).unwrap();
+    let mouth = &plain.stations[0];
+
+    // 2025-06-15T00:00:00Z, the example's run.start
+    let start_unix = 1_749_945_600.0;
+    let mut record = String::from(
+        "# station: mouth\n# longitude: 8.5\n# latitude: 63.5\n# columns: time(s) water_level(m)\n",
+    );
+    for h in -720..=744 {
+        let t = 3600.0 * f64::from(h);
+        let level = match mouth.time_s.iter().position(|&s| (s - t).abs() < 1e-6) {
+            Some(i) => mouth.eta_m[i] + 0.1,
+            None => 0.8 * (2.0 * std::f64::consts::PI * t / (12.420_601 * 3600.0)).cos(),
+        };
+        record += &format!("{} {level}\n", start_unix + t);
+    }
+    let gauge = inputs.path().join("gauge.txt");
+    std::fs::write(&gauge, record).unwrap();
+
+    let output = tempfile::tempdir().unwrap();
+    let file = CaseFile::read(
+        Path::new(EXAMPLE),
+        &[
+            format!("run.duration_hours={hours}"),
+            format!("output.directory={:?}", output.path().display().to_string()),
+            format!("output.station.0.gauge={:?}", gauge.display().to_string()),
+        ],
+    )
+    .unwrap();
+    let gauged = GaugedExample {
+        file,
+        _inputs: inputs,
+        output,
+    };
+    (gauged, plain)
+}
+
+/// `dgcom score`: a finished run is scored again from its `stations.csv`
+/// without the run, and its score files come back byte for byte (the
+/// records read back to the bit). From a later spin-up it scores fewer
+/// samples; a case whose start, boundary or stations differ from the run's is
+/// refused, one whose physics differ is not (the score does not read them).
+#[test]
+fn a_finished_run_is_scored_again_from_its_station_records() {
+    let (gauged, _) = gauged_example(15.0);
+    let (file, dir) = (&gauged.file, gauged.output.path());
+    let report = file.run(&mut |_| {}).unwrap();
+    let files = ["gauge_skill.csv", "gauge_constituents.csv"];
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+    let ran: Vec<String> = files.iter().map(|f| read(f)).collect();
+    for f in files {
+        std::fs::remove_file(dir.join(f)).unwrap();
+    }
+
+    let again = file.score().unwrap();
+    println!("{}", again.notes.join("\n"));
+    let scored: Vec<String> = files.iter().map(|f| read(f)).collect();
+    assert_eq!(scored, ran);
+    assert_eq!(again.stations[0].eta_m, report.stations[0].eta_m);
+    assert!(again.stations[1].gauge.is_none());
+    assert!(again.notes.iter().any(|n| n.starts_with("the run in ")));
+
+    // From 4 h on: 12 hourly samples to 15 h, not 14
+    let later = gauged.read(&["output.spinup_hours=4.0"]).unwrap();
+    let v = later.score().unwrap().stations[0]
+        .gauge
+        .as_ref()
+        .unwrap()
+        .vs_observations
+        .clone()
+        .unwrap();
+    assert_eq!(v.n, 12);
+
+    // Not the run of this case: what the score reads differs
+    for (set, key) in [
+        (
+            "boundary.0.tide.ramp_hours=3.0",
+            "boundary.0.tide.ramp_hours",
+        ),
+        ("output.station.1.x_m=21000.0", "output.station.1.x_m"),
+        ("run.start=\"2025-06-16T00:00:00Z\"", "run.start"),
+    ] {
+        let err = gauged
+            .read(&[set])
+            .unwrap()
+            .score()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot score the run") && err.contains(key),
+            "{err}"
+        );
+    }
+    // What it does not read may differ
+    gauged
+        .read(&["physics.friction.manning=0.03"])
+        .unwrap()
+        .score()
+        .unwrap();
 }
 
 /// A 3D channel 10 km long, stratified by a `[three_d] profile` (a 4 °C

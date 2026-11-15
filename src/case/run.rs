@@ -6,15 +6,17 @@
 
 use std::fs::{self, File};
 
-use crate::analysis::{GaugeComparison, HarmonicAnalysis, TimeSeries};
+use crate::analysis::{GaugeComparison, GaugeRecord, HarmonicAnalysis, TimeSeries};
 use crate::waves::{CoupledWaves2D, SeaStateFields, SeaStateFrames};
 
 mod mesh;
 mod restart;
+mod score;
 mod three_d;
 mod waves;
 
 pub use mesh::MeshReport;
+pub use score::ScoreReport;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -411,7 +413,13 @@ impl CaseFile {
         notes.extend(restarts.map(|r| r.note()));
         let mut stations = output.finish();
         if let Some(clock) = &clock {
-            score_gauges(domain, &mut stations, clock, 3600.0 * case.spinup_hours());
+            score_gauges(
+                &domain.tide_constituents,
+                domain.stations.iter().map(|s| s.gauge.as_ref()),
+                &mut stations,
+                clock,
+                3600.0 * case.spinup_hours(),
+            );
             if stations.iter().any(|s| s.gauge.is_some()) {
                 write_gauge_scores(&self.output_dir(), &stations)?;
             }
@@ -699,18 +707,19 @@ pub(super) fn boundary_conditions<'a>(
     bc
 }
 
-/// Each station with a gauge against it, from `spinup` (s) on, on the
-/// gauge's Unix time axis; its record fitted with the constituents the
-/// boundaries carry (`Domain::tide_constituents`).
-fn score_gauges(
-    domain: &Domain,
+/// Each station with a gauge against it (`gauges`, one per station), from
+/// `spinup` (s) on, on the gauge's Unix time axis; its record fitted with the
+/// constituents the boundaries carry (`Domain::tide_constituents`).
+fn score_gauges<'a>(
+    carried: &[&'static str],
+    gauges: impl IntoIterator<Item = Option<&'a GaugeRecord>>,
     stations: &mut [StationSeries],
     clock: &crate::time::ModelClock,
     spinup: f64,
 ) {
-    let candidates = HarmonicAnalysis::station_candidates(&domain.tide_constituents);
-    for (series, station) in stations.iter_mut().zip(&domain.stations) {
-        let Some(gauge) = &station.gauge else {
+    let candidates = HarmonicAnalysis::station_candidates(carried);
+    for (series, gauge) in stations.iter_mut().zip(gauges) {
+        let Some(gauge) = gauge else {
             continue;
         };
         let first = series.time_s.partition_point(|&t| t < spinup - 1e-6);

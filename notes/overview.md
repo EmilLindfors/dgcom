@@ -38,6 +38,17 @@ This roadmap is driven by the full-crate review of **2026-09-25** in `review-202
 | 3D | Scaffolding; tracer constancy (P4.2) and the balanced PGF (P4.3) fixed 2026-09-30; vertical advection ×D (P0.16) and the tracer wall leak (P0.22) fixed; mode splitting: one filtered barotropic pass (0.035 % seiche damping per period), second-order slow coupling, wind setup/Ekman to < 0.1 % (P4.1 PR 1–2; DU_avg2 is PR 3) | lock exchange, mode-1 internal wave, seamount spin-up |
 | GPU | Non-functional (P0.11) | fixed or replaced (P2.7) |
 
+## Altitude pass on the TODO list (2026-11-15)
+
+Asked: what to work on next for the most gain. Taken up from the next item to the outcome behind it: **farm-site currents someone can act on, with a measured error, on any coast** ("dgcom's current at site X is within Y of a measured record, and closer than NorKyst's").
+
+- **The η score at a nested gauge measures the parent, not dgcom.** The 2D run follows NorKyst within 0.5–0.7 cm and the 3D run follows 2D within 0.2 cm (`validation.md`, 2026-06-12). The open fit refinements (K2's lead, the diurnal age at Vardø, nodal f/u per time, shelf waves, a quadratic nodal drift) move millimetres of a score the model does not own.
+- **Where dgcom differs from NorKyst it has no reference.** The M2 current is 0.56–0.61 of NorKyst's where NorKyst is under 50 m; the island lee is 0.12–0.19 against 0.255 m/s; 3D/2D is 0.78 in 3–20 m; Kattholmen's mean current is 0.08 m/s. About ten items end in "settle with observed currents" (P3.1 ×3, P1.3 ×2, F.1 ×2, F.2's K, P4.4's roughness, P4.6 Frohavet), and the project holds none.
+- **Chiloé's inner sea is where η tests dgcom.** It is forced by an atlas, and Puerto Montt is 16–18 cm, 22 % over at neaps.
+- **Scoring was slow.** A change to the fit meant every scored run again.
+
+Decided (the user, 2026-11-15): `dgcom score` first (done the same day, `case-files.md`), then the 15-day 2D runs that settle `nest_tides` (P3.4/P1.5; 2D parent files of 15 days should load whole, ≈ 22 MB per 3 days, so no lazy reading), with the search for measured currents beside it (P3.1, leads in `validation.md`). The proposed mechanism behind `dgcom score` is a scoreboard: every run scored the same way, against the observations, against its parent, and with the parent's own error over the window. Backtested on what the notes record: the walled parent file's 1.9–2.1 cm at Mausund (NorKyst's own 7.5) put the model at least 5.4 cm from its parent, against ≈ 0.5 cm for an honest nest, so a model-against-parent column flags it on the first run; the pre-registered 2026-06-12 day was NorKyst's worst of June (11.9 of 2.3–12.1 cm), which the parent's spread over the month beside the day would have shown at once.
+
 ---
 
 ## References

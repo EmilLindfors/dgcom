@@ -4,6 +4,11 @@ All notable changes to this project should be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`dgcom score <case.toml>` scores a finished run against its tide gauges again from its `stations.csv`, without the mesh or the run (`notes/case-files.md`, P8.1, 2026-11-15).** A change of the harmonic fit, the window (`--set output.spinup_hours=…`) or the gauge record no longer needs the run again: the run's own `gauge_skill.csv` and `gauge_constituents.csv` come back byte for byte, a 49.7 h Mausund run is rescored in 0.3 s (212 s to run). The run's `case.resolved.toml` must agree with the case in what the score reads (`run.start`, the boundaries, the stations but their `gauge`), else it is refused, naming the keys.
+  - **API:** `CaseFile::score` and `ScoreReport`; `CaseFile::tide_constituents`, the constituents a station's record is fitted with, from the case without its mesh (`Domain::tide_constituents` is built by it).
+
 ### Changed
 
 - **A gauge fit infers the minor semidiurnals it cannot resolve, and a fortnight's N2 takes its lag from the age of the tide (`notes/validation.md`, P3.1 "Inference of the minor constituents", 2026-11-14).** A month's fit left ν2, μ2, 2N2, L2, λ2 and T2 out, so its N2 was 0.78–1.19 of the year's with the month (ν2, 206 days from N2) and its S2 6 % off (T2). Judged against UTide's fit of the year at 17 Norwegian gauges, a 30-day fit's N2 is now 7 mm off instead of 30, its S2 7.5 instead of 15, and the tide it predicts for the rest of the year 2.9 cm instead of 4.8; a 15-day fit's M2 15 mm instead of 42 and its tide 3.8 cm instead of 7.2. At six gauges on other coasts (Puerto Montt, Valparaíso, Brest, Prince Rupert, San Diego, Darwin), which no rule was chosen on: 8.5 cm instead of 11.8 on a month, 10.7 instead of 16.7 on a fortnight.

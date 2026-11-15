@@ -88,10 +88,9 @@ impl CaseFile {
             return refuse("it was not written by a case run (it holds no case)".into());
         };
         let theirs = match Case::parse(text, false, &[]) {
-            Ok(case) => flatten_case(&case.resolved()),
+            Ok(case) => case,
             Err(e) => return refuse(format!("its case does not read in this build: {e}")),
         };
-        let ours = flatten_case(&self.case.resolved());
         let changes = self
             .case
             .restart
@@ -102,23 +101,14 @@ impl CaseFile {
                 .iter()
                 .copied()
                 .chain(changes.iter().map(String::as_str))
-                .any(|p| key == p || key.strip_prefix(p).is_some_and(|r| r.starts_with('.')))
+                .any(|p| covers(p, key))
         };
-        let shown = |v: Option<&toml::Value>| v.map_or("(none)".to_string(), |v| v.to_string());
-        let differ: Vec<String> = ours
-            .keys()
-            .chain(theirs.keys())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .filter(|key| !free(key) && ours.get(*key) != theirs.get(*key))
-            .map(|key| {
-                format!(
-                    "{key} = {} (the restart's run: {})",
-                    shown(ours.get(key)),
-                    shown(theirs.get(key))
-                )
-            })
-            .collect();
+        let differ = differences(
+            &flatten_resolved(&self.case),
+            &flatten_resolved(&theirs),
+            |key| !free(key),
+            "the restart's run",
+        );
         if differ.is_empty() {
             return Ok(());
         }
@@ -130,9 +120,45 @@ impl CaseFile {
     }
 }
 
-/// `case` as `key.path → value`, tables and arrays of tables by their keys
-/// and indices (`boundary.0.tag`), other arrays whole.
-fn flatten_case(case: &Case) -> BTreeMap<String, toml::Value> {
+/// Whether `prefix` is `key` or a table above it (`boundary` covers
+/// `boundary.0.tag`).
+pub(super) fn covers(prefix: &str, key: &str) -> bool {
+    key == prefix || key.strip_prefix(prefix).is_some_and(|r| r.starts_with('.'))
+}
+
+/// `case` resolved, as `key.path → value` ([`flatten`]).
+pub(super) fn flatten_resolved(case: &Case) -> BTreeMap<String, toml::Value> {
+    let value = toml::Value::try_from(case.resolved()).expect("a case serializes to TOML");
+    flatten(&value)
+}
+
+/// The keys where the flattened cases `ours` and `theirs` differ, of those
+/// `considered`, each as `key = ours's value (label: theirs's)`.
+pub(super) fn differences(
+    ours: &BTreeMap<String, toml::Value>,
+    theirs: &BTreeMap<String, toml::Value>,
+    considered: impl Fn(&str) -> bool,
+    label: &str,
+) -> Vec<String> {
+    let shown = |v: Option<&toml::Value>| v.map_or("(none)".to_string(), |v| v.to_string());
+    ours.keys()
+        .chain(theirs.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| considered(key) && ours.get(*key) != theirs.get(*key))
+        .map(|key| {
+            format!(
+                "{key} = {} ({label}: {})",
+                shown(ours.get(key)),
+                shown(theirs.get(key))
+            )
+        })
+        .collect()
+}
+
+/// A case's TOML as `key.path → value`, tables and arrays of tables by their
+/// keys and indices (`boundary.0.tag`), other arrays whole.
+pub(super) fn flatten(value: &toml::Value) -> BTreeMap<String, toml::Value> {
     fn walk(prefix: &str, value: &toml::Value, out: &mut BTreeMap<String, toml::Value>) {
         let join = |key: &str| match prefix {
             "" => key.to_string(),
@@ -156,9 +182,8 @@ fn flatten_case(case: &Case) -> BTreeMap<String, toml::Value> {
             }
         }
     }
-    let value = toml::Value::try_from(case).expect("a case serializes to TOML");
     let mut out = BTreeMap::new();
-    walk("", &value, &mut out);
+    walk("", value, &mut out);
     out
 }
 
