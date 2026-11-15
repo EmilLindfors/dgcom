@@ -135,6 +135,20 @@ pub trait BottomFriction2D: Send + Sync {
     fn n_total_nodes(&self) -> Option<usize> {
         None
     }
+
+    /// This law as a device runs it, if it has a device form (P2.7,
+    /// `notes/gpu.md`): a run on a device refuses a law without one.
+    fn device_form(&self) -> Option<DeviceFriction2D> {
+        None
+    }
+}
+
+/// A bottom-friction law as a device runs it
+/// ([`BottomFriction2D::device_form`]): a closed set of laws, as data.
+#[derive(Clone, Debug)]
+pub enum DeviceFriction2D {
+    /// Manning's law
+    Manning(ManningFriction2D),
 }
 
 /// A shared law, such as [`crate::physics::SWEPhysics2D::friction`], wrapped
@@ -331,6 +345,10 @@ impl BottomFriction2D for ManningFriction2D {
     fn damping_rates(&self, _first_node: usize, h: &[f64], speed: &[f64], out: &mut [f64]) {
         let g_n2 = self.g * self.manning_n * self.manning_n;
         manning_rates(|_| g_n2, self.h_min, h, speed, out);
+    }
+
+    fn device_form(&self) -> Option<DeviceFriction2D> {
+        Some(DeviceFriction2D::Manning(self.clone()))
     }
 }
 

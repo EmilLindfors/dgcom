@@ -8,6 +8,9 @@
 #   dgcom check cases/tidal_channel/case.toml   # validate, print with defaults
 #   dgcom run   cases/tidal_channel/case.toml   # run (seconds in a release build)
 #
+# On a CUDA GPU: gpu/'s `dgcom-gpu run <case> --set compute.device=cuda`
+# (`[compute] device`, notes/gpu.md).
+#
 # Output goes to cases/tidal_channel/output/tidal_channel/: the case as run
 # (case.resolved.toml), the stations' records (stations.csv) and the whole
 # state for the viewer (tidal_channel.dgsnap). Paths are relative to this

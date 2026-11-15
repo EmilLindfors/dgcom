@@ -2535,3 +2535,168 @@ fn a_rivers_water_fills_a_closed_3d_basin() {
     );
     assert!(domain.notes.iter().any(|n| n.contains("left out: river 2")));
 }
+
+/// What [`Recorder`] saw of a run handed to a device.
+#[derive(Debug, Default)]
+struct Recorded {
+    ordinal: usize,
+    formulation: Option<dgcom::solver::SWEFormulation2D>,
+    subcells: Option<(f64, f64)>,
+    wet_dry: bool,
+    manning_n: Option<f64>,
+    coriolis_f: Option<f64>,
+    walls: usize,
+    /// Each open boundary's elevation-only velocity, and its external
+    /// state at 3 h
+    opens: Vec<(
+        dgcom::boundary::ElevationOnly,
+        dgcom::boundary::ExternalState,
+    )>,
+    span: (f64, f64),
+}
+
+/// A device that records the run it is handed (`CaseDevice`) and refuses
+/// to step it: the case runner's hook without a GPU.
+#[derive(Default)]
+struct Recorder(std::cell::RefCell<Recorded>);
+
+impl dgcom::case::CaseDevice for Recorder {
+    fn run_2d(
+        &self,
+        ordinal: usize,
+        form: &dgcom::physics::SWEDeviceForm2D<'_>,
+        _q: &mut dgcom::solver::SWESolution2D,
+        run: &dgcom::case::DeviceRun<'_>,
+        _callback: &mut dyn FnMut(&dgcom::solver::SWESolution2D, f64),
+    ) -> Result<dgcom::case::DeviceRunReport, String> {
+        use dgcom::boundary::DeviceBoundary2D;
+        use dgcom::source::{DeviceFriction2D, DeviceSource2D};
+        let mut seen = self.0.borrow_mut();
+        seen.ordinal = ordinal;
+        seen.formulation = Some(form.formulation);
+        seen.subcells = form.subcells;
+        seen.wet_dry = form.wet_dry.is_some();
+        seen.manning_n = form.friction.as_ref().map(|f| match f {
+            DeviceFriction2D::Manning(m) => m.manning_n,
+        });
+        seen.coriolis_f = form.source.map(|s| match s {
+            DeviceSource2D::Coriolis(c) => c.f0,
+        });
+        for (_, boundary) in &form.boundaries {
+            match boundary {
+                DeviceBoundary2D::Wall { .. } => seen.walls += 1,
+                DeviceBoundary2D::Characteristic {
+                    provider,
+                    elevation_only,
+                } => seen.opens.push((
+                    *elevation_only,
+                    provider.uniform_state(10_800.0).expect("uniform"),
+                )),
+            }
+        }
+        seen.span = run.span;
+        Err("the recorder does not step".into())
+    }
+}
+
+/// `[compute] device`: the runner hands a device the case's physics as data
+/// (`SWEPhysics2D::device_form`), refuses a device case without a device,
+/// and refuses what a device does not run, naming it.
+#[test]
+fn a_device_run_is_handed_the_cases_physics_as_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let on = |overrides: &[&str]| {
+        let mut all = vec![
+            "run.duration_hours=1.0".to_string(),
+            format!("output.directory={:?}", dir.path().display().to_string()),
+        ];
+        all.extend(overrides.iter().map(|o| o.to_string()));
+        CaseFile::read(Path::new(EXAMPLE), &all).unwrap()
+    };
+    let file = on(&["compute.device=cuda:1"]);
+    let domain = file.build_domain().unwrap();
+
+    // Without a device: refused
+    let refused = file.run_on(&domain, &mut |_| {}).unwrap_err().to_string();
+    assert!(refused.contains("computes on the CPU only"), "{refused}");
+
+    // With one: handed the physics, which the recorder refuses to step
+    let recorder = Recorder::default();
+    let stopped = file
+        .run_on_with(&domain, Some(&recorder), &mut |_| {})
+        .unwrap_err();
+    assert!(
+        matches!(&stopped, CaseError::Run(e) if e.contains("the recorder does not step")),
+        "{stopped}"
+    );
+    let seen = recorder.0.into_inner();
+    assert_eq!(seen.ordinal, 1);
+    assert_eq!(
+        seen.formulation,
+        Some(dgcom::solver::SWEFormulation2D::WetDry)
+    );
+    let h_dry = dgcom::solver::WetDryConfig::DEFAULT_H_DRY;
+    assert_eq!(seen.subcells, Some((h_dry, h_dry)));
+    assert!(seen.wet_dry);
+    assert_eq!(seen.manning_n, Some(0.025));
+    assert_eq!(
+        seen.coriolis_f,
+        Some(dgcom::source::coriolis_parameter(63.5))
+    );
+    assert_eq!(seen.walls, 1);
+    // The tide (M2 and S2 after their 2 h ramp), elevation only, at rest
+    let [(velocity, tide)] = seen.opens[..] else {
+        panic!("one open boundary: {:?}", seen.opens);
+    };
+    assert_eq!(velocity, dgcom::boundary::ElevationOnly::AtRest);
+    assert!(tide.velocity.is_none() && tide.eta.abs() > 0.1 && tide.eta.abs() < 1.35);
+    assert_eq!(seen.span, (0.0, 3600.0));
+
+    // What a device does not run yet is refused, named, before the run
+    for (overrides, named) in [
+        (
+            &["numerics.local_time_stepping_levels=2"][..],
+            "local time stepping",
+        ),
+        (&["physics.viscosity_m2_s=1.0"][..], "horizontal viscosity"),
+    ] {
+        let mut all = vec!["compute.device=cuda"];
+        all.extend(overrides);
+        let file = on(&all);
+        let domain = file.build_domain().unwrap();
+        let refused = file
+            .run_on_with(&domain, Some(&Recorder::default()), &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains(&format!("compute.device = \"cuda:0\" does not run {named}")),
+            "{refused}"
+        );
+    }
+}
+
+/// `[compute] device` reads `"cpu"`, `"cuda"` and `"cuda:N"`, and writes back
+/// what it read.
+#[test]
+fn the_compute_device_reads_and_writes_back() {
+    use dgcom::case::ComputeDevice;
+    let text = std::fs::read_to_string(EXAMPLE).unwrap();
+    for (value, device) in [
+        ("cpu", ComputeDevice::Cpu),
+        ("cuda", ComputeDevice::Cuda(0)),
+        ("cuda:2", ComputeDevice::Cuda(2)),
+    ] {
+        let case = Case::parse(&text, false, &[format!("compute.device={value}")]).unwrap();
+        assert_eq!(case.compute.device, device);
+        let again = Case::parse(&case.to_toml(), false, &[]).unwrap();
+        assert_eq!(again.compute.device, device);
+    }
+    assert_eq!(
+        Case::parse(&text, false, &[]).unwrap().compute.device,
+        ComputeDevice::Cpu
+    );
+    for wrong in ["gpu", "cuda:x"] {
+        let e = Case::parse(&text, false, &[format!("compute.device={wrong}")]).unwrap_err();
+        assert!(e.contains("compute.device"), "{wrong}: {e}");
+    }
+}

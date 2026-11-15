@@ -23,7 +23,7 @@
 //! let config = SWE2DRhsConfig::new(&equation, &multi_bc);
 //! ```
 
-use crate::boundary::{BCContext2D, BoundaryState, SWEBoundaryCondition2D};
+use crate::boundary::{BCContext2D, BoundaryState, DeviceBoundary2D, SWEBoundaryCondition2D};
 use crate::mesh::BoundaryTag;
 use crate::solver::SWEState2D;
 
@@ -153,6 +153,13 @@ impl<'a> SWEBoundaryCondition2D for MultiBoundaryCondition2D<'a> {
         match &tag {
             Some(t) => self.bc_for_tag(t).is_wall(tag),
             None => self.default_bc.is_wall(tag),
+        }
+    }
+
+    fn device_form(&self, tag: Option<BoundaryTag>) -> Option<DeviceBoundary2D<'_>> {
+        match &tag {
+            Some(t) => self.bc_for_tag(t).device_form(tag),
+            None => self.default_bc.device_form(tag),
         }
     }
 

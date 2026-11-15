@@ -27,7 +27,8 @@ pub use bathymetry::BathymetrySource2D;
 pub use cage::{CageDrag2D, CageFootprint, CageNode, NetCage, loland_drag_coefficient};
 pub use coriolis::{CoriolisSource2D, coriolis_beta, coriolis_parameter};
 pub use friction::{
-    BottomFriction2D, ChezyFriction2D, ManningFriction2D, SpatiallyVaryingManning2D,
+    BottomFriction2D, ChezyFriction2D, DeviceFriction2D, ManningFriction2D,
+    SpatiallyVaryingManning2D,
 };
 pub use gridded_atmosphere::{GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress};
 pub use tidal::{TidalPotential, TidalPotentialConstituent};

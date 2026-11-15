@@ -16,7 +16,7 @@ use dgcom::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D};
 use dgcom::solver::{
     SWE2DRhsConfig, SWEFormulation2D, SWESolution2D, StandardLimiter2D, WetDryConfig,
 };
-use dgcom::source::ManningFriction2D;
+use dgcom::source::{CoriolisSource2D, ManningFriction2D};
 use dgcom::time::Integrable;
 use dgcom::types::ElementIndex;
 
@@ -97,6 +97,8 @@ pub struct Case {
     pub formulation: Formulation,
     /// Manning's n of the bed friction, if any
     pub manning: Option<f64>,
+    /// The Coriolis force
+    pub coriolis: CoriolisSource2D,
 }
 
 /// The wet/dry depth of the beach (`WetDryConfig::DEFAULT_H_DRY`).
@@ -136,6 +138,8 @@ impl Case {
             q,
             formulation: Formulation::EntropyStable,
             manning: None,
+            // An f-plane
+            coriolis: CoriolisSource2D::f_plane_at_latitude(63.5),
         }
     }
 
@@ -184,12 +188,17 @@ impl Case {
                 h_dry: H_DRY,
             },
             manning: Some(0.025),
+            // A β-plane: f of each node's y
+            coriolis: CoriolisSource2D::beta_plane_at_latitude(63.5, 0.5 * ny as f64 * DX),
         }
     }
 
     /// The CPU's RHS configuration of this case, its walls `wall`.
     pub fn rhs_config<'a>(&'a self, wall: &'a Reflective2D) -> SWE2DRhsConfig<'a, Reflective2D> {
-        let config = SWE2DRhsConfig::new(&self.equation, wall).with_bathymetry(&self.bathymetry);
+        let config = SWE2DRhsConfig::new(&self.equation, wall)
+            .with_bathymetry(&self.bathymetry)
+            .with_coriolis(false)
+            .with_source_terms(&self.coriolis);
         match self.formulation {
             Formulation::EntropyStable => config.with_formulation(SWEFormulation2D::EntropyStable),
             Formulation::WetDry {
@@ -223,26 +232,15 @@ impl Case {
             .count()
     }
 
-    /// The GPU physics module of this case.
-    pub fn gpu_physics(&self, gpu: &Arc<Gpu>) -> GpuSWE2D {
-        let mut physics = GpuSWE2D::new(
-            gpu,
-            self.mesh.clone(),
-            self.ops.clone(),
-            self.geom.clone(),
-            &self.bathymetry,
-            &self.equation,
-            self.formulation,
-            &Reflective2D::new(),
-        )
-        .expect("GPU physics");
-        if let Formulation::WetDry { .. } = self.formulation {
-            physics = physics.with_wet_dry(WetDryConfig::default());
-        }
-        if let Some(n) = self.manning {
-            physics = physics.with_friction(ManningFriction2D::new(G, n));
-        }
-        physics
+    /// The GPU physics module of this case: its CPU module `twin`
+    /// ([`Self::cpu_physics`]) as a device runs it.
+    pub fn gpu_physics<'a>(
+        &self,
+        gpu: &Arc<Gpu>,
+        twin: &'a SWEPhysics2D<Reflective2D>,
+    ) -> GpuSWE2D<'a> {
+        let form = twin.device_form().expect("a device form");
+        GpuSWE2D::from_form(gpu, &form).expect("GPU physics")
     }
 
     /// The CPU physics module of this case, as the case runner builds it
@@ -256,7 +254,8 @@ impl Case {
             self.equation.clone(),
             Reflective2D::new(),
         )
-        .with_bathymetry(self.bathymetry.clone());
+        .with_bathymetry(self.bathymetry.clone())
+        .with_source(self.coriolis);
         builder = match self.formulation {
             Formulation::EntropyStable => builder.with_formulation(SWEFormulation2D::EntropyStable),
             Formulation::WetDry { .. } => builder
@@ -331,7 +330,8 @@ fn run_case(
     let mut cpu = SWESolution2D::new(n_el, NN);
     rhs_cpu(&mut cpu);
 
-    let physics = case.gpu_physics(gpu);
+    let twin = case.cpu_physics();
+    let physics = case.gpu_physics(gpu, &twin);
     let state = DeviceState::upload(gpu, &case.q);
     let mut out = state.zeros_like();
     physics.compute_rhs_into(&state, 0.0, &mut out);

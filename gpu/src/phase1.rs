@@ -41,7 +41,8 @@ fn run_case(
     let cpu_seconds = start.elapsed().as_secs_f64();
     assert!(cpu_result.success, "CPU run: {cpu_result:?}");
 
-    let gpu_sim = Simulation::new(case.gpu_physics(gpu), SSPRK43).with_cfl(CFL);
+    let twin = case.cpu_physics();
+    let gpu_sim = Simulation::new(case.gpu_physics(gpu, &twin), SSPRK43).with_cfl(CFL);
     let mut state = DeviceState::upload(gpu, &case.q);
     gpu.stream.synchronize()?;
     let start = Instant::now();

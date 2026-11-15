@@ -78,12 +78,13 @@ pub use tidal::{InterpolatedTidalBC, TidalBC, TidalConstituent};
 
 // 2D boundary conditions
 pub use boundary_2d::{
-    BCContext2D, BoundaryState, ConstantDischarge2D, Discharge2D, Extrapolation2D, FixedState2D,
-    HarmonicTidal2D, Reflective2D, SWEBoundaryCondition2D, Tidal2D,
+    BCContext2D, BoundaryState, ConstantDischarge2D, DeviceBoundary2D, Discharge2D,
+    Extrapolation2D, FixedState2D, HarmonicTidal2D, Reflective2D, SWEBoundaryCondition2D, Tidal2D,
 };
 pub use characteristic::{
     BoundaryLevel, CharacteristicOBC, ElevationOnly, ExternalState, ExternalStateProvider,
-    InverseBarometer, ParentTimeSeries, StillWater, characteristic_state,
+    InverseBarometer, ParentTimeSeries, StillWater, characteristic_boundary_state,
+    characteristic_state,
 };
 pub use coverage::{BoundaryCoverage, CoverageError};
 pub use harmonic_tide::{HarmonicTide, tidal_ramp};

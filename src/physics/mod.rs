@@ -29,6 +29,7 @@ pub mod air_sea;
 pub mod bottom_drag;
 pub mod builder;
 pub mod cage_drag;
+pub mod device;
 pub mod eos;
 pub mod gls;
 pub mod hydrostatic_3d;
@@ -42,6 +43,7 @@ pub mod vertical_mixing;
 pub use air_sea::{AirState, Coare35, JerlovWater, SurfaceBudget};
 pub use bottom_drag::BottomDrag3D;
 pub use builder::{PhysicsBuilder, SWEPhysics2D, SWEPhysics2DBuilder};
+pub use device::SWEDeviceForm2D;
 pub use eos::{EquationOfState, LinearEOS, UnescoEOS};
 pub use gls::{GlsMixing, GlsParameters, StabilityFunctions, WaveBreaking};
 pub use hydrostatic_3d::{

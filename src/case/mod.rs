@@ -37,6 +37,7 @@
 //! Next: the farm's analysis and particles (TODO F.1, F.2), and retiring
 //! `froya_real_data`'s moved modes (`notes/case-files.md`).
 
+pub mod cli;
 mod domain;
 mod run;
 pub mod schema;
@@ -44,7 +45,10 @@ pub mod schema;
 use std::path::{Path, PathBuf};
 
 pub use domain::{Domain, ParentWavePoints, StationProbe, WaveDomain};
-pub use run::{MeshReport, Progress, RunReport, ScoreReport, StationSeries};
+pub use run::{
+    CaseDevice, DeviceRun, DeviceRunReport, MeshReport, Progress, RunReport, ScoreReport,
+    StationSeries,
+};
 pub use schema::*;
 
 /// What can go wrong with a case.

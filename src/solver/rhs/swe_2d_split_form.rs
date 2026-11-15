@@ -487,10 +487,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             SWEFormulation2D::Standard => return None,
             SWEFormulation2D::EntropyConservative => (SurfaceFlux::EntropyConservative, None),
             SWEFormulation2D::EntropyStable => (SurfaceFlux::EntropyStable, None),
-            SWEFormulation2D::WetDry => (
-                SurfaceFlux::HydrostaticHll,
-                Some((config.subcell_depth.unwrap_or(config.h_dry), config.h_dry)),
-            ),
+            SWEFormulation2D::WetDry => (SurfaceFlux::HydrostaticHll, config.subcells()),
         };
         assert!(
             !config

@@ -64,7 +64,7 @@
 use std::sync::atomic::AtomicBool;
 
 use super::bathymetry_validation::warn_once_if_misconfigured;
-use super::{BCContext2D, BoundaryState, SWEBoundaryCondition2D};
+use super::{BCContext2D, BoundaryState, DeviceBoundary2D, SWEBoundaryCondition2D};
 use crate::io::BoundaryTimeSeries;
 use crate::mesh::BoundaryTag;
 use crate::solver::SWEState2D;
@@ -102,6 +102,14 @@ impl ExternalState {
 pub trait ExternalStateProvider: Send + Sync {
     /// External state at the boundary point and time of `ctx`.
     fn external_state(&self, ctx: &BCContext2D) -> ExternalState;
+
+    /// The external state at time `t`, if it is the same at every point of
+    /// the boundary (it depends on the time alone): what a device runs, the
+    /// state evaluated once per stage on the host (P2.7, `notes/gpu.md`).
+    /// `None` (the default) if it varies along the boundary.
+    fn uniform_state(&self, _t: f64) -> Option<ExternalState> {
+        None
+    }
 }
 
 /// Any closure `(x, y, t) → ExternalState`.
@@ -132,6 +140,10 @@ impl StillWater {
 impl ExternalStateProvider for StillWater {
     fn external_state(&self, _ctx: &BCContext2D) -> ExternalState {
         ExternalState::new(self.eta, 0.0, 0.0)
+    }
+
+    fn uniform_state(&self, _t: f64) -> Option<ExternalState> {
+        Some(ExternalState::new(self.eta, 0.0, 0.0))
     }
 }
 
@@ -295,29 +307,44 @@ impl<P: ExternalStateProvider> CharacteristicOBC<P> {
             ctx.bathymetry,
             external.eta,
         );
-        let (nx, ny) = ctx.normal;
-        let g = ctx.g;
-        let h_e = (external.eta - ctx.bathymetry).max(0.0);
-        let (un_e, ut_e) = match external.velocity {
-            Some((u, v)) => (u * nx + v * ny, -u * ny + v * nx),
-            None => {
-                let un = match self.elevation_only {
-                    ElevationOnly::AtRest => 0.0,
-                    ElevationOnly::IncomingWave => {
-                        2.0 * ((g * (-ctx.bathymetry).max(0.0)).sqrt() - (g * h_e).sqrt())
-                    }
-                };
-                (un, ctx.interior_tangential_velocity())
-            }
-        };
-        characteristic_state(
-            &ctx.interior_state,
-            (h_e, un_e, ut_e),
-            ctx.normal,
-            g,
-            ctx.h_min,
-        )
+        characteristic_boundary_state(ctx, external, self.elevation_only)
     }
+}
+
+/// The boundary state of [`CharacteristicOBC`] at the point of `ctx` for the
+/// external state `external` (elevation-only data with the velocity of
+/// `elevation_only`): [`characteristic_state`] from the interior trace and
+/// the external depth and velocity. One source for the CPU and a device,
+/// which evaluates a uniform external state once per stage
+/// ([`ExternalStateProvider::uniform_state`]).
+#[inline]
+pub fn characteristic_boundary_state(
+    ctx: &BCContext2D,
+    external: ExternalState,
+    elevation_only: ElevationOnly,
+) -> SWEState2D {
+    let (nx, ny) = ctx.normal;
+    let g = ctx.g;
+    let h_e = (external.eta - ctx.bathymetry).max(0.0);
+    let (un_e, ut_e) = match external.velocity {
+        Some((u, v)) => (u * nx + v * ny, -u * ny + v * nx),
+        None => {
+            let un = match elevation_only {
+                ElevationOnly::AtRest => 0.0,
+                ElevationOnly::IncomingWave => {
+                    2.0 * ((g * (-ctx.bathymetry).max(0.0)).sqrt() - (g * h_e).sqrt())
+                }
+            };
+            (un, ctx.interior_tangential_velocity())
+        }
+    };
+    characteristic_state(
+        &ctx.interior_state,
+        (h_e, un_e, ut_e),
+        ctx.normal,
+        g,
+        ctx.h_min,
+    )
 }
 
 impl CharacteristicOBC<StillWater> {
@@ -342,6 +369,16 @@ impl<P: ExternalStateProvider> SWEBoundaryCondition2D for CharacteristicOBC<P> {
 
     fn name(&self) -> &'static str {
         "characteristic_obc"
+    }
+
+    /// With a uniform external state only (a harmonic tide, still water).
+    fn device_form(&self, _tag: Option<BoundaryTag>) -> Option<DeviceBoundary2D<'_>> {
+        self.provider
+            .uniform_state(0.0)
+            .map(|_| DeviceBoundary2D::Characteristic {
+                provider: &self.provider,
+                elevation_only: self.elevation_only,
+            })
     }
 }
 
@@ -525,5 +562,27 @@ mod tests {
         let q = bc.state(&ctx(interior, -depth, n));
         assert!((q.h - h).abs() < 1e-12);
         assert!((normal_velocity(&q, n) - un).abs() < 1e-12);
+    }
+
+    /// A device evaluates a uniform external state once per stage
+    /// (`uniform_state`): it must be the state every boundary point gets, and
+    /// a provider that varies along the boundary has none.
+    #[test]
+    fn a_uniform_state_is_the_external_state_of_every_point() {
+        let tide = crate::boundary::HarmonicTide::m2(0.8, 0.3)
+            .with_mean_elevation(0.1)
+            .with_ramp_up(3600.0);
+        let still = StillWater::at(0.25);
+        let varying = |x: f64, _y: f64, t: f64| ExternalState::elevation(1e-4 * x + 1e-5 * t);
+        for t in [0.0, 1800.0, 7200.0, 40_000.0] {
+            for (x, y) in [(0.0, 0.0), (1500.0, -20.0)] {
+                let mut c = ctx(SWEState2D::new(5.0, 1.0, 0.5), -5.0, (1.0, 0.0));
+                (c.time, c.position) = (t, (x, y));
+                for provider in [&tide as &dyn ExternalStateProvider, &still] {
+                    assert_eq!(provider.uniform_state(t), Some(provider.external_state(&c)));
+                }
+                assert_eq!(varying.uniform_state(t), None);
+            }
+        }
     }
 }

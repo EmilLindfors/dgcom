@@ -57,6 +57,9 @@ pub struct Case {
     /// Time stepping.
     #[serde(default)]
     pub numerics: NumericsSection,
+    /// Where the run computes (default: the CPU).
+    #[serde(default)]
+    pub compute: ComputeSection,
     /// What is written, and where.
     #[serde(default)]
     pub output: OutputSection,
@@ -1583,6 +1586,66 @@ pub struct NumericsSection {
     /// step for all; at most 16).
     #[serde(default)]
     pub local_time_stepping_levels: usize,
+}
+
+/// `[compute]`
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComputeSection {
+    /// The device the 2D run steps on: `"cpu"` (the default), or a CUDA GPU,
+    /// `"cuda"` (the first) or `"cuda:N"` (`notes/gpu.md`). A GPU needs a
+    /// build with a device backend (`gpu/`'s `dgcom-gpu`), runs P2 meshes
+    /// and global time steps, and refuses physics it does not run yet,
+    /// naming it (`SWEPhysics2D::device_form`).
+    #[serde(default)]
+    pub device: ComputeDevice,
+}
+
+/// Where a run computes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum ComputeDevice {
+    /// The CPU's threads
+    #[default]
+    Cpu,
+    /// The CUDA GPU of this ordinal
+    Cuda(usize),
+}
+
+impl std::fmt::Display for ComputeDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpu => write!(f, "cpu"),
+            Self::Cuda(ordinal) => write!(f, "cuda:{ordinal}"),
+        }
+    }
+}
+
+impl TryFrom<String> for ComputeDevice {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        let ordinal = |n: &str| {
+            n.parse()
+                .map_err(|_| format!("compute.device: no CUDA ordinal in {s:?}"))
+        };
+        match s.as_str() {
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => Ok(Self::Cuda(0)),
+            _ => match s.strip_prefix("cuda:") {
+                Some(n) => ordinal(n).map(Self::Cuda),
+                None => Err(format!(
+                    "compute.device must be \"cpu\", \"cuda\" or \"cuda:N\", not {s:?}"
+                )),
+            },
+        }
+    }
+}
+
+impl From<ComputeDevice> for String {
+    fn from(device: ComputeDevice) -> Self {
+        device.to_string()
+    }
 }
 
 /// The time stepper.

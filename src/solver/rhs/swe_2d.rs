@@ -287,6 +287,14 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
         self.subcell_depth = Some(depth);
         self
     }
+
+    /// `WetDry`'s subcells: the depth below which a node puts its element
+    /// on them, and the dry-node depth of their reconstruction; `None` for
+    /// the other formulations.
+    pub fn subcells(&self) -> Option<(f64, f64)> {
+        (self.formulation == SWEFormulation2D::WetDry)
+            .then(|| (self.subcell_depth.unwrap_or(self.h_dry), self.h_dry))
+    }
 }
 
 /// Boundary state from the configured boundary condition at `node` of
