@@ -4,6 +4,7 @@
 //! dgcom run   <case.toml> [--set key.path=value]... [--resume <restart>]
 //! dgcom check <case.toml> [--set key.path=value]...
 //! dgcom mesh  <case.toml> [--set key.path=value]...
+//! dgcom score <case.toml> [--set key.path=value]...
 //! dgcom --version
 //! ```
 //!
@@ -12,7 +13,11 @@
 //! and prints the case with every default filled in, without running it.
 //! `mesh` builds the mesh and bed and writes them to the output directory's
 //! `mesh` folder (Gmsh with the boundary tags; VTK with the bed and each
-//! element's time step at rest) to inspect before a run.
+//! element's time step at rest) to inspect before a run. `score` scores the
+//! finished run in the output directory against its tide gauges again, from
+//! its `stations.csv`, without the mesh or the run (`CaseFile::score`): after
+//! a change to the harmonic fit, or over another window
+//! (`--set output.spinup_hours=…`).
 //! `--set` overrides a key of the case file, e.g. `--set numerics.cfl=0.5`.
 //! `--resume` continues a run from one of its restarts (`[restart]`): it
 //! sets `restart.from` to the file, relative to the working directory.
@@ -20,7 +25,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use dgcom::case::{CaseFile, Domain, Progress};
+use dgcom::case::{CaseFile, Domain, Progress, StationSeries};
 
 const USAGE: &str = "\
 dgcom: the Discontinuous Galerkin Coastal Ocean Model
@@ -30,7 +35,8 @@ usage:
               [--resume <restart>]                  ... from one of its restarts
   dgcom check <case.toml> [--set key.path=value]...   validate a case and print it resolved
   dgcom mesh  <case.toml> [--set key.path=value]...   write the mesh and bed to inspect (Gmsh, VTK)
-  dgcom --version                                     the build: version and git commit
+  dgcom score <case.toml> [--set key.path=value]...   score its finished run against the gauges again
+  dgcom --version                                    the build: version and git commit
 
 A case file is TOML (or JSON, by its .json extension); see
 cases/tidal_channel/case.toml and the `dgcom::case` documentation.";
@@ -81,6 +87,7 @@ fn cli(args: Vec<String>) -> Result<(), String> {
         "check" => check(&file),
         "mesh" => mesh(&file),
         "run" => run(&file),
+        "score" => score(&file),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     }
 }
@@ -240,12 +247,28 @@ fn run(file: &CaseFile) -> Result<(), String> {
     if dgcom::profiling::enabled() {
         print!("{}", dgcom::profiling::report());
     }
-    for s in &done.stations {
+    print_gauge_scores(&done.stations, case.spinup_hours());
+    Ok(())
+}
+
+fn score(file: &CaseFile) -> Result<(), String> {
+    println!("{}", dgcom::provenance::describe());
+    let report = file.score().map_err(|e| e.to_string())?;
+    for line in &report.notes {
+        println!("  {line}");
+    }
+    print_gauge_scores(&report.stations, file.case.spinup_hours());
+    Ok(())
+}
+
+/// Each gauged station's scores after `spinup` hours, as written to
+/// `gauge_skill.csv` and `gauge_constituents.csv`.
+fn print_gauge_scores(stations: &[StationSeries], spinup: f64) {
+    for s in stations {
         let Some(g) = &s.gauge else { continue };
         println!(
-            "gauge {} after {} h (gauge_skill.csv, gauge_constituents.csv):",
-            s.name,
-            case.spinup_hours()
+            "gauge {} after {spinup} h (gauge_skill.csv, gauge_constituents.csv):",
+            s.name
         );
         for (what, score) in [
             ("observations", &g.vs_observations),
@@ -275,5 +298,4 @@ fn run(file: &CaseFile) -> Result<(), String> {
             Err(e) => println!("  reference constants: not fitted ({e})"),
         }
     }
-    Ok(())
 }

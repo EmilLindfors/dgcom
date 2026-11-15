@@ -461,7 +461,13 @@ impl CaseFile {
         notes.extend(restarts.map(|r| r.note()));
         let mut stations = output.finish();
         if let Some(clock) = &clock {
-            score_gauges(domain, &mut stations, clock, 3600.0 * case.spinup_hours());
+            score_gauges(
+                &domain.tide_constituents,
+                domain.stations.iter().map(|s| s.gauge.as_ref()),
+                &mut stations,
+                clock,
+                3600.0 * case.spinup_hours(),
+            );
             if stations.iter().any(|s| s.gauge.is_some()) {
                 super::write_gauge_scores(&self.output_dir(), &stations)?;
             }

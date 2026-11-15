@@ -48,3 +48,28 @@
 - [ ] Wave–current interaction: now F.4 (the spectral wave model, stage 1 done 2026-10-03; coupling is a stage there).
 - [ ] Biological coupling (NPZD). Salmon-lice dispersion is particle tracking, now F.2 under "Application target".
 - [ ] Sediment transport.
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Folded
+
+- **P5.1** Delete the superseded `Discharge2D`/`ConstantDischarge2D` (and the `River` tag's boundary dispatch) with P6. *(Folded 2026-11-15 into `TODO.md`'s P6 the legacy 2D paths.)*
+
+### Parked
+
+- **P5.2** A ROMS variable-name mapping for `NetCDFWriter` (CF-1.8 today).
+- **P5.3** A NetCDF export of restarts (`ocean_rst.nc`) once P5.2's conventions are settled.
+- **P5.4** The operational pipeline: run scripts, monitoring/alerting, THREDDS/OPeNDAP serving.
+- **P7** IMEX time stepping via diffsol (implicit vertical diffusion).
+- **P7** Subcell positivity preservation with convex limiting (Wu et al. 2024).
+- **P7** hp-adaptive mesh refinement.
+- **P7** Data assimilation (EnKF, then 4D-Var).
+- **P7** Two-way nesting.
+- **P7** Biological coupling (NPZD); sediment transport.
+
+### Dropped
+
+- **P5.1** River mouths from NVE's river network: NorKyst's are its 800 m coastline faces, snapped 1.6–1.9 km onto the Frøya coastline mesh. *(Dropped 2026-11-15: a duplicate of P1.6's river-mouth line.)*
+- **P5.3** `froya_real_data`'s resume check (`check_resumed_options`) still compares the options as given: a default changed between two binaries goes unnoticed, and an option left out is refused against one given at its default. Case runs compare their resolved case instead since 2026-11-08 (`[restart]`, `notes/case-files.md`); the example's check goes when P8.2 retires its restarts. *(Dropped 2026-11-15: the example's restarts retire with it; case runs compare resolved cases.)*

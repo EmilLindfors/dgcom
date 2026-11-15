@@ -158,3 +158,29 @@
 
       Inside the mesh, NorKyst isn't cold at night: +0.11 overall, against −0.13 over the whole box. The model follows NorKyst within 0.1 °C. By the last night both lag the satellite's warming (+0.54 °C from 7 to 8 June against the model's +0.30). At night the model's 0–3 m difference is zero, as the satellite can't tell apart either.
     - Thin columns go far out of range in both runs: −2.00 °C (the lower bound) around the low waters at 42–46 h and 66 h, and up to 21 °C (k-ε) or 36 °C (generic) at 54–58 h. The ordinary columns stay at 6.9–14.8 °C, and the scores above don't sample columns shallower than their depth.
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Folded
+
+- **P4.6** The lowest S in the MET run fell from 9.4 to 7.8 after ≈ 24 h: find the node (a river source, a pond or a thin column) and whether it is bounded. *(Folded 2026-11-15 into `TODO.md`'s P4.5 3D tracers out of range at dry and thin columns.)*
+
+### Parked
+
+- **P4.6** The afternoon peak against observations. ACSPO and Copernicus Marine's ODYSSEA L3S are night and foundation SST only, and Copernicus Marine has no in situ SST in the domain. Daytime needs SLSTR L2P from CDSE (09–10 UTC, its own account) or VIIRS L2P from PO.DAAC (13:30 local, Earthdata) (`notes/3d-validation.md` "What the accounts give").
+- **P4.6** The afternoon warm layer: at the farms on 5–8 June 2026 the model's 0–3 m difference peaks at +0.34 °C at 15 UTC against NorKyst's +0.47, forms earlier and lingers into the evening, the same with k-ε and generic. Try finer levels at the surface (`levels=30`, or stronger surface stretching) and the surface k/ψ boundary conditions before the closure (`notes/3d-validation.md` "The 2026 window").
+- **P4.6** Draugen (64.35° N, 7.78° E; Copernicus Marine `AR_TS_MO_Draugen`, 10 min) against the forcing and the surface current: wind at 10 m, air temperature, dew point and current against MET Nordic, MEPS and NorKyst. It needs MET and NorKyst subsets about 30 km wider to the north-west.
+- **P4.6** A source for `TracerReferenceProfile` (a z-binned horizontal mean of the state or the parent), needed before the Kuzmin limiter over slopes in a realistic run.
+- **P4.6** Move the smooth references to `from_smooth_fn` and measure (Frøya `tidal_run_3d`, `levels=N`, `seamount_3d.rs kuzmin=2`, `src/simulation/simulation_3d.rs:3359`).
+- **P4.6** Tanh-pycnocline seamount at r_x0 0.08 spins up 0.38 → 1.5 cm/s over 5 days: 30 days, refine nx and levels, compare with Shchepetkin & McWilliams (2003, Fig. 10).
+- **P4.6** Exact vertical PGF/advection energy exchange for curved profiles (the Hermite mean as the advection's face value); does it remove the residual seamount growth?
+- **P4.6** The balanced reference sampled at the reference η gives an η/D error under a tide: refresh it or interpolate to current level depths; measure with a tide over the seamount.
+- **P4.6** At r_x0 0.32 the Kuzmin limiter adds to the error flow: a detector for steep continuous fronts (Persson–Peraire), isopycnal bounds for spice.
+- **P4.6** The sill fjord 1 km wide is less critical at its mouth (F₁² 0.84, 0.69 without rotation): the exit's expansion, a control seaward of the mouth, or the width mean (`notes/3d-validation.md`).
+- **P4.6** The sill fjord's entrainment against Stigebrandt's: P under wind and tidal mixing (the model's P 1.4–1.7 is the outflow's shear alone).
+- **P4.6** Exact section budgets from the model's own face fluxes, RK-weighted (salt budget off 1–3 % from nodal `H_z u S`); needed for P5.2 farm exchange output.
+- **P4.6** Periodic meshes: `Mesh2D::elements_at_vertex` has no periodic images, so Kuzmin bounds there are one-sided (also `limiters/swe_2d.rs:260`, `tracer_2d.rs:593`).
+- **P4.6** The 3D limiter's remaining cost (1.6 ms/call): one buffer of inventory weights per call, T and S in one pass.
+- **P4.6** Frohavet's depth-mean M2 current is 1.41× NorKyst's in the 72 h open-boundary run (0.388 against 0.275 m/s, G 58° against 55°; 0.89× when walled): its 83 m column against NorKyst's 55 m, or the strait's transport? A section across Frohavet over the 3 days (`norkyst_profiles_3d section=`).

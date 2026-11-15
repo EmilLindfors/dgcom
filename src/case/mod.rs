@@ -24,7 +24,8 @@
 //! - a weather model's wind and pressure, with the inverse-barometer level
 //!   at the open boundaries (NetCDF);
 //! - snapshot, VTK, NetCDF and station output, the stations scored
-//!   against tide gauges;
+//!   against tide gauges, and scored again from a finished run's records
+//!   without the run (`dgcom score`, [`CaseFile::score`]);
 //! - a 3D run (`[three_d]`): σ-layers under the depth mean, started from
 //!   and nested in a parent's columns or a profile, with rivers (`[rivers]`);
 //! - spectral waves coupled to the 2D run (`[waves]`), on its mesh or their
@@ -43,7 +44,7 @@ pub mod schema;
 use std::path::{Path, PathBuf};
 
 pub use domain::{Domain, ParentWavePoints, StationProbe, WaveDomain};
-pub use run::{MeshReport, Progress, RunReport, StationSeries};
+pub use run::{MeshReport, Progress, RunReport, ScoreReport, StationSeries};
 pub use schema::*;
 
 /// What can go wrong with a case.

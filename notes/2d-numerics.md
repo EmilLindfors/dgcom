@@ -151,3 +151,33 @@ The first step of #231: uniform P1–P4 at about equal unknowns on the Mausund s
   - P1 does not get there by refining: at 0.8 of P2's unknowns Chiloé is 10 cm worse and 20 min later at Puerto Montt, and Mausund's 133 m mesh scores as its 200 m one (7.7 against 7.9 cm, 7 min late on both). P1's error there is not the element size.
   - So the premise of #231 does not hold on these two domains: there is no accuracy for a higher deep order to buy, and by the issue's own rule the fixed-stride refactor is not worth it. What was not measured is the other direction, P1 at the shore under P2 in deep water. It could save at most the shore elements' share of the work (22 % of Chiloé's elements), and P1's lag would have to come from the deep water for it to keep P2's scores; the 133 m Mausund run, 38 % shore elements, says it does not.
   - Not judged: currents. Each run's station is the nearest node of an element at least 3 m deep, which moves with the mesh and the order (Melinka's station depth 4.4–14.5 m over the runs), so the stations' currents differ by as much as the current itself (2–6 cm/s) and say nothing about the order. Since 2026-11-14 a station's current is sampled where the bed is 3 m deep, which agrees across these five runs to 30 m at Melinka and 100 m at Ancud (`notes/case-files.md`, "a station's current at a point that does not move with the mesh"); the currents have not been compared again.
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Folded
+
+- **P1.7** Nonlinear SWE convergence with bathymetry on curved meshes, asserting N+1 in `tests/convergence_test.rs` (thresholds 1.5/2.5 today). *(Folded 2026-11-15 into `TODO.md`'s P1.7 convergence on curved and jittered meshes.)*
+- **P1.2** Retire the `Standard` wet/dry path and the cell-average/`linearize` workarounds once the legacy `ssp_rk3_swe_2d` users are on `Simulation` (P6). *(Folded 2026-11-15 into `TODO.md`'s P6 the legacy 2D paths.)*
+- **P1.2** Water that flows steadily without draining, in 2D on the Frøya coastline bed (`slopes3d=on debug_3d=thin=1`): before `ponds3d`, node P at (−1.395, −9.278) km kept its two copies 0.6 m apart in η (7790 at +0.18 m, perched 0.62 m above a dry interior sill it should drain over; 7791 at −0.43) with 0.38 m/s across their face, and a 2.2 m pond at (−2.153, 6.606) km held 1.23 m/s over a 6 cm sill for hours; both are filled now, but a 0.2 m film on +0.27 m land at (13.228, −4.318) km still runs at 0.8 m/s from 5 to 8 h at the same η. Log the face and subcell mass fluxes there (`notes/2d-numerics.md`). *(Folded 2026-11-15 into `TODO.md`'s P1.2 films on land that do not drain.)*
+- **P1.2** `SWE2DRhsConfig::new` defaults to `Standard` unchecked: warn on an unbalanced sloping bed in `with_bathymetry`, as the builder does. *(Folded 2026-11-15 into `TODO.md`'s P6 the legacy 2D paths.)*
+- **P1.7** Merge the three legacy long-run conservation tests in `tests/swe_2d_test.rs` into one on `Simulation` when tests move off the legacy steppers. *(Folded 2026-11-15 into `TODO.md`'s P6 the legacy 2D paths.)*
+- **P1.2** Viscosity on 1 cm films at large ν: at ν = 10 a Kattholmen shoreline element (1183) with a 1.2 cm node above the 1 mm subcell depth runs at 0.2–0.8 m/s and its film node at the 20 m/s cap (still at ν ≤ 1). Scale the viscous depth threshold with ν, or taper νh over a depth band. *(Folded 2026-11-15 into `TODO.md`'s P1.2 films on land that do not drain.)*
+
+### Parked
+
+- **P1.2** Limit η (and velocities or characteristic variables), not h, with a troubled-cell indicator (TVB-M/KXRCF); limit h only in partially dry cells (Vater et al. 2019). Strict Kuzmin on h collapses sloping elements to P0 every half-cycle.
+- **P1.1** Remaining stage allocations: a buffer-reusing `clone_from` for `DGSolution1D`/`DGSolution2D`/`Solution3D`; limiter `Vec`s (P2.3); `Simulation3D` off the stage workspace (P4.1).
+- **P1.2** End subcells on physical boundaries stay first order: the outer slope neighbour from the BC, or one-sided slopes where both nodes are wet.
+- **P1.2** Dry fronts lag (Ritter 1 mm front at 71.5 m against 79.8 m): suspects strict Kuzmin at the front and zeroed momentum below h_dry; revisit with η-based limiting.
+- **P1.2** A roughness map from data (sediment type or calibrated n per region), projected like `Bathymetry2D::project` (Frøya uses n = 0.025 everywhere; a Mausund phase suspect).
+- **P1.2** Guidance for `h_dry` (≈ 1e-4 of the characteristic depth), derived from the bathymetry or relative (1 mm dominates the 0.1 m Thacker error, 7.4 % against 4.5 %).
+- **P1.2** Chen–Noelle (2017) reconstruction instead of Audusse, for bed steps larger than the depth.
+- **P1.2** `outer_nodes` scales by affine element heights: per-node isoparametric factors (P1.3).
+- **P1.1** Specialise hot paths through the kernel split: a `const N` kernel for fixed-size products; skip `reference_to_physical` + `SourceContext2D` for sources that need neither (P2.2).
+- **P1.2** Lower priority: convex DG/FV blending (Hennemann–Gassner) so one node below `h_dry` doesn't switch a whole element to subcells.
+
+### Dropped
+
+- **P1.2** Only if friction's first-order error matters on flats: second-order IMEX for point-implicit friction (13–32 % above exact decay at dt·Λ ≈ 3). *(Dropped 2026-11-15: only if, as the line says.)*

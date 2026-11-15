@@ -33,7 +33,8 @@ Reference documents live in `docs/`: `architecture.md` (module tree, status by l
 
 ## Conventions
 
-- **`TODO.md` holds open items only**, one line each, starting with the item's ID (`**P1.3**`) under a section whose heading links its notes file. Search the notes file for the ID to find the context. No results, no history.
+- **`TODO.md` holds what is worth doing next only**, one line each, starting with the item's ID (`**P1.3**`) under a section whose heading links its notes file, and serving the outcome its header names. Search the notes file for the ID to find the context. No results, no history.
+- **Out of TODO.md:** each notes file ends with what left `TODO.md` in the triage of 2026-11-15, verbatim: Folded (part of a line there now), Parked (comes back when a run, a measurement or a user asks for it) and Dropped (with the reason).
 - **Finishing an item:** delete its line from `TODO.md`, and record the outcome (date, PR, the numbers) under the item's heading in its notes file. Notable changes also go in `CHANGELOG.md`.
-- **A new opportunity or follow-up:** a one-line checkbox in `TODO.md` under the matching area; put the measurement, file/function pointer and reasoning in the notes file when it takes more than the line.
+- **A new opportunity or follow-up:** a line under Parked in its notes file, with the measurement, file/function pointer and reasoning. A line in `TODO.md` only when it beats the ones there, and why.
 - **A new area:** add a file here and a row to the table above.

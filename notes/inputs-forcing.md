@@ -128,3 +128,32 @@
   - [x] ~~The 2D tracer path (`coupled_swe_tracer`, legacy) gets no river T/S~~: the 2D tracer path is deleted (2026-10-15, `notes/tech-debt.md`).
   - [ ] `Hydrostatic3D::update_vertical_velocity` (the `w` output) closes Ω with the state's own transports and no rivers: in river elements the output Ω has the river volume spread linearly over the column instead of entering at the river's levels. Pass the last step's `RiverInflow` (or the stages' Ω) to it.
 - [ ] Fix the tidal-potential sign vs its docs (`source/swe_2d/tidal.rs:299-305`) and the diurnal Love factor (low priority, < 5 mm effect).
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Folded
+
+- **P1.6** Check a nested 3D case's tide against the default 3D bed's levels (−1.43 to +2 m) from the parent's own ζ at the boundary over the run, as `default_3d_bed_tide_warning` does for a `[[boundary]]` atlas; the shipped 3D cases are nested and unchecked (`notes/case-files.md`, P8.1 sixth part). *(Folded 2026-11-15 into `TODO.md`'s P8.12 the 3D bed's levels from the case's tide.)*
+
+### Parked
+
+- **P1.6** A filled topobathy bed depends on where the raster is cut: `BedRaster::fill_holes` fills the zero pixels from their surroundings within the cut, so the Mausund box cut to the box (444 × 380 pixels, 1404 filled) and to the mesh's extent (461 × 395, 1540 filled) differ at 25 nodes and one tidal pond (2026-11-08, the Kattholmen case). Fill on a margin wider than the fill's reach, or once on the whole file, so the bed is the cut's own; then drop `[bathymetry.raster] crop`.
+- **P1.6** Measure `lower_wall_land` in 3D (stratified rest, and a tide with `levels=20 slopes3d=on`) before making it the default, then in `viz/src/scenario.rs`.
+- **P1.6** Put the coastline mesh's walls in the water in `scripts/gmsh_coastline_mesh.py` (dilate the opened land back, or the projected bed's 0 contour), never closing a sound.
+- **P1.6** `scripts/gmsh_coastline_mesh.py` leaves non-convex quads at coarse sizes when `min_water` is under 2 × `coast` (Chiloé `coast=833 min_water=1500`: 24; Mausund `coast=333`: 3; `smooth=` and `recombine_quality=` do not help), and only reports them: fix them in the script (split or move the node), or refuse with the size that works (`notes/2d-numerics.md`, mixed order).
+- **P1.6** A farm-scale bed: tile the 1 m topobathy level over the 50 m model using the "Dybdedata - dekning" coverage layer; Kattholmen needs another source (dybdedata WFS or a survey).
+- **P1.6** Pass the last step's `RiverInflow` to `Hydrostatic3D::update_vertical_velocity` (output Ω spreads river volume over the column).
+- **P1.6** UTM33/Lambert projections for coast-scale domains (the local projection's error grows with the domain).
+- **P1.6** A spatial index for point-in-polygon and GSHHS inner rings in `coastline.rs:81-95` (the land mask costs ≈ 20 s of setup at Frøya).
+- **P1.6** Cut the atmosphere forcing's memory (≈ 210 MB at 10⁶ nodes): share stencils per element, or drop them after regridding.
+- **P1.6** River mouths for fine meshes: NorKyst's mouths sit on its 800 m grid (Frøya's river 848 34.5 m up a hill, 250 m from the DEM's water), so on a 50 m mesh refined at them (`gmsh_coastline_mesh.py rivers=`) a river still moves up to 195 m. Read NVE's own outlet coordinates for the rivers (`notes/inputs-forcing.md`, rivers).
+- **P1.6** River details: river momentum `Q/(width·depth)` for jets at narrow mouths; spreading over elements within a radius if one-element plumes show.
+- **P1.6** If the wind-driven residual matters at farms: stress from the wind relative to the current, with a stability-dependent COARE drag.
+
+### Dropped
+
+- **P1.6** Count wet as h > 1 cm in the example's η statistics, so mm films don't set "η max". *(Dropped 2026-11-15: the example retires; case runs report the water at least 1 m deep since 2026-11-13.)*
+- **P1.6** Low priority (< 5 mm): the tidal-potential sign against its docs (`source/swe_2d/tidal.rs:299-305`) and the diurnal Love factor. *(Dropped 2026-11-15: `TidalPotential` has no caller and goes (P6).)*
+- **P1.6** Not worth it now: a constrained bed projection at walls (median −0.2 m, 1st percentile −12 m). *(Dropped 2026-11-15: as the line says.)*
