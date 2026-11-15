@@ -63,6 +63,7 @@ pub use rhs::{
     SWEFluxType,
     SWEFormulation2D,
     SWERhsConfig,
+    SWESide2D,
     TracerBCContext3D,
     TracerBoundaryCondition3D,
     UpwindTracerBC3D,
@@ -85,12 +86,14 @@ pub use rhs::{
     element_dt_swe_2d,
     element_dt_viscous_swe_2d,
     face_mass_len,
+    hydrostatic_hll,
     largest_viscosity_swe_2d,
     linear_cfl_subcells_swe_2d,
     linear_cfl_swe_2d,
     min_element_dt_swe_2d,
     node_reference_rate,
     positivity_cfl_swe_2d,
+    reconstruct_subcell,
     subcell_mass_len,
 };
 

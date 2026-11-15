@@ -3,13 +3,15 @@
 //! ([`GpuSWE2D`], dgcom's [`PhysicsModule`]), so that dgcom's own
 //! `Simulation` and SSP-RK steppers drive the GPU.
 //!
-//! Phase 1's first scope: the fully wet split-form RHS
-//! (`SWEFormulation2D::EntropyStable`) with a bed, on meshes without
-//! boundary faces (periodic), no sources, global steps. The kernels follow
+//! The split-form RHS of `SWEFormulation2D::EntropyStable` and of `WetDry`
+//! (the subcells in elements with a node shallower than the subcell depth,
+//! the hydrostatic HLL at faces) with a bed, walls (`Reflective2D`, called
+//! as the CPU calls it), no sources yet, global steps. The kernels follow
 //! `SplitFormSWE2D` (`src/solver/rhs/swe_2d_split_form.rs`) operation for
-//! operation and call dgcom's pointwise physics, so a build without
-//! multiply–add contraction (`cargo oxide run --no-fmad`) gives the CPU's
-//! bits. One thread per edge and one per element; every loop unrolls (P2's
+//! operation and call dgcom's pointwise physics (the two-point flux, the
+//! hydrostatic HLL, the subcell reconstruction, the interface metrics, the
+//! wall's ghost state), so a build without multiply–add contraction
+//! (`cargo oxide run --no-fmad`) gives the CPU's bits. One thread per edge and one per element; every loop unrolls (P2's
 //! bounds are constants, the face nodes a formula), so an element's nodes and
 //! RHS stay in registers.
 
@@ -19,15 +21,20 @@ use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig, Stream};
 use cuda_device::{DisjointSlice, device, kernel, thread};
 use cuda_host::cuda_module;
 use dgcom::SWEState2D;
+use dgcom::boundary::{BCContext2D, Reflective2D, SWEBoundaryCondition2D};
 use dgcom::equations::ShallowWater2D;
 use dgcom::flux::{
     SWENodeState2D, entropy_stable_dissipation_2d, wintermeyer_bed_interface_term_2d,
     wintermeyer_flux_2d,
 };
-use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
 use dgcom::physics::{PhysicsModule, PhysicsModuleInfo};
-use dgcom::solver::{SWESolution2D, dt_from_reference_rate, node_reference_rate};
+use dgcom::solver::rhs::subcells::telescoped_interfaces;
+use dgcom::solver::{
+    SWESide2D, SWESolution2D, dt_from_reference_rate, hydrostatic_hll, node_reference_rate,
+    reconstruct_subcell,
+};
 use dgcom::time::Integrable;
 use dgcom::types::{Depth, ElementIndex};
 
@@ -40,8 +47,11 @@ pub const NN: usize = N1 * N1;
 /// Face-buffer slots per edge: the left side's `N1`, then the right side's.
 pub const NF: usize = 2 * N1;
 /// Per-element geometry of a parallelogram: `J∇r` (2), `J∇s` (2), `1/J`,
-/// then each face's outward normal (2) and surface Jacobian.
-const EG: usize = 17;
+/// each face's outward normal (2) and surface Jacobian, then `J`.
+const EG: usize = 18;
+
+/// The right side of a boundary edge (`edges`).
+const NO_NEIGHBOUR: u32 = u32::MAX;
 
 /// Threads per block of the element kernels (their registers bound the block).
 const ELEMENT_BLOCK: u32 = 128;
@@ -77,15 +87,22 @@ fn node_state(
     SWENodeState2D::new(&SWEState2D::new(h[n], hu[n], hv[n]), bed[n], h_min)
 }
 
-/// `SplitFormSWE2D::surface_flux` for `SurfaceFlux::EntropyStable`: `F*·n`
-/// seen from side a, and `F*·(−n)` from side b.
+/// `SplitFormSWE2D::surface_flux`: `F*·n` seen from side a, and `F*·(−n)`
+/// from side b; the hydrostatic HLL of `WetDry` if `hll`, else the
+/// entropy-stable flux.
 #[inline]
 fn surface_flux(
     q_a: &SWENodeState2D,
     q_b: &SWENodeState2D,
     n: (f64, f64),
     g: f64,
+    hll: bool,
+    h_min: f64,
 ) -> (SWEState2D, SWEState2D) {
+    if hll {
+        let (f_a, f_b) = hydrostatic_hll(&q_a.into(), &q_b.into(), n, g, h_min);
+        return (f_a, -f_b);
+    }
     let mut shared = wintermeyer_flux_2d(q_a, q_b, n, g);
     shared = shared + entropy_stable_dissipation_2d(q_a, q_b, n, g);
     let minus_n = (-n.0, -n.1);
@@ -154,6 +171,180 @@ fn line_volume<const AFFINE: bool, I: Fn(usize) -> usize>(
     }
 }
 
+/// `SplitFormSWE2D::line_subcells`: the subcell finite-volume update (times
+/// J) along the line of nodes `idx(0..N1)`, its end subcells taking their
+/// outer slope neighbour from `ends` (the node, its distance, whether there
+/// is one).
+#[device]
+#[allow(clippy::too_many_arguments)]
+fn line_subcells<I: Fn(usize) -> usize>(
+    nodes: &[SWENodeState2D; NN],
+    rhs: &mut [SWEState2D; NN],
+    metric: &[(f64, f64); N1],
+    idx: I,
+    ends: [(SWENodeState2D, f64, bool); 2],
+    affine: bool,
+    w: &[f64],
+    xi: &[f64],
+    d1: &[f64],
+    g: f64,
+    h_min: f64,
+    h_dry: f64,
+) {
+    // Interface metrics (the telescoping sum of the flux-differencing term)
+    let mut interfaces = [(0.0, 0.0); N1 + 1];
+    telescoped_interfaces(w, d1, metric, affine, &mut interfaces);
+
+    let (first, last) = (idx(0), idx(N1 - 1));
+    let (q_first, q_last) = (nodes[first], nodes[last]);
+    let (m_first, m_last) = (metric[0], metric[N1 - 1]);
+    rhs[first] = rhs[first] + (1.0 / w[0]) * wintermeyer_flux_2d(&q_first, &q_first, m_first, g);
+    rhs[last] = rhs[last] - (1.0 / w[N1 - 1]) * wintermeyer_flux_2d(&q_last, &q_last, m_last, g);
+
+    // Face states. Subcell a spans [x_a, x_a + w_a] with x_0 = −1
+    let mut faces = [(SWESide2D::default(), SWESide2D::default()); N1];
+    let mut x_left = -1.0;
+    #[unroll]
+    for a in 0..N1 {
+        let q = SWESide2D::from(&nodes[idx(a)]);
+        let x_right = x_left + w[a];
+        let (left, x_l, has_left) = if a > 0 {
+            (SWESide2D::from(&nodes[idx(a - 1)]), xi[a - 1], true)
+        } else {
+            (SWESide2D::from(&ends[0].0), -1.0 - ends[0].1, ends[0].2)
+        };
+        let (right, x_r, has_right) = if a + 1 < N1 {
+            (SWESide2D::from(&nodes[idx(a + 1)]), xi[a + 1], true)
+        } else {
+            (SWESide2D::from(&ends[1].0), 1.0 + ends[1].1, ends[1].2)
+        };
+        faces[a] = if has_left && has_right {
+            reconstruct_subcell(
+                [left, q, right],
+                [x_l, xi[a], x_r],
+                (x_left, x_right),
+                h_dry,
+            )
+        } else {
+            (q, q)
+        };
+        x_left = x_right;
+    }
+
+    #[unroll]
+    for a in 0..N1 - 1 {
+        let (ia, ib) = (idx(a), idx(a + 1));
+        let m = interfaces[a + 1];
+        let (f_a, f_b) = hydrostatic_hll(&faces[a].1, &faces[a + 1].0, m, g, h_min);
+        rhs[ia] = rhs[ia] - (1.0 / w[a]) * f_a;
+        rhs[ib] = rhs[ib] + (1.0 / w[a + 1]) * f_b;
+    }
+
+    // Bed-slope term, zero in subcells without a slope (B_L = B_R), and the
+    // metric balance term, zero on affine elements
+    #[unroll]
+    for a in 0..N1 {
+        let ia = idx(a);
+        let (left, right) = faces[a];
+        let w_a = w[a];
+        let bed = -0.5 * g * (left.h + right.h) * (right.b - left.b) / w_a;
+        let (force_x, force_y) = if affine {
+            let m = metric[0];
+            (bed * m.0, bed * m.1)
+        } else {
+            let (m_l, m_r) = (interfaces[a], interfaces[a + 1]);
+            let (h_a, b_a) = (nodes[ia].h, nodes[ia].b);
+            let balance =
+                0.25 * g * ((right.h + h_a) * (b_a - right.b) + (left.h + h_a) * (b_a - left.b))
+                    / w_a;
+            (
+                bed * 0.5 * (m_l.0 + m_r.0) + balance * (m_r.0 - m_l.0),
+                bed * 0.5 * (m_l.1 + m_r.1) + balance * (m_r.1 - m_l.1),
+            )
+        };
+        rhs[ia] = rhs[ia] + SWEState2D::new(0.0, force_x, force_y);
+    }
+}
+
+/// `SplitFormSWE2D::outer_node`: of face node `fi` of `face` of element `k`,
+/// the neighbour's first interior node on the GLL line through it, its
+/// distance from the face in `k`'s reference coordinate, and whether there
+/// is a neighbour.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn outer_node(
+    k: usize,
+    face: usize,
+    fi: usize,
+    state: (&[f64], &[f64], &[f64], &[f64]),
+    affine: &[u32],
+    egeom: &[[f64; EG]],
+    jac: &[f64],
+    fgeom: &[[f64; 3]],
+    element_edges: &[[u32; 4]],
+    edges: &[[u32; 4]],
+    xi: &[f64],
+    h_min: f64,
+) -> (SWENodeState2D, f64, bool) {
+    let edge = edges[element_edges[k][face] as usize];
+    if edge[2] == NO_NEIGHBOUR {
+        return (SWENodeState2D::default(), 0.0, false);
+    }
+    let (nb, nb_face) = if edge[0] as usize == k && edge[1] as usize == face {
+        (edge[2] as usize, edge[3] as usize)
+    } else {
+        (edge[0] as usize, edge[1] as usize)
+    };
+    // Element height normal to a face at a face node, in physical units / 2:
+    // J / sJ there (constant on a parallelogram)
+    let height = |e: usize, f: usize, fi: usize, node: usize| {
+        if affine[e] != 0 {
+            egeom[e][17] / egeom[e][7 + 3 * f]
+        } else {
+            jac[e * NN + node] / fgeom[(e * 4 + f) * N1 + fi][2]
+        }
+    };
+    let nb_node = face_node(nb_face, N1 - 1 - fi);
+    // One node into the neighbour, normal to its face
+    let inner = match nb_face {
+        0 => nb_node + N1,
+        1 => nb_node - 1,
+        2 => nb_node - N1,
+        _ => nb_node + 1,
+    };
+    let own_node = face_node(face, fi);
+    let distance =
+        (xi[1] - xi[0]) * height(nb, nb_face, N1 - 1 - fi, nb_node) / height(k, face, fi, own_node);
+    let (h, hu, hv, bed) = state;
+    (
+        node_state(h, hu, hv, bed, nb * NN + inner, h_min),
+        distance,
+        true,
+    )
+}
+
+/// `SplitFormSWE2D::boundary_flux` at a wall: `Reflective2D`'s ghost state
+/// (dgcom's own), through the surface flux.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn wall_flux(
+    q_int: &SWENodeState2D,
+    state: SWEState2D,
+    bed: f64,
+    normal: (f64, f64),
+    time: f64,
+    g: f64,
+    h_min: f64,
+    wall_h_min: f64,
+    hll: bool,
+) -> SWEState2D {
+    // The position is not read by a wall
+    let ctx = BCContext2D::new(time, (0.0, 0.0), state, bed, normal, g, h_min);
+    let ghost = Reflective2D::with_h_min(wall_h_min).ghost_state(&ctx);
+    let q_ext = SWENodeState2D::new(&ghost, q_int.b, h_min);
+    surface_flux(q_int, &q_ext, normal, g, hll, h_min).0
+}
+
 /// `(∇r, ∇s, |∇r|, |∇s|)` of a node from `[r_x, r_y, s_x, s_y]`, as
 /// `element_max_reference_rate` forms it.
 #[inline]
@@ -161,6 +352,143 @@ fn rate_metric(grads: [f64; 4]) -> ((f64, f64), (f64, f64), f64, f64) {
     let norm_r = (grads[0] * grads[0] + grads[1] * grads[1]).sqrt();
     let norm_s = (grads[2] * grads[2] + grads[3] * grads[3]).sqrt();
     ((grads[0], grads[1]), (grads[2], grads[3]), norm_r, norm_s)
+}
+
+/// `SplitFormSWE2D::edge_fluxes` of edge `e`, into `slot`: both sides' F*
+/// of an interior edge (left first, each in its own face-node order), the
+/// hydrostatic HLL if `HLL`, else the entropy-stable flux; at a wall
+/// (`boundary_flux`) the left side's F* from the wall's ghost state.
+#[device]
+#[allow(clippy::too_many_arguments)]
+fn edge_body<const HLL: bool>(
+    e: usize,
+    g: f64,
+    h_min: f64,
+    wall_h_min: f64,
+    time: f64,
+    (h, hu, hv, bed): (&[f64], &[f64], &[f64], &[f64]),
+    affine: &[u32],
+    egeom: &[[f64; EG]],
+    fgeom: &[[f64; 3]],
+    edges: &[[u32; 4]],
+    slot: &mut [[f64; 3]; NF],
+) {
+    let [le, lf, re, rf] = edges[e];
+    let (le, lf) = (le as usize, lf as usize);
+    #[unroll]
+    for fi in 0..N1 {
+        let normal = if affine[le] != 0 {
+            (egeom[le][5 + 3 * lf], egeom[le][6 + 3 * lf])
+        } else {
+            let f = fgeom[(le * 4 + lf) * N1 + fi];
+            (f[0], f[1])
+        };
+        let left = le * NN + face_node(lf, fi);
+        let q_left = node_state(h, hu, hv, bed, left, h_min);
+        if re == NO_NEIGHBOUR {
+            let state = SWEState2D::new(h[left], hu[left], hv[left]);
+            let f = wall_flux(
+                &q_left, state, bed[left], normal, time, g, h_min, wall_h_min, HLL,
+            );
+            slot[fi] = [f.h, f.hu, f.hv];
+        } else {
+            let (re, rf) = (re as usize, rf as usize);
+            let rfi = N1 - 1 - fi;
+            let right = re * NN + face_node(rf, rfi);
+            let (f_left, f_right) = surface_flux(
+                &q_left,
+                &node_state(h, hu, hv, bed, right, h_min),
+                normal,
+                g,
+                HLL,
+                h_min,
+            );
+            slot[fi] = [f_left.h, f_left.hu, f_left.hv];
+            slot[N1 + rfi] = [f_right.h, f_right.hu, f_right.hv];
+        }
+    }
+}
+
+/// Whether element `k` has a node shallower than `depth` (its volume term
+/// is then the subcells', `SplitFormSWE2D::element_rhs`).
+#[device]
+// The device backend makes this alwaysinline (no call in the PTX); the host
+// compiler, which sees an exported symbol, ignores it.
+#[allow(unused_attributes)]
+#[inline(always)]
+fn is_subcell_element(k: usize, h: &[f64], depth: f64) -> bool {
+    let mut shallow = false;
+    #[unroll]
+    for i in 0..NN {
+        if h[k * NN + i] < depth {
+            shallow = true;
+        }
+    }
+    shallow
+}
+
+/// The end of `SplitFormSWE2D::element_rhs` for element `k`: the lifted face
+/// terms `LIFT sJ (F(q⁻)·n − F*)` with F* from `faces`, then `1/J`, into
+/// `out` (`[h, hu, hv]`).
+#[device]
+// The device backend makes this alwaysinline (no call in the PTX); the host
+// compiler, which sees an exported symbol, ignores it.
+#[allow(unused_attributes)]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn finish_element(
+    k: usize,
+    nodes: &[SWENodeState2D; NN],
+    mut rhs: [SWEState2D; NN],
+    g: f64,
+    aff: bool,
+    eg: &[f64; EG],
+    jinv: &[f64],
+    fgeom: &[[f64; 3]],
+    lift: &[f64],
+    element_edges: &[[u32; 4]],
+    edges: &[[u32; 4]],
+    faces: &[[[f64; 3]; NF]],
+    out_h: &mut DisjointSlice<f64>,
+    out_hu: &mut DisjointSlice<f64>,
+    out_hv: &mut DisjointSlice<f64>,
+) {
+    #[unroll]
+    for face in 0..4 {
+        let e = element_edges[k][face] as usize;
+        let edge = edges[e];
+        // A wall's F* is in its left (own) side
+        let side = usize::from(edge[0] as usize != k || edge[1] as usize != face);
+        #[unroll]
+        for fi in 0..N1 {
+            let node = face_node(face, fi);
+            let (normal, scale) = if aff {
+                ((eg[5 + 3 * face], eg[6 + 3 * face]), eg[7 + 3 * face])
+            } else {
+                let f = fgeom[(k * 4 + face) * N1 + fi];
+                ((f[0], f[1]), f[2])
+            };
+            let q_int = nodes[node];
+            let s = faces[e][side * N1 + fi];
+            let f_star = SWEState2D::new(s[0], s[1], s[2]);
+            let flux_diff = wintermeyer_flux_2d(&q_int, &q_int, normal, g) - f_star;
+            rhs[node] = rhs[node] + (scale * lift[(face * NN + node) * N1 + fi]) * flux_diff;
+        }
+    }
+
+    #[unroll]
+    for i in 0..NN {
+        let r = rhs[i];
+        let j_inv = if aff { eg[4] } else { jinv[k * NN + i] };
+        let n = k * NN + i;
+        // SAFETY: thread k writes only its own element's rows
+        // (k·NN..(k + 1)·NN), and k < n_elements.
+        unsafe {
+            *out_h.get_unchecked_mut(n) = j_inv * r.h;
+            *out_hu.get_unchecked_mut(n) = j_inv * r.hu;
+            *out_hv.get_unchecked_mut(n) = j_inv * r.hv;
+        }
+    }
 }
 
 // =============================================================================
@@ -171,14 +499,14 @@ fn rate_metric(grads: [f64; 4]) -> ((f64, f64), (f64, f64), f64, f64) {
 pub mod kernels {
     use super::*;
 
-    /// `SplitFormSWE2D::edge_fluxes`: F* of both sides of interior edge `e`
-    /// (one thread per edge), left side first, each in its own face-node
-    /// order.
+    /// The entropy-stable F* of every edge (one thread per edge).
     #[kernel]
     #[allow(clippy::too_many_arguments)]
-    pub fn edge_fluxes(
+    pub fn edge_fluxes_entropy_stable(
         g: f64,
         h_min: f64,
+        wall_h_min: f64,
+        time: f64,
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -192,39 +520,69 @@ pub mod kernels {
         let idx = thread::index_1d();
         let e = idx.get();
         if let Some(slot) = out.get_mut(idx) {
-            let [le, lf, re, rf] = edges[e];
-            let (le, lf, re, rf) = (le as usize, lf as usize, re as usize, rf as usize);
-            #[unroll]
-            for fi in 0..N1 {
-                let normal = if affine[le] != 0 {
-                    (egeom[le][5 + 3 * lf], egeom[le][6 + 3 * lf])
-                } else {
-                    let f = fgeom[(le * 4 + lf) * N1 + fi];
-                    (f[0], f[1])
-                };
-                let rfi = N1 - 1 - fi;
-                let left = le * NN + face_node(lf, fi);
-                let right = re * NN + face_node(rf, rfi);
-                let (f_left, f_right) = surface_flux(
-                    &node_state(h, hu, hv, bed, left, h_min),
-                    &node_state(h, hu, hv, bed, right, h_min),
-                    normal,
-                    g,
-                );
-                slot[fi] = [f_left.h, f_left.hu, f_left.hv];
-                slot[N1 + rfi] = [f_right.h, f_right.hu, f_right.hv];
-            }
+            edge_body::<false>(
+                e,
+                g,
+                h_min,
+                wall_h_min,
+                time,
+                (h, hu, hv, bed),
+                affine,
+                egeom,
+                fgeom,
+                edges,
+                slot,
+            );
         }
     }
 
-    /// `SplitFormSWE2D::element_rhs` of a fully wet element (one thread per
-    /// element): the flux-differencing volume term, the lifted face terms
-    /// with F* from `faces`, divided by J.
+    /// The hydrostatic HLL F* of every edge (`WetDry`, one thread per edge).
     #[kernel]
     #[allow(clippy::too_many_arguments)]
-    pub fn element_rhs(
+    pub fn edge_fluxes_hll(
         g: f64,
         h_min: f64,
+        wall_h_min: f64,
+        time: f64,
+        h: &[f64],
+        hu: &[f64],
+        hv: &[f64],
+        bed: &[f64],
+        affine: &[u32],
+        egeom: &[[f64; EG]],
+        fgeom: &[[f64; 3]],
+        edges: &[[u32; 4]],
+        mut out: DisjointSlice<[[f64; 3]; NF]>,
+    ) {
+        let idx = thread::index_1d();
+        let e = idx.get();
+        if let Some(slot) = out.get_mut(idx) {
+            edge_body::<true>(
+                e,
+                g,
+                h_min,
+                wall_h_min,
+                time,
+                (h, hu, hv, bed),
+                affine,
+                egeom,
+                fgeom,
+                edges,
+                slot,
+            );
+        }
+    }
+
+    /// `SplitFormSWE2D::element_rhs` of the elements without a node
+    /// shallower than `subcell_depth` (one thread per element; the others
+    /// are `element_rhs_subcells`'): the flux-differencing volume term and
+    /// the lifted face terms, divided by J.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn element_rhs_volume(
+        g: f64,
+        h_min: f64,
+        subcell_depth: f64,
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -244,7 +602,7 @@ pub mod kernels {
         mut out_hv: DisjointSlice<f64>,
     ) {
         let k = thread::index_1d().get();
-        if k >= element_edges.len() {
+        if k >= element_edges.len() || is_subcell_element(k, h, subcell_depth) {
             return;
         }
         let mut nodes = [SWENodeState2D::default(); NN];
@@ -292,41 +650,146 @@ pub mod kernels {
             }
         }
 
+        finish_element(
+            k,
+            &nodes,
+            rhs,
+            g,
+            aff,
+            &eg,
+            jinv,
+            fgeom,
+            lift,
+            element_edges,
+            edges,
+            faces,
+            &mut out_h,
+            &mut out_hu,
+            &mut out_hv,
+        );
+    }
+
+    /// `SplitFormSWE2D::element_rhs` of the elements with a node shallower
+    /// than `subcell_depth` (`WetDry`, one thread per element; the others
+    /// return at once): the subcell finite volumes, with the neighbours'
+    /// outer nodes, and the lifted face terms, divided by J.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn element_rhs_subcells(
+        g: f64,
+        h_min: f64,
+        subcell_depth: f64,
+        h_dry: f64,
+        h: &[f64],
+        hu: &[f64],
+        hv: &[f64],
+        bed: &[f64],
+        affine: &[u32],
+        egeom: &[[f64; EG]],
+        contra: &[[f64; 4]],
+        jinv: &[f64],
+        jac: &[f64],
+        fgeom: &[[f64; 3]],
+        d1: &[f64],
+        w: &[f64],
+        xi: &[f64],
+        lift: &[f64],
+        element_edges: &[[u32; 4]],
+        edges: &[[u32; 4]],
+        faces: &[[[f64; 3]; NF]],
+        mut out_h: DisjointSlice<f64>,
+        mut out_hu: DisjointSlice<f64>,
+        mut out_hv: DisjointSlice<f64>,
+    ) {
+        let k = thread::index_1d().get();
+        if k >= element_edges.len() || !is_subcell_element(k, h, subcell_depth) {
+            return;
+        }
+        let mut nodes = [SWENodeState2D::default(); NN];
+        #[unroll]
+        for i in 0..NN {
+            nodes[i] = node_state(h, hu, hv, bed, k * NN + i, h_min);
+        }
+        let mut rhs = [SWEState2D::zero(); NN];
+
+        let mut outer = [(SWENodeState2D::default(), 0.0, false); 4 * N1];
         #[unroll]
         for face in 0..4 {
-            let e = element_edges[k][face] as usize;
-            let edge = edges[e];
-            let side = usize::from(edge[0] as usize != k || edge[1] as usize != face);
             #[unroll]
             for fi in 0..N1 {
-                let node = face_node(face, fi);
-                let (normal, scale) = if aff {
-                    ((eg[5 + 3 * face], eg[6 + 3 * face]), eg[7 + 3 * face])
-                } else {
-                    let f = fgeom[(k * 4 + face) * N1 + fi];
-                    ((f[0], f[1]), f[2])
-                };
-                let q_int = nodes[node];
-                let s = faces[e][side * N1 + fi];
-                let f_star = SWEState2D::new(s[0], s[1], s[2]);
-                let flux_diff = wintermeyer_flux_2d(&q_int, &q_int, normal, g) - f_star;
-                rhs[node] = rhs[node] + (scale * lift[(face * NN + node) * N1 + fi]) * flux_diff;
+                outer[face * N1 + fi] = outer_node(
+                    k,
+                    face,
+                    fi,
+                    (h, hu, hv, bed),
+                    affine,
+                    egeom,
+                    jac,
+                    fgeom,
+                    element_edges,
+                    edges,
+                    xi,
+                    h_min,
+                );
             }
         }
 
+        let aff = affine[k] != 0;
+        let eg = egeom[k];
+        let (affine_r, affine_s) = ((eg[0], eg[1]), (eg[2], eg[3]));
+        let mut metric = [(0.0, 0.0); N1];
         #[unroll]
-        for i in 0..NN {
-            let r = rhs[i];
-            let j_inv = if aff { eg[4] } else { jinv[k * NN + i] };
-            let n = k * NN + i;
-            // SAFETY: thread k writes only its own element's rows
-            // (k·NN..(k + 1)·NN), and k < n_elements.
-            unsafe {
-                *out_h.get_unchecked_mut(n) = j_inv * r.h;
-                *out_hu.get_unchecked_mut(n) = j_inv * r.hu;
-                *out_hv.get_unchecked_mut(n) = j_inv * r.hv;
+        for line in 0..N1 {
+            let r_line = |a: usize| line * N1 + a;
+            let s_line = |j: usize| j * N1 + line;
+            // Line ends on faces 3/1 (r-lines) and 0/2 (s-lines); faces 2
+            // and 3 list their nodes in reverse
+            let (rev, fwd) = (N1 - 1 - line, line);
+            #[unroll]
+            for a in 0..N1 {
+                metric[a] = if aff {
+                    affine_r
+                } else {
+                    let c = contra[k * NN + r_line(a)];
+                    (c[0], c[1])
+                };
             }
+            let ends = [outer[3 * N1 + rev], outer[N1 + fwd]];
+            line_subcells(
+                &nodes, &mut rhs, &metric, r_line, ends, aff, w, xi, d1, g, h_min, h_dry,
+            );
+            #[unroll]
+            for j in 0..N1 {
+                metric[j] = if aff {
+                    affine_s
+                } else {
+                    let c = contra[k * NN + s_line(j)];
+                    (c[2], c[3])
+                };
+            }
+            let ends = [outer[fwd], outer[2 * N1 + rev]];
+            line_subcells(
+                &nodes, &mut rhs, &metric, s_line, ends, aff, w, xi, d1, g, h_min, h_dry,
+            );
         }
+
+        finish_element(
+            k,
+            &nodes,
+            rhs,
+            g,
+            aff,
+            &eg,
+            jinv,
+            fgeom,
+            lift,
+            element_edges,
+            edges,
+            faces,
+            &mut out_h,
+            &mut out_hu,
+            &mut out_hv,
+        );
     }
 
     /// `Integrable::combine` with a base: `out = a·base + c₁x₁ (+ c₂x₂)`,
@@ -662,10 +1125,17 @@ struct Statics {
     egeom: DeviceBuffer<[f64; EG]>,
     contra: DeviceBuffer<[f64; 4]>,
     jinv: DeviceBuffer<f64>,
+    /// `J` at every node
+    jac: DeviceBuffer<f64>,
     fgeom: DeviceBuffer<[f64; 3]>,
     d1: DeviceBuffer<f64>,
+    /// The GLL weights and nodes on [−1, 1]
+    w: DeviceBuffer<f64>,
+    xi: DeviceBuffer<f64>,
     lift: DeviceBuffer<f64>,
     element_edges: DeviceBuffer<[u32; 4]>,
+    /// Left element and face, right element and face (`NO_NEIGHBOUR` at a
+    /// wall)
     edges: DeviceBuffer<[u32; 4]>,
     /// `[r_x, r_y, s_x, s_y]` of every node, and of every parallelogram
     grads: DeviceBuffer<[f64; 4]>,
@@ -684,8 +1154,11 @@ impl Statics {
         let n_el = mesh.n_elements;
         assert_eq!(ops.n_1d, N1, "the kernels are compiled for P{ORDER}");
         assert!(
-            mesh.edges.iter().all(|e| e.right.is_some()),
-            "the kernels take interior faces only so far (a periodic mesh)"
+            mesh.edges
+                .iter()
+                .all(|e| e.right.is_some()
+                    || e.boundary_tag.unwrap_or_default() == BoundaryTag::Wall),
+            "the kernels take walls only so far: no open boundaries"
         );
         for (face, nodes) in ops.face_nodes.iter().enumerate() {
             for (fi, &node) in nodes.iter().enumerate() {
@@ -699,6 +1172,7 @@ impl Statics {
         let mut contra = Vec::with_capacity(n_el * NN);
         let mut grads = Vec::with_capacity(n_el * NN);
         let mut jinv = Vec::with_capacity(n_el * NN);
+        let mut jac = Vec::with_capacity(n_el * NN);
         let mut fgeom = Vec::with_capacity(n_el * 4 * N1);
         let mut bed = Vec::with_capacity(n_el * NN);
         for k in 0..n_el {
@@ -710,6 +1184,7 @@ impl Statics {
             for (face, &((nx, ny), sj)) in element.faces.iter().enumerate() {
                 eg[5 + 3 * face..8 + 3 * face].copy_from_slice(&[nx, ny, sj]);
             }
+            eg[17] = element.metric.det_j;
             egeom.push(eg);
             let m = &element.metric;
             affine_grads.push([m.rx, m.ry, m.sx, m.sy]);
@@ -719,6 +1194,7 @@ impl Statics {
                 let ((rx, ry), (sx, sy)) = (geom.grad_r(k, i), geom.grad_s(k, i));
                 grads.push([rx, ry, sx, sy]);
                 jinv.push(geom.jacobian_inv(k, i));
+                jac.push(geom.jacobian(k, i));
                 bed.push(bathymetry.get(ElementIndex::new(k), i));
             }
             for face in 0..4 {
@@ -738,13 +1214,10 @@ impl Statics {
             .edges
             .iter()
             .map(|e| {
-                let right = e.right.expect("interior edge");
-                [
-                    e.left.element as u32,
-                    e.left.face as u32,
-                    right.element as u32,
-                    right.face as u32,
-                ]
+                let (right, right_face) = e.right.map_or((NO_NEIGHBOUR, NO_NEIGHBOUR), |r| {
+                    (r.element as u32, r.face as u32)
+                });
+                [e.left.element as u32, e.left.face as u32, right, right_face]
             })
             .collect();
         Ok(Self {
@@ -753,8 +1226,11 @@ impl Statics {
             egeom: DeviceBuffer::from_host(stream, &egeom)?,
             contra: DeviceBuffer::from_host(stream, &contra)?,
             jinv: DeviceBuffer::from_host(stream, &jinv)?,
+            jac: DeviceBuffer::from_host(stream, &jac)?,
             fgeom: DeviceBuffer::from_host(stream, &fgeom)?,
             d1: DeviceBuffer::from_host(stream, &ops.dr_1d_row_major)?,
+            w: DeviceBuffer::from_host(stream, &ops.weights_1d)?,
+            xi: DeviceBuffer::from_host(stream, &ops.nodes_1d)?,
             lift: DeviceBuffer::from_host(stream, &lift)?,
             element_edges: DeviceBuffer::from_host(stream, &element_edges)?,
             edges: DeviceBuffer::from_host(stream, &edges)?,
@@ -764,9 +1240,19 @@ impl Statics {
     }
 }
 
-/// The 2D SWE physics module on the GPU: `SWEPhysics2D` with
-/// `SWEFormulation2D::EntropyStable`, a bed, no boundary faces and no sources
-/// (Phase 1's first scope, `notes/gpu.md`).
+/// The split form the GPU runs (`SWEFormulation2D`).
+#[derive(Clone, Copy, Debug)]
+pub enum Formulation {
+    /// Flux differencing everywhere, the entropy-stable interface flux
+    EntropyStable,
+    /// Subcells in elements with a node shallower than `subcell_depth`, the
+    /// hydrostatic HLL at faces, `h_dry` for the reconstruction
+    WetDry { subcell_depth: f64, h_dry: f64 },
+}
+
+/// The 2D SWE physics module on the GPU: `SWEPhysics2D` with a split
+/// formulation ([`Formulation`]), a bed, walls (`Reflective2D`), no sources
+/// yet (Phase 1, `notes/gpu.md`).
 pub struct GpuSWE2D {
     gpu: Arc<Gpu>,
     mesh: Arc<Mesh2D>,
@@ -775,6 +1261,9 @@ pub struct GpuSWE2D {
     statics: Statics,
     g: f64,
     h_min: f64,
+    formulation: Formulation,
+    /// The walls' `Reflective2D::h_min`
+    wall_h_min: f64,
     /// Both sides' F* of every edge, written by the edge kernel for the
     /// element kernel
     faces: Mutex<DeviceBuffer<[[f64; 3]; NF]>>,
@@ -790,6 +1279,8 @@ impl GpuSWE2D {
         geom: Arc<GeometricFactors2D>,
         bathymetry: &Bathymetry2D,
         equation: &ShallowWater2D,
+        formulation: Formulation,
+        wall: &Reflective2D,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let statics = Statics::upload(gpu, &mesh, &ops, &geom, bathymetry)?;
         let faces = DeviceBuffer::zeroed(&gpu.stream, mesh.n_edges)?;
@@ -802,6 +1293,8 @@ impl GpuSWE2D {
             statics,
             g: equation.g,
             h_min: equation.h_min.meters(),
+            formulation,
+            wall_h_min: wall.h_min,
             faces: Mutex::new(faces),
             rates: Mutex::new(rates),
         })
@@ -833,19 +1326,31 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
         out
     }
 
-    fn compute_rhs_into(&self, state: &DeviceState, _time: f64, out: &mut DeviceState) {
+    fn compute_rhs_into(&self, state: &DeviceState, time: f64, out: &mut DeviceState) {
         let (gpu, s) = (&self.gpu, &self.statics);
+        // The element kernels split at the subcell depth (none for the
+        // entropy-stable form: no depth is below −∞)
+        let (hll, subcell_depth, h_dry) = match self.formulation {
+            Formulation::EntropyStable => (false, f64::NEG_INFINITY, 0.0),
+            Formulation::WetDry {
+                subcell_depth,
+                h_dry,
+            } => (true, subcell_depth, h_dry),
+        };
         let mut faces = self.faces.lock().expect("face buffer");
-        let [out_h, out_hu, out_hv] = out.fields_mut();
+        let edges_cfg = one_dimensional(self.mesh.n_edges);
+        let elements_cfg = per_element(self.mesh.n_elements);
         // SAFETY: every buffer is sized for this mesh (`Statics::upload`, the
         // state's), and the kernels index within its elements, edges and nodes.
         unsafe {
-            gpu.module
-                .edge_fluxes(
+            if hll {
+                gpu.module.edge_fluxes_hll(
                     &gpu.stream,
-                    one_dimensional(self.mesh.n_edges),
+                    edges_cfg,
                     self.g,
                     self.h_min,
+                    self.wall_h_min,
+                    time,
                     &state.h,
                     &state.hu,
                     &state.hv,
@@ -856,13 +1361,34 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
                     &s.edges,
                     &mut *faces,
                 )
-                .expect("edge fluxes");
-            gpu.module
-                .element_rhs(
+            } else {
+                gpu.module.edge_fluxes_entropy_stable(
                     &gpu.stream,
-                    per_element(self.mesh.n_elements),
+                    edges_cfg,
                     self.g,
                     self.h_min,
+                    self.wall_h_min,
+                    time,
+                    &state.h,
+                    &state.hu,
+                    &state.hv,
+                    &s.bed,
+                    &s.affine,
+                    &s.egeom,
+                    &s.fgeom,
+                    &s.edges,
+                    &mut *faces,
+                )
+            }
+            .expect("edge fluxes");
+            let [out_h, out_hu, out_hv] = out.fields_mut();
+            gpu.module
+                .element_rhs_volume(
+                    &gpu.stream,
+                    elements_cfg,
+                    self.g,
+                    self.h_min,
+                    subcell_depth,
                     &state.h,
                     &state.hu,
                     &state.hv,
@@ -881,7 +1407,40 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
                     out_hu,
                     out_hv,
                 )
-                .expect("element RHS");
+                .expect("element RHS (volume)");
+            if hll {
+                let [out_h, out_hu, out_hv] = out.fields_mut();
+                gpu.module
+                    .element_rhs_subcells(
+                        &gpu.stream,
+                        elements_cfg,
+                        self.g,
+                        self.h_min,
+                        subcell_depth,
+                        h_dry,
+                        &state.h,
+                        &state.hu,
+                        &state.hv,
+                        &s.bed,
+                        &s.affine,
+                        &s.egeom,
+                        &s.contra,
+                        &s.jinv,
+                        &s.jac,
+                        &s.fgeom,
+                        &s.d1,
+                        &s.w,
+                        &s.xi,
+                        &s.lift,
+                        &s.element_edges,
+                        &s.edges,
+                        &*faces,
+                        out_h,
+                        out_hu,
+                        out_hv,
+                    )
+                    .expect("element RHS (subcells)");
+            }
         }
     }
 

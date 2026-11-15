@@ -60,18 +60,17 @@ pub fn line_node(n_1d: usize, dir: usize, line: usize, a: usize) -> usize {
 /// the end node's metric). On an affine element every interface takes the
 /// one metric.
 pub fn telescoped_interfaces(
-    ops: &DGOperators2D,
+    w: &[f64],
+    d1: &[f64],
     metric: &[(f64, f64)],
     affine: bool,
     out: &mut [(f64, f64)],
 ) {
-    let n1 = ops.n_1d;
+    let n1 = w.len();
     if affine {
         out[..=n1].fill(metric[0]);
         return;
     }
-    let w = &ops.weights_1d;
-    let d1 = &ops.dr_1d_row_major;
     out[0] = metric[0];
     // From zero: the summation-by-parts boundary term makes the first step
     // the first node's metric
@@ -148,10 +147,22 @@ mod tests {
         let mut metric = vec![(0.0, 0.0); n1];
         let mut out = vec![(0.0, 0.0); n1 + 1];
         assert!(line_metric(&ops, &geom, 0, 0, 1, &mut metric));
-        telescoped_interfaces(&ops, &metric, true, &mut out);
+        telescoped_interfaces(
+            &ops.weights_1d,
+            &ops.dr_1d_row_major,
+            &metric,
+            true,
+            &mut out,
+        );
         assert!(out.iter().all(|&m| m == metric[0]));
         // The general formula on the same constant metric telescopes to it
-        telescoped_interfaces(&ops, &metric, false, &mut out);
+        telescoped_interfaces(
+            &ops.weights_1d,
+            &ops.dr_1d_row_major,
+            &metric,
+            false,
+            &mut out,
+        );
         for m in &out {
             assert!((m.0 - metric[0].0).abs() < 1e-13 && (m.1 - metric[0].1).abs() < 1e-13);
         }

@@ -987,7 +987,13 @@ impl LayerTransport {
                 for dir in 0..2 {
                     for line in 0..n1 {
                         let affine = line_metric(ops, geom, k, dir, line, &mut metric[..n1]);
-                        telescoped_interfaces(ops, &metric[..n1], affine, &mut interfaces);
+                        telescoped_interfaces(
+                            &ops.weights_1d,
+                            &ops.dr_1d_row_major,
+                            &metric[..n1],
+                            affine,
+                            &mut interfaces,
+                        );
                         for a in 0..n1 - 1 {
                             let slot = subcell_slot(n1, dir, line, a);
                             let m = interfaces[a + 1];
