@@ -25,7 +25,10 @@
 //! values by default, as in Foreman's `t_tide`), so both enter the basis but
 //! share one pair of unknowns. A fitted pair that is not separable is an
 //! error ([`AnalysisError::NotSeparable`]); [`HarmonicAnalysis::resolvable`]
-//! chooses what a record can fit.
+//! chooses what a record can fit. The mean is the constituent of speed
+//! zero: a record shorter than a constituent's period cannot tell the two
+//! apart, so `resolvable` leaves out Ssa under half a year and M2 under
+//! 12.4 hours.
 //!
 //! A constituent left out is not gone from the water: its energy goes to
 //! the fitted neighbour it cannot be told from, with a phase that turns over
@@ -41,7 +44,9 @@
 //! An inference states that the constituent is in the signal. A model run
 //! forced without ν2 has none, and inferring one gives its N2 the beat the
 //! inference takes out of a gauge's: the candidates passed for a record are
-//! the constituents it carries.
+//! the constituents it carries ([`HarmonicAnalysis::GAUGE_RECORD`] for a
+//! gauge, [`HarmonicAnalysis::station_candidates`] of its forcing's for a
+//! model).
 //!
 //! # Solution
 //!
@@ -307,14 +312,41 @@ impl HarmonicAnalysis {
         Self::fit_with_reference(&Self::GAUGE_RECORD, times, values, None)
     }
 
-    /// Constituents fitted to a model's record at a station, in priority
-    /// order: [`Self::GAUGE_RECORD`]'s major tides and overtides. A run
-    /// whose forcing carries minor semidiurnals adds them (a run without ν2
-    /// has none to infer: its N2 would take the beat the inference removes
-    /// from a gauge's).
-    pub const STATION_RECORD: [&'static str; 12] = [
-        "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6",
-    ];
+    /// The eight major constituents, which an ocean model's tide is taken
+    /// to carry where nothing says what it was forced with (NorKyst-800:
+    /// these eight from TPXO).
+    pub const MAJOR: [&'static str; 8] = ["M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1"];
+
+    /// The overtides and compound tides of [`Self::GAUGE_RECORD`], which
+    /// shallow water makes of the tide that enters: a model has them
+    /// whatever its boundary carries.
+    pub const OVERTIDES: [&'static str; 4] = ["M4", "MS4", "MN4", "M6"];
+
+    /// The candidates of a model's record at a station, for
+    /// [`Self::fit_with_reference`]: of [`Self::GAUGE_RECORD`], in its
+    /// priority order, the constituents its forcing carries (`carried`,
+    /// matched without case) and [`Self::OVERTIDES`].
+    ///
+    /// An inference states that the constituent is in the record, so the
+    /// candidates are what the run was forced with, no more and no fewer:
+    ///
+    /// - a run without ν2 (a nest in NorKyst as it is) has none to infer,
+    ///   and an inferred one gives its N2 the ±20 % beat that the inference
+    ///   takes out of a gauge's;
+    /// - a run with the minor semidiurnals (an atlas corrected from theory)
+    ///   has that beat in a month's N2 unless they are inferred, and under
+    ///   27.6 days M2 takes a share;
+    /// - a run forced with M2 alone has no N2: inferred, it puts a tenth of
+    ///   M2 into a fortnight's M2 (|ΔZ|, at any phase of the month).
+    pub fn station_candidates(carried: &[&str]) -> Vec<&'static str> {
+        Self::GAUGE_RECORD
+            .into_iter()
+            .filter(|name| {
+                Self::OVERTIDES.contains(name)
+                    || carried.iter().any(|c| c.eq_ignore_ascii_case(name))
+            })
+            .collect()
+    }
 
     /// The reference constants of a record that carries `candidates` (Unix
     /// times): those the record resolves (Rayleigh criterion 1) fitted, the
@@ -411,41 +443,47 @@ impl HarmonicAnalysis {
     /// constituent is left out and whose sources are fitted or inferred.
     ///
     /// Each candidate, in priority order, is kept if the record is at least
-    /// `rayleigh` times its synodic period with every kept one (`rayleigh`
-    /// = 1 is the classical criterion; unknown names are skipped), and with
-    /// every earlier candidate that was left out and has an inference: that
-    /// one is in the fit through its source, and a constituent fitted
-    /// beside it would take what the inference misses. A fortnight infers
-    /// N2 from M2, so it does not fit 2N2 (13.8 days from M2, 27.6 from
-    /// N2), which then held N2's error and made the predicted tide worse
-    /// than with no minor constituent at all.
+    /// `rayleigh` times its synodic period with every earlier candidate,
+    /// kept or left out (`rayleigh` = 1 is the classical criterion; unknown
+    /// names are skipped). One left out is still in the water, in the fit
+    /// through its inference or not at all, and a later one fitted beside
+    /// it takes what is missing under its own name:
+    ///
+    /// - a fortnight infers N2 from M2, so it does not fit 2N2 (13.8 days
+    ///   from M2, 27.6 from N2), which then held N2's error and made the
+    ///   predicted tide worse than with no minor constituent at all;
+    /// - 14 days do not separate S2 from M2, so they do not fit K2 either
+    ///   (13.7 days from M2, half a year from S2), nor 12 days Q1 without
+    ///   O1.
+    ///
+    /// The mean is in every fit, and it is the constituent of speed zero:
+    /// a candidate is separable from it once the record is `rayleigh` times
+    /// its own period. Ssa (183 days) on a record of two months, or Mf on
+    /// one of four days, is a trend beside the mean: the two cancel inside
+    /// the record and the prediction leaves it at once.
     pub fn resolvable(
         candidates: &[&'static str],
         length: f64,
         rayleigh: f64,
         inferences: &[Inference],
     ) -> Self {
-        let mut kept: Vec<(&'static str, f64)> = Vec::new();
-        // The speeds of the candidates left out that an inference carries
-        let mut carried: Vec<f64> = Vec::new();
+        let mut names: Vec<&'static str> = Vec::new();
+        // The speeds of the mean and of the earlier candidates
+        let mut earlier: Vec<f64> = vec![0.0];
         for &name in candidates {
             let Some(period) = constituent_period(name) else {
                 continue;
             };
             let omega = 2.0 * std::f64::consts::PI / period;
-            let separable = |other: f64| {
+            let separable = |other: &f64| {
                 let synodic = 2.0 * std::f64::consts::PI / (omega - other).abs();
                 length >= rayleigh * synodic
             };
-            if kept.iter().all(|&(_, other)| separable(other))
-                && carried.iter().all(|&other| separable(other))
-            {
-                kept.push((name, omega));
-            } else if inferences.iter().any(|i| i.name == name) {
-                carried.push(omega);
+            if earlier.iter().all(separable) {
+                names.push(name);
             }
+            earlier.push(omega);
         }
-        let names: Vec<&'static str> = kept.into_iter().map(|(name, _)| name).collect();
         // An inference is kept once each source is fitted or itself inferred
         // (the first of a name wins), so the passes repeat until none is added
         let mut inferred: Vec<Inference> = Vec::new();
@@ -1121,6 +1159,179 @@ mod tests {
         let (fitted, inferred, _) = of(366.0);
         assert_eq!(fitted, MINOR);
         assert!(inferred.is_empty());
+    }
+
+    /// A long-period constituent is fitted once the record is as long as its
+    /// period (the mean is the constituent of speed zero): Mf from 13.7
+    /// days, Mm from 27.6, Ssa from 183. On 40 days whose level sags 2 cm
+    /// in the middle (weather), a fitted Ssa is that curve, over three times
+    /// as high, and the mean goes with it.
+    #[test]
+    fn a_constituent_longer_than_the_record_is_left_out() {
+        let long = |days: f64| -> Vec<&'static str> {
+            HarmonicAnalysis::resolvable(
+                &HarmonicAnalysis::GAUGE_RECORD,
+                days * 86_400.0,
+                1.0,
+                &Inference::theory(),
+            )
+            .names()
+            .iter()
+            .copied()
+            .filter(|n| ["Mf", "Mm", "Ssa"].contains(n))
+            .collect()
+        };
+        assert!(long(4.0).is_empty());
+        assert_eq!(long(15.0), ["Mf"]);
+        assert_eq!(long(30.0), ["Mf", "Mm"]);
+        assert_eq!(long(90.0), ["Mf", "Mm"]);
+        assert_eq!(long(183.0), ["Mf", "Mm", "Ssa"]);
+        // Twelve hours fit no tide at all (S2's period, but M2 is in the
+        // water beside it), a day M2 alone
+        let short = |hours: f64| {
+            HarmonicAnalysis::resolvable(&HarmonicAnalysis::MAJOR, hours * 3600.0, 1.0, &[])
+                .names()
+                .to_vec()
+        };
+        assert!(short(12.0).is_empty());
+        assert_eq!(short(24.0), ["M2"]);
+        // A candidate left out keeps out the later ones the record cannot
+        // tell from it: Q1 without O1 (12 days), K2 without S2 (14 days)
+        assert_eq!(short(12.0 * 24.0), ["M2", "K1"]);
+        assert_eq!(short(14.0 * 24.0), ["M2", "K1", "O1"]);
+        assert_eq!(short(15.0 * 24.0), ["M2", "S2", "K1", "O1"]);
+
+        let t0 = ModelClock::at_datetime(2025, 3, 1, 0, 0).epoch_unix;
+        let hours = 40 * 24;
+        let half = 0.5 * (hours - 1) as f64;
+        let truth = [("M2", 0.74, 301.0), ("S2", 0.25, 339.0)];
+        let values: Vec<f64> = synthesize(t0, hours, 0.3, &truth)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| v + 0.02 * ((i as f64 - half) / half).powi(2))
+            .collect();
+        let times: Vec<f64> = (0..hours).map(|i| t0 + i as f64 * 3600.0).collect();
+        // The mean of the level without the tide: the sag's is a third of it
+        let level = 0.3 + 0.02 / 3.0;
+
+        let with_ssa = HarmonicAnalysis::new(&["M2", "S2", "Ssa"])
+            .fit(&times, &values)
+            .unwrap();
+        assert!(
+            with_ssa.get("Ssa").unwrap().amplitude > 0.06 && (with_ssa.mean - level).abs() > 0.06,
+            "Ssa {}, mean {} vs {level}",
+            with_ssa.get("Ssa").unwrap().amplitude,
+            with_ssa.mean
+        );
+        let fit = HarmonicAnalysis::fit_with_reference(&["M2", "S2", "Ssa"], &times, &values, None)
+            .unwrap();
+        assert!(fit.get("Ssa").is_none());
+        assert!(
+            (fit.mean - level).abs() < 1e-3,
+            "mean {} vs {level}",
+            fit.mean
+        );
+    }
+
+    /// A model's record is fitted with what its forcing carries
+    /// (`station_candidates`). Inferring the minor semidiurnals in a run
+    /// without them, or leaving them out of a run that has them, puts ν2's
+    /// 19 % of N2 into a month's N2; and a run forced with M2 alone has no
+    /// N2 to infer (inferred, a fortnight's M2 is a tenth off).
+    #[test]
+    fn a_models_record_is_fitted_with_what_its_forcing_carries() {
+        assert_eq!(
+            HarmonicAnalysis::station_candidates(&HarmonicAnalysis::MAJOR),
+            [
+                "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6"
+            ]
+        );
+        assert_eq!(
+            HarmonicAnalysis::station_candidates(&["m2", "S2", "nu2", "Z0", "Mf"]),
+            ["M2", "S2", "M4", "MS4", "MN4", "M6", "NU2", "Mf"]
+        );
+
+        // The majors with K2 and P1 at their equilibrium ratios, and the same
+        // with the minor semidiurnals
+        let mut with_minors = tide_with_minors();
+        with_minors.extend([
+            ("K2", 0.272 * 0.25, 339.0),
+            ("P1", 0.331 * 0.06, 165.0),
+            ("Q1", 0.01, 350.0),
+        ]);
+        let minor = |name: &str| AdmittanceInference::MINORS.iter().any(|a| a.name == name);
+        let majors: Vec<_> = with_minors
+            .iter()
+            .copied()
+            .filter(|c| !minor(c.0))
+            .collect();
+        let carried = |truth: &[(&'static str, f64, f64)]| -> Vec<&'static str> {
+            truth.iter().map(|c| c.0).collect()
+        };
+        let hours = 30 * 24;
+        // The largest error of N2's amplitude over six months of the year,
+        // as a share of it
+        let n2_error = |truth: &[(&'static str, f64, f64)], candidates: &[&'static str]| {
+            [1, 3, 5, 7, 9, 11]
+                .into_iter()
+                .map(|month| {
+                    let t0 = ModelClock::at_datetime(2025, month, 1, 0, 0).epoch_unix;
+                    let values = synthesize(t0, hours, 0.0, truth);
+                    let times: Vec<f64> = (0..hours).map(|i| t0 + i as f64 * 3600.0).collect();
+                    let fit =
+                        HarmonicAnalysis::fit_with_reference(candidates, &times, &values, None)
+                            .unwrap();
+                    (fit.get("N2").unwrap().amplitude / 0.15 - 1.0).abs()
+                })
+                .fold(0.0, f64::max)
+        };
+        let of = |truth: &[(&'static str, f64, f64)]| {
+            HarmonicAnalysis::station_candidates(&carried(truth))
+        };
+        for truth in [&majors, &with_minors] {
+            let own = n2_error(truth, &of(truth));
+            assert!(own < 1e-7, "N2 with the forcing's constituents: {own}");
+        }
+        let (inferred, left_out) = (
+            n2_error(&majors, &of(&with_minors)),
+            n2_error(&with_minors, &of(&majors)),
+        );
+        assert!(
+            inferred > 0.1 && left_out > 0.1,
+            "N2 with minors inferred that the run lacks {inferred}, left out of one that has \
+             them {left_out}"
+        );
+
+        // M2 alone over a fortnight, from six days of the month: the largest
+        // |ΔZ| of M2 as a share of it. An N2 inferred beside it takes a tenth
+        // (9.5 to 11.7 % over the six)
+        let hours = 15 * 24;
+        let m2 = |candidates: &[&'static str]| {
+            [1, 6, 11, 16, 21, 26]
+                .into_iter()
+                .map(|day| {
+                    let t0 = ModelClock::at_datetime(2025, 6, day, 0, 0).epoch_unix;
+                    let values = synthesize(t0, hours, 0.0, &[("M2", 0.74, 301.0)]);
+                    let times: Vec<f64> = (0..hours).map(|i| t0 + i as f64 * 3600.0).collect();
+                    let fit =
+                        HarmonicAnalysis::fit_with_reference(candidates, &times, &values, None)
+                            .unwrap();
+                    let c = fit.get("M2").unwrap();
+                    let (a, b) = (c.lag_deg.to_radians(), 301.0_f64.to_radians());
+                    let dz = (c.amplitude * a.cos() - 0.74 * b.cos())
+                        .hypot(c.amplitude * a.sin() - 0.74 * b.sin());
+                    dz / 0.74
+                })
+                .fold(0.0, f64::max)
+        };
+        assert!(m2(&HarmonicAnalysis::station_candidates(&["M2"])) < 1e-9);
+        let with_n2 = m2(&HarmonicAnalysis::station_candidates(
+            &HarmonicAnalysis::MAJOR,
+        ));
+        assert!(
+            with_n2 > 0.09,
+            "M2 with an N2 inferred beside it: {with_n2}"
+        );
     }
 
     /// A fortnight cannot fit N2. With N2 at M2's lag (the equilibrium

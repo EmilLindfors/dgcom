@@ -6,7 +6,7 @@
 
 use std::fs::{self, File};
 
-use crate::analysis::{GaugeComparison, TimeSeries};
+use crate::analysis::{GaugeComparison, HarmonicAnalysis, TimeSeries};
 use crate::waves::{CoupledWaves2D, SeaStateFields, SeaStateFrames};
 
 mod mesh;
@@ -700,13 +700,15 @@ pub(super) fn boundary_conditions<'a>(
 }
 
 /// Each station with a gauge against it, from `spinup` (s) on, on the
-/// gauge's Unix time axis.
+/// gauge's Unix time axis; its record fitted with the constituents the
+/// boundaries carry (`Domain::tide_constituents`).
 fn score_gauges(
     domain: &Domain,
     stations: &mut [StationSeries],
     clock: &crate::time::ModelClock,
     spinup: f64,
 ) {
+    let candidates = HarmonicAnalysis::station_candidates(&domain.tide_constituents);
     for (series, station) in stations.iter_mut().zip(&domain.stations) {
         let Some(gauge) = &station.gauge else {
             continue;
@@ -717,7 +719,7 @@ fn score_gauges(
             .map(|&t| clock.unix(t))
             .collect();
         let model = TimeSeries::new(&times, &series.eta_m[first..]);
-        series.gauge = Some(GaugeComparison::compute(&model, gauge));
+        series.gauge = Some(GaugeComparison::compute(&model, gauge, &candidates));
     }
 }
 

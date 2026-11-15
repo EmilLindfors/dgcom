@@ -413,10 +413,11 @@ fn stations_can_be_recorded_more_often_than_the_fields() {
 /// tide's 2 h ramp): here a gauge that read the station's own surface 10 cm
 /// high through the run, and a pure M2 for a month on either side. The
 /// skill against it is a bias of −10 cm with nothing else, over the hourly
-/// samples from 2 h to the end (14 h), and both score files are written.
+/// samples from 2 h to the end (15 h: 13 h, a period of M2 at least, or no
+/// constant is fitted), and both score files are written.
 #[test]
 fn a_station_is_scored_against_its_gauge() {
-    let hours = 14.0;
+    let hours = 15.0;
     let dir = tempfile::tempdir().unwrap();
     let plain = example(dir.path(), hours).run(&mut |_| {}).unwrap();
     let mouth = &plain.stations[0];
@@ -461,7 +462,7 @@ fn a_station_is_scored_against_its_gauge() {
         v.n,
         g.vs_prediction.as_ref().map(|p| p.centred_rmse)
     );
-    assert_eq!(v.n, 13, "hours 2 to 14");
+    assert_eq!(v.n, 14, "hours 2 to 15");
     assert!((v.bias + 0.1).abs() < 1e-9 && v.centred_rmse < 1e-9);
     assert!((v.correlation - 1.0).abs() < 1e-9);
     assert!(g.vs_prediction.is_ok());
@@ -476,7 +477,7 @@ fn a_station_is_scored_against_its_gauge() {
             .lines()
             .nth(1)
             .unwrap()
-            .starts_with("mouth,observations,13,")
+            .starts_with("mouth,observations,14,")
     );
     let constants = std::fs::read_to_string(dir.path().join("gauge_constituents.csv")).unwrap();
     assert_eq!(constants.lines().count(), 1 + names.len(), "{constants}");
@@ -1379,6 +1380,13 @@ fn write_atlas(path: &Path, points: &[(f64, f64)], constituents: &[(&str, f64, f
 /// A placed channel 30 km long, 2 km wide and 10 m deep, open at its west
 /// end, with the given boundary entry; its stations' records over 6 h.
 fn placed_channel(dir: &Path, boundary: &str) -> Result<Vec<StationSeries>, CaseError> {
+    Ok(placed_channel_case(dir, boundary)?
+        .run(&mut |_| {})?
+        .stations)
+}
+
+/// The case of `placed_channel`.
+fn placed_channel_case(dir: &Path, boundary: &str) -> Result<CaseFile, CaseError> {
     let text = format!(
         r#"
         [run]
@@ -1421,7 +1429,61 @@ fn placed_channel(dir: &Path, boundary: &str) -> Result<Vec<StationSeries>, Case
     );
     let path = dir.join("case.toml");
     std::fs::write(&path, text).unwrap();
-    Ok(CaseFile::read(&path, &[])?.run(&mut |_| {})?.stations)
+    CaseFile::read(&path, &[])
+}
+
+/// A domain knows the constituents its boundaries carry, which a station's
+/// record is fitted with (`score_gauges`): a `tide`'s own, an atlas's, and
+/// with `correction = "minors"` the six the correction adds. A gauge's fit
+/// infers the minor semidiurnals whatever the run; the model's must only
+/// where the run has them, or a month's N2 beats ±20 % in one of the two.
+#[test]
+fn a_domain_knows_the_constituents_its_boundaries_carry() {
+    let carried = |boundary: &str, atlas: &[(&str, f64, f64)]| {
+        let dir = tempfile::tempdir().unwrap();
+        let points: Vec<(f64, f64)> = (0..=4).map(|i| (0.0, 500.0 * i as f64)).collect();
+        write_atlas(&dir.path().join("atlas.txt"), &points, atlas);
+        placed_channel_case(dir.path(), boundary)
+            .unwrap()
+            .build_domain()
+            .unwrap()
+            .tide_constituents
+    };
+    let majors = [
+        ("M2", 0.3, 40.0),
+        ("S2", 0.1, 75.0),
+        ("N2", 0.06, 20.0),
+        ("K1", 0.05, 200.0),
+    ];
+    assert_eq!(
+        carried(
+            "tide = { constituents = [{ name = \"m2\", amplitude_m = 0.3 }] }",
+            &majors
+        ),
+        ["M2"]
+    );
+    assert_eq!(
+        carried("atlas = { file = \"atlas.txt\" }", &majors),
+        ["M2", "S2", "N2", "K1"]
+    );
+    let with_minors = carried(
+        "atlas = { file = \"atlas.txt\", correction = \"minors\" }",
+        &majors,
+    );
+    assert_eq!(
+        with_minors,
+        [
+            "M2", "S2", "N2", "K1", "2N2", "MU2", "NU2", "LDA2", "L2", "T2"
+        ]
+    );
+    // In the order a record is fitted in, with the overtides a model makes
+    assert_eq!(
+        dgcom::analysis::HarmonicAnalysis::station_candidates(&with_minors),
+        [
+            "M2", "S2", "K1", "N2", "M4", "MS4", "MN4", "M6", "NU2", "MU2", "2N2", "L2", "LDA2",
+            "T2"
+        ]
+    );
 }
 
 /// An atlas holding one tide at every point gives the boundary the same

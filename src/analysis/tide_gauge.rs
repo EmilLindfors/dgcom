@@ -221,9 +221,10 @@ impl SkillScore {
 #[derive(Clone, Debug)]
 pub struct GaugeComparison {
     /// The model's reference constants
-    /// ([`HarmonicAnalysis::fit_with_reference`] of
-    /// [`HarmonicAnalysis::STATION_RECORD`] with the gauge's ratios). A
-    /// record too short for any is an error, and the rest stands.
+    /// ([`HarmonicAnalysis::fit_with_reference`] of the constituents the
+    /// run carries, with the gauge's ratios). A record shorter than M2's
+    /// period has no constants; one that cannot be fitted is an error, and
+    /// the rest stands.
     pub model_fit: Result<ReferenceFit, AnalysisError>,
     /// Model against gauge for each constituent of the model's fit that the
     /// gauge's has, in the model's order
@@ -236,11 +237,15 @@ pub struct GaugeComparison {
 
 impl GaugeComparison {
     /// Compare `model` (the surface at the gauge, Unix times, the spin-up
-    /// already cut) with `gauge`.
-    pub fn compute(model: &TimeSeries, gauge: &GaugeRecord) -> Self {
+    /// already cut) with `gauge`. `candidates` are the constituents the
+    /// model's record carries, in priority order
+    /// ([`HarmonicAnalysis::station_candidates`] of its forcing's): the
+    /// gauge's water has the minor semidiurnals, a run has them only if its
+    /// boundary does.
+    pub fn compute(model: &TimeSeries, gauge: &GaugeRecord, candidates: &[&'static str]) -> Self {
         let gauge_fit = gauge.fit.as_ref().ok();
         let model_fit = HarmonicAnalysis::fit_with_reference(
-            &HarmonicAnalysis::STATION_RECORD,
+            candidates,
             model.times(),
             model.values(),
             gauge_fit,
@@ -1043,8 +1048,12 @@ mod tests {
             ],
             &model_times,
         );
-        let comparison =
-            GaugeComparison::compute(&TimeSeries::new(&model_times, &model_values), &gauge);
+        // The run carries M2, K1 and P1, and no more
+        let comparison = GaugeComparison::compute(
+            &TimeSeries::new(&model_times, &model_values),
+            &gauge,
+            &HarmonicAnalysis::station_candidates(&["M2", "K1", "P1"]),
+        );
         for (name, ratio) in [("M2", 1.2), ("K1", 2.5)] {
             let c = comparison
                 .constituents
