@@ -27,8 +27,8 @@
 //! error ([`AnalysisError::NotSeparable`]); [`HarmonicAnalysis::resolvable`]
 //! chooses what a record can fit. The mean is the constituent of speed
 //! zero: a record shorter than a constituent's period cannot tell the two
-//! apart, so `resolvable` leaves out Ssa under half a year and M2 under
-//! 12.4 hours.
+//! apart, so a fit of Ssa under half a year, or of M2 under 12.4 hours, is
+//! the same error, and `resolvable` leaves them out.
 //!
 //! A constituent left out is not gone from the water: its energy goes to
 //! the fitted neighbour it cannot be told from, with a phase that turns over
@@ -597,14 +597,17 @@ impl HarmonicAnalysis {
     }
 
     /// The record length the fitted constituents need to separate pairwise
-    /// (Rayleigh criterion: the longest synodic period of a pair, s); 0 for
-    /// fewer than two, or unknown names.
+    /// and from the mean (Rayleigh criterion: the longest synodic period of
+    /// a pair, the mean's with a constituent being its period; s); 0 for
+    /// none, or unknown names.
     pub fn minimum_record_length(&self) -> f64 {
-        let omegas: Vec<f64> = self
-            .names
-            .iter()
-            .filter_map(|&n| constituent_period(n))
-            .map(|p| 2.0 * std::f64::consts::PI / p)
+        let omegas: Vec<f64> = std::iter::once(0.0)
+            .chain(
+                self.names
+                    .iter()
+                    .filter_map(|&n| constituent_period(n))
+                    .map(|p| 2.0 * std::f64::consts::PI / p),
+            )
             .collect();
         let mut longest = 0.0_f64;
         for (i, &a) in omegas.iter().enumerate() {
@@ -627,8 +630,9 @@ impl HarmonicAnalysis {
     ///
     /// Errors on samples and times of different lengths, an unknown
     /// constituent, an inference whose source is not fitted, fewer samples
-    /// than unknowns, or a pair of fitted constituents that the record
-    /// cannot separate.
+    /// than unknowns, or a fitted constituent that the record cannot
+    /// separate from another or from the mean (a record shorter than its
+    /// period: Ssa on a month, M2 on 12 hours).
     pub fn fit(&self, times_unix: &[f64], values: &[f64]) -> Result<ReferenceFit, AnalysisError> {
         let n = times_unix.len();
         if n != values.len() {
@@ -668,14 +672,21 @@ impl HarmonicAnalysis {
             .map(|n| astronomy(n))
             .collect::<Result<_, _>>()?;
 
-        // Rayleigh criterion between the fitted constituents
-        for (i, a) in fitted.iter().enumerate() {
-            for (j, b) in fitted.iter().enumerate().skip(i + 1) {
-                let synodic = 2.0 * std::f64::consts::PI / (a.0 - b.0).abs();
+        // Rayleigh criterion between the fitted constituents, and between each
+        // and the mean: the constituent of speed zero, which a record shorter
+        // than a constituent's period cannot tell from it (column 0, "Z0")
+        let speed = |j: usize| match j {
+            0 => ("Z0", 0.0),
+            _ => (names[j - 1], fitted[j - 1].0),
+        };
+        for i in 0..=names.len() {
+            for j in i + 1..=names.len() {
+                let ((a, omega_a), (b, omega_b)) = (speed(i), speed(j));
+                let synodic = 2.0 * std::f64::consts::PI / (omega_a - omega_b).abs();
                 if length < synodic {
                     return Err(AnalysisError::NotSeparable {
-                        a: names[i],
-                        b: names[j],
+                        a,
+                        b,
                         needed_days: synodic / 86_400.0,
                         have_days: length / 86_400.0,
                     });
@@ -1195,8 +1206,9 @@ mod tests {
     /// A long-period constituent is fitted once the record is as long as its
     /// period (the mean is the constituent of speed zero): Mf from 13.7
     /// days, Mm from 27.6, Ssa from 183. On 40 days whose level sags 2 cm
-    /// in the middle (weather), a fitted Ssa is that curve, over three times
-    /// as high, and the mean goes with it.
+    /// in the middle (weather), a fitted Ssa was that curve, over three
+    /// times as high, and the mean went with it (`notes/validation.md`
+    /// P3.1); `fit` refuses it, and the gauge's fit leaves it out.
     #[test]
     fn a_constituent_longer_than_the_record_is_left_out() {
         let long = |days: f64| -> Vec<&'static str> {
@@ -1245,14 +1257,17 @@ mod tests {
         // The mean of the level without the tide: the sag's is a third of it
         let level = 0.3 + 0.02 / 3.0;
 
-        let with_ssa = HarmonicAnalysis::new(&["M2", "S2", "Ssa"])
-            .fit(&times, &values)
-            .unwrap();
+        let with_ssa = HarmonicAnalysis::new(&["M2", "S2", "Ssa"]).fit(&times, &values);
         assert!(
-            with_ssa.get("Ssa").unwrap().amplitude > 0.06 && (with_ssa.mean - level).abs() > 0.06,
-            "Ssa {}, mean {} vs {level}",
-            with_ssa.get("Ssa").unwrap().amplitude,
-            with_ssa.mean
+            matches!(
+                with_ssa,
+                Err(AnalysisError::NotSeparable {
+                    a: "Z0",
+                    b: "Ssa",
+                    ..
+                })
+            ),
+            "{with_ssa:?}"
         );
         let fit = HarmonicAnalysis::fit_with_reference(&["M2", "S2", "Ssa"], &times, &values, None)
             .unwrap();
@@ -1554,6 +1569,35 @@ mod tests {
                 ..
             }
         ));
+        // Nor Ssa from a month beside the mean, the constituent of speed
+        // zero, nor M2 from 12 hours (13 do)
+        let ssa = fit(&["M2", "Ssa"], &[]);
+        assert!(
+            matches!(
+                ssa,
+                AnalysisError::NotSeparable {
+                    a: "Z0",
+                    b: "Ssa",
+                    ..
+                }
+            ),
+            "{ssa}"
+        );
+        assert!(
+            ssa.to_string().contains("infer Ssa or leave it out"),
+            "{ssa}"
+        );
+        let m2 = HarmonicAnalysis::new(&["M2"]);
+        assert!(matches!(
+            m2.fit(&times[..13], &values[..13]),
+            Err(AnalysisError::NotSeparable {
+                a: "Z0",
+                b: "M2",
+                ..
+            })
+        ));
+        assert!(m2.fit(&times[..14], &values[..14]).is_ok());
+        assert!((m2.minimum_record_length() - constituent_period("M2").unwrap()).abs() < 1e-6);
         assert_eq!(
             fit(&["M2"], &[Inference::P1_FROM_K1]),
             AnalysisError::InferenceSourceNotFitted {
