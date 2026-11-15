@@ -111,6 +111,7 @@
   - [ ] `Simulation3D` still fires callbacks at the first step past each interval (drifting by up to a step), as the 2D runner did before its callbacks landed exactly; port the 2D logic with P4.1.
 
 ### P2.7 GPU and distributed memory (decision)
+- **2026-11-15: decided, continued in [`gpu.md`](gpu.md):** CUDA first (RTX 3090, RTX PRO 6000), kernels in Rust with NVIDIA's cuda-oxide over physics shared with the CPU kernels; Burn goes.
 - [ ] Either fix Burn (P0.11) or replace it with custom fused f64 kernels (CubeCL/cudarc) over CSR faces. Burn with fusion disabled (`Cargo.toml:38`) moves ~13× more bytes per node-stage than fused kernels.
 - [ ] MPI/domain decomposition plan (METIS partitioning, halo exchange of face traces).
 - Sizing (2026-09-28): neither more cores nor a GPU helps the current farm mesh (3,584 P2 elements, 32k nodes). LTS went from ≈ 10× real time on 4 threads to ≈ 17× on 10 (1.6× for 2.5× the threads): the per-step work is too small to spread. On a GPU, 124k steps × 3 stages × several kernels per 50 model minutes would be dominated by launch overhead.

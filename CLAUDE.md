@@ -13,7 +13,7 @@ This is a high-performance Discontinuous Galerkin (DG) solver for coastal ocean 
 - **Long-term architecture over short-term patches**: the crate is an early-stage experiment with no external users. Breaking the public API is fine (rename, merge, delete, re-shape types and functions) whenever it gives a better design or better performance; do not keep compatibility shims, deprecated paths or duplicate APIs, and port the callers (examples, tests) instead. Fix the cause, not the symptom.
 - **Correctness first**: Numerical methods must converge at theoretical rates
 - **Performance matters**: Will scale to millions of elements; every unnecessary allocation counts
-- **GPU-ready architecture**: Design data structures for future GPU port (cudarc)
+- **GPU-ready architecture**: flat SoA data and pointwise physics that the scalar CPU kernel and the GPU kernels (Rust, NVIDIA's cuda-oxide; `notes/gpu.md`) both call; the SIMD batch is still a second copy, gated bit for bit
 - **Composable**: Clean separation between operators, mesh, flux, and time integration
 
 ## Code Standards
@@ -67,7 +67,7 @@ src/
 │                   # well-balanced bathymetry)
 ├── boundary/       # CharacteristicOBC + providers (tides, atlas, nesting), walls
 ├── solver/         # Solution state (SoA), RHS kernels, limiters,
-│                   # wetting/drying, SIMD, burn GPU prototype
+│                   # wetting/drying, SIMD
 ├── time/           # Integrable/TimeIntegrator traits, SSP-RK3, mode splitting
 ├── vertical/       # Sigma grid, stretching functions (3D)
 ├── physics/        # PhysicsModule trait, SWEPhysics2D, Hydrostatic3D,
@@ -212,6 +212,11 @@ cargo run --release --example advection_1d
 
 # Check for issues
 cargo clippy
+
+# GPU kernels (gpu/, cuda-oxide's pinned toolchain; environment in notes/gpu.md)
+cd gpu && cargo oxide run --no-fmad                   # the gate against the scalar CPU kernel
+cd gpu && cargo oxide run --no-fmad --features simd   # ... and against the SIMD batch
+cd gpu && cargo oxide run --features simd             # FMA build: the timing
 
 # Profiling (see scripts/ for details)
 ./scripts/flamegraph.sh froya_real_data       # Generate flamegraph SVG

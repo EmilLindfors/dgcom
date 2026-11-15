@@ -18,6 +18,7 @@ The files were split out of the old 1,500-line `TODO.md` on 2026-10-10, verbatim
 | [boundaries-nesting.md](boundaries-nesting.md) | Characteristic open boundaries, tidal atlases, NorKyst/ROMS nesting | P1.4, P1.5 |
 | [inputs-forcing.md](inputs-forcing.md) | Bathymetry, vertical datum, atmospheric forcing, rivers, shoreline handling | P1.6 |
 | [performance.md](performance.md) | Time step, kernels, fused stepper, local time stepping, benchmarks, GPU/MPI | P2 |
+| [gpu.md](gpu.md) | The GPU port: hardware, the cuda-oxide toolchain, kernels' design, phases and gates | P2.7 |
 | [3d-mode-splitting.md](3d-mode-splitting.md) | Barotropic/baroclinic mode splitting | P4.1 |
 | [3d-numerics.md](3d-numerics.md) | 3D continuity, tracers, momentum, PGF and vertical grid, 3D wet/dry, viscosity, kernels | P4.2, P4.3, P4.5 |
 | [3d-mixing.md](3d-mixing.md) | GLS, bottom and surface boundary layers | P4.4 |

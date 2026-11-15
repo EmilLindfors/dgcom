@@ -41,7 +41,7 @@ src/
 │   ├── core/         # Mesh1D, Mesh2D (quads), Mesh2DBuilder, PointLocator2D
 │   ├── data/         # Bathymetry, land mask, boundary tags
 │   ├── io/           # Gmsh MSH 4.1 (ASCII/binary) + 2.2 reader, 2.2 writer
-│   └── traits/       # Mesh traits, Point; MeshGPUData (unimplemented)
+│   └── traits/       # Mesh traits, Point
 ├── flux/             # Upwind, Lax-Friedrichs, Roe, HLL; 2D SWE fluxes;
 │                     # entropy-conservative/-stable SWE fluxes (Wintermeyer)
 │
@@ -83,9 +83,7 @@ src/
 │   ├── diagnostics/  # Runtime diagnostics (2D conservation); 3D potential
 │   │                 # and reference potential energy (PotentialEnergy3D:
 │   │                 # spurious mixing, Ilıcak et al. 2012)
-│   ├── probe.rs      # Probe2D: the DG solution at a point (stations)
-│   └── burn/         # Burn GPU prototype — incomplete, physically wrong
-│                     # (TODO P0.11/P2.7)
+│   └── probe.rs      # Probe2D: the DG solution at a point (stations)
 ├── time/             # Integrable + TimeIntegrator traits, generic SSPRK3, SSPRK43,
 │                     # multirate (local time stepping, Multirate<B>),
 │                     # mode_split (barotropic subcycling); legacy per-type
@@ -155,7 +153,7 @@ Summary as of 2026-10-10; the details and open items are in `notes/` and `TODO.m
 | Particles | 2D and 3D tracking on the DG velocity, random walks, salmon-lice behaviour, site-to-site connectivity (F.2) |
 | Validation | Mausund gauge, 15 days on the coastline mesh: RSS 3.37 cm over the main constituents (NorKyst 14 cm). Open: M2 gain, weak overtides, a month-long run, observed currents, the ROMS cost benchmark (P3) |
 | Performance | SoA + rayon, local time stepping, SSP-RK(4,3), the split form batched across elements with fearless_simd. The speed claim against ROMS is unproven (P3.2); the cost levers are in P2 |
-| GPU | Burn prototype physically wrong; fix or replace with fused f64 kernels over CSR (P0.11/P2.7) |
+| GPU | Starting (P2.7, `notes/gpu.md`): CUDA first, kernels in Rust with NVIDIA's cuda-oxide over pointwise physics shared with the CPU kernels; the Burn prototype is deleted |
 
 ## What NOT to Do
 
@@ -163,9 +161,12 @@ Summary as of 2026-10-10; the details and open items are in `notes/` and `TODO.m
    must keep the convergence and conservation tests passing.
 2. **Don't allocate in the RHS** — and don't add new APIs shaped
    `fn rhs(&state) -> State`; use write-into signatures.
-3. **Don't extend the Burn module** — fix or replace it is the open P2.7
-   decision; a future GPU port goes through flat SoA/CSR data + fused
-   f64 kernels.
+3. **Don't add a third copy of the physics for the GPU** — the GPU kernels
+   (P2.7, `notes/gpu.md`) call the scalar CPU kernel's pointwise functions
+   and are gated bit for bit against both CPU copies (scalar and the SIMD
+   batch) in a build without FMA contraction. The batch is still a second
+   copy; making the pointwise physics generic over the lane type is the
+   open Phase 1 decision.
 4. **Don't add another hand-rolled integrator or run loop** — implement
    `Integrable` and use `SSPRK3`/`Simulation`.
 5. **Don't preserve backwards compatibility** — pre-1.0, no external

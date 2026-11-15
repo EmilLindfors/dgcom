@@ -61,9 +61,13 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Tech debt (P6) — [notes/tech-debt.md](notes/tech-debt.md)
 
-- [ ] **P6** Delete the legacy 2D paths in one go: move `profile_cpu`, `quick_profile` and `high_res_benchmark` onto `Simulation` + `SWEPhysics2D`, then delete the `ssp_rk3*` steppers and `SWE2DTimeConfig`, the `Standard` wet/dry path with the cell-average/`linearize` workarounds and its kernels, `solver/simd/`, `Discharge2D`/`ConstantDischarge2D`, and the Burn prototype (`src/solver/burn/`, `burn_ssp_rk3.rs`: it discards its surface term). Merge the three legacy conservation tests into one on `Simulation`, and fold `Simulation3D::run_with_callback` into one time loop that lands callbacks exactly (`notes/tech-debt.md`).
+- [ ] **P6** Delete the legacy 2D paths in one go: move `profile_cpu`, `quick_profile` and `high_res_benchmark` onto `Simulation` + `SWEPhysics2D`, then delete the `ssp_rk3*` steppers and `SWE2DTimeConfig`, the `Standard` wet/dry path with the cell-average/`linearize` workarounds and its kernels, `solver/simd/`, and `Discharge2D`/`ConstantDischarge2D`. Merge the three legacy conservation tests into one on `Simulation`, and fold `Simulation3D::run_with_callback` into one time loop that lands callbacks exactly (`notes/tech-debt.md`).
 - [ ] **P6** Delete the code without callers: `LandMask2D`; `SillOverflow2D`, `SillWithFriction`, `SillDetector`, `StraitFriction2D` and `TidalPotential` with their presets (≈ 1,800 lines); `TidalConstituent::with_nodal_correction` and `tides::correct_amplitude_phase` (`notes/tech-debt.md`).
 
 ## Viewer (F.3) — [notes/viz.md](notes/viz.md)
 
 - [ ] **F.3** Build `viz/` in CI (a `cargo check` in its workspace, or a job on PRs touching `src/` public API): it is its own workspace, so dg-rs's tests never compile it, and it stayed broken for a week after `4d3a160` (`notes/viz.md` 2026-11-05).
+
+## GPU (P2.7) — [notes/gpu.md](notes/gpu.md)
+
+- [ ] **P2.7** Time the GPU's fully wet RHS (`gpu/`, `cargo oxide run`) on the RTX 3090 and the RTX PRO 6000 against the predictions (≈ 10 and 3 ns per P2 element evaluation; the laptop's RTX 4060 takes 25, its 24 threads 50), with Nsight Compute's FP64 counts; then Phase 1, the full 2D stage behind a `cuda` feature. Phase 0's gate holds: the kernels call dgcom's own pointwise physics and give the CPU's RHS bit for bit under `--no-fmad` (2026-11-15). Phases 1–2 would put the 15-day runs (P3.4) and Chiloé's spring–neap cycle (P8.6) at minutes per model day.

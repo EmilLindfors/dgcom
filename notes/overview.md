@@ -36,7 +36,7 @@ This roadmap is driven by the full-crate review of **2026-09-25** in `review-202
 | Validated against observations | Mausund (Kartverket MSU), 15 days at 1 km: M2 1.03×, +5.4° (≈ +2.3° at 500 m); tidal-prediction RMSE 9.8 cm | 5+ tide gauges, ADCP |
 | Multi-day stability | One M2 cycle on Frøya (9,653 P2 elements, 11.4 min wall, 0 clips) | 30+ days, real domain |
 | 3D | Scaffolding; tracer constancy (P4.2) and the balanced PGF (P4.3) fixed 2026-09-30; vertical advection ×D (P0.16) and the tracer wall leak (P0.22) fixed; mode splitting: one filtered barotropic pass (0.035 % seiche damping per period), second-order slow coupling, wind setup/Ekman to < 0.1 % (P4.1 PR 1–2; DU_avg2 is PR 3) | lock exchange, mode-1 internal wave, seamount spin-up |
-| GPU | Non-functional (P0.11) | fixed or replaced (P2.7) |
+| GPU | Non-functional (P0.11); Burn deleted 2026-11-15, the cuda-oxide port starting (`gpu.md`) | fixed or replaced (P2.7) |
 
 ## Altitude pass on the TODO list (2026-11-15)
 
