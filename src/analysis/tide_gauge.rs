@@ -1002,11 +1002,14 @@ mod tests {
         let gauge_times: Vec<f64> = (0..60 * 24).map(|h| t0 + 3600.0 * f64::from(h)).collect();
         // P1 at its equilibrium ratio to K1 and the minor semidiurnals at
         // their admittance, as the gauge's fit infers them: a gauge's water
-        // has them (an M2 without N2 and S2 gives each its share of M2)
+        // has them (an M2 without N2 and S2 gives each its share of M2).
+        // O1 at K1's lag, so the diurnal band has no age and P1 sits at
+        // K1's lag (without O1 the fit's O1 has no lag to age P1 by)
         let p1 = crate::analysis::Inference::P1_FROM_K1.from.amplitude_ratio;
         let mut gauge_tide = vec![
             ("M2", 1.0, 60.0),
             ("K1", 0.2, 200.0),
+            ("O1", 0.05, 200.0),
             ("P1", 0.2 * p1, 200.0),
         ];
         for minor in crate::tides::AdmittanceInference::MINORS {

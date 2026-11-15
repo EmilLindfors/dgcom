@@ -114,8 +114,8 @@ impl Inference {
     /// What theory gives the constituents a record does not resolve, with
     /// no longer record to take their ratios from:
     ///
-    /// - [`Self::EQUILIBRIUM`]: P1, K2, N2 and Q1 (with N2's and Q1's lags
-    ///   from the age of the tide in
+    /// - [`Self::EQUILIBRIUM`]: P1, K2, N2 and Q1 (with N2's, Q1's and P1's
+    ///   lags from the age of the tide in
     ///   [`HarmonicAnalysis::fit_with_reference`]);
     /// - 2N2, μ2, ν2, λ2, L2 and T2 by linear admittance between N2, M2 and
     ///   S2 ([`AdmittanceInference::MINORS`]), as tide models' predictions
@@ -389,8 +389,9 @@ impl HarmonicAnalysis {
     }
 
     /// This analysis with an N2 inferred from M2 at equal lag
-    /// ([`Inference::N2_FROM_M2`]), and a Q1 so inferred from O1
-    /// ([`Inference::Q1_FROM_O1`]), given the lags that `fit`, this
+    /// ([`Inference::N2_FROM_M2`]), a Q1 so inferred from O1
+    /// ([`Inference::Q1_FROM_O1`]) and a P1 from K1
+    /// ([`Inference::P1_FROM_K1`]), given the lags that `fit`, this
     /// analysis's own, implies: the lag of a band taken linear in frequency
     /// through its two fitted constituents (one age of the tide per band,
     /// Garrett & Munk 1971),
@@ -398,10 +399,11 @@ impl HarmonicAnalysis {
     /// ```text
     /// G(N2) = G(M2) − 0.536 (G(S2) − G(M2))
     /// G(Q1) = G(O1) − 0.496 (G(K1) − G(O1))
+    /// G(P1) = G(K1) − 0.075 (G(K1) − G(O1))
     /// ```
     ///
-    /// `None` unless N2 is so inferred with M2 and S2 fitted, or Q1 with O1
-    /// and K1.
+    /// `None` unless N2 is so inferred with M2 and S2 fitted, or Q1 or P1
+    /// with O1 and K1.
     ///
     /// The equilibrium ratio gives N2's amplitude within 10 %, but its lag
     /// is 15–35° before M2's on most coasts, which a fortnight's fit then
@@ -419,6 +421,17 @@ impl HarmonicAnalysis {
     /// equilibrium one, 14.5 to 13.7 mm and 3.81 to 3.76 cm (better at 13
     /// of the 17 gauges, 0.13 cm worse at Vardø) (`notes/validation.md`,
     /// P3.1 "Inference of the minor constituents").
+    ///
+    /// P1 is inferred up to half a year, and K1 lags O1 by 127–166° at 15
+    /// of the 17 Norwegian gauges, so the age puts P1 10–12° before K1
+    /// (UTide's year has it 8–24° before at 13 of them): it takes a month's P1 from
+    /// 8.0 to 6.8 mm in Norway and from 18.3 to 17.8 mm on the other coasts,
+    /// and the predicted tide from 2.90 to 2.87 and 8.52 to 8.51 cm (better
+    /// at 13 of 17 and 5 of 6; Vardø, whose K1 and O1 are 180° apart,
+    /// 0.08 cm worse). K2 is not aged: in UTide's year it leads S2 at all
+    /// 23 gauges (by 3° at 15 of the Norwegian ones), where the slope puts
+    /// it 2–4° after at 21, and aged it is worse at every length (a
+    /// month's tide 3.04 cm in Norway, 8.78 elsewhere).
     pub fn with_the_age_of_the_tide(&self, fit: &ReferenceFit) -> Option<Self> {
         let fitted = |name: &str| fit.get(name).filter(|c| !c.inferred);
         let speed = |name| constituent_period(name).map(|p| 1.0 / p);
@@ -445,9 +458,13 @@ impl HarmonicAnalysis {
 
     /// The equal-lag inferences that [`Self::with_the_age_of_the_tide`]
     /// gives a lag, each with the second fitted constituent of its band
-    /// that sets the slope: N2 from M2 by S2, Q1 from O1 by K1.
-    const AGED: [(Inference, &'static str); 2] =
-        [(Inference::N2_FROM_M2, "S2"), (Inference::Q1_FROM_O1, "K1")];
+    /// that sets the slope: N2 from M2 by S2, Q1 from O1 by K1, P1 from K1
+    /// by O1. Not K2 from S2 by M2: it leads S2, against the slope.
+    const AGED: [(Inference, &'static str); 3] = [
+        (Inference::N2_FROM_M2, "S2"),
+        (Inference::Q1_FROM_O1, "K1"),
+        (Inference::P1_FROM_K1, "O1"),
+    ];
 
     /// Fit `names`, inferring nothing.
     pub fn new(names: &[&'static str]) -> Self {
@@ -1297,12 +1314,15 @@ mod tests {
             ["M2", "S2", "M4", "MS4", "MN4", "M6", "NU2", "Mf"]
         );
 
-        // The majors with K2 and P1 at their equilibrium ratios, and the same
-        // with the minor semidiurnals
+        // The majors with K2 and P1 at their equilibrium ratios (P1 at the
+        // diurnal age, as a month infers it), and the same with the minor
+        // semidiurnals
+        let speed = |name| 1.0 / constituent_period(name).unwrap();
+        let p1_age = (speed("P1") - speed("K1")) / (speed("O1") - speed("K1"));
         let mut with_minors = tide_with_minors();
         with_minors.extend([
             ("K2", 0.272 * 0.25, 339.0),
-            ("P1", 0.331 * 0.06, 165.0),
+            ("P1", 0.331 * 0.06, 165.0 + p1_age * (38.0 - 165.0)),
             ("Q1", 0.01, 350.0),
         ]);
         let minor = |name: &str| AdmittanceInference::MINORS.iter().any(|a| a.name == name);
@@ -1334,9 +1354,11 @@ mod tests {
         let of = |truth: &[(&'static str, f64, f64)]| {
             HarmonicAnalysis::station_candidates(&carried(truth))
         };
+        // Not exact: P1's age is taken once, from a fit with P1 at K1's lag,
+        // whose K1 is 2° off, so P1 is 0.2° off and leaves 3e-6 in N2
         for truth in [&majors, &with_minors] {
             let own = n2_error(truth, &of(truth));
-            assert!(own < 1e-7, "N2 with the forcing's constituents: {own}");
+            assert!(own < 1e-5, "N2 with the forcing's constituents: {own}");
         }
         let (inferred, left_out) = (
             n2_error(&majors, &of(&with_minors)),
@@ -1509,6 +1531,72 @@ mod tests {
             );
         }
         for name in ["M2", "S2"] {
+            assert!(error(&aged, name) < 1e-4, "{name}: {}", error(&aged, name));
+        }
+    }
+
+    /// P1, inferred from K1 up to half a year, takes the lag of the
+    /// diurnal age too, `G(P1) = G(K1) − 0.075 (G(K1) − G(O1))`: 10.5° before
+    /// K1 where K1 lags O1 by 141° (Ålesund). A month fits Q1, so P1 is the
+    /// only one aged, and nothing else moves.
+    #[test]
+    fn a_months_p1_takes_its_lag_from_the_diurnal_age() {
+        let (k1, o1) = ((0.057, 153.1), (0.060, 11.5));
+        let p1_lag = k1.1 - 0.0748 * (k1.1 - o1.1);
+        let truth = [
+            ("M2", 0.62, 289.9),
+            ("S2", 0.21, 327.2),
+            ("N2", 0.13, 267.7),
+            ("K1", k1.0, k1.1),
+            ("O1", o1.0, o1.1),
+            ("Q1", 0.024, 330.9),
+            ("P1", 0.331 * k1.0, p1_lag),
+        ];
+        let t0 = ModelClock::at_datetime(2025, 1, 10, 0, 0).epoch_unix;
+        let hours = 30 * 24;
+        let values = synthesize(t0, hours, 0.0, &truth);
+        let times: Vec<f64> = (0..hours).map(|i| t0 + i as f64 * 3600.0).collect();
+        let error = |fit: &ReferenceFit, name: &str| {
+            let (c, t) = (
+                fit.get(name).unwrap(),
+                truth.iter().find(|t| t.0 == name).unwrap(),
+            );
+            let (a, b) = (c.lag_deg.to_radians(), t.2.to_radians());
+            (c.amplitude * a.cos() - t.1 * b.cos()).hypot(c.amplitude * a.sin() - t.1 * b.sin())
+        };
+        let candidates = ["M2", "S2", "K1", "O1", "N2", "Q1", "P1"];
+        let equal_lag = HarmonicAnalysis::resolvable(
+            &candidates,
+            times[hours - 1] - t0,
+            1.0,
+            &Inference::EQUILIBRIUM,
+        );
+        assert_eq!(equal_lag.names(), ["M2", "S2", "K1", "O1", "N2", "Q1"]);
+        let first = equal_lag.fit(&times, &values).unwrap();
+        assert!(
+            error(&first, "P1") > 2e-3 && error(&first, "K1") > 1e-3,
+            "at equal lag: P1 {}, K1 {}",
+            error(&first, "P1"),
+            error(&first, "K1")
+        );
+
+        let aged =
+            HarmonicAnalysis::fit_with_reference(&candidates, &times, &values, None).unwrap();
+        assert!(aged.get("P1").unwrap().inferred);
+        assert!(
+            lag_error(aged.get("P1").unwrap().lag_deg, p1_lag) < 0.5,
+            "P1 lag {} vs {p1_lag}",
+            aged.get("P1").unwrap().lag_deg
+        );
+        for name in ["P1", "K1"] {
+            assert!(
+                error(&aged, name) < 0.2 * error(&first, name),
+                "{name}: {} vs {} at equal lag",
+                error(&aged, name),
+                error(&first, name)
+            );
+        }
+        for name in ["M2", "S2", "N2", "O1", "Q1"] {
             assert!(error(&aged, name) < 1e-4, "{name}: {}", error(&aged, name));
         }
     }
