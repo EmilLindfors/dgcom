@@ -1,0 +1,89 @@
+//! Phase 1's first gate: dgcom's own `Simulation` and SSP-RK(4,3) stepping
+//! the GPU state ([`DeviceState`]) with the GPU physics ([`GpuSWE2D`]),
+//! against the same run on the CPU (`SWEPhysics2D`, EntropyStable), and the
+//! time per step of both.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use dgcom::boundary::Reflective2D;
+use dgcom::physics::PhysicsBuilder;
+use dgcom::simulation::Simulation;
+use dgcom::solver::SWEFormulation2D;
+use dgcom::time::SSPRK43;
+
+use crate::phase0::{Case, agreement, cpu_kernel};
+use crate::swe2d::{DeviceState, Gpu, NN};
+
+/// The CFL number of both runs.
+const CFL: f64 = 0.5;
+
+/// Runs `case` to `t_end` on both and reports the steps, the agreement of the
+/// final states and the time per step.
+fn run_case(
+    label: &str,
+    case: &Case,
+    gpu: &Arc<Gpu>,
+    t_end: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n_el = case.n_elements();
+
+    let physics = PhysicsBuilder::swe_2d(
+        case.mesh.clone(),
+        case.ops.clone(),
+        case.geom.clone(),
+        case.equation.clone(),
+        Reflective2D::new(),
+    )
+    .with_bathymetry(case.bathymetry.clone())
+    .with_formulation(SWEFormulation2D::EntropyStable)
+    .build();
+    let cpu_sim = Simulation::new(physics, SSPRK43).with_cfl(CFL);
+    let mut cpu = case.q.clone();
+    let start = Instant::now();
+    let cpu_result = cpu_sim.run(&mut cpu, 0.0, t_end);
+    let cpu_seconds = start.elapsed().as_secs_f64();
+    assert!(cpu_result.success, "CPU run: {cpu_result:?}");
+
+    let gpu_sim = Simulation::new(case.gpu_physics(gpu), SSPRK43).with_cfl(CFL);
+    let mut state = DeviceState::upload(gpu, &case.q);
+    gpu.stream.synchronize()?;
+    let start = Instant::now();
+    let gpu_result = gpu_sim.run(&mut state, 0.0, t_end);
+    gpu.stream.synchronize()?;
+    let gpu_seconds = start.elapsed().as_secs_f64();
+    assert!(gpu_result.success, "GPU run: {gpu_result:?}");
+
+    let (identical, worst_ulps, worst_rel) = agreement(&cpu, &state.download());
+    println!(
+        "{label}: {n_el} P2 elements ({} affine), {} steps on the CPU and {} on the GPU to \
+         t = {t_end} s; after them {identical} of {} nodes bit-identical to the {} CPU kernel, \
+         largest difference {worst_ulps} ulp, {worst_rel:.1e} of the field's largest",
+        case.affine_elements(),
+        cpu_result.n_steps,
+        gpu_result.n_steps,
+        n_el * NN,
+        cpu_kernel()
+    );
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per_step = |seconds: f64, steps: usize| seconds * 1e3 / steps as f64;
+    let per_element_stage = |seconds: f64, steps: usize| seconds * 1e9 / (steps * 4 * n_el) as f64;
+    println!(
+        "  per step: CPU {:.2} ms ({threads} threads), GPU {:.2} ms ({:.2}x); per element \
+         and stage: CPU {:.1} ns, GPU {:.1} ns",
+        per_step(cpu_seconds, cpu_result.n_steps),
+        per_step(gpu_seconds, gpu_result.n_steps),
+        cpu_seconds / gpu_seconds * gpu_result.n_steps as f64 / cpu_result.n_steps as f64,
+        per_element_stage(cpu_seconds, cpu_result.n_steps),
+        per_element_stage(gpu_seconds, gpu_result.n_steps),
+    );
+    Ok(())
+}
+
+pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
+    println!("== Phase 1: Simulation with SSP-RK(4,3) on the GPU ==");
+    run_case("parallelograms", &Case::new(48, 40, 0.0), gpu, 30.0)?;
+    run_case("jittered", &Case::new(48, 40, 0.15), gpu, 30.0)?;
+    run_case("jittered, timing", &Case::new(320, 300, 0.15), gpu, 30.0)?;
+    Ok(())
+}

@@ -23,7 +23,7 @@ use crate::solver::{SWESolution2D, SWEState2D};
 use crate::source::swe_2d::viscosity::HorizontalViscosity2D;
 use crate::source::{ElementSources, HydrostaticReconstruction2D, SourceTerm2D};
 use crate::time::SspScheme;
-use crate::types::ElementIndex;
+use crate::types::{Depth, ElementIndex};
 
 use super::diffusion_2d::ScalarGradient2D;
 use super::swe_2d_split_form::{ELEMENT_CHUNK, SplitFormSWE2D, SplitFormWorkspace};
@@ -1324,28 +1324,34 @@ fn element_max_reference_rate(
                 return 0.0;
             }
             let metric = affine.unwrap_or_else(|| norms((geom.grad_r(ki, i), geom.grad_s(ki, i))));
-            node_reference_rate(equation, &state, metric)
+            node_reference_rate(&state, metric, equation.g, equation.h_min)
         })
         .fold(0.0_f64, f64::max)
 }
 
 /// ¼(λ_r + λ_s) of `state` with the metric `(∇r, ∇s, |∇r|, |∇s|)` of a node:
-/// λ_r = |u·∇r| + c|∇r|, |∇r| times the wave speed along ∇r.
+/// λ_r = |u·∇r| + c|∇r|, |∇r| times the wave speed along ∇r, with the
+/// velocity of [`SWEState2D::velocity_simple`] and the celerity `√(g h)` of
+/// [`ShallowWater2D::celerity`]. The time step's pointwise rate, shared with
+/// the GPU kernels (`gpu/`, `notes/gpu.md`).
 #[inline]
-fn node_reference_rate(
-    equation: &ShallowWater2D,
+pub fn node_reference_rate(
     state: &SWEState2D,
     (grad_r, grad_s, norm_r, norm_s): ((f64, f64), (f64, f64), f64, f64),
+    g: f64,
+    h_min: Depth,
 ) -> f64 {
-    let (u, v) = equation.velocity_simple(state);
-    let c = equation.celerity(state.h);
+    let (u, v) = state.velocity_simple(h_min);
+    let c = (g * state.h.max(0.0)).sqrt();
     let lambda_r = (u * grad_r.0 + v * grad_r.1).abs() + c * norm_r;
     let lambda_s = (u * grad_s.0 + v * grad_s.1).abs() + c * norm_s;
     0.25 * (lambda_r + lambda_s)
 }
 
+/// The time step at `cfl` from the largest [`node_reference_rate`] of the
+/// state, `cfl / ((2N + 1) · rate)` (infinite for a state at rest).
 #[inline]
-fn dt_from_reference_rate(max_rate: f64, order: usize, cfl: f64) -> f64 {
+pub fn dt_from_reference_rate(max_rate: f64, order: usize, cfl: f64) -> f64 {
     if max_rate < 1e-14 {
         return f64::INFINITY;
     }
@@ -2065,7 +2071,12 @@ fn element_dt(
             }
             let (grad_r, grad_s) = (geom.grad_r(k, i), geom.grad_s(k, i));
             let metric = (grad_r, grad_s, norm(grad_r), norm(grad_s));
-            rate = rate.max(node_reference_rate(equation, &state, metric));
+            rate = rate.max(node_reference_rate(
+                &state,
+                metric,
+                equation.g,
+                equation.h_min,
+            ));
         }
     }
     let cfl = positivity.map_or(cfl, |bound| {
