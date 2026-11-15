@@ -1,0 +1,4 @@
+# cargo check and rust-analyzer read the cuda-oxide crates' unstable bits
+# (the codegen backend's toolchain is a pinned stable; see notes/gpu.md).
+[env]
+RUSTC_BOOTSTRAP = "1"

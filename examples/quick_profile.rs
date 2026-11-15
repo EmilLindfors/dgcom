@@ -1,65 +1,31 @@
 //! Quick profiling benchmark - realistic element count
 //!
-//! Run with different backends:
 //! ```bash
 //! # CPU serial
 //! cargo run --release --example quick_profile
 //!
 //! # CPU parallel (rayon)
 //! cargo run --release --features parallel --example quick_profile
-//!
-//! # GPU CUDA
-//! cargo run --release --features burn-cuda --example quick_profile
-//!
-//! # GPU WGPU (cross-platform)
-//! cargo run --release --features burn-wgpu --example quick_profile
 //! ```
 
 use std::time::Instant;
 
+use dgcom::SWEFluxType2D;
 use dgcom::SWEState2D;
+use dgcom::boundary::{MultiBoundaryCondition2D, Reflective2D};
+use dgcom::equations::ShallowWater2D;
+use dgcom::mesh::Bathymetry2D;
 use dgcom::mesh::{BoundaryTag, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::solver::SWE2DRhsConfig;
 use dgcom::solver::SWESolution2D;
+use dgcom::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
 use dgcom::types::ElementIndex;
 
-// CPU imports
-#[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dgcom::SWEFluxType2D;
-#[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dgcom::boundary::{MultiBoundaryCondition2D, Reflective2D};
-#[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dgcom::equations::ShallowWater2D;
-#[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dgcom::mesh::Bathymetry2D;
-#[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dgcom::solver::SWE2DRhsConfig;
-#[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dgcom::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
-
-#[cfg(all(
-    not(all(feature = "parallel", feature = "simd")),
-    not(any(feature = "burn-cuda", feature = "burn-wgpu"))
-))]
+#[cfg(not(all(feature = "parallel", feature = "simd")))]
 use dgcom::solver::{compute_dt_swe_2d, compute_rhs_swe_2d};
-#[cfg(all(
-    all(feature = "parallel", feature = "simd"),
-    not(any(feature = "burn-cuda", feature = "burn-wgpu"))
-))]
+#[cfg(all(feature = "parallel", feature = "simd"))]
 use dgcom::solver::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
-
-// GPU imports
-#[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
-use dgcom::solver::burn::{
-    BurnConnectivity, BurnGeometricFactors2D, BurnOperators2D, BurnRhsConfig, BurnSWESolution2D,
-};
-#[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
-use dgcom::time::{compute_dt_burn, ssp_rk3_step_burn};
-
-#[cfg(feature = "burn-cuda")]
-use burn_cuda::{Cuda, CudaDevice};
-#[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
-use burn_wgpu::{Wgpu, WgpuDevice};
 
 fn k(idx: usize) -> ElementIndex {
     ElementIndex::new(idx)
@@ -88,20 +54,9 @@ fn main() {
     let geom = GeometricFactors2D::compute(&mesh, &ops);
     let n_elements = mesh.n_elements;
 
-    // Determine backend name for output
-    #[cfg(feature = "burn-cuda")]
-    let backend_name = "GPU (CUDA)";
-    #[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
-    let backend_name = "GPU (WGPU)";
-    #[cfg(all(
-        feature = "parallel",
-        not(any(feature = "burn-cuda", feature = "burn-wgpu"))
-    ))]
+    #[cfg(feature = "parallel")]
     let backend_name = "CPU (parallel/rayon)";
-    #[cfg(all(
-        not(feature = "parallel"),
-        not(any(feature = "burn-cuda", feature = "burn-wgpu"))
-    ))]
+    #[cfg(not(feature = "parallel"))]
     let backend_name = "CPU (serial)";
 
     println!("Backend: {}", backend_name);
@@ -121,118 +76,10 @@ fn main() {
         }
     }
 
-    // Run benchmark based on feature
-    #[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
-    run_gpu_benchmark(&mesh, &ops, &geom, state, n_elements);
-
-    #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
     run_cpu_benchmark(&mesh, &ops, &geom, state, n_elements);
 }
 
-/// GPU benchmark using Burn
-#[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
-fn run_gpu_benchmark(
-    mesh: &Mesh2D,
-    ops: &DGOperators2D,
-    geom: &GeometricFactors2D,
-    state: SWESolution2D,
-    n_elements: usize,
-) {
-    // Use f64 precision for numerical stability (coastal ocean modeling requires f64)
-    // Note: We use default-features=false for burn-cuda/burn-wgpu to disable fusion
-    // because fusion doesn't support f64
-    #[cfg(feature = "burn-cuda")]
-    type B = Cuda<f64, i64>;
-    #[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
-    type B = Wgpu<f64, i64, u32>;
-
-    // Get device
-    #[cfg(feature = "burn-cuda")]
-    let device = CudaDevice::default();
-    #[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
-    let device = WgpuDevice::default();
-
-    println!("Uploading data to GPU...");
-    let upload_start = Instant::now();
-
-    // Upload operators, geometry, and connectivity to GPU
-    let burn_ops = BurnOperators2D::<B>::from_cpu(ops, &device);
-    let burn_geom = BurnGeometricFactors2D::<B>::from_cpu(geom, &device);
-    let connectivity =
-        BurnConnectivity::<B>::from_mesh(mesh, geom, &ops.face_nodes, ops.n_face_nodes, &device);
-
-    // Upload initial state
-    let mut burn_state = BurnSWESolution2D::<B>::from_cpu(&state, &device);
-
-    let upload_time = upload_start.elapsed().as_secs_f64();
-    println!("Upload time: {:.3}s", upload_time);
-
-    // RHS config (no Coriolis/friction for simplicity)
-    let config = BurnRhsConfig {
-        g: G,
-        h_min: H_MIN,
-        coriolis_f: None,
-        manning_g_n2: None,
-    };
-
-    println!("Running 20 time steps on GPU...");
-    let start = Instant::now();
-    let mut t = 0.0;
-
-    for step in 0..20 {
-        // Compute time step on GPU
-        let dt = compute_dt_burn(&burn_state, &burn_geom, G, H_MIN, 0.2);
-
-        // SSP-RK3 step on GPU
-        ssp_rk3_step_burn(
-            &mut burn_state,
-            dt,
-            &burn_ops,
-            &burn_geom,
-            &connectivity,
-            &config,
-        );
-        t += dt;
-
-        if step % 5 == 0 {
-            println!("Step {}/20: t = {:.4}s, dt = {:.6}s", step, t, dt);
-        }
-    }
-
-    let elapsed = start.elapsed().as_secs_f64();
-
-    // Download result to verify
-    println!("Downloading result from GPU...");
-    let download_start = Instant::now();
-    let result = burn_state.to_cpu();
-    let download_time = download_start.elapsed().as_secs_f64();
-    println!("Download time: {:.3}s", download_time);
-
-    // Check result validity
-    let (mut min_h, mut max_h) = (f64::INFINITY, f64::NEG_INFINITY);
-    for ki in 0..n_elements {
-        for i in 0..ops.n_nodes {
-            let h = result.get_state(k(ki), i).h;
-            min_h = min_h.min(h);
-            max_h = max_h.max(h);
-        }
-    }
-    println!("Result: h in [{:.4}, {:.4}]", min_h, max_h);
-
-    println!(
-        "\nGPU Performance: {} elements x 20 steps in {:.2}s ({:.1} steps/s)",
-        n_elements,
-        elapsed,
-        20.0 / elapsed
-    );
-    println!(
-        "Total time (incl. transfer): {:.2}s",
-        upload_time + elapsed + download_time
-    );
-}
-
 /// CPU benchmark (parallel or serial)
-#[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
 fn run_cpu_benchmark(
     mesh: &Mesh2D,
     ops: &DGOperators2D,

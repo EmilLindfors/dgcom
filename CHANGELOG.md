@@ -6,6 +6,8 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **`gpu/`: the first GPU kernels, in Rust on NVIDIA's cuda-oxide (P2.7 Phase 0, `notes/gpu.md`, 2026-11-15).** The fully wet split-form 2D RHS (`SWEFormulation2D::EntropyStable`): a kernel per interior edge for the interface fluxes and one per element for the volume and lifted surface terms, calling dgcom's own `wintermeyer_flux_2d`, `entropy_stable_dissipation_2d`, `wintermeyer_bed_interface_term_2d` and `SWENodeState2D` unchanged. Built without multiply–add contraction (`cargo oxide run --no-fmad`) it gives `compute_rhs_swe_2d_parallel_into`'s RHS bit for bit on 96,000 P2 elements, parallelograms and jittered quadrilaterals, against the scalar kernel and against the 8-wide SIMD batch (still a second copy of the physics, with its own gates); with it, within 1.2e-11 of each field's largest value. The laptop's RTX 4060 (FP64 at 1:64) takes 25 ns per element evaluation (jittered) against 50 ns on the HX 370's 24 threads. A workspace of its own with cuda-oxide's pinned toolchain, as `viz/`; CI does not build it.
+
 - **`dgcom score <case.toml>` scores a finished run against its tide gauges again from its `stations.csv`, without the mesh or the run (`notes/case-files.md`, P8.1, 2026-11-15).** A change of the harmonic fit, the window (`--set output.spinup_hours=…`) or the gauge record no longer needs the run again: the run's own `gauge_skill.csv` and `gauge_constituents.csv` come back byte for byte, a 49.7 h Mausund run is rescored in 0.3 s (212 s to run). The run's `case.resolved.toml` must agree with the case in what the score reads (`run.start`, the boundaries, the stations but their `gauge`), else it is refused, naming the keys.
   - **API:** `CaseFile::score` and `ScoreReport`; `CaseFile::tide_constituents`, the constituents a station's record is fitted with, from the case without its mesh (`Domain::tide_constituents` is built by it).
 
@@ -81,6 +83,9 @@ All notable changes to this project should be documented in this file.
   - Restart, snapshot and particle files keep their format, so files written before the rename still load.
 
 ### Removed
+
+- **The Burn GPU prototype (P0.11, P2.7; `notes/gpu.md`, 2026-11-15).** It computed the HLL flux and discarded it (no surface term), and ran f64 with Burn's fusion off. The GPU port starts again: CUDA first, kernels in Rust with NVIDIA's cuda-oxide, calling the same pointwise physics as the CPU kernels (a spike ran `wintermeyer_flux_2d` and `entropy_stable_dissipation_2d` unchanged on the GPU, bit for bit against the CPU over 2²⁰ face nodes without FMA contraction).
+  - **Deleted:** the `burn`, `burn-cuda`, `burn-wgpu`, `burn-ndarray` and `gpu` features and their dependencies, `src/solver/burn/`, `src/time/burn_ssp_rk3.rs` (`ssp_rk3_step_burn`, `compute_dt_burn`, `run_swe_2d_burn`, `BurnTimeConfig`), `examples/profile_gpu.rs`, the GPU path of `examples/quick_profile.rs`, and the unimplemented `MeshGPUData` trait.
 
 - **The presets and station lists named after Norway (issue #219; `notes/tech-debt.md`).** A coast is described by its case file, not by code.
   - **Deleted:** `CoriolisSource2D::norwegian_coast`/`norwegian_coast_beta`, `ShallowWater2D::norwegian_coast`, `WindStress2D::norwegian_winter_storm`/`norwegian_summer`, `AtmosphericPressure2D::norwegian_winter_storm`/`severe_storm`, `SillOverflow2D::norwegian_sill`, `SillWithFriction::norwegian_fjord`, `StraitFriction2D::norwegian_strait`, `TracerBounds::norwegian_coast`, and the `norwegian_stations` modules of `analysis::tide_gauge` and `analysis::adcp`.

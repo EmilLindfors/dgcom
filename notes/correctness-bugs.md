@@ -67,8 +67,8 @@ All confirmed in code or by measurement (`review-2026-09-25.md` "Top correctness
   - Done: reflected velocity **and** the interior tracer/Hz at the ghost, so the Rusanov tracer flux is exactly zero like the volume flux (a ghost value from the BC would still leak through the dissipation term). Test: `horizontal_tracer_advection_closed_basin_conserves_inventory` (was −0.39 of the advective scale).
   - Consequence: `TracerBoundaryCondition3D` (`Hydrostatic3D::temp_bc/salt_bc`) is no longer consulted. It comes back with 3D open boundaries (P4.2).
 
-### P0.11 Burn GPU RHS is physically wrong (BLOCKER, GPU) — DEFERRED
+### P0.11 Burn GPU RHS is physically wrong (BLOCKER, GPU) — CLOSED (deleted 2026-11-15)
 Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now (burn-cuda is the stated GPU target).
-- [ ] `src/solver/burn/rhs.rs` computes the HLL flux, then discards it. There is no surface term, so it is not solving the SWE.
-- [ ] Implement the surface term plus a burn-vs-CPU equivalence test before trusting any GPU result.
+- [x] `src/solver/burn/rhs.rs` computes the HLL flux, then discards it. There is no surface term, so it is not solving the SWE. Closed 2026-11-15: the Burn prototype is deleted (`burn*` and `gpu` features, `src/solver/burn/`, `burn_ssp_rk3.rs`, `profile_gpu`, `MeshGPUData`); the GPU port starts again in Rust with cuda-oxide (`gpu.md`).
+- [x] Implement the surface term plus a burn-vs-CPU equivalence test before trusting any GPU result. Superseded: the new kernels are gated bit for bit against the CPU (`gpu.md`).
 - See P2.7: the review recommends custom fused f64 kernels over CSR faces rather than Burn tensor ops with fusion disabled (`review-2026-09-25.md` §5.2).

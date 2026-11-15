@@ -1,0 +1,27 @@
+[package]
+name = "dgcom-gpu"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "dgcom's GPU kernels (P2.7, notes/gpu.md): Rust on NVIDIA's cuda-oxide"
+publish = false
+
+# A workspace of its own, as viz/: it builds with cuda-oxide's pinned
+# toolchain (rust-toolchain.toml) through `cargo oxide`, dgcom with stable.
+[workspace]
+
+[dependencies]
+# cuda-oxide at one revision: its codegen backend is built for that revision
+# (`cargo oxide setup` in a checkout of it), and its API still breaks between
+# releases.
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "348895e421a92d13a2c3a843ccb20ed1fb8b7f8b" }
+cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "348895e421a92d13a2c3a843ccb20ed1fb8b7f8b" }
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "348895e421a92d13a2c3a843ccb20ed1fb8b7f8b" }
+dgcom = { path = "..", default-features = false, features = ["parallel"] }
+
+[features]
+# The CPU reference of the gate. Without `simd`: the scalar kernel,
+# `SplitFormSWE2D::element_rhs` element by element. With it: the 8-wide batch
+# (`swe_2d_split_form_batch.rs`) that real runs use, a second copy of the
+# physics that its own gates hold bit for bit to the scalar one.
+simd = ["dgcom/simd"]

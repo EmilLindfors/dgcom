@@ -23,8 +23,6 @@
 //! - [`StandardLimiter2D`]: Enum for zero-cost dispatch
 
 pub mod algorithms;
-#[cfg(feature = "burn")]
-pub mod burn;
 pub mod core;
 pub mod diagnostics;
 pub mod limiters;

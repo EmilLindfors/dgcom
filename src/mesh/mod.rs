@@ -43,6 +43,6 @@ pub use io::{GmshError, parse_gmsh_mesh, read_gmsh_mesh, write_gmsh_mesh};
 
 // Re-export trait types
 pub use traits::{
-    FaceConnection, Mesh1DGeometry, Mesh2DGeometry, MeshCFL, MeshGPUData, MeshGeometry,
-    MeshGeometryExt, MeshIter, MeshTopology, Neighbor, Point,
+    FaceConnection, Mesh1DGeometry, Mesh2DGeometry, MeshCFL, MeshGeometry, MeshGeometryExt,
+    MeshIter, MeshTopology, Neighbor, Point,
 };

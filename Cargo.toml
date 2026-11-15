@@ -25,13 +25,6 @@ mimalloc = ["dep:mimalloc"]
 # takes a backtrace per allocation: not for timing.
 dhat-heap = ["dep:dhat"]
 
-# Burn GPU acceleration features
-burn = ["dep:burn"]
-burn-cuda = ["burn", "burn/cuda", "dep:burn-cuda"]   # NVIDIA CUDA backend (primary target)
-burn-wgpu = ["burn", "burn/wgpu", "dep:burn-wgpu"]   # Portable GPU backend (Vulkan/DX12/Metal)
-burn-ndarray = ["burn", "burn/ndarray", "dep:burn-ndarray"]  # CPU backend for testing
-gpu = ["burn-cuda"]                      # Default GPU = CUDA
-
 [dependencies]
 faer = "0.23"
 thiserror = "2.0"
@@ -43,11 +36,6 @@ rayon = { version = "1.10", optional = true }
 netcdf = { version = "0.10", optional = true }
 chrono = { version = "0.4", optional = true }
 fearless_simd = { version = "1.1", optional = true }
-burn = { version = "0.20", optional = true, default-features = false }
-burn-ndarray = { version = "0.20", optional = true }
-# Disable fusion feature to support f64 precision (fusion only supports f32)
-burn-cuda = { version = "0.20", optional = true, default-features = false }
-burn-wgpu = { version = "0.20", optional = true, default-features = false }
 
 # High-performance allocator (alternative to system allocator)
 mimalloc = { version = "0.1", optional = true, default-features = false }
@@ -151,8 +139,3 @@ debug = 0               # No debug info
 [[example]]
 name = "advection_1d"
 path = "examples/advection_1d.rs"
-
-[[example]]
-name = "profile_gpu"
-path = "examples/profile_gpu.rs"
-required-features = ["burn"]
