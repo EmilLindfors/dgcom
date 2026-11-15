@@ -995,17 +995,27 @@ mod tests {
     fn a_comparison_finds_the_models_constants_against_the_gauges() {
         let t0 = 1_749_945_600.0;
         let gauge_times: Vec<f64> = (0..60 * 24).map(|h| t0 + 3600.0 * f64::from(h)).collect();
-        // P1 at its equilibrium ratio to K1, as the fit infers it
-        let p1 = crate::analysis::Inference::P1_FROM_K1.amplitude_ratio;
-        let mut gauge_values = tide(
-            0.0,
-            &[
-                ("M2", 1.0, 60.0),
-                ("K1", 0.2, 200.0),
-                ("P1", 0.2 * p1, 200.0),
-            ],
-            &gauge_times,
-        );
+        // P1 at its equilibrium ratio to K1 and the minor semidiurnals at
+        // their admittance, as the gauge's fit infers them: a gauge's water
+        // has them (an M2 without N2 and S2 gives each its share of M2)
+        let p1 = crate::analysis::Inference::P1_FROM_K1.from.amplitude_ratio;
+        let mut gauge_tide = vec![
+            ("M2", 1.0, 60.0),
+            ("K1", 0.2, 200.0),
+            ("P1", 0.2 * p1, 200.0),
+        ];
+        for minor in crate::tides::AdmittanceInference::MINORS {
+            let of = |name| {
+                if name == "M2" {
+                    (1.0, 60.0)
+                } else {
+                    (0.0, 0.0)
+                }
+            };
+            let (h, g) = minor.infer(of(minor.lower), of(minor.upper)).unwrap();
+            gauge_tide.push((minor.name, h, g));
+        }
+        let mut gauge_values = tide(0.0, &gauge_tide, &gauge_times);
         gauge_values[100] = f64::NAN;
         let gauge = GaugeRecord::new(
             TideGaugeStation::new("Test", 8.0, 63.0),

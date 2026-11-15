@@ -167,13 +167,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "  {}/{} = {:.3}, lag {:+.1}° (equilibrium {:.3})",
             i.name,
-            i.from,
-            i.amplitude_ratio,
-            i.lag_offset_deg,
+            i.from.name,
+            i.from.amplitude_ratio,
+            i.from.lag_offset_deg,
             Inference::EQUILIBRIUM
                 .iter()
                 .find(|e| e.name == i.name)
-                .map_or(f64::NAN, |e| e.amplitude_ratio)
+                .map_or(f64::NAN, |e| e.from.amplitude_ratio)
         );
     }
 

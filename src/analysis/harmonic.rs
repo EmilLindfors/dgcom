@@ -27,6 +27,22 @@
 //! error ([`AnalysisError::NotSeparable`]); [`HarmonicAnalysis::resolvable`]
 //! chooses what a record can fit.
 //!
+//! A constituent left out is not gone from the water: its energy goes to
+//! the fitted neighbour it cannot be told from, with a phase that turns over
+//! their synodic period. ν2 is 0.19 of N2 and 206 days from it, so a month's
+//! N2 is ±20 % off with the month; T2 does 6 % to S2 over a year. The minor
+//! semidiurnals are therefore inferred too, each from two neighbours with
+//! the weights of a linear admittance ([`Inference::by_admittance`],
+//! [`Inference::theory`]), and a source may itself be inferred (a
+//! fortnight's ν2 rests on an N2 inferred from M2). Where a longer record
+//! at the same place exists, its own ratios replace theory's
+//! ([`HarmonicAnalysis::fit_with_reference`]).
+//!
+//! An inference states that the constituent is in the signal. A model run
+//! forced without ν2 has none, and inferring one gives its N2 the beat the
+//! inference takes out of a gauge's: the candidates passed for a record are
+//! the constituents it carries.
+//!
 //! # Solution
 //!
 //! Each sample's row of the design matrix is rotated into the triangular
@@ -36,58 +52,51 @@
 //! equations `AᵀA x = Aᵀy` have.
 
 use super::{AnalysisError, TimeSeries};
-use crate::tides::constituent_period;
+use crate::tides::{AdmittanceInference, constituent_period};
 use crate::time::ModelClock;
 
-/// A constituent inferred from a resolved one: `H = ratio · H_from`,
-/// `G = G_from + lag_offset`.
+/// One source of an [`Inference`]: its share of the inferred constant is
+/// `amplitude_ratio · H` at the lag `G + lag_offset_deg` of `name`'s `(H, G)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InferenceSource {
+    /// The constituent followed: a fitted one, or one that is itself
+    /// inferred (ν2 from an N2 that a fortnight infers from M2).
+    pub name: &'static str,
+    /// Amplitude ratio to the source.
+    pub amplitude_ratio: f64,
+    /// Phase-lag offset from the source (degrees).
+    pub lag_offset_deg: f64,
+}
+
+/// A constituent inferred from one other, `H = ratio · H_from`,
+/// `G = G_from + lag_offset`, or from two: the sum of both shares as complex
+/// constants `H e^{−iG}`, which is an admittance interpolated between two
+/// references ([`AdmittanceInference`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Inference {
     /// Inferred constituent.
     pub name: &'static str,
-    /// Resolved constituent it follows.
-    pub from: &'static str,
-    /// Amplitude ratio `H / H_from`.
-    pub amplitude_ratio: f64,
-    /// Phase-lag offset `G − G_from` (degrees).
-    pub lag_offset_deg: f64,
+    /// The constituent it follows.
+    pub from: InferenceSource,
+    /// A second one, whose share is added.
+    pub and: Option<InferenceSource>,
 }
 
 impl Inference {
     /// P1 from K1 with the equilibrium amplitude ratio 0.331 (Cartwright &
     /// Tayler 1971) and equal lag.
-    pub const P1_FROM_K1: Self = Self {
-        name: "P1",
-        from: "K1",
-        amplitude_ratio: 0.331,
-        lag_offset_deg: 0.0,
-    };
+    pub const P1_FROM_K1: Self = Self::single("P1", "K1", 0.331, 0.0);
 
     /// K2 from S2 with the equilibrium amplitude ratio 0.272 and equal lag.
-    pub const K2_FROM_S2: Self = Self {
-        name: "K2",
-        from: "S2",
-        amplitude_ratio: 0.272,
-        lag_offset_deg: 0.0,
-    };
+    pub const K2_FROM_S2: Self = Self::single("K2", "S2", 0.272, 0.0);
 
     /// N2 from M2 with the equilibrium amplitude ratio 0.191 and equal lag
     /// (separable only from 27.6 days).
-    pub const N2_FROM_M2: Self = Self {
-        name: "N2",
-        from: "M2",
-        amplitude_ratio: 0.191,
-        lag_offset_deg: 0.0,
-    };
+    pub const N2_FROM_M2: Self = Self::single("N2", "M2", 0.191, 0.0);
 
     /// Q1 from O1 with the equilibrium amplitude ratio 0.191 and equal lag
     /// (separable only from 27.6 days).
-    pub const Q1_FROM_O1: Self = Self {
-        name: "Q1",
-        from: "O1",
-        amplitude_ratio: 0.191,
-        lag_offset_deg: 0.0,
-    };
+    pub const Q1_FROM_O1: Self = Self::single("Q1", "O1", 0.191, 0.0);
 
     /// The equilibrium inferences above.
     pub const EQUILIBRIUM: [Self; 4] = [
@@ -96,6 +105,73 @@ impl Inference {
         Self::N2_FROM_M2,
         Self::Q1_FROM_O1,
     ];
+
+    /// What theory gives the constituents a record does not resolve, with
+    /// no longer record to take their ratios from:
+    ///
+    /// - [`Self::EQUILIBRIUM`]: P1, K2, N2 and Q1 (with N2's lag from the
+    ///   age of the tide in [`HarmonicAnalysis::fit_with_reference`]);
+    /// - 2N2, μ2, ν2, λ2, L2 and T2 by linear admittance between N2, M2 and
+    ///   S2 ([`AdmittanceInference::MINORS`]), as tide models' predictions
+    ///   add them (Ray's `perth`, OTPS).
+    ///
+    /// The admittance holds for the astronomical ones (ν2 is 0.99 of it at
+    /// Bodø and Mausund). μ2 and L2 share their speeds with the compound
+    /// tides 2MS2 and 2MN2, which shallow water makes: at Puerto Montt μ2
+    /// lies 55° from its admittance. Inferring them still beats leaving
+    /// them out, on open and shallow coasts alike, and a record fits them
+    /// first of the six ([`HarmonicAnalysis::GAUGE_RECORD`]).
+    pub fn theory() -> Vec<Self> {
+        let mut rules = Self::EQUILIBRIUM.to_vec();
+        rules.extend(
+            AdmittanceInference::MINORS
+                .iter()
+                .filter_map(Self::by_admittance),
+        );
+        rules
+    }
+
+    /// `name` from `from` alone, with an amplitude ratio and a lag offset
+    /// (degrees).
+    pub const fn single(
+        name: &'static str,
+        from: &'static str,
+        amplitude_ratio: f64,
+        lag_offset_deg: f64,
+    ) -> Self {
+        Self {
+            name,
+            from: InferenceSource {
+                name: from,
+                amplitude_ratio,
+                lag_offset_deg,
+            },
+            and: None,
+        }
+    }
+
+    /// `admittance`'s constituent from its two references with the weights
+    /// of the linear admittance (a negative weight, where the constituent
+    /// lies outside its references, is a ratio at 180°); `None` as
+    /// [`AdmittanceInference::weights`].
+    pub fn by_admittance(admittance: &AdmittanceInference) -> Option<Self> {
+        let (lower, upper) = admittance.weights()?;
+        let source = |name, weight: f64| InferenceSource {
+            name,
+            amplitude_ratio: weight.abs(),
+            lag_offset_deg: if weight < 0.0 { 180.0 } else { 0.0 },
+        };
+        Some(Self {
+            name: admittance.name,
+            from: source(admittance.lower, lower),
+            and: (upper != 0.0).then(|| source(admittance.upper, upper)),
+        })
+    }
+
+    /// The sources, one or two.
+    pub fn sources(&self) -> impl Iterator<Item = &InferenceSource> {
+        std::iter::once(&self.from).chain(&self.and)
+    }
 
     /// `name` from `from` with the ratio and lag offset of a reference fit
     /// (e.g. a long record at a nearby gauge), which beats the equilibrium
@@ -107,19 +183,20 @@ impl Inference {
         reference: &ReferenceFit,
     ) -> Option<Self> {
         let (a, b) = (reference.get(name)?, reference.get(from)?);
-        Some(Self {
+        Some(Self::single(
             name,
             from,
-            amplitude_ratio: a.amplitude / b.amplitude,
-            lag_offset_deg: a.lag_deg - b.lag_deg,
-        })
+            a.amplitude / b.amplitude,
+            a.lag_deg - b.lag_deg,
+        ))
     }
 
-    /// This inference with the ratio and lag offset of `reference` where it
-    /// has both constituents, else unchanged.
+    /// This inference from its first source alone, with the ratio and lag
+    /// offset of `reference`, where it has both constituents; else
+    /// unchanged.
     pub fn or_from(self, reference: Option<&ReferenceFit>) -> Self {
         reference
-            .and_then(|r| Self::from_reference(self.name, self.from, r))
+            .and_then(|r| Self::from_reference(self.name, self.from.name, r))
             .unwrap_or(self)
     }
 }
@@ -200,42 +277,61 @@ pub struct HarmonicAnalysis {
 }
 
 impl HarmonicAnalysis {
-    /// Constituents fitted to a tide gauge's whole record, in priority
-    /// order: the forcing's and the long-period ones, so that the seasonal
-    /// and fortnightly signal does not leak into the tides.
-    pub const GAUGE_RECORD: [&'static str; 15] = [
-        "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6", "Mf", "Mm", "Ssa",
+    /// Constituents of a tide gauge's record, in priority order: the major
+    /// ones and the overtides, the minor semidiurnals, and the long-period
+    /// ones, so that the seasonal and fortnightly signal does not leak into
+    /// the tides. Of the minor ones μ2 comes before 2N2 and L2 before λ2:
+    /// each pair is 206 days apart, and the first is the one theory cannot
+    /// give in shallow water ([`Inference::theory`]), so it is fitted from
+    /// 32 days and the other inferred.
+    pub const GAUGE_RECORD: [&'static str; 21] = [
+        "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6", "NU2", "MU2",
+        "2N2", "L2", "LDA2", "T2", "Mf", "Mm", "Ssa",
     ];
 
-    /// The reference constants of a tide gauge's whole record (Unix times):
-    /// the [`Self::GAUGE_RECORD`] constituents the record resolves (Rayleigh
-    /// criterion 1), the others of P1, K2, N2 and Q1 inferred at their
-    /// equilibrium ratios.
+    /// The reference constants of a tide gauge's record (Unix times): the
+    /// [`Self::GAUGE_RECORD`] constituents the record resolves (Rayleigh
+    /// criterion 1), the others inferred from them by theory
+    /// ([`Self::fit_with_reference`] with no reference).
+    ///
+    /// A gauge's water carries the minor semidiurnals whether the record
+    /// separates them or not. Left out of a month's fit, ν2 moves N2 by
+    /// ±20 % with the month and T2 moves S2 by 6 %; over a year ν2 still
+    /// leaves 2 % in N2. Scored against UTide's fit of the year at 17
+    /// Norwegian gauges, a 30-day fit's N2 is off by 30 mm without them and
+    /// 7 mm with, its S2 by 15 and 7.5 mm, and the tide it predicts for the
+    /// rest of the year by 4.8 and 2.9 cm; at six gauges on other coasts by
+    /// 11.8 and 8.5 cm (`notes/validation.md`, P3.1 "Inference of the minor
+    /// constituents"; `examples/tide_inference_skill.rs`).
     pub fn fit_gauge_record(times: &[f64], values: &[f64]) -> Result<ReferenceFit, AnalysisError> {
-        let length = times
-            .first()
-            .zip(times.last())
-            .map_or(0.0, |(t0, t1)| t1 - t0);
-        Self::resolvable(&Self::GAUGE_RECORD, length, 1.0, &Inference::EQUILIBRIUM)
-            .fit(times, values)
+        Self::fit_with_reference(&Self::GAUGE_RECORD, times, values, None)
     }
 
     /// Constituents fitted to a model's record at a station, in priority
-    /// order: [`Self::GAUGE_RECORD`]'s tides, without the long-period
-    /// constituents a run of days cannot hold.
+    /// order: [`Self::GAUGE_RECORD`]'s major tides and overtides. A run
+    /// whose forcing carries minor semidiurnals adds them (a run without ν2
+    /// has none to infer: its N2 would take the beat the inference removes
+    /// from a gauge's).
     pub const STATION_RECORD: [&'static str; 12] = [
         "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6",
     ];
 
-    /// The reference constants of a record shorter than `reference`'s (Unix
-    /// times; e.g. a model run against its gauge's whole record): the
-    /// `candidates` the record resolves (Rayleigh criterion 1), the others
-    /// of P1, K2, N2 and Q1 inferred with `reference`'s ratios and lag
-    /// offsets where it has both constituents, else at equilibrium. A short
-    /// record resolves few candidates, and their constants carry the
-    /// unresolved constituents of their band: a day's M2 holds S2
-    /// (`notes/validation.md`, the 2026-06-12 Mausund outcome), which only a
-    /// fortnight separates.
+    /// The reference constants of a record that carries `candidates` (Unix
+    /// times): those the record resolves (Rayleigh criterion 1) fitted, the
+    /// others inferred, where a rule of [`Inference::theory`] gives them,
+    /// with the ratio and lag offset of `reference` (a longer record at the
+    /// same place, e.g. the gauge's whole record for a model run) where it
+    /// has both constituents, else theory's. A short record resolves few
+    /// candidates, and their constants carry the unresolved constituents of
+    /// their band: a day's M2 holds S2 (`notes/validation.md`, the
+    /// 2026-06-12 Mausund outcome), which only a fortnight separates.
+    ///
+    /// Under a month the reference is what makes the fit: N2 is 22° from
+    /// M2's lag on the Norwegian coast, not at equal lag, so a fortnight's
+    /// M2 is off by 40 mm with N2 at its equilibrium ratio and by 11 mm
+    /// with the gauge's own ratio from another year. Without a reference
+    /// that has N2 and M2, a record that separates M2 from S2 is fitted
+    /// twice ([`Self::with_the_age_of_the_tide`]): 15 mm.
     pub fn fit_with_reference(
         candidates: &[&'static str],
         times: &[f64],
@@ -246,8 +342,48 @@ impl HarmonicAnalysis {
             .first()
             .zip(times.last())
             .map_or(0.0, |(t0, t1)| t1 - t0);
-        let inferences = Inference::EQUILIBRIUM.map(|i| i.or_from(reference));
-        Self::resolvable(candidates, length, 1.0, &inferences).fit(times, values)
+        let inferences: Vec<Inference> = Inference::theory()
+            .into_iter()
+            .filter(|i| candidates.contains(&i.name))
+            .map(|i| i.or_from(reference))
+            .collect();
+        let analysis = Self::resolvable(candidates, length, 1.0, &inferences);
+        let fit = analysis.fit(times, values)?;
+        match analysis.with_the_age_of_the_tide(&fit) {
+            Some(aged) => aged.fit(times, values),
+            None => Ok(fit),
+        }
+    }
+
+    /// This analysis with an N2 inferred from M2 at equal lag
+    /// ([`Inference::N2_FROM_M2`]) given the lag that `fit`, this
+    /// analysis's own, implies: the lag of the semidiurnal tide taken
+    /// linear in frequency through M2 and S2 (one age of the tide, Garrett
+    /// & Munk 1971), `G(N2) = G(M2) − 0.536 (G(S2) − G(M2))`. `None`
+    /// unless N2 is so inferred and M2 and S2 are fitted.
+    ///
+    /// The equilibrium ratio gives N2's amplitude within 10 %, but its lag
+    /// is 15–35° before M2's on most coasts, which a fortnight's fit then
+    /// puts into M2. The lag's slope is the same on both sides of M2 to a
+    /// few degrees where the tide is not near an amphidrome: at 17
+    /// Norwegian gauges the tide a 15-day fit predicts for the rest of the
+    /// year is off by 6.6 cm at equal lag and by 3.8 cm so (worse by 0.3 cm
+    /// at Tregde, whose M2 is 10 cm, and by 0.05 cm at Stavanger); at six
+    /// gauges on other coasts by 14.4 and 10.7 cm (`notes/validation.md`,
+    /// P3.1 "Inference of the minor constituents").
+    pub fn with_the_age_of_the_tide(&self, fit: &ReferenceFit) -> Option<Self> {
+        let n2 = self
+            .inferences
+            .iter()
+            .position(|i| *i == Inference::N2_FROM_M2)?;
+        let fitted = |name: &str| fit.get(name).filter(|c| !c.inferred);
+        let (m2, s2) = (fitted("M2")?, fitted("S2")?);
+        let speed = |name| constituent_period(name).map(|p| 1.0 / p);
+        let (to_n2, to_s2) = (speed("N2")? - speed("M2")?, speed("S2")? - speed("M2")?);
+        let m2_to_s2 = (s2.lag_deg - m2.lag_deg + 180.0).rem_euclid(360.0) - 180.0;
+        let mut aged = self.clone();
+        aged.inferences[n2].from.lag_offset_deg = to_n2 / to_s2 * m2_to_s2;
+        Some(aged)
     }
 
     /// Fit `names`, inferring nothing.
@@ -271,11 +407,18 @@ impl HarmonicAnalysis {
     }
 
     /// For a record of `length` seconds: the longest prefix-greedy subset of
-    /// `candidates` it separates (each candidate, in priority order, is kept
-    /// if the record is at least `rayleigh` times its synodic period with
-    /// every kept one; `rayleigh` = 1 is the classical criterion; unknown
-    /// names are skipped), and of `inferences` those whose constituent is
-    /// left out and whose source is kept.
+    /// `candidates` it separates, and of `inferences` those whose
+    /// constituent is left out and whose sources are fitted or inferred.
+    ///
+    /// Each candidate, in priority order, is kept if the record is at least
+    /// `rayleigh` times its synodic period with every kept one (`rayleigh`
+    /// = 1 is the classical criterion; unknown names are skipped), and with
+    /// every earlier candidate that was left out and has an inference: that
+    /// one is in the fit through its source, and a constituent fitted
+    /// beside it would take what the inference misses. A fortnight infers
+    /// N2 from M2, so it does not fit 2N2 (13.8 days from M2, 27.6 from
+    /// N2), which then held N2's error and made the predicted tide worse
+    /// than with no minor constituent at all.
     pub fn resolvable(
         candidates: &[&'static str],
         length: f64,
@@ -283,26 +426,89 @@ impl HarmonicAnalysis {
         inferences: &[Inference],
     ) -> Self {
         let mut kept: Vec<(&'static str, f64)> = Vec::new();
+        // The speeds of the candidates left out that an inference carries
+        let mut carried: Vec<f64> = Vec::new();
         for &name in candidates {
             let Some(period) = constituent_period(name) else {
                 continue;
             };
             let omega = 2.0 * std::f64::consts::PI / period;
-            let separable = kept.iter().all(|&(_, other)| {
+            let separable = |other: f64| {
                 let synodic = 2.0 * std::f64::consts::PI / (omega - other).abs();
                 length >= rayleigh * synodic
-            });
-            if separable {
+            };
+            if kept.iter().all(|&(_, other)| separable(other))
+                && carried.iter().all(|&other| separable(other))
+            {
                 kept.push((name, omega));
+            } else if inferences.iter().any(|i| i.name == name) {
+                carried.push(omega);
             }
         }
         let names: Vec<&'static str> = kept.into_iter().map(|(name, _)| name).collect();
-        let inferences = inferences
-            .iter()
-            .filter(|i| !names.contains(&i.name) && names.contains(&i.from))
-            .copied()
-            .collect();
-        Self { names, inferences }
+        // An inference is kept once each source is fitted or itself inferred
+        // (the first of a name wins), so the passes repeat until none is added
+        let mut inferred: Vec<Inference> = Vec::new();
+        loop {
+            let before = inferred.len();
+            for i in inferences {
+                let known =
+                    |name: &str| names.contains(&name) || inferred.iter().any(|k| k.name == name);
+                if !known(i.name) && i.sources().all(|s| known(s.name)) {
+                    inferred.push(*i);
+                }
+            }
+            if inferred.len() == before {
+                break;
+            }
+        }
+        Self {
+            names,
+            inferences: inferred,
+        }
+    }
+
+    /// The fitted constituents that `inference` rests on, each with the
+    /// amplitude ratio and lag offset (degrees) of its share: its sources,
+    /// and the sources of those that are themselves inferred.
+    fn shares(&self, inference: &Inference) -> Result<Vec<(usize, f64, f64)>, AnalysisError> {
+        let mut shares = Vec::new();
+        self.follow(inference, (1.0, 0.0), 0, inference.name, &mut shares)?;
+        Ok(shares)
+    }
+
+    /// Add `via`'s sources to `shares`, scaled by `(ratio, lag offset)`;
+    /// `depth` inferences deep in the chain from `name` (a chain longer
+    /// than the inferences is a cycle).
+    fn follow(
+        &self,
+        via: &Inference,
+        (ratio, offset): (f64, f64),
+        depth: usize,
+        name: &'static str,
+        shares: &mut Vec<(usize, f64, f64)>,
+    ) -> Result<(), AnalysisError> {
+        for source in via.sources() {
+            let share = (
+                ratio * source.amplitude_ratio,
+                offset + source.lag_offset_deg,
+            );
+            if let Some(column) = self.names.iter().position(|&n| n == source.name) {
+                shares.push((column, share.0, share.1));
+                continue;
+            }
+            let next = self
+                .inferences
+                .iter()
+                .find(|i| i.name == source.name)
+                .filter(|_| depth < self.inferences.len())
+                .ok_or(AnalysisError::InferenceSourceNotFitted {
+                    name,
+                    from: source.name,
+                })?;
+            self.follow(next, share, depth + 1, name, shares)?;
+        }
+        Ok(())
     }
 
     /// Also infer `inferences` from the fitted constituents.
@@ -408,18 +614,20 @@ impl HarmonicAnalysis {
             }
         }
 
-        // Inferred constituents, attached to the index of their source
-        let attached: Vec<(usize, Inference, (f64, f64, f64))> = self
+        // Inferred constituents: their astronomy, and their shares of the
+        // fitted ones (column, amplitude ratio, lag offset in degrees and in
+        // radians)
+        type Attached = (&'static str, (f64, f64, f64), Vec<(usize, f64, f64, f64)>);
+        let attached: Vec<Attached> = self
             .inferences
             .iter()
             .map(|inf| {
-                let source = names.iter().position(|&n| n == inf.from).ok_or(
-                    AnalysisError::InferenceSourceNotFitted {
-                        name: inf.name,
-                        from: inf.from,
-                    },
-                )?;
-                Ok((source, *inf, astronomy(inf.name)?))
+                let shares = self
+                    .shares(inf)?
+                    .into_iter()
+                    .map(|(j, ratio, offset)| (j, ratio, offset, offset.to_radians()))
+                    .collect();
+                Ok((inf.name, astronomy(inf.name)?, shares))
             })
             .collect::<Result<_, AnalysisError>>()?;
 
@@ -439,10 +647,12 @@ impl HarmonicAnalysis {
                 w[1 + 2 * j] = f * arg.cos();
                 w[2 + 2 * j] = f * arg.sin();
             }
-            for &(j, inf, (omega, f, phase)) in &attached {
-                let arg = omega * t + phase - inf.lag_offset_deg.to_radians();
-                w[1 + 2 * j] += inf.amplitude_ratio * f * arg.cos();
-                w[2 + 2 * j] += inf.amplitude_ratio * f * arg.sin();
+            for (_, (omega, f, phase), shares) in &attached {
+                for &(j, ratio, _, offset) in shares {
+                    let arg = omega * t + phase - offset;
+                    w[1 + 2 * j] += ratio * f * arg.cos();
+                    w[2 + 2 * j] += ratio * f * arg.sin();
+                }
             }
             w[n_unknowns] = value;
             for j in 0..p {
@@ -482,8 +692,25 @@ impl HarmonicAnalysis {
             .enumerate()
             .map(|(j, &name)| constant(name, j, 1.0, 0.0, false))
             .collect();
-        constants.extend(attached.iter().map(|&(j, inf, _)| {
-            constant(inf.name, j, inf.amplitude_ratio, inf.lag_offset_deg, true)
+        constants.extend(attached.iter().map(|(name, _, shares)| match shares[..] {
+            [(j, ratio, offset_deg, _)] => constant(*name, j, ratio, offset_deg, true),
+            // The shares' sum as complex constants H e^{−iG}
+            _ => {
+                let (re, im) =
+                    shares
+                        .iter()
+                        .fold((0.0, 0.0), |(re, im), &(j, ratio, _, offset)| {
+                            let h = ratio * x[1 + 2 * j].hypot(x[2 + 2 * j]);
+                            let g = x[2 + 2 * j].atan2(x[1 + 2 * j]) + offset;
+                            (re + h * g.cos(), im + h * g.sin())
+                        });
+                ReferenceConstant {
+                    name,
+                    amplitude: re.hypot(im),
+                    lag_deg: im.atan2(re).to_degrees().rem_euclid(360.0),
+                    inferred: true,
+                }
+            }
         }));
 
         let mean_value = values.iter().sum::<f64>() / n as f64;
@@ -720,8 +947,9 @@ mod tests {
             residual_rms: 0.0,
         };
         let inf = Inference::from_reference("N2", "M2", &reference).unwrap();
-        assert!((inf.amplitude_ratio - 0.2).abs() < 1e-12);
-        assert!((inf.lag_offset_deg + 20.0).abs() < 1e-12);
+        assert!((inf.from.amplitude_ratio - 0.2).abs() < 1e-12);
+        assert!((inf.from.lag_offset_deg + 20.0).abs() < 1e-12);
+        assert!(inf.and.is_none());
         assert!(Inference::from_reference("Q1", "O1", &reference).is_none());
         assert_eq!(Inference::N2_FROM_M2.or_from(Some(&reference)), inf);
         assert_eq!(
@@ -729,6 +957,282 @@ mod tests {
             Inference::Q1_FROM_O1
         );
         assert_eq!(Inference::N2_FROM_M2.or_from(None), Inference::N2_FROM_M2);
+    }
+
+    /// The semidiurnal constants of a tide whose minor constituents follow
+    /// the linear admittance of N2, M2 and S2.
+    fn tide_with_minors() -> Vec<(&'static str, f64, f64)> {
+        let mut truth = vec![
+            ("M2", 0.74, 301.0),
+            ("S2", 0.25, 339.0),
+            ("N2", 0.15, 279.0),
+            ("K1", 0.06, 165.0),
+            ("O1", 0.05, 38.0),
+        ];
+        let of = |truth: &[(&str, f64, f64)], name| {
+            let c = truth.iter().find(|c| c.0 == name).unwrap();
+            (c.1, c.2)
+        };
+        for admittance in AdmittanceInference::MINORS {
+            let (h, g) = admittance
+                .infer(of(&truth, admittance.lower), of(&truth, admittance.upper))
+                .unwrap();
+            truth.push((admittance.name, h, g));
+        }
+        truth
+    }
+
+    /// A month cannot separate ν2 from N2 (206 days), so a fit without ν2
+    /// folds it into N2: N2 swings by ν2's share of it, ±19 %, with the
+    /// month (the Norwegian gauges' monthly N2, `notes/validation.md` P3.1).
+    /// With the minor constituents inferred by admittance from N2, M2 and S2
+    /// every month returns the same constants, the inferred ones included.
+    #[test]
+    fn minor_semidiurnals_inferred_by_admittance_stop_the_monthly_beat_of_n2() {
+        let truth = tide_with_minors();
+        let minors: Vec<Inference> = AdmittanceInference::MINORS
+            .iter()
+            .filter_map(Inference::by_admittance)
+            .collect();
+        assert_eq!(minors.len(), 6);
+        let names = ["M2", "S2", "N2", "K1", "O1"];
+        let (mut lowest, mut highest) = (f64::MAX, f64::MIN);
+        for month in [1, 3, 5, 7, 9, 11] {
+            let t0 = ModelClock::at_datetime(2025, month, 1, 0, 0).epoch_unix;
+            let hours = 30 * 24;
+            let values = synthesize(t0, hours, 0.0, &truth);
+            let times: Vec<f64> = (0..hours).map(|i| t0 + i as f64 * 3600.0).collect();
+
+            let without = HarmonicAnalysis::new(&names).fit(&times, &values).unwrap();
+            let n2 = without.get("N2").unwrap().amplitude / 0.15;
+            (lowest, highest) = (lowest.min(n2), highest.max(n2));
+
+            let fit = HarmonicAnalysis::new(&names)
+                .with_inferences(&minors)
+                .fit(&times, &values)
+                .unwrap();
+            for &(name, h, g) in &truth {
+                let c = fit.get(name).unwrap();
+                assert!(
+                    (c.amplitude - h).abs() < 1e-8,
+                    "{name}: H {} vs {h}",
+                    c.amplitude
+                );
+                assert!(
+                    lag_error(c.lag_deg, g) < 1e-6,
+                    "{name}: G {} vs {g}",
+                    c.lag_deg
+                );
+                assert_eq!(c.inferred, !names.contains(&name));
+            }
+            assert!(fit.residual_rms < 1e-8);
+        }
+        assert!(
+            lowest < 0.87 && highest > 1.13,
+            "N2 without ν2: {lowest:.3} to {highest:.3} of the truth"
+        );
+    }
+
+    /// A fortnight infers N2 from M2, and ν2 from that N2 and M2: an
+    /// inference may rest on an inferred constituent, and its constant is
+    /// the admittance of the constants the fit returns.
+    #[test]
+    fn an_inference_follows_an_inferred_source_to_the_fitted_ones() {
+        let (ratio, offset) = (0.2, -22.0);
+        let mut truth = vec![
+            ("M2", 0.74, 301.0),
+            ("S2", 0.25, 339.0),
+            ("N2", ratio * 0.74, 301.0 + offset),
+            ("K1", 0.06, 165.0),
+            ("O1", 0.05, 38.0),
+        ];
+        let nu2 = AdmittanceInference::new("NU2", "N2", "M2");
+        let (h, g) = nu2.infer((truth[2].1, truth[2].2), (0.74, 301.0)).unwrap();
+        truth.push(("NU2", h, g));
+
+        let t0 = ModelClock::at_datetime(2025, 6, 1, 0, 0).epoch_unix;
+        let hours = 15 * 24;
+        let values = synthesize(t0, hours, 0.0, &truth);
+        let times: Vec<f64> = (0..hours).map(|i| t0 + i as f64 * 3600.0).collect();
+        // ν2 is listed before the N2 it rests on
+        let inferences = [
+            Inference::by_admittance(&nu2).unwrap(),
+            Inference::single("N2", "M2", ratio, offset),
+        ];
+        let analysis = HarmonicAnalysis::resolvable(
+            &["M2", "S2", "K1", "O1", "N2", "NU2"],
+            times[hours - 1] - t0,
+            1.0,
+            &inferences,
+        );
+        assert_eq!(analysis.names(), ["M2", "S2", "K1", "O1"]);
+        let inferred: Vec<_> = analysis.inferences().iter().map(|i| i.name).collect();
+        assert_eq!(inferred, ["N2", "NU2"]);
+        let fit = analysis.fit(&times, &values).unwrap();
+        for (name, h, g) in truth {
+            let c = fit.get(name).unwrap();
+            assert!(
+                (c.amplitude - h).abs() < 1e-8,
+                "{name}: H {} vs {h}",
+                c.amplitude
+            );
+            assert!(
+                lag_error(c.lag_deg, g) < 1e-6,
+                "{name}: G {} vs {g}",
+                c.lag_deg
+            );
+        }
+    }
+
+    /// What a gauge's record fits and infers of [`HarmonicAnalysis::GAUGE_RECORD`]
+    /// with theory's rules: a fortnight fits no minor semidiurnal (2N2 is
+    /// 13.8 days from M2, but 27.6 from the N2 it infers); a month none
+    /// either; 35 days fit μ2 and L2 and infer their partners; a year and a
+    /// day fits them all.
+    #[test]
+    fn a_gauge_record_fits_the_minor_semidiurnals_it_separates() {
+        const MINOR: [&str; 6] = ["NU2", "MU2", "2N2", "L2", "LDA2", "T2"];
+        let of = |days: f64| {
+            let analysis = HarmonicAnalysis::resolvable(
+                &HarmonicAnalysis::GAUGE_RECORD,
+                days * 86_400.0,
+                1.0,
+                &Inference::theory(),
+            );
+            let minor = |names: Vec<&'static str>| -> Vec<&'static str> {
+                names.into_iter().filter(|n| MINOR.contains(n)).collect()
+            };
+            (
+                minor(analysis.names().to_vec()),
+                minor(analysis.inferences().iter().map(|i| i.name).collect()),
+                analysis.names().contains(&"N2"),
+            )
+        };
+        let all_inferred = ["2N2", "MU2", "NU2", "LDA2", "L2", "T2"];
+        let (fitted, inferred, n2) = of(15.0);
+        assert!(fitted.is_empty() && !n2, "{fitted:?}");
+        assert_eq!(inferred, all_inferred);
+        let (fitted, inferred, n2) = of(30.0);
+        assert!(fitted.is_empty() && n2, "{fitted:?}");
+        assert_eq!(inferred, all_inferred);
+        let (fitted, inferred, _) = of(35.0);
+        assert_eq!(fitted, ["MU2", "L2"]);
+        assert_eq!(inferred, ["2N2", "NU2", "LDA2", "T2"]);
+        let (fitted, inferred, _) = of(366.0);
+        assert_eq!(fitted, MINOR);
+        assert!(inferred.is_empty());
+    }
+
+    /// A fortnight cannot fit N2. With N2 at M2's lag (the equilibrium
+    /// inference) the 21° that N2 really leads M2 by go into M2 and S2;
+    /// with the lag the M2-to-S2 slope implies (`fit_gauge_record`'s second
+    /// pass), a tide whose lag is linear in frequency is recovered.
+    #[test]
+    fn a_fortnights_n2_takes_its_lag_from_the_age_of_the_tide() {
+        let (m2, s2) = ((0.74, 301.0), (0.25, 339.0));
+        let n2_lag = m2.1 - 0.536 * (s2.1 - m2.1);
+        let truth = [
+            ("M2", m2.0, m2.1),
+            ("S2", s2.0, s2.1),
+            ("N2", 0.191 * m2.0, n2_lag),
+            ("K1", 0.06, 165.0),
+            ("O1", 0.05, 38.0),
+        ];
+        let t0 = ModelClock::at_datetime(2025, 6, 1, 0, 0).epoch_unix;
+        let hours = 15 * 24;
+        let values = synthesize(t0, hours, 0.0, &truth);
+        let times: Vec<f64> = (0..hours).map(|i| t0 + i as f64 * 3600.0).collect();
+        let error = |fit: &ReferenceFit, name: &str| {
+            let (c, t) = (
+                fit.get(name).unwrap(),
+                truth.iter().find(|t| t.0 == name).unwrap(),
+            );
+            let (a, b) = (c.lag_deg.to_radians(), t.2.to_radians());
+            (c.amplitude * a.cos() - t.1 * b.cos()).hypot(c.amplitude * a.sin() - t.1 * b.sin())
+        };
+        let candidates = ["M2", "S2", "K1", "O1", "N2"];
+        let equal_lag = HarmonicAnalysis::resolvable(
+            &candidates,
+            times[hours - 1] - t0,
+            1.0,
+            &Inference::EQUILIBRIUM,
+        );
+        let first = equal_lag.fit(&times, &values).unwrap();
+        assert!(
+            error(&first, "N2") > 0.04 && error(&first, "M2") > 0.01,
+            "at equal lag: N2 {}, M2 {}",
+            error(&first, "N2"),
+            error(&first, "M2")
+        );
+
+        let aged =
+            HarmonicAnalysis::fit_with_reference(&candidates, &times, &values, None).unwrap();
+        assert!(aged.get("N2").unwrap().inferred);
+        assert!(
+            lag_error(aged.get("N2").unwrap().lag_deg, n2_lag) < 3.0,
+            "N2 lag {} vs {n2_lag}",
+            aged.get("N2").unwrap().lag_deg
+        );
+        for name in ["M2", "S2", "N2"] {
+            assert!(
+                error(&aged, name) < 0.2 * error(&first, name),
+                "{name}: {} vs {} at equal lag",
+                error(&aged, name),
+                error(&first, name)
+            );
+        }
+        // A month fits N2: nothing to age
+        let month = HarmonicAnalysis::resolvable(
+            &candidates,
+            30.0 * 86_400.0,
+            1.0,
+            &Inference::EQUILIBRIUM,
+        );
+        assert!(month.with_the_age_of_the_tide(&first).is_none());
+        // Nor is a ratio from a reference touched
+        let mut referenced = equal_lag.clone();
+        let n2 = referenced
+            .inferences
+            .iter_mut()
+            .find(|i| i.name == "N2")
+            .unwrap();
+        *n2 = Inference::single("N2", "M2", 0.2, -20.0);
+        assert!(referenced.with_the_age_of_the_tide(&first).is_none());
+    }
+
+    /// Inferences that rest on each other, or on nothing fitted, are an
+    /// error; `resolvable` leaves them out.
+    #[test]
+    fn inferences_without_a_fitted_source_are_refused() {
+        let times: Vec<f64> = (0..720).map(|i| 1.7e9 + i as f64 * 3600.0).collect();
+        let values = vec![0.0; 720];
+        let cycle = [
+            Inference::single("N2", "NU2", 5.0, 0.0),
+            Inference::single("NU2", "N2", 0.2, 0.0),
+        ];
+        let err = HarmonicAnalysis::new(&["M2"])
+            .with_inferences(&cycle)
+            .fit(&times, &values)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AnalysisError::InferenceSourceNotFitted { name: "N2", .. }
+        ));
+        let nu2 = Inference::by_admittance(&AdmittanceInference::new("NU2", "N2", "M2")).unwrap();
+        assert_eq!(
+            HarmonicAnalysis::new(&["M2"])
+                .with_inferences(&[nu2])
+                .fit(&times, &values)
+                .unwrap_err(),
+            AnalysisError::InferenceSourceNotFitted {
+                name: "NU2",
+                from: "N2"
+            }
+        );
+        let kept = HarmonicAnalysis::resolvable(&["M2"], 30.0 * 86_400.0, 1.0, &cycle);
+        assert!(kept.inferences().is_empty());
+        let kept = HarmonicAnalysis::resolvable(&["M2"], 30.0 * 86_400.0, 1.0, &[nu2]);
+        assert!(kept.inferences().is_empty());
     }
 
     /// What cannot be fitted is an error, not a panic or a garbage fit.

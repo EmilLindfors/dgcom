@@ -194,7 +194,7 @@ mod app {
         }
         let fit = analysis.fit(&t, &v)?;
         let inferences = INFERRED.map(|i| {
-            Inference::from_reference(i.name, i.from, &fit).expect("fitted K2, S2, P1, K1")
+            Inference::from_reference(i.name, i.from.name, &fit).expect("fitted K2, S2, P1, K1")
         });
         let how = format!(
             "at the ratios of {} ({} to {}): {}",
@@ -205,7 +205,7 @@ mod app {
                 .iter()
                 .map(|i| format!(
                     "{}/{} {:.3}, {:+.1}°",
-                    i.name, i.from, i.amplitude_ratio, i.lag_offset_deg
+                    i.name, i.from.name, i.from.amplitude_ratio, i.from.lag_offset_deg
                 ))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -404,7 +404,7 @@ mod app {
                 ModelClock::new(times[0]).format(0.0),
                 opts.days,
                 NAMES.join(" "),
-                inferred.map(|i| format!("{} from {}", i.name, i.from)).join(", ")
+                inferred.map(|i| format!("{} from {}", i.name, i.from.name)).join(", ")
             ),
             "velocity: z-level u_eastward/v_northward averaged over the column (levels end at 300 m)".into(),
         ];

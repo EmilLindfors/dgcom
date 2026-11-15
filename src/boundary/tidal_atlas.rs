@@ -494,12 +494,14 @@ impl TidalAtlas {
                     "gauge ratio {name}: not P1, K2, N2 or Q1"
                 )));
             };
-            let from = inference.from;
-            let i = Inference::from_reference(inference.name, from, gauge).ok_or_else(|| {
-                inconsistent(format!(
-                    "gauge ratio {name}: the gauge lacks {name} or {from}"
-                ))
-            })?;
+            let from = inference.from.name;
+            let i = Inference::from_reference(inference.name, from, gauge)
+                .ok_or_else(|| {
+                    inconsistent(format!(
+                        "gauge ratio {name}: the gauge lacks {name} or {from}"
+                    ))
+                })?
+                .from;
             self.infer(inference.name, from, i.amplitude_ratio, i.lag_offset_deg)?;
             done.push(GaugeAdjustment::Ratio {
                 name: inference.name,

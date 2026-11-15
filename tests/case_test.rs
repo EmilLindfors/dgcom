@@ -1531,8 +1531,9 @@ fn an_atlas_walls_the_open_faces_it_does_not_cover() {
 
 /// A year's hourly gauge record (2025) of M2 and S2 (amplitudes, lags) at
 /// (x, y) of the placed mesh, in the format of `scripts/kartverket_gauge.sh`.
-/// A year separates every constituent of the gauge fit, so none is inferred
-/// at a ratio the record lacks.
+/// A year separates every constituent of the gauge fit but T2 from S2 (a
+/// year and six hours), so the record has the T2 that the fit infers, and
+/// none is inferred at a ratio the record lacks.
 fn write_gauge(path: &Path, (x, y): (f64, f64), m2: (f64, f64), s2: (f64, f64)) {
     use dgcom::io::{CoordinateProjection, LocalProjection};
     use dgcom::time::ModelClock;
@@ -1544,9 +1545,12 @@ fn write_gauge(path: &Path, (x, y): (f64, f64), m2: (f64, f64), s2: (f64, f64)) 
          # columns: datetime water_level(m)\n"
     );
     const DAYS: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let t2 = dgcom::tides::AdmittanceInference::new("T2", "M2", "S2")
+        .infer(m2, s2)
+        .unwrap();
     for hour in 0..365 * 24 {
         let t = 3600.0 * f64::from(hour);
-        let level: f64 = [("M2", m2), ("S2", s2)]
+        let level: f64 = [("M2", m2), ("S2", s2), ("T2", t2)]
             .iter()
             .map(|&(name, (amp, lag))| {
                 let drift = clock.nodal_drift(name).unwrap().at(t);

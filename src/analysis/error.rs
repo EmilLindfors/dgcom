@@ -43,8 +43,9 @@ pub enum AnalysisError {
         /// The record's length (days)
         have_days: f64,
     },
-    /// An inference from a constituent that is not fitted.
-    #[error("{name} is inferred from {from}, which is not fitted")]
+    /// An inference that rests on a constituent neither fitted nor inferred
+    /// from fitted ones (or on itself, through a cycle of inferences).
+    #[error("{name} is inferred from {from}, which is neither fitted nor inferred from what is")]
     InferenceSourceNotFitted {
         /// Inferred constituent
         name: &'static str,

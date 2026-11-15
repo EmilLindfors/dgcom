@@ -4,9 +4,11 @@
 //! 1. Read a gauge file (`dgcom::io::read_tide_gauge_file`, ISO times, e.g.
 //!    from `scripts/kartverket_gauge.sh`), keep `[from, to)`.
 //! 2. Fit reference constants (`HarmonicAnalysis::fit`) of every constituent
-//!    the record resolves (`HarmonicAnalysis::resolvable`, Rayleigh factor
-//!    `rayleigh`); unresolved P1, K2, N2 and Q1 are inferred at their
-//!    equilibrium ratios.
+//!    of `HarmonicAnalysis::GAUGE_RECORD` the record resolves
+//!    (`HarmonicAnalysis::resolvable`, Rayleigh factor `rayleigh`); the
+//!    unresolved ones are inferred by theory (`Inference::theory`: P1, K2,
+//!    N2 and Q1 at their equilibrium ratios, the minor semidiurnals by
+//!    admittance).
 //! 3. With `atlas=<file>`: the atlas point nearest the gauge and, per
 //!    constituent, the amplitude ratio, phase difference and complex
 //!    difference, plus their root sum of squares.
@@ -36,13 +38,6 @@ use dgcom::boundary::TidalAtlas;
 use dgcom::io::{TideGaugeFile, read_tide_gauge_file};
 use dgcom::tides::AdmittanceInference;
 use dgcom::time::ModelClock;
-
-/// Candidates in priority order: a short record keeps the first ones (the
-/// minor semidiurnals need half a year to a year).
-const CANDIDATES: [&str; 20] = [
-    "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "MN4", "M6", "NU2", "MU2", "2N2",
-    "L2", "LDA2", "Mf", "Mm", "Ssa",
-];
 
 /// Long-period constituents (mostly weather), left out of the comparison's
 /// root sum of squares
@@ -173,10 +168,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map_or(file.clone(), |s| s.name.clone());
 
-    // Every constituent the record resolves, the equilibrium inferences for
-    // the rest
-    let analysis =
-        HarmonicAnalysis::resolvable(&CANDIDATES, t1 - t0, rayleigh, &Inference::EQUILIBRIUM);
+    // Every constituent the record resolves, theory's inferences for the rest
+    let analysis = HarmonicAnalysis::resolvable(
+        &HarmonicAnalysis::GAUGE_RECORD,
+        t1 - t0,
+        rayleigh,
+        &Inference::theory(),
+    );
     let fit = analysis.fit(&times, &values)?;
     print_fit(&name, &times, &fit);
     print_admittance_check(&fit);

@@ -649,7 +649,7 @@ const STATION_MAX_OFFSET: f64 = 3000.0;
 /// keeps the first ones): the forcing's, without the long-period ones
 const STATION_CONSTITUENTS: [&str; 12] = HarmonicAnalysis::STATION_RECORD;
 /// Constituents fitted to a gauge's or current meter's whole record
-const GAUGE_CONSTITUENTS: [&str; 15] = HarmonicAnalysis::GAUGE_RECORD;
+const GAUGE_CONSTITUENTS: [&str; 21] = HarmonicAnalysis::GAUGE_RECORD;
 
 /// How a nested run treats its parent's tides (`nest_tides=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5827,10 +5827,11 @@ fn record_length(times: &[f64]) -> f64 {
         .map_or(0.0, |(t0, t1)| t1 - t0)
 }
 
-/// Tidal ellipses of the constituents a current record resolves; the others
-/// of P1, K2, N2 and Q1 are inferred with the major-axis ratio and lag
-/// difference of `reference` (a longer record at the same place) where it
-/// has them, else at equilibrium, for both components alike.
+/// Tidal ellipses of the `candidates` a current record resolves; the others
+/// are inferred, where theory has a rule (`Inference::theory`), with the
+/// major-axis ratio and lag difference of `reference` (a longer record at
+/// the same place) where it has them, else theory's, for both components
+/// alike.
 fn fit_current_record(
     times: &[f64],
     u: &[f64],
@@ -5838,7 +5839,13 @@ fn fit_current_record(
     candidates: &[&'static str],
     reference: Option<&EllipseFit>,
 ) -> Result<EllipseFit, AnalysisError> {
-    let inferences = Inference::EQUILIBRIUM.map(|i| i.or_from_ellipses(reference));
+    // As `HarmonicAnalysis::fit_with_reference`: theory's rules for the
+    // candidates, at the reference's ratios where it has them
+    let inferences: Vec<Inference> = Inference::theory()
+        .into_iter()
+        .filter(|i| candidates.contains(&i.name))
+        .map(|i| i.or_from_ellipses(reference))
+        .collect();
     HarmonicAnalysis::resolvable(candidates, record_length(times), 1.0, &inferences)
         .fit_ellipses(times, u, v)
 }

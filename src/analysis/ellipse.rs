@@ -226,18 +226,22 @@ impl HarmonicAnalysis {
 }
 
 impl Inference {
-    /// This inference with the major-axis ratio and lag difference of
-    /// `reference`'s ellipses (a longer current record at the same place)
-    /// where it has both constituents, else unchanged; applied to both
+    /// This inference from its first source alone, with the major-axis
+    /// ratio and lag difference of `reference`'s ellipses (a longer current
+    /// record at the same place), where it has both constituents; else
+    /// unchanged. Applied to both
     /// components alike by [`HarmonicAnalysis::fit_ellipses`].
     pub fn or_from_ellipses(self, reference: Option<&EllipseFit>) -> Self {
         reference
             .and_then(|r| {
-                let (a, b) = (r.get(self.name)?, r.get(self.from)?);
-                (b.major > 0.0).then(|| Self {
-                    amplitude_ratio: a.major / b.major,
-                    lag_offset_deg: a.lag_deg - b.lag_deg,
-                    ..self
+                let (a, b) = (r.get(self.name)?, r.get(self.from.name)?);
+                (b.major > 0.0).then(|| {
+                    Self::single(
+                        self.name,
+                        self.from.name,
+                        a.major / b.major,
+                        a.lag_deg - b.lag_deg,
+                    )
                 })
             })
             .unwrap_or(self)
