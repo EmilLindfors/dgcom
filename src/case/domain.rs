@@ -36,6 +36,7 @@ use crate::physics::Coare35;
 use crate::solver::Probe2D;
 use crate::source::{CageFootprint, NetCage, RiverSources};
 use crate::source::{GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress};
+use crate::tides::canonical_name;
 use crate::types::ElementIndex;
 use crate::waves::{PointSpectra, WindSeries};
 
@@ -62,6 +63,12 @@ pub struct Domain {
     /// The parent model of each `[[boundary]]` nested in one, sampled at the
     /// boundary and its relaxation band, its tide corrected
     pub parents: Vec<(SideTag, OceanModelState)>,
+    /// The tidal constituents the boundaries carry: those of each
+    /// `[boundary.tide]` and of each atlas after its correction; for a
+    /// parent model the eight major ones ([`HarmonicAnalysis::MAJOR`]) and
+    /// those of its atlas after its correction. A station's record is
+    /// fitted with them ([`HarmonicAnalysis::station_candidates`]).
+    pub tide_constituents: Vec<&'static str>,
     /// Where each `[[output.station]]` samples the model
     pub stations: Vec<StationProbe>,
     /// `[atmosphere]`'s weather on the mesh, if any: in a 3D run its
@@ -179,6 +186,24 @@ impl CaseFile {
         let (mut mesh, ops, geom, mut bathymetry) =
             self.mesh_and_bed(&case.mesh, projection.as_ref(), &mut notes)?;
 
+        // What the boundaries' tides carry, for the fit of a station's record
+        let mut tide_constituents: Vec<&'static str> = Vec::new();
+        let mut carry = |names: &[&'static str]| {
+            for name in names {
+                if !tide_constituents.contains(name) {
+                    tide_constituents.push(name);
+                }
+            }
+        };
+        for tide in case.boundaries.iter().filter_map(|b| b.tide.as_ref()) {
+            let names: Vec<&'static str> = tide
+                .constituents
+                .iter()
+                .filter_map(|c| canonical_name(&c.name))
+                .collect();
+            carry(&names);
+        }
+
         // Tidal atlases: the open faces they do not cover become walls
         let mut atlases = Vec::new();
         for b in &case.boundaries {
@@ -230,6 +255,7 @@ impl CaseFile {
                 spec.coverage_m / 1000.0,
                 closed_length(&coverage)
             ));
+            carry(&atlas.names());
             atlases.push((b.tag, atlas));
         }
         Self::check_3d_bed_tide(case, &atlases, &mut notes);
@@ -241,7 +267,7 @@ impl CaseFile {
         for b in &case.boundaries {
             let Some(spec) = &b.nesting else { continue };
             let projection = projection.as_ref().expect("validated: placed");
-            let (parent, reader) = self.nest(
+            let (parent, reader, carried) = self.nest(
                 b.tag,
                 spec,
                 &mut mesh,
@@ -251,6 +277,8 @@ impl CaseFile {
                 projection,
                 &mut notes,
             )?;
+            carry(&HarmonicAnalysis::MAJOR);
+            carry(&carried);
             parents.push((b.tag, parent));
             parent_reader = Some(reader);
         }
@@ -274,6 +302,12 @@ impl CaseFile {
             }
         }
         let stations = self.stations(&mesh, &ops, &bathymetry, projection.as_ref(), &mut notes)?;
+        if stations.iter().any(|s| s.gauge.is_some()) {
+            notes.push(format!(
+                "gauged stations: the model's record is fitted with the constituents the                  boundaries carry and the overtides: {}",
+                HarmonicAnalysis::station_candidates(&tide_constituents).join(" ")
+            ));
+        }
         let atmosphere = match &case.atmosphere {
             Some(spec) => Some(self.atmosphere(spec, &mesh, &ops, projection, &mut notes)?),
             None => None,
@@ -318,6 +352,7 @@ impl CaseFile {
             projection,
             atlases,
             parents,
+            tide_constituents,
             stations,
             atmosphere,
             wind_3d,
@@ -868,7 +903,7 @@ impl CaseFile {
         bathymetry: &mut Bathymetry2D,
         projection: &LocalProjection,
         notes: &mut Vec<String>,
-    ) -> Result<(OceanModelState, Arc<OceanModelReader>), CaseError> {
+    ) -> Result<(OceanModelState, Arc<OceanModelReader>, Vec<&'static str>), CaseError> {
         let path = self.resolve(&spec.file);
         let reader = Arc::new(read_parent(&path, self.case.three_d.is_some())?);
         notes.push(format!("parent {}: {}", path.display(), reader.summary()));
@@ -959,6 +994,7 @@ impl CaseFile {
 
         // The parent's tide corrected by (corrected − raw) atlas: the atlas
         // is the parent's own harmonic fit, so its residual flow stays
+        let mut carried = atlas.as_ref().map(TidalAtlas::names).unwrap_or_default();
         let parent = match atlas {
             Some(raw) if spec.correction != AtlasCorrection::None || spec.gauge.is_some() => {
                 let mut corrected = raw.clone();
@@ -976,6 +1012,7 @@ impl CaseFile {
                         notes.push(format!("parent's tide: {change}"));
                     }
                 }
+                carried = corrected.names();
                 let correction = corrected.difference(&raw).map_err(|e| invalid(&e))?;
                 let keeps = |name: &str| {
                     correction.points.iter().all(|p| {
@@ -1031,7 +1068,7 @@ impl CaseFile {
                 invalid(&e)
             }
         })?;
-        Ok((parent, reader))
+        Ok((parent, reader, carried))
     }
 
     /// Correct `atlas` at the gauge of `spec`; what changed.

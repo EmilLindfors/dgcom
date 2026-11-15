@@ -28,23 +28,26 @@ pub enum AnalysisError {
         unknowns: usize,
     },
     /// Two fitted constituents the record is too short to separate
-    /// (Rayleigh criterion).
+    /// (Rayleigh criterion), or one that is longer than the record: the
+    /// mean is the constituent of speed zero, `Z0`, and the two need a
+    /// record of the constituent's period.
     #[error(
         "{a} and {b} need a {needed_days:.1}-day record to separate (have {have_days:.1} days); \
-         infer one of them instead"
+         infer {b} or leave it out"
     )]
     NotSeparable {
-        /// First constituent
+        /// The earlier constituent, or `Z0` (the mean)
         a: &'static str,
-        /// Second constituent
+        /// The later constituent: the one to infer or leave out
         b: &'static str,
         /// Their synodic period (days)
         needed_days: f64,
         /// The record's length (days)
         have_days: f64,
     },
-    /// An inference from a constituent that is not fitted.
-    #[error("{name} is inferred from {from}, which is not fitted")]
+    /// An inference that rests on a constituent neither fitted nor inferred
+    /// from fitted ones (or on itself, through a cycle of inferences).
+    #[error("{name} is inferred from {from}, which is neither fitted nor inferred from what is")]
     InferenceSourceNotFitted {
         /// Inferred constituent
         name: &'static str,

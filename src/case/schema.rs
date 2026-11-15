@@ -1761,7 +1761,11 @@ pub struct Station {
     /// needs `run.start`): the skill against the observations and the
     /// gauge's tidal prediction, and the reference constants against the
     /// gauge's (`GaugeComparison`), into `gauge_skill.csv` and
-    /// `gauge_constituents.csv`.
+    /// `gauge_constituents.csv`. The station's record is fitted with the
+    /// constituents the boundaries carry and the overtides
+    /// (`Domain::tide_constituents`), those it cannot resolve inferred at
+    /// the gauge's ratios; a record shorter than M2's period (12.4 h after
+    /// the spin-up) gets the skill and no constants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gauge: Option<PathBuf>,
 }

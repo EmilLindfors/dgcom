@@ -563,7 +563,7 @@ use dgcom::source::{
     GriddedSurfaceFluxes, GriddedWindStress, HorizontalViscosity2D, ManningFriction2D,
     WindStress2D,
 };
-use dgcom::tides::canonical_name;
+use dgcom::tides::{AdmittanceInference, canonical_name};
 use dgcom::time::{
     IntegratorInfo, ModelClock, Multirate, SSPRK3, SspScheme, StandardIntegrator, TimeIntegrator,
 };
@@ -646,10 +646,19 @@ const STATION_MIN_DEPTH: f64 = 3.0;
 /// ... no farther than this from the station (m)
 const STATION_MAX_OFFSET: f64 = 3000.0;
 /// Constituents fitted at the stations, in priority order (a short record
-/// keeps the first ones): the forcing's, without the long-period ones
-const STATION_CONSTITUENTS: [&str; 12] = HarmonicAnalysis::STATION_RECORD;
+/// keeps the first ones): the forcing's and the overtides
+/// (`HarmonicAnalysis::station_candidates`). The atlas and NorKyst carry
+/// the eight major ones; a nested run with `nest_tides=theory` also the
+/// minor semidiurnals that theory adds.
+fn station_constituents(opts: &Options) -> Vec<&'static str> {
+    let mut carried = HarmonicAnalysis::MAJOR.to_vec();
+    if opts.norkyst.is_some() && opts.nest_tides == NestTides::Theory {
+        carried.extend(AdmittanceInference::MINOR_SEMIDIURNALS.map(|a| a.name));
+    }
+    HarmonicAnalysis::station_candidates(&carried)
+}
 /// Constituents fitted to a gauge's or current meter's whole record
-const GAUGE_CONSTITUENTS: [&str; 15] = HarmonicAnalysis::GAUGE_RECORD;
+const GAUGE_CONSTITUENTS: [&str; 21] = HarmonicAnalysis::GAUGE_RECORD;
 
 /// How a nested run treats its parent's tides (`nest_tides=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3639,6 +3648,7 @@ fn report_stations(
     station_atlas: Option<&TidalAtlas>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let analysis_start = clock.unix(opts.spinup_hours * 3600.0);
+    let candidates = station_constituents(opts);
     for s in stations {
         let slug = slug(&s.name);
         let path = output_dir.join(format!("station_{slug}.txt"));
@@ -3678,11 +3688,18 @@ fn report_stations(
             );
         }
         if let Some(gauge) = &s.gauge
-            && let Err(e) = report_station(s, gauge, analysis_start, atlas_point.map(|(p, _)| p))
+            && let Err(e) = report_station(
+                s,
+                gauge,
+                analysis_start,
+                &candidates,
+                atlas_point.map(|(p, _)| p),
+            )
         {
             println!("  no harmonic comparison: {e}");
         }
-        if let Err(e) = report_currents(s, analysis_start, atlas_point.map(|(p, _)| p)) {
+        if let Err(e) = report_currents(s, analysis_start, &candidates, atlas_point.map(|(p, _)| p))
+        {
             println!("  no current comparison: {e}");
         }
     }
@@ -5827,10 +5844,11 @@ fn record_length(times: &[f64]) -> f64 {
         .map_or(0.0, |(t0, t1)| t1 - t0)
 }
 
-/// Tidal ellipses of the constituents a current record resolves; the others
-/// of P1, K2, N2 and Q1 are inferred with the major-axis ratio and lag
-/// difference of `reference` (a longer record at the same place) where it
-/// has them, else at equilibrium, for both components alike.
+/// Tidal ellipses of the `candidates` a current record resolves; the others
+/// are inferred, where theory has a rule (`Inference::theory`), with the
+/// major-axis ratio and lag difference of `reference` (a longer record at
+/// the same place) where it has them, else theory's, for both components
+/// alike.
 fn fit_current_record(
     times: &[f64],
     u: &[f64],
@@ -5838,26 +5856,33 @@ fn fit_current_record(
     candidates: &[&'static str],
     reference: Option<&EllipseFit>,
 ) -> Result<EllipseFit, AnalysisError> {
-    let inferences = Inference::EQUILIBRIUM.map(|i| i.or_from_ellipses(reference));
+    // As `HarmonicAnalysis::fit_with_reference`: theory's rules for the
+    // candidates, at the reference's ratios where it has them
+    let inferences: Vec<Inference> = Inference::theory()
+        .into_iter()
+        .filter(|i| candidates.contains(&i.name))
+        .map(|i| i.or_from_ellipses(reference))
+        .collect();
     HarmonicAnalysis::resolvable(candidates, record_length(times), 1.0, &inferences)
         .fit_ellipses(times, u, v)
 }
 
 /// The model's surface at a station after spin-up (from `analysis_start`,
-/// Unix s) against its gauge (`GaugeComparison`: the reference constants
-/// against the gauge's whole record and NorKyst's, `norkyst` from the
-/// station atlas; the skill against the observations and the gauge's tidal
-/// prediction).
+/// Unix s), fitted with `candidates`, against its gauge (`GaugeComparison`:
+/// the reference constants against the gauge's whole record and NorKyst's,
+/// `norkyst` from the station atlas; the skill against the observations and
+/// the gauge's tidal prediction).
 fn report_station(
     s: &Station,
     gauge: &GaugeRecord,
     analysis_start: f64,
+    candidates: &[&'static str],
     norkyst: Option<&AtlasPoint>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let first = s.times.partition_point(|&t| t < analysis_start);
     let model_series = TimeSeries::new(&s.times[first..], &s.eta[first..]);
     let gauge_fit = gauge.fit.as_ref().map_err(|e| format!("gauge fit: {e}"))?;
-    let comparison = GaugeComparison::compute(&model_series, gauge);
+    let comparison = GaugeComparison::compute(&model_series, gauge, candidates);
     let model = comparison.model_fit.as_ref().map_err(|e| e.to_string())?;
 
     let days = |t: &[f64]| (t[t.len() - 1] - t[0]) / 86_400.0;
@@ -5937,12 +5962,14 @@ fn report_station(
 }
 
 /// The model's tidal ellipses of the depth-averaged current at a station
-/// after spin-up (from `analysis_start`, Unix s) against NorKyst's (the
-/// station atlas, if it has currents) and a current record's (its whole
-/// record fitted); time-series skill against the record.
+/// after spin-up (from `analysis_start`, Unix s), fitted with `candidates`,
+/// against NorKyst's (the station atlas, if it has currents) and a current
+/// record's (its whole record fitted); time-series skill against the
+/// record.
 fn report_currents(
     s: &Station,
     analysis_start: f64,
+    candidates: &[&'static str],
     norkyst: Option<&AtlasPoint>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let first = s.times.partition_point(|&t| t < analysis_start);
@@ -5956,7 +5983,7 @@ fn report_currents(
                 .map_err(|e| format!("current record fit: {e}"))
         })
         .transpose()?;
-    let model = fit_current_record(times, u, v, &STATION_CONSTITUENTS, observed)?;
+    let model = fit_current_record(times, u, v, candidates, observed)?;
     let norkyst: Vec<TidalEllipse> = norkyst
         .map(|p| {
             p.constituents

@@ -221,9 +221,10 @@ impl SkillScore {
 #[derive(Clone, Debug)]
 pub struct GaugeComparison {
     /// The model's reference constants
-    /// ([`HarmonicAnalysis::fit_with_reference`] of
-    /// [`HarmonicAnalysis::STATION_RECORD`] with the gauge's ratios). A
-    /// record too short for any is an error, and the rest stands.
+    /// ([`HarmonicAnalysis::fit_with_reference`] of the constituents the
+    /// run carries, with the gauge's ratios). A record shorter than M2's
+    /// period has no constants; one that cannot be fitted is an error, and
+    /// the rest stands.
     pub model_fit: Result<ReferenceFit, AnalysisError>,
     /// Model against gauge for each constituent of the model's fit that the
     /// gauge's has, in the model's order
@@ -236,11 +237,15 @@ pub struct GaugeComparison {
 
 impl GaugeComparison {
     /// Compare `model` (the surface at the gauge, Unix times, the spin-up
-    /// already cut) with `gauge`.
-    pub fn compute(model: &TimeSeries, gauge: &GaugeRecord) -> Self {
+    /// already cut) with `gauge`. `candidates` are the constituents the
+    /// model's record carries, in priority order
+    /// ([`HarmonicAnalysis::station_candidates`] of its forcing's): the
+    /// gauge's water has the minor semidiurnals, a run has them only if its
+    /// boundary does.
+    pub fn compute(model: &TimeSeries, gauge: &GaugeRecord, candidates: &[&'static str]) -> Self {
         let gauge_fit = gauge.fit.as_ref().ok();
         let model_fit = HarmonicAnalysis::fit_with_reference(
-            &HarmonicAnalysis::STATION_RECORD,
+            candidates,
             model.times(),
             model.values(),
             gauge_fit,
@@ -995,17 +1000,30 @@ mod tests {
     fn a_comparison_finds_the_models_constants_against_the_gauges() {
         let t0 = 1_749_945_600.0;
         let gauge_times: Vec<f64> = (0..60 * 24).map(|h| t0 + 3600.0 * f64::from(h)).collect();
-        // P1 at its equilibrium ratio to K1, as the fit infers it
-        let p1 = crate::analysis::Inference::P1_FROM_K1.amplitude_ratio;
-        let mut gauge_values = tide(
-            0.0,
-            &[
-                ("M2", 1.0, 60.0),
-                ("K1", 0.2, 200.0),
-                ("P1", 0.2 * p1, 200.0),
-            ],
-            &gauge_times,
-        );
+        // P1 at its equilibrium ratio to K1 and the minor semidiurnals at
+        // their admittance, as the gauge's fit infers them: a gauge's water
+        // has them (an M2 without N2 and S2 gives each its share of M2).
+        // O1 at K1's lag, so the diurnal band has no age and P1 sits at
+        // K1's lag (without O1 the fit's O1 has no lag to age P1 by)
+        let p1 = crate::analysis::Inference::P1_FROM_K1.from.amplitude_ratio;
+        let mut gauge_tide = vec![
+            ("M2", 1.0, 60.0),
+            ("K1", 0.2, 200.0),
+            ("O1", 0.05, 200.0),
+            ("P1", 0.2 * p1, 200.0),
+        ];
+        for minor in crate::tides::AdmittanceInference::MINORS {
+            let of = |name| {
+                if name == "M2" {
+                    (1.0, 60.0)
+                } else {
+                    (0.0, 0.0)
+                }
+            };
+            let (h, g) = minor.infer(of(minor.lower), of(minor.upper)).unwrap();
+            gauge_tide.push((minor.name, h, g));
+        }
+        let mut gauge_values = tide(0.0, &gauge_tide, &gauge_times);
         gauge_values[100] = f64::NAN;
         let gauge = GaugeRecord::new(
             TideGaugeStation::new("Test", 8.0, 63.0),
@@ -1033,8 +1051,12 @@ mod tests {
             ],
             &model_times,
         );
-        let comparison =
-            GaugeComparison::compute(&TimeSeries::new(&model_times, &model_values), &gauge);
+        // The run carries M2, K1 and P1, and no more
+        let comparison = GaugeComparison::compute(
+            &TimeSeries::new(&model_times, &model_values),
+            &gauge,
+            &HarmonicAnalysis::station_candidates(&["M2", "K1", "P1"]),
+        );
         for (name, ratio) in [("M2", 1.2), ("K1", 2.5)] {
             let c = comparison
                 .constituents

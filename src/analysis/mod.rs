@@ -62,7 +62,7 @@ pub use adcp::{
 };
 pub use ellipse::{EllipseFit, TidalEllipse};
 pub use error::AnalysisError;
-pub use harmonic::{HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit};
+pub use harmonic::{HarmonicAnalysis, Inference, InferenceSource, ReferenceConstant, ReferenceFit};
 pub use metrics::{
     ComparisonMetrics, ConstituentComparison, ConstituentComparisonSummary, compare_harmonics,
 };

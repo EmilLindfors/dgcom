@@ -177,6 +177,7 @@ pub use analysis::{
     ConstituentComparisonSummary,
     HarmonicAnalysis,
     Inference,
+    InferenceSource,
     // Tide gauge validation
     ModelExtractor,
     PrecomputedExtractor,
