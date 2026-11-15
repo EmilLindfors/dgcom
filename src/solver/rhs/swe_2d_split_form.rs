@@ -97,7 +97,7 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::rhs::subcells::{subcell_slot, telescoped_interfaces};
 use crate::solver::{SWESolution2D, SWEState2D};
 use crate::source::HydrostaticReconstruction2D;
-use crate::types::ElementIndex;
+use crate::types::{ElementIndex, Lane};
 
 use super::swe_2d::{SWE2DRhsConfig, SWEFormulation2D};
 
@@ -143,15 +143,16 @@ pub(super) const ELEMENT_CHUNK: usize = 64;
 ///   `h_min` (`δ ≤ 0`).
 ///
 /// At rest the term vanishes, so lake at rest is kept.
-#[inline]
-fn wall_ram_pressure(h: f64, un: f64, sill: f64, g: f64) -> f64 {
-    let un = un.max(0.0);
-    let head = un * un / (2.0 * g);
-    if sill > head {
-        (1.0 - head / sill) * h * un * (2.0 * un + (g * h).sqrt())
-    } else {
-        0.0
-    }
+#[inline(always)]
+fn wall_ram_pressure<T: Lane>(h: T, un: T, sill: T, g: f64) -> T {
+    let zero = h.constant(0.0);
+    let un = un.max(zero);
+    let head = un * un / h.constant(2.0 * g);
+    let ram = (h.constant(1.0) - head / sill)
+        * h
+        * un
+        * (h.constant(2.0) * un + (h.constant(g) * h).sqrt());
+    T::select(sill.greater_than(head), ram, zero)
 }
 
 /// Limited slope of one variable at node `ξ` of a subcell spanning
@@ -159,23 +160,69 @@ fn wall_ram_pressure(h: f64, un: f64, sill: f64, g: f64) -> f64 {
 /// the central slope, capped so that the face values `q + σ(x − ξ)` stay
 /// between the neighbouring node values (a monotonized-central limiter on the
 /// non-uniform GLL subcells); zero at an extremum.
-#[inline]
-fn limited_slope(q: [f64; 3], xi: [f64; 3], (x_l, x_r): (f64, f64)) -> f64 {
+#[inline(always)]
+fn limited_slope<T: Lane>(q: [T; 3], xi: [T; 3], (x_l, x_r): (T, T)) -> T {
+    let zero = q[0].constant(0.0);
     let (dm, dp) = (q[1] - q[0], q[2] - q[1]);
-    if dm * dp <= 0.0 {
-        return 0.0;
-    }
+    let extremum = (dm * dp).at_most(zero);
     let central = (q[2] - q[0]) / (xi[2] - xi[0]);
     // An end subcell has its face on the node, where the value is the node
     // value; bound its slope on that side as the standard MC limiter does
     // (face halfway to the neighbour), so that a round-off difference cannot
     // let the central slope through
-    let bound = |dq: f64, face: f64, node: f64| {
-        let dx = if face > 0.0 { face } else { 0.5 * node };
+    let half = q[0].constant(0.5);
+    let bound = |dq: T, face: T, node: T| {
+        let dx = T::select(face.greater_than(zero), face, half * node);
         (dq / dx).abs()
     };
     let bound = bound(dm, xi[1] - x_l, xi[1] - xi[0]).min(bound(dp, x_r - xi[1], xi[2] - xi[1]));
-    central.signum() * central.abs().min(bound)
+    // The sign of the central slope, nonzero away from an extremum
+    let one = q[0].constant(1.0);
+    let sign = T::select(central.less_than(zero), -one, one);
+    T::select(extremum, zero, sign * central.abs().min(bound))
+}
+
+/// What the hydrostatic HLL flux and the subcells' reconstruction read of a
+/// node: its depth, velocity and bed (no momenta). Generic over [`Lane`]:
+/// one node, or one per SIMD lane in the batched kernel.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Side<T = f64> {
+    h: T,
+    u: T,
+    v: T,
+    b: T,
+}
+
+impl<T: Lane> Side<T> {
+    /// Free-surface elevation η = h + B.
+    #[inline(always)]
+    fn eta(&self) -> T {
+        self.h + self.b
+    }
+
+    /// `if_true` in the lanes of `mask`, `if_false` in the others.
+    #[cfg_attr(not(feature = "simd"), allow(dead_code))]
+    #[inline(always)]
+    fn select(mask: T::Mask, if_true: Self, if_false: Self) -> Self {
+        Self {
+            h: T::select(mask, if_true.h, if_false.h),
+            u: T::select(mask, if_true.u, if_false.u),
+            v: T::select(mask, if_true.v, if_false.v),
+            b: T::select(mask, if_true.b, if_false.b),
+        }
+    }
+}
+
+impl<T: Copy> From<&SWENodeState2D<T>> for Side<T> {
+    #[inline(always)]
+    fn from(q: &SWENodeState2D<T>) -> Self {
+        Self {
+            h: q.h,
+            u: q.u,
+            v: q.v,
+            b: q.b,
+        }
+    }
 }
 
 /// Face states `(q_L, q_R)` of the subcell `[x_l, x_r]` around node `ξ`, from
@@ -203,44 +250,128 @@ fn limited_slope(q: [f64; 3], xi: [f64; 3], (x_l, x_r): (f64, f64)) -> f64 {
 ///   the hydrostatic reconstruction closes the interface to a wet side;
 /// - each side of an interface then sees the flux `½g h_face² (0, m)`, and
 ///   these balance `S_a`: `½g(h_R² − h_L²) = −½g(h_L + h_R)(B_R − B_L)`.
-#[inline]
-fn reconstruct_subcell(
-    nodes: [&SWENodeState2D; 3],
-    xi: [f64; 3],
-    subcell: (f64, f64),
+#[inline(always)]
+fn reconstruct_subcell<T: Lane>(
+    nodes: [Side<T>; 3],
+    xi: [T; 3],
+    subcell: (T, T),
     h_dry: f64,
-) -> (SWENodeState2D, SWENodeState2D) {
+) -> (Side<T>, Side<T>) {
     let [m, c, p] = nodes;
-    let slope = |f: fn(&SWENodeState2D) -> f64| limited_slope([f(m), f(c), f(p)], xi, subcell);
-    let wet_surface = nodes
-        .iter()
-        .filter(|n| n.h >= h_dry)
-        .fold(f64::NEG_INFINITY, |top, n| top.max(n.eta()));
-    let flooding = nodes.iter().any(|n| n.h < h_dry && n.eta() < wet_surface);
-    let (s_h, s_eta, s_u, s_v) = (
-        slope(|n| n.h),
-        if flooding {
-            0.0
-        } else {
-            slope(SWENodeState2D::eta)
-        },
-        slope(|n| n.u),
-        slope(|n| n.v),
-    );
-    let at = |x: f64| {
+    let zero = c.h.constant(0.0);
+    let h_dry = c.h.constant(h_dry);
+    let eta = [m.eta(), c.eta(), p.eta()];
+    let h = [m.h, c.h, p.h];
+    // The highest surface of the stencil's wet nodes
+    let mut wet_surface = c.h.constant(f64::NEG_INFINITY);
+    for (&h, &eta) in h.iter().zip(&eta) {
+        let higher = eta.greater_than(wet_surface);
+        wet_surface = T::select(h.at_least(h_dry) & higher, eta, wet_surface);
+    }
+    // A dry node below it
+    let mut flooding = c.h.none();
+    for (&h, &eta) in h.iter().zip(&eta) {
+        flooding = flooding | (h.less_than(h_dry) & eta.less_than(wet_surface));
+    }
+    let s_h = limited_slope(h, xi, subcell);
+    let s_eta = T::select(flooding, zero, limited_slope(eta, xi, subcell));
+    let s_u = limited_slope([m.u, c.u, p.u], xi, subcell);
+    let s_v = limited_slope([m.v, c.v, p.v], xi, subcell);
+    let at = |x: T| {
         let d = x - xi[1];
-        let h = (c.h + s_h * d).max(0.0);
-        let (u, v) = (c.u + s_u * d, c.v + s_v * d);
-        SWENodeState2D {
+        let h = (c.h + s_h * d).max(zero);
+        Side {
             h,
-            hu: h * u,
-            hv: h * v,
-            u,
-            v,
-            b: c.eta() + s_eta * d - h,
+            u: c.u + s_u * d,
+            v: c.v + s_v * d,
+            b: eta[1] + s_eta * d - h,
         }
     };
     (at(subcell.0), at(subcell.1))
+}
+
+/// HLL flux on hydrostatically reconstructed states in direction `m` (unit
+/// normal or contravariant vector), as seen from side `a` and from side `b`:
+/// `|m| F_HLL(q*_a, q*_b, m̂) + ½g(h² − h*²)(0, m)`, each with its own side's
+/// depths. The mass parts are equal (conservative); at lake at rest each
+/// equals the physical flux `½g h² (0, m)` of its side.
+///
+/// Audusse et al. (2004): `h* = max(0, η − max(B_a, B_b))` with the velocity
+/// kept (zero on a side at or below `h_min`), so `hu* = h* u`: the node
+/// states carry `u` and `v`, and HLL needs no division to recover them. HLL
+/// gives zero, without the pressure `½g h*²`, where both sides are at or
+/// below `h_min` (thin reconstructed subcell faces at a shoreline): the
+/// correction then restores all of `½g h²`, and a wet side faces a wall
+/// ([`wall_ram_pressure`]), which lies along `+m` from side a and along `−m`
+/// from side b.
+///
+/// Generic over [`Lane`]: the scalar, batched and GPU kernels share it.
+#[inline(always)]
+fn hydrostatic_hll<T: Lane>(
+    q_a: &Side<T>,
+    q_b: &Side<T>,
+    m: (T, T),
+    g: f64,
+    h_min: f64,
+) -> (SWEState2D<T>, SWEState2D<T>) {
+    let zero = m.0.constant(0.0);
+    let h_min_v = m.0.constant(h_min);
+    let norm = (m.0 * m.0 + m.1 * m.1).sqrt();
+    let (nx, ny) = (m.0 / norm, m.1 / norm);
+    let b_face = q_a.b.max(q_b.b);
+    let side = |q: &Side<T>| {
+        let h_star = (q.h + q.b - b_face).max(zero);
+        let wet = q.h.greater_than(h_min_v);
+        let (u, v) = (T::select(wet, q.u, zero), T::select(wet, q.v, zero));
+        let (un, ut) = (u * nx + v * ny, -u * ny + v * nx);
+        let (hun, hut) = (h_star * un, h_star * ut);
+        let star_wet = h_star.greater_than(h_min_v);
+        HllSide {
+            h: h_star,
+            hun,
+            hut,
+            un: T::select(star_wet, un, zero),
+            ut: T::select(star_wet, ut, zero),
+        }
+    };
+    let (a, b) = (side(q_a), side(q_b));
+    let rotated = rotate_from_normal(&hll_flux_face_aligned(a, b, g, h_min), nx, ny);
+    let flux = SWEState2D {
+        h: norm * rotated.h,
+        hu: norm * rotated.hu,
+        hv: norm * rotated.hv,
+    };
+    // Pressure as in F(q)·m = F#(q, q)·m: all of it where HLL is dry
+    let hll_dry = a.h.at_most(h_min_v) & b.h.at_most(h_min_v);
+    let (h_star_a, h_star_b) = (T::select(hll_dry, zero, a.h), T::select(hll_dry, zero, b.h));
+    // (zero unless a side is dry: two divisions and a square root per side
+    // that most faces do not need)
+    let (wall_a, wall_b) = if T::any(hll_dry) {
+        let wall = |q: &Side<T>, towards: f64| {
+            let un = q.u.constant(towards) * (q.u * nx + q.v * ny);
+            let sill = b_face - (q.h + q.b);
+            let ram = wall_ram_pressure(q.h, un, sill, g);
+            T::select(hll_dry & q.h.greater_than(h_min_v), ram, zero)
+        };
+        (wall(q_a, 1.0), wall(q_b, -1.0))
+    } else {
+        (zero, zero)
+    };
+    let half_g = m.0.constant(0.5 * g);
+    let dp_a = half_g * (q_a.h * q_a.h - h_star_a * h_star_a) + wall_a;
+    let dp_b = half_g * (q_b.h * q_b.h - h_star_b * h_star_b) + wall_b;
+    (
+        SWEState2D {
+            h: flux.h + zero,
+            hu: flux.hu + dp_a * m.0,
+            hv: flux.hv + dp_a * m.1,
+        },
+        SWEState2D {
+            h: flux.h + zero,
+            hu: flux.hu + dp_b * m.0,
+            hv: flux.hv + dp_b * m.1,
+        },
+    )
 }
 
 /// Interface flux of a split form.
@@ -268,7 +399,7 @@ pub(super) struct SplitFormWorkspace {
     /// node metrics at the two line ends
     interfaces: Vec<(f64, f64)>,
     /// Reconstructed (left, right) face states of the subcells of one line
-    faces: Vec<(SWENodeState2D, SWENodeState2D)>,
+    faces: Vec<(Side, Side)>,
     /// Per face node (`face · n_1d + fi`): the first interior node of the
     /// neighbour element on the GLL line through it, and its distance from
     /// the face in this element's reference coordinate (`None` at boundaries)
@@ -477,7 +608,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     ) -> (SWEState2D, SWEState2D) {
         match self.surface {
             SurfaceFlux::HydrostaticHll => {
-                let (f_a, f_b) = self.hydrostatic_hll(q_a, q_b, n, g);
+                let (f_a, f_b) =
+                    hydrostatic_hll(&q_a.into(), &q_b.into(), n, g, self.reconstruction.h_min);
                 (f_a, -f_b)
             }
             surface => {
@@ -737,65 +869,6 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         }
     }
 
-    /// HLL flux on hydrostatically reconstructed states in direction `m`
-    /// (unit normal or contravariant vector), as seen from side `a` and from
-    /// side `b`: `|m| F_HLL(q*_a, q*_b, m̂) + ½g(h² − h*²)(0, m)`, each with
-    /// its own side's depths. The mass parts are equal (conservative); at lake
-    /// at rest each equals the physical flux `½g h² (0, m)` of its side.
-    #[inline]
-    fn hydrostatic_hll(
-        &self,
-        q_a: &SWENodeState2D,
-        q_b: &SWENodeState2D,
-        m: (f64, f64),
-        g: f64,
-    ) -> (SWEState2D, SWEState2D) {
-        let h_min = self.reconstruction.h_min;
-        let norm = (m.0 * m.0 + m.1 * m.1).sqrt();
-        let (nx, ny) = (m.0 / norm, m.1 / norm);
-        // Audusse et al. (2004): h* = max(0, η − max(B_a, B_b)) with the
-        // velocity kept (zero on a side at or below h_min), so hu* = h* u.
-        // The node states carry u and v: HLL needs no division to recover them.
-        let b_face = q_a.b.max(q_b.b);
-        let side = |q: &SWENodeState2D| {
-            let h_star = (q.h + q.b - b_face).max(0.0);
-            let (u, v) = if q.h > h_min { (q.u, q.v) } else { (0.0, 0.0) };
-            let (un, ut) = (u * nx + v * ny, -u * ny + v * nx);
-            let (hun, hut) = (h_star * un, h_star * ut);
-            let (un, ut) = if h_star > h_min { (un, ut) } else { (0.0, 0.0) };
-            HllSide {
-                h: h_star,
-                hun,
-                hut,
-                un,
-                ut,
-            }
-        };
-        let (a_star, b_star) = (side(q_a), side(q_b));
-        let flux =
-            norm * rotate_from_normal(&hll_flux_face_aligned(a_star, b_star, g, h_min), nx, ny);
-        // HLL returns zero, without the pressure ½g h*², when both sides are
-        // below h_min (thin reconstructed subcell faces at a shoreline): the
-        // correction then restores all of ½g h²
-        let hll_dry = a_star.h <= h_min && b_star.h <= h_min;
-        // Pressure as in F(q)·m = F#(q, q)·m (no dry cutoff); where no water
-        // passes, a wet side faces a wall (see `wall_ram_pressure`), which
-        // lies along +m from side a and along −m from side b
-        let correction = |q: &SWENodeState2D, h_star: f64, towards: f64| {
-            let h = q.h;
-            let mut dp = 0.5 * g * (h * h - if hll_dry { 0.0 } else { h_star * h_star });
-            if hll_dry && h > h_min {
-                let (un, sill) = (towards * (q.u * nx + q.v * ny), b_face - (h + q.b));
-                dp += wall_ram_pressure(h, un, sill, g);
-            }
-            SWEState2D::new(0.0, dp * m.0, dp * m.1)
-        };
-        (
-            flux + correction(q_a, a_star.h, 1.0),
-            flux + correction(q_b, b_star.h, -1.0),
-        )
-    }
-
     /// Accumulate (times J) the subcell finite-volume update along one line of
     /// nodes `idx(0..n1)`:
     ///
@@ -869,21 +942,21 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         // value, and take their outer slope neighbour from the next element.
         let mut x_left = -1.0;
         for a in 0..n1 {
-            let q = ws.nodes[idx(a)];
+            let q = Side::from(&ws.nodes[idx(a)]);
             let x_right = x_left + w[a];
             let left = if a > 0 {
-                Some((ws.nodes[idx(a - 1)], xi[a - 1]))
+                Some((Side::from(&ws.nodes[idx(a - 1)]), xi[a - 1]))
             } else {
-                ends[0].map(|(s, d)| (s, -1.0 - d))
+                ends[0].map(|(s, d)| (Side::from(&s), -1.0 - d))
             };
             let right = if a + 1 < n1 {
-                Some((ws.nodes[idx(a + 1)], xi[a + 1]))
+                Some((Side::from(&ws.nodes[idx(a + 1)]), xi[a + 1]))
             } else {
-                ends[1].map(|(s, d)| (s, 1.0 + d))
+                ends[1].map(|(s, d)| (Side::from(&s), 1.0 + d))
             };
             ws.faces[a] = match (left, right) {
                 (Some((l, x_l)), Some((r, x_r))) => {
-                    reconstruct_subcell([&l, &q, &r], [x_l, xi[a], x_r], (x_left, x_right), h_dry)
+                    reconstruct_subcell([l, q, r], [x_l, xi[a], x_r], (x_left, x_right), h_dry)
                 }
                 _ => (q, q),
             };
@@ -893,7 +966,13 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         for a in 0..n1 - 1 {
             let (ia, ib) = (idx(a), idx(a + 1));
             let m = ws.interfaces[a + 1];
-            let (f_a, f_b) = self.hydrostatic_hll(&ws.faces[a].1, &ws.faces[a + 1].0, m, g);
+            let (f_a, f_b) = hydrostatic_hll(
+                &ws.faces[a].1,
+                &ws.faces[a + 1].0,
+                m,
+                g,
+                self.reconstruction.h_min,
+            );
             if let Some(mass) = mass.as_deref_mut() {
                 mass[a] = f_a.h;
             }

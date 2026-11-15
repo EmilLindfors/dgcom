@@ -9,21 +9,24 @@ use std::ops::{Add, Mul, Neg, Sub};
 
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
-use crate::types::{Depth, ElementIndex};
+use crate::types::{Depth, ElementIndex, Lane};
 
 use super::super::core::SystemSolution2D;
 
 /// 2D Shallow water state: (h, hu, hv).
 ///
-/// Stores the conserved variables for 2D shallow water equations.
+/// Stores the conserved variables for 2D shallow water equations, or a flux
+/// of them. `T` is `f64` except in the pointwise physics shared by the scalar,
+/// batched and GPU kernels ([`Lane`]), where it may hold one value per SIMD
+/// lane.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct SWEState2D {
+pub struct SWEState2D<T = f64> {
     /// Water depth h (must be non-negative)
-    pub h: f64,
+    pub h: T,
     /// x-momentum hu = h * u
-    pub hu: f64,
+    pub hu: T,
     /// y-momentum hv = h * v
-    pub hv: f64,
+    pub hv: T,
 }
 
 impl SWEState2D {
@@ -137,9 +140,10 @@ impl SWEState2D {
     }
 }
 
-impl Add for SWEState2D {
+impl<T: Lane> Add for SWEState2D<T> {
     type Output = Self;
 
+    #[inline(always)]
     fn add(self, other: Self) -> Self {
         Self {
             h: self.h + other.h,
@@ -149,9 +153,10 @@ impl Add for SWEState2D {
     }
 }
 
-impl Sub for SWEState2D {
+impl<T: Lane> Sub for SWEState2D<T> {
     type Output = Self;
 
+    #[inline(always)]
     fn sub(self, other: Self) -> Self {
         Self {
             h: self.h - other.h,
@@ -161,9 +166,10 @@ impl Sub for SWEState2D {
     }
 }
 
-impl Neg for SWEState2D {
+impl<T: Lane> Neg for SWEState2D<T> {
     type Output = Self;
 
+    #[inline(always)]
     fn neg(self) -> Self {
         Self {
             h: -self.h,

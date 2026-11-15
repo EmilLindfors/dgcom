@@ -161,12 +161,11 @@ Summary as of 2026-10-10; the details and open items are in `notes/` and `TODO.m
    must keep the convergence and conservation tests passing.
 2. **Don't allocate in the RHS** — and don't add new APIs shaped
    `fn rhs(&state) -> State`; use write-into signatures.
-3. **Don't add a third copy of the physics for the GPU** — the GPU kernels
-   (P2.7, `notes/gpu.md`) call the scalar CPU kernel's pointwise functions
-   and are gated bit for bit against both CPU copies (scalar and the SIMD
-   batch) in a build without FMA contraction. The batch is still a second
-   copy; making the pointwise physics generic over the lane type is the
-   open Phase 1 decision.
+3. **Don't copy the pointwise physics** — the split form's fluxes and
+   reconstruction are written once, generic over `types::Lane`: the scalar
+   kernel and the GPU kernels (P2.7, `notes/gpu.md`) instantiate them with
+   `f64`, the SIMD batch with `f64x8`. A kernel for a new target keeps its
+   own loops and reads, and calls these.
 4. **Don't add another hand-rolled integrator or run loop** — implement
    `Integrable` and use `SSPRK3`/`Simulation`.
 5. **Don't preserve backwards compatibility** — pre-1.0, no external

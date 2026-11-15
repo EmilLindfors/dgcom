@@ -13,6 +13,7 @@
 //! Reference: Toro, "Riemann Solvers and Numerical Methods for Fluid Dynamics"
 
 use crate::solver::SWEState2D;
+use crate::types::Lane;
 
 /// Rotate 2D SWE state to face-aligned coordinates.
 ///
@@ -33,8 +34,8 @@ fn rotate_to_normal(state: &SWEState2D, nx: f64, ny: f64) -> SWEState2D {
 /// Transforms (F_n, F_t) to (F_x, F_y) where:
 /// - F_x = F_n * nx - F_t * ny
 /// - F_y = F_n * ny + F_t * nx
-#[inline]
-pub(crate) fn rotate_from_normal(flux: &SWEState2D, nx: f64, ny: f64) -> SWEState2D {
+#[inline(always)]
+pub(crate) fn rotate_from_normal<T: Lane>(flux: &SWEState2D<T>, nx: T, ny: T) -> SWEState2D<T> {
     SWEState2D {
         h: flux.h,
         hu: flux.hu * nx - flux.hv * ny,
@@ -230,12 +231,24 @@ pub fn hll_flux_swe_2d(
 /// wave speeds and fluxes use (zero on a side at or below `h_min`; the
 /// momenta still enter the dissipation term).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct HllSide {
-    pub h: f64,
-    pub hun: f64,
-    pub hut: f64,
-    pub un: f64,
-    pub ut: f64,
+pub(crate) struct HllSide<T = f64> {
+    pub h: T,
+    pub hun: T,
+    pub hut: T,
+    pub un: T,
+    pub ut: T,
+}
+
+impl<T: Lane> HllSide<T> {
+    /// The physical flux in face-aligned components, with `half_g` = ½g.
+    #[inline(always)]
+    fn flux(self, half_g: T) -> SWEState2D<T> {
+        SWEState2D {
+            h: self.h * self.un,
+            hu: self.h * self.un * self.un + half_g * self.h * self.h,
+            hv: self.h * self.un * self.ut,
+        }
+    }
 }
 
 impl HllSide {
@@ -255,84 +268,97 @@ impl HllSide {
 /// normal and tangential momentum), from sides whose velocities are already
 /// known, so that callers holding velocities (the split-form kernel) skip
 /// the divisions.
-pub(crate) fn hll_flux_face_aligned(l: HllSide, r: HllSide, g: f64, h_min: f64) -> SWEState2D {
+///
+/// Generic over [`Lane`] (the scalar, batched and GPU kernels share it): its
+/// branches are selects. Both sides at or below `h_min` give zero; else the
+/// left flux where `s_l ≥ 0`, the right where `s_r ≤ 0`, the star flux
+/// between.
+#[inline(always)]
+pub(crate) fn hll_flux_face_aligned<T: Lane>(
+    l: HllSide<T>,
+    r: HllSide<T>,
+    g: f64,
+    h_min: f64,
+) -> SWEState2D<T> {
     let (h_l, h_r) = (l.h, r.h);
+    let zero = h_l.constant(0.0);
+    let h_min_v = h_l.constant(h_min);
+    let dry = h_l.at_most(h_min_v) & h_r.at_most(h_min_v);
 
-    // Handle dry cells
-    if h_l <= h_min && h_r <= h_min {
-        return SWEState2D::zero();
-    }
-
-    let c_l = (g * h_l.max(0.0)).sqrt();
-    let c_r = (g * h_r.max(0.0)).sqrt();
+    let g_v = h_l.constant(g);
+    let c_l = (g_v * h_l.max(zero)).sqrt();
+    let c_r = (g_v * h_r.max(zero)).sqrt();
 
     // Wave speed estimates (Einfeldt)
     let (s_l, s_r) = einfeldt_speeds_2d(h_l, h_r, l.un, r.un, c_l, c_r, g, h_min);
 
     // Physical fluxes in rotated coordinates
-    let f_l = SWEState2D {
-        h: h_l * l.un,
-        hu: h_l * l.un * l.un + 0.5 * g * h_l * h_l,
-        hv: h_l * l.un * l.ut,
-    };
-
-    let f_r = SWEState2D {
-        h: h_r * r.un,
-        hu: h_r * r.un * r.un + 0.5 * g * h_r * h_r,
-        hv: h_r * r.un * r.ut,
-    };
+    let half_g = h_l.constant(0.5 * g);
+    let (f_l, f_r) = (l.flux(half_g), r.flux(half_g));
 
     // HLL flux in rotated coordinates
-    if s_l >= 0.0 {
-        f_l
-    } else if s_r <= 0.0 {
-        f_r
-    } else {
-        let inv_ds = 1.0 / (s_r - s_l);
-        SWEState2D {
-            h: inv_ds * (s_r * f_l.h - s_l * f_r.h + s_l * s_r * (h_r - h_l)),
-            hu: inv_ds * (s_r * f_l.hu - s_l * f_r.hu + s_l * s_r * (r.hun - l.hun)),
-            hv: inv_ds * (s_r * f_l.hv - s_l * f_r.hv + s_l * s_r * (r.hut - l.hut)),
-        }
+    let inv_ds = h_l.constant(1.0) / (s_r - s_l);
+    let s_lr = s_l * s_r;
+    let star = SWEState2D {
+        h: inv_ds * (s_r * f_l.h - s_l * f_r.h + s_lr * (h_r - h_l)),
+        hu: inv_ds * (s_r * f_l.hu - s_l * f_r.hu + s_lr * (r.hun - l.hun)),
+        hv: inv_ds * (s_r * f_l.hv - s_l * f_r.hv + s_lr * (r.hut - l.hut)),
+    };
+    let (from_l, from_r) = (s_l.at_least(zero), s_r.at_most(zero));
+    let pick = |f_l: T, f_r: T, star: T| {
+        T::select(
+            dry,
+            zero,
+            T::select(from_l, f_l, T::select(from_r, f_r, star)),
+        )
+    };
+    SWEState2D {
+        h: pick(f_l.h, f_r.h, star.h),
+        hu: pick(f_l.hu, f_r.hu, star.hu),
+        hv: pick(f_l.hv, f_r.hv, star.hv),
     }
 }
 
-/// Einfeldt wave speed estimates for 2D.
-fn einfeldt_speeds_2d(
-    h_l: f64,
-    h_r: f64,
-    un_l: f64,
-    un_r: f64,
-    c_l: f64,
-    c_r: f64,
+/// Einfeldt wave speed estimates for 2D (generic over [`Lane`]: the
+/// branches are selects).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn einfeldt_speeds_2d<T: Lane>(
+    h_l: T,
+    h_r: T,
+    un_l: T,
+    un_r: T,
+    c_l: T,
+    c_r: T,
     g: f64,
     h_min: f64,
-) -> (f64, f64) {
-    // Roe-averaged quantities
-    let sqrt_h_l = h_l.max(0.0).sqrt();
-    let sqrt_h_r = h_r.max(0.0).sqrt();
+) -> (T, T) {
+    let zero = h_l.constant(0.0);
+    let two = h_l.constant(2.0);
+    let h_min = h_l.constant(h_min);
 
-    let (un_roe, c_roe) = if sqrt_h_l + sqrt_h_r > 1e-10 {
-        let h_roe = 0.5 * (h_l + h_r);
-        let un_roe = (sqrt_h_l * un_l + sqrt_h_r * un_r) / (sqrt_h_l + sqrt_h_r);
-        let c_roe = (g * h_roe).sqrt();
-        (un_roe, c_roe)
-    } else {
-        (0.0, 0.0)
-    };
+    // Roe-averaged quantities (zero where both depths vanish)
+    let sqrt_h_l = h_l.max(zero).sqrt();
+    let sqrt_h_r = h_r.max(zero).sqrt();
+    let roe = (sqrt_h_l + sqrt_h_r).greater_than(h_l.constant(1e-10));
+    let h_roe = h_l.constant(0.5) * (h_l + h_r);
+    let un_roe = T::select(
+        roe,
+        (sqrt_h_l * un_l + sqrt_h_r * un_r) / (sqrt_h_l + sqrt_h_r),
+        zero,
+    );
+    let c_roe = T::select(roe, (h_l.constant(g) * h_roe).sqrt(), zero);
 
-    let s_l = if h_l > h_min {
-        (un_l - c_l).min(un_roe - c_roe)
-    } else {
-        un_r - 2.0 * c_r
-    };
-
-    let s_r = if h_r > h_min {
-        (un_r + c_r).max(un_roe + c_roe)
-    } else {
-        un_l + 2.0 * c_l
-    };
-
+    let s_l = T::select(
+        h_l.greater_than(h_min),
+        (un_l - c_l).min(un_roe - c_roe),
+        un_r - two * c_r,
+    );
+    let s_r = T::select(
+        h_r.greater_than(h_min),
+        (un_r + c_r).max(un_roe + c_roe),
+        un_l + two * c_l,
+    );
     (s_l, s_r)
 }
 
