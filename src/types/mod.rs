@@ -31,12 +31,14 @@
 
 mod bounds;
 mod indices;
+mod lane;
 mod physical;
 mod resolution;
 mod sides;
 
 pub use bounds::Bounds2D;
 pub use indices::{ElementIndex, FaceIndex, LevelIndex, NodeIndex};
+pub use lane::Lane;
 pub use physical::{Depth, Elevation, PhysicalZ, Sigma};
 pub use resolution::Resolution2D;
 pub use sides::SideBoundaries;

@@ -66,25 +66,27 @@
 //!   shallow water equations", Appl. Math. Comput. 272.
 
 use crate::solver::SWEState2D;
+use crate::types::Lane;
 
 /// SWE state at one node together with its bed elevation and velocity.
 ///
 /// Precomputing the velocity once per node keeps the O(p³) flux-differencing
-/// loops free of divisions.
+/// loops free of divisions. `T` is `f64` except in the pointwise physics shared
+/// by the scalar, batched and GPU kernels ([`Lane`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct SWENodeState2D {
+pub struct SWENodeState2D<T = f64> {
     /// Water depth h
-    pub h: f64,
+    pub h: T,
     /// x-momentum hu
-    pub hu: f64,
+    pub hu: T,
     /// y-momentum hv
-    pub hv: f64,
+    pub hv: T,
     /// x-velocity hu/h (zero for dry nodes)
-    pub u: f64,
+    pub u: T,
     /// y-velocity hv/h (zero for dry nodes)
-    pub v: f64,
+    pub v: T,
     /// Bed elevation B
-    pub b: f64,
+    pub b: T,
 }
 
 impl SWENodeState2D {
@@ -107,11 +109,26 @@ impl SWENodeState2D {
             b,
         }
     }
+}
 
+impl<T: Lane> SWENodeState2D<T> {
     /// Free-surface elevation η = h + B.
-    #[inline]
-    pub fn eta(&self) -> f64 {
+    #[inline(always)]
+    pub fn eta(&self) -> T {
         self.h + self.b
+    }
+
+    /// `if_true` in the lanes of `mask`, `if_false` in the others.
+    #[inline(always)]
+    pub fn select(mask: T::Mask, if_true: Self, if_false: Self) -> Self {
+        Self {
+            h: T::select(mask, if_true.h, if_false.h),
+            hu: T::select(mask, if_true.hu, if_false.hu),
+            hv: T::select(mask, if_true.hv, if_false.hv),
+            u: T::select(mask, if_true.u, if_false.u),
+            v: T::select(mask, if_true.v, if_false.v),
+            b: T::select(mask, if_true.b, if_false.b),
+        }
     }
 }
 
@@ -120,19 +137,20 @@ impl SWENodeState2D {
 /// `m` need not be a unit vector: the volume term uses the contravariant
 /// metric vectors `(r_x, r_y)` and `(s_x, s_y)`, faces the unit normal.
 /// `F#(q, q)·m` is the physical flux `F(q)·m`.
-#[inline]
-pub fn wintermeyer_flux_2d(
-    q_l: &SWENodeState2D,
-    q_r: &SWENodeState2D,
-    m: (f64, f64),
+#[inline(always)]
+pub fn wintermeyer_flux_2d<T: Lane>(
+    q_l: &SWENodeState2D<T>,
+    q_r: &SWENodeState2D<T>,
+    m: (T, T),
     g: f64,
-) -> SWEState2D {
+) -> SWEState2D<T> {
     // Every operation is commutative in the two states, so the flux is bitwise
     // symmetric and the face terms of neighbouring elements cancel exactly.
-    let mass = 0.5 * ((q_l.hu + q_r.hu) * m.0 + (q_l.hv + q_r.hv) * m.1);
-    let pressure = 0.5 * g * (q_l.h * q_r.h);
-    let u_avg = 0.5 * (q_l.u + q_r.u);
-    let v_avg = 0.5 * (q_l.v + q_r.v);
+    let half = q_l.h.constant(0.5);
+    let mass = half * ((q_l.hu + q_r.hu) * m.0 + (q_l.hv + q_r.hv) * m.1);
+    let pressure = q_l.h.constant(0.5 * g) * (q_l.h * q_r.h);
+    let u_avg = half * (q_l.u + q_r.u);
+    let v_avg = half * (q_l.v + q_r.v);
     SWEState2D {
         h: mass,
         hu: mass * u_avg + pressure * m.0,

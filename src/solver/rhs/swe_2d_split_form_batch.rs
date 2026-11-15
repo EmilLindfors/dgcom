@@ -13,9 +13,16 @@
 //! time. The node states and bed of a batch are transposed into
 //! `[node][lane]` vectors, the loops run on them in the scalar order, and
 //! each element's terms go to [`SplitFormWorkspace::batch`], from where
-//! [`SplitFormSWE2D::element_rhs`] copies them out. The subcells' branches
-//! (incomplete stencils at boundaries, the limiter's extrema, the dry-node
-//! rule for `η`, dry HLL sides, upwind wave speeds) become selects.
+//! [`SplitFormSWE2D::element_rhs`] copies them out.
+//!
+//! **One source for the physics.** The pointwise physics is the scalar
+//! kernel's own, instantiated on `f64x8` ([`crate::types::Lane`]): the
+//! two-point flux (`wintermeyer_flux_2d`), the hydrostatic HLL with its wave
+//! speeds and wall pressure (`hydrostatic_hll`) and the subcells' limited
+//! reconstruction (`reconstruct_subcell`), written once for the scalar, batched
+//! and GPU kernels. Their branches (the limiter's extrema, the dry-node rule
+//! for `η`, dry HLL sides, upwind wave speeds) are selects there; this module
+//! keeps what a batch reads and its loops.
 //!
 //! **What a batch reads.** Arithmetic is the smaller part of an element's
 //! cost: the kernel is bound by what it reads (`notes/performance.md`, P2.8,
@@ -45,8 +52,7 @@
 //! vector at every node, whose pair average `½(m + m) = m` is exact, and
 //! where the two forms associate differently (the bed term, the subcell
 //! interface metrics and balance term) both are computed and selected per
-//! lane. `f64::max`/`min`/`signum` become compare-and-select, which agrees
-//! with them except for NaN arguments and a tie of +0 with −0.
+//! lane. The incomplete subcell stencils at boundaries are selects too.
 //!
 //! Boundary faces take their flux from the scalar
 //! [`SplitFormSWE2D::boundary_flux`]; the unused lanes of a short batch
@@ -54,9 +60,12 @@
 
 use fearless_simd::{Level, dispatch, f64x8, mask64x8, prelude::*};
 
-use super::{ELEMENT_CHUNK, SplitFormSWE2D, SplitFormWorkspace, SurfaceFlux, VOLUME_BATCH};
+use super::{
+    ELEMENT_CHUNK, SplitFormSWE2D, SplitFormWorkspace, SurfaceFlux, VOLUME_BATCH, hydrostatic_hll,
+    reconstruct_subcell,
+};
 use crate::boundary::SWEBoundaryCondition2D;
-use crate::flux::SWENodeState2D;
+use crate::flux::{SWENodeState2D, wintermeyer_flux_2d};
 use crate::mesh::FaceLink;
 use crate::solver::SWEState2D;
 use crate::solver::rhs::subcells::line_node;
@@ -283,7 +292,7 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         let fused = self.surface == SurfaceFlux::HydrostaticHll;
         let [q_h, q_hu, q_hv] = &self.q.data;
         let bed = self.config.bathymetry.map(|b| &b.data[..]);
-        let nodes = data.nodes(simd, g);
+        let nodes = data.nodes(g);
         let n_lanes = at.slots.len();
         let zero = f64x8::<S>::splat(simd, 0.0);
         let h_min_v = f64x8::<S>::splat(simd, h_min);
@@ -373,17 +382,23 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                 if fused {
                     // SWENodeState2D::new of the neighbour's node
                     let h = f64x8::<S>::from_slice(simd, &other[0]);
+                    let (hu, hv) = (
+                        f64x8::<S>::from_slice(simd, &other[1]),
+                        f64x8::<S>::from_slice(simd, &other[2]),
+                    );
                     let wet = h.simd_gt(h_min_v);
-                    let neighbour = Side {
+                    let neighbour = Node {
                         h,
-                        u: wet.select(f64x8::<S>::from_slice(simd, &other[1]) / h, zero),
-                        v: wet.select(f64x8::<S>::from_slice(simd, &other[2]) / h, zero),
+                        hu,
+                        hv,
+                        u: wet.select(hu / h, zero),
+                        v: wet.select(hv / h, zero),
                         b: f64x8::<S>::from_slice(simd, &other[3]),
                     };
                     let this = data.side(node);
                     let (a, b) = (
-                        neighbour.select(is_left, this),
-                        this.select(is_left, neighbour),
+                        Node::select(is_left, this, neighbour),
+                        Node::select(is_left, neighbour, this),
                     );
                     // The edge's normal is its left side's
                     let (mut mx, mut my) = (is_left.select(nx, -nx), is_left.select(ny, -ny));
@@ -392,7 +407,7 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                         my = is_apart.select(f64x8::<S>::from_slice(simd, &normal[1]), my);
                     }
                     // surface_flux: (F_a, −F_b); boundary lanes keep their F*
-                    let (f_a, f_b) = hydrostatic_hll(simd, a, b, (mx, my), g, h_min);
+                    let (f_a, f_b) = hydrostatic_hll(&a, &b, (mx, my), g, h_min);
                     star = Flux {
                         h: is_boundary.select(star.h, is_left.select(f_a.h, -f_b.h)),
                         hu: is_boundary.select(star.hu, is_left.select(f_a.hu, -f_b.hu)),
@@ -527,7 +542,7 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         let zero = f64x8::<S>::splat(simd, 0.0);
         let half = f64x8::<S>::splat(simd, 0.5);
         let g_v = f64x8::<S>::splat(simd, g);
-        let nodes = data.nodes(simd, g);
+        let nodes = data.nodes(g);
         let [rh, rhu, rhv] = rhs;
 
         for line in 0..N1 {
@@ -605,8 +620,10 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         let r0 = f64x8::<S>::splat(simd, ops.nodes_r[0]);
         let s0 = f64x8::<S>::splat(simd, ops.nodes_s[0]);
         let empty = Outer {
-            node: Side {
+            node: Node {
                 h: zero,
+                hu: zero,
+                hv: zero,
                 u: zero,
                 v: zero,
                 b: zero,
@@ -673,11 +690,17 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                 }
                 // SWENodeState2D::new
                 let h = f64x8::<S>::from_slice(simd, &t[0]);
+                let (hu, hv) = (
+                    f64x8::<S>::from_slice(simd, &t[1]),
+                    f64x8::<S>::from_slice(simd, &t[2]),
+                );
                 let wet = h.simd_gt(h_min);
-                let node = Side {
+                let node = Node {
                     h,
-                    u: wet.select(f64x8::<S>::from_slice(simd, &t[1]) / h, zero),
-                    v: wet.select(f64x8::<S>::from_slice(simd, &t[2]) / h, zero),
+                    hu,
+                    hv,
+                    u: wet.select(hu / h, zero),
+                    v: wet.select(hv / h, zero),
                     b: f64x8::<S>::from_slice(simd, &t[3]),
                 };
                 // Heights J / sJ normal to the face (a parallelogram's J at
@@ -721,7 +744,7 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         let d1 = &self.ops.dr_1d_row_major;
         let zero = f64x8::<S>::splat(simd, 0.0);
         let half = f64x8::<S>::splat(simd, 0.5);
-        let nodes = data.nodes(simd, g);
+        let nodes = data.nodes(g);
         let outer = self.gather_outer::<S, N1, NN>(simd, data, lanes);
         let [rh, rhu, rhv] = rhs;
 
@@ -802,14 +825,19 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                     };
                     let x_c = f64x8::<S>::splat(simd, xi[a]);
                     let (face_l, face_r) = reconstruct_subcell(
-                        simd,
                         [left, q, right],
                         [x_l, x_c, x_r],
-                        (x_left, x_right),
+                        (
+                            f64x8::<S>::splat(simd, x_left),
+                            f64x8::<S>::splat(simd, x_right),
+                        ),
                         h_dry,
                     );
                     let complete = left_present & right_present;
-                    faces[a] = (q.select(complete, face_l), q.select(complete, face_r));
+                    faces[a] = (
+                        Node::select(complete, face_l, q),
+                        Node::select(complete, face_r, q),
+                    );
                     x_left = x_right;
                 }
 
@@ -818,7 +846,7 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                     let (ia, ib) = (idx(a), idx(a + 1));
                     let m = interfaces[a + 1];
                     let (f_a, f_b) =
-                        hydrostatic_hll(simd, faces[a].1, faces[a + 1].0, (m.0, m.1), g, h_min);
+                        hydrostatic_hll(&faces[a].1, &faces[a + 1].0, (m.0, m.1), g, h_min);
                     mass[(direction * N1 + line) * (N1 - 1) + a] = f_a.h;
                     let s = f64x8::<S>::splat(simd, 1.0 / w[a]);
                     rh[ia] -= s * f_a.h;
@@ -977,9 +1005,11 @@ struct Lanes<'a> {
 impl<S: Simd, const NN: usize> Batch<S, NN> {
     /// The state of node `i` as a face state.
     #[inline(always)]
-    fn side(&self, i: usize) -> Side<S> {
-        Side {
+    fn side(&self, i: usize) -> Node<S> {
+        Node {
             h: self.h[i],
+            hu: self.hu[i],
+            hv: self.hv[i],
             u: self.u[i],
             v: self.v[i],
             b: self.b[i],
@@ -987,16 +1017,8 @@ impl<S: Simd, const NN: usize> Batch<S, NN> {
     }
 
     #[inline(always)]
-    fn nodes(&self, simd: S, g: f64) -> Nodes<'_, S, NN> {
-        Nodes {
-            h: &self.h,
-            hu: &self.hu,
-            hv: &self.hv,
-            u: &self.u,
-            v: &self.v,
-            half: f64x8::<S>::splat(simd, 0.5),
-            half_g: f64x8::<S>::splat(simd, 0.5 * g),
-        }
+    fn nodes(&self, g: f64) -> Nodes<'_, S, NN> {
+        Nodes { batch: self, g }
     }
 }
 
@@ -1004,81 +1026,9 @@ impl<S: Simd, const NN: usize> Batch<S, NN> {
 /// element's reference coordinate, and the lanes where it exists.
 #[derive(Clone, Copy)]
 struct Outer<S: Simd> {
-    node: Side<S>,
+    node: Node<S>,
     distance: f64x8<S>,
     present: mask64x8<S>,
-}
-
-/// `f64::signum(x) · f64::min(|x|, bound)` for a nonzero `x`.
-#[inline(always)]
-fn signed_min<S: Simd>(simd: S, x: f64x8<S>, bound: f64x8<S>) -> f64x8<S> {
-    let zero = f64x8::<S>::splat(simd, 0.0);
-    let one = f64x8::<S>::splat(simd, 1.0);
-    let sign = x.simd_lt(zero).select(-one, one);
-    sign * min(x.abs(), bound)
-}
-
-/// `limited_slope`: the central slope of `q` at `xi[1]`, capped so that the
-/// face values stay between the neighbouring node values; zero at an
-/// extremum.
-#[inline(always)]
-fn limited_slope<S: Simd>(
-    simd: S,
-    q: [f64x8<S>; 3],
-    xi: [f64x8<S>; 3],
-    (x_l, x_r): (f64x8<S>, f64x8<S>),
-) -> f64x8<S> {
-    let zero = f64x8::<S>::splat(simd, 0.0);
-    let half = f64x8::<S>::splat(simd, 0.5);
-    let (dm, dp) = (q[1] - q[0], q[2] - q[1]);
-    let extremum = (dm * dp).simd_le(zero);
-    let central = (q[2] - q[0]) / (xi[2] - xi[0]);
-    // bound(dq, face, node) = |dq / (face > 0 ? face : node / 2)|
-    let (face_m, node_m) = (xi[1] - x_l, xi[1] - xi[0]);
-    let (face_p, node_p) = (x_r - xi[1], xi[2] - xi[1]);
-    let bound_m = (dm / face_m.simd_gt(zero).select(face_m, half * node_m)).abs();
-    let bound_p = (dp / face_p.simd_gt(zero).select(face_p, half * node_p)).abs();
-    let bound = min(bound_m, bound_p);
-    extremum.select(zero, signed_min(simd, central, bound))
-}
-
-/// `reconstruct_subcell`: the face states of the subcell `[x_l, x_r]`
-/// around `nodes[1]` from a limited linear reconstruction of `h`, `η`, `u`
-/// and `v` (no `η` slope where a dry node lies below a wet surface of the
-/// stencil).
-#[inline(always)]
-fn reconstruct_subcell<S: Simd>(
-    simd: S,
-    nodes: [Side<S>; 3],
-    xi: [f64x8<S>; 3],
-    (x_l, x_r): (f64, f64),
-    h_dry: f64,
-) -> (Side<S>, Side<S>) {
-    let zero = f64x8::<S>::splat(simd, 0.0);
-    let h_dry = f64x8::<S>::splat(simd, h_dry);
-    let subcell = (f64x8::<S>::splat(simd, x_l), f64x8::<S>::splat(simd, x_r));
-    let [m, c, p] = nodes;
-    let eta = [m.h + m.b, c.h + c.b, p.h + p.b];
-    let h = [m.h, c.h, p.h];
-    let mut wet_surface = f64x8::<S>::splat(simd, f64::NEG_INFINITY);
-    for (h, eta) in h.iter().zip(&eta) {
-        // top.max(η) over the wet nodes
-        let higher = eta.simd_gt(wet_surface);
-        wet_surface = (h.simd_ge(h_dry) & higher).select(*eta, wet_surface);
-    }
-    let mut flooding = zero.simd_gt(zero);
-    for (h, eta) in h.iter().zip(&eta) {
-        flooding |= h.simd_lt(h_dry) & eta.simd_lt(wet_surface);
-    }
-    let s_h = limited_slope(simd, h, xi, subcell);
-    let s_eta = flooding.select(zero, limited_slope(simd, eta, xi, subcell));
-    let s_u = limited_slope(simd, [m.u, c.u, p.u], xi, subcell);
-    let s_v = limited_slope(simd, [m.v, c.v, p.v], xi, subcell);
-    let slopes = [s_h, s_eta, s_u, s_v];
-    (
-        reconstructed(simd, c, eta[1], slopes, subcell.0 - xi[1]),
-        reconstructed(simd, c, eta[1], slopes, subcell.1 - xi[1]),
-    )
 }
 
 /// `[node][lane]` vectors of the nodal `field` of the elements `lanes`: each
@@ -1155,17 +1105,12 @@ fn interleave4<S: Simd>(v: [f64x8<S>; L]) -> [f64x8<S>; L] {
 
 /// The node states of a batch of elements for the two-point flux.
 struct Nodes<'a, S: Simd, const NN: usize> {
-    h: &'a [f64x8<S>; NN],
-    hu: &'a [f64x8<S>; NN],
-    hv: &'a [f64x8<S>; NN],
-    u: &'a [f64x8<S>; NN],
-    v: &'a [f64x8<S>; NN],
-    half: f64x8<S>,
-    half_g: f64x8<S>,
+    batch: &'a Batch<S, NN>,
+    g: f64,
 }
 
 impl<S: Simd, const NN: usize> Nodes<'_, S, NN> {
-    /// `wintermeyer_flux_2d(q_l, q_r, m)`, operation for operation.
+    /// `wintermeyer_flux_2d(q_l, q_r, m)` of nodes `l` and `r`.
     #[inline(always)]
     fn flux(
         &self,
@@ -1174,231 +1119,18 @@ impl<S: Simd, const NN: usize> Nodes<'_, S, NN> {
         mx: f64x8<S>,
         my: f64x8<S>,
     ) -> (f64x8<S>, f64x8<S>, f64x8<S>) {
-        let (h, hu, hv, u, v) = (self.h, self.hu, self.hv, self.u, self.v);
-        let mass = self.half * ((hu[l] + hu[r]) * mx + (hv[l] + hv[r]) * my);
-        let pressure = self.half_g * (h[l] * h[r]);
-        let u_avg = self.half * (u[l] + u[r]);
-        let v_avg = self.half * (v[l] + v[r]);
-        (
-            mass,
-            mass * u_avg + pressure * mx,
-            mass * v_avg + pressure * my,
-        )
+        let f = wintermeyer_flux_2d(&self.batch.side(l), &self.batch.side(r), (mx, my), self.g);
+        (f.h, f.hu, f.hv)
     }
 }
 
-/// One side of a face for the batched hydrostatic HLL: the node states
-/// (`SWENodeState2D`) of [`VOLUME_BATCH`] face nodes, one per lane.
-#[derive(Clone, Copy)]
-struct Side<S: Simd> {
-    h: f64x8<S>,
-    u: f64x8<S>,
-    v: f64x8<S>,
-    b: f64x8<S>,
-}
-
-impl<S: Simd> Side<S> {
-    /// `other` in the lanes of `mask`, `self` elsewhere.
-    #[inline(always)]
-    fn select(self, mask: mask64x8<S>, other: Self) -> Self {
-        Self {
-            h: mask.select(other.h, self.h),
-            u: mask.select(other.u, self.u),
-            v: mask.select(other.v, self.v),
-            b: mask.select(other.b, self.b),
-        }
-    }
-}
-
-/// A side of the hydrostatic HLL after the Audusse et al. (2004)
-/// reconstruction, in face-aligned components (as `HllSide`).
-#[derive(Clone, Copy)]
-struct Star<S: Simd> {
-    h: f64x8<S>,
-    hun: f64x8<S>,
-    hut: f64x8<S>,
-    un: f64x8<S>,
-    ut: f64x8<S>,
-}
-
-impl<S: Simd> Star<S> {
-    /// The `side` of `hydrostatic_hll`: `h* = max(0, h + B − b_face)` with
-    /// the velocity kept (zero on a side at or below `h_min`).
-    #[inline(always)]
-    fn new(
-        simd: S,
-        q: Side<S>,
-        b_face: f64x8<S>,
-        (nx, ny): (f64x8<S>, f64x8<S>),
-        h_min: f64,
-    ) -> Self {
-        let zero = f64x8::<S>::splat(simd, 0.0);
-        let h_min = f64x8::<S>::splat(simd, h_min);
-        let h_star = max(q.h + q.b - b_face, zero);
-        let wet = q.h.simd_gt(h_min);
-        let (u, v) = (wet.select(q.u, zero), wet.select(q.v, zero));
-        let (un, ut) = (u * nx + v * ny, -u * ny + v * nx);
-        let (hun, hut) = (h_star * un, h_star * ut);
-        let star_wet = h_star.simd_gt(h_min);
-        Self {
-            h: h_star,
-            hun,
-            hut,
-            un: star_wet.select(un, zero),
-            ut: star_wet.select(ut, zero),
-        }
-    }
-
-    /// The physical flux in face-aligned components.
-    #[inline(always)]
-    fn flux(self, half_g: f64x8<S>) -> Flux<S> {
-        Flux {
-            h: self.h * self.un,
-            hu: self.h * self.un * self.un + half_g * self.h * self.h,
-            hv: self.h * self.un * self.ut,
-        }
-    }
-}
+/// A node state of a batch, one element per lane: the split form's
+/// pointwise physics (`wintermeyer_flux_2d`, `hydrostatic_hll`,
+/// `reconstruct_subcell`) runs on it as on one `f64` node (`crate::types::Lane`).
+type Node<S> = SWENodeState2D<f64x8<S>>;
 
 /// The components of [`VOLUME_BATCH`] fluxes, one per lane.
-#[derive(Clone, Copy)]
-struct Flux<S: Simd> {
-    h: f64x8<S>,
-    hu: f64x8<S>,
-    hv: f64x8<S>,
-}
+type Flux<S> = SWEState2D<f64x8<S>>;
 
 /// Largest face of P1–P4.
 const MAX_FACE_NODES: usize = 5;
-
-/// `f64::max(a, b)` for a non-NaN `b`: `a` if `a > b`, else `b` (a tie of
-/// ±0 gives `b`).
-#[inline(always)]
-fn max<S: Simd>(a: f64x8<S>, b: f64x8<S>) -> f64x8<S> {
-    a.simd_gt(b).select(a, b)
-}
-
-/// `f64::min(a, b)` for a non-NaN `b`: `a` if `a < b`, else `b`.
-#[inline(always)]
-fn min<S: Simd>(a: f64x8<S>, b: f64x8<S>) -> f64x8<S> {
-    a.simd_lt(b).select(a, b)
-}
-
-/// [`SplitFormSWE2D::hydrostatic_hll`] with `hll_flux_face_aligned`,
-/// `einfeldt_speeds_2d` and `rotate_from_normal`, lane by lane in the scalar
-/// order: every branch is evaluated and selected.
-#[inline(always)]
-fn hydrostatic_hll<S: Simd>(
-    simd: S,
-    q_a: Side<S>,
-    q_b: Side<S>,
-    m: (f64x8<S>, f64x8<S>),
-    g: f64,
-    h_min: f64,
-) -> (Flux<S>, Flux<S>) {
-    let zero = f64x8::<S>::splat(simd, 0.0);
-    let half = f64x8::<S>::splat(simd, 0.5);
-    let two = f64x8::<S>::splat(simd, 2.0);
-    let one = f64x8::<S>::splat(simd, 1.0);
-    let g_v = f64x8::<S>::splat(simd, g);
-    let half_g = f64x8::<S>::splat(simd, 0.5 * g);
-    let h_min_v = f64x8::<S>::splat(simd, h_min);
-    let norm = (m.0 * m.0 + m.1 * m.1).sqrt();
-    let (nx, ny) = (m.0 / norm, m.1 / norm);
-    let b_face = max(q_a.b, q_b.b);
-    let a = Star::new(simd, q_a, b_face, (nx, ny), h_min);
-    let b = Star::new(simd, q_b, b_face, (nx, ny), h_min);
-    let (h_l, h_r) = (a.h, b.h);
-
-    // hll_flux_face_aligned, with einfeldt_speeds_2d
-    let hll_dry = h_l.simd_le(h_min_v) & h_r.simd_le(h_min_v);
-    let c_l = (g_v * max(h_l, zero)).sqrt();
-    let c_r = (g_v * max(h_r, zero)).sqrt();
-    let sqrt_h_l = max(h_l, zero).sqrt();
-    let sqrt_h_r = max(h_r, zero).sqrt();
-    let roe = (sqrt_h_l + sqrt_h_r).simd_gt(f64x8::<S>::splat(simd, 1e-10));
-    let h_roe = half * (h_l + h_r);
-    let un_roe = roe.select(
-        (sqrt_h_l * a.un + sqrt_h_r * b.un) / (sqrt_h_l + sqrt_h_r),
-        zero,
-    );
-    let c_roe = roe.select((g_v * h_roe).sqrt(), zero);
-    let s_l = h_l
-        .simd_gt(h_min_v)
-        .select(min(a.un - c_l, un_roe - c_roe), b.un - two * c_r);
-    let s_r = h_r
-        .simd_gt(h_min_v)
-        .select(max(b.un + c_r, un_roe + c_roe), a.un + two * c_l);
-    let (f_l, f_r) = (a.flux(half_g), b.flux(half_g));
-    let inv_ds = f64x8::<S>::splat(simd, 1.0) / (s_r - s_l);
-    let s_lr = s_l * s_r;
-    let star = Flux {
-        h: inv_ds * (s_r * f_l.h - s_l * f_r.h + s_lr * (h_r - h_l)),
-        hu: inv_ds * (s_r * f_l.hu - s_l * f_r.hu + s_lr * (b.hun - a.hun)),
-        hv: inv_ds * (s_r * f_l.hv - s_l * f_r.hv + s_lr * (b.hut - a.hut)),
-    };
-    // s_l >= 0: F_l; else s_r <= 0: F_r; else the star flux; zero if dry
-    let (from_l, from_r) = (s_l.simd_ge(zero), s_r.simd_le(zero));
-    let hll = Flux {
-        h: hll_dry.select(zero, from_l.select(f_l.h, from_r.select(f_r.h, star.h))),
-        hu: hll_dry.select(zero, from_l.select(f_l.hu, from_r.select(f_r.hu, star.hu))),
-        hv: hll_dry.select(zero, from_l.select(f_l.hv, from_r.select(f_r.hv, star.hv))),
-    };
-    // |m| rotate_from_normal
-    let flux = Flux {
-        h: norm * hll.h,
-        hu: norm * (hll.hu * nx - hll.hv * ny),
-        hv: norm * (hll.hu * ny + hll.hv * nx),
-    };
-    // + g/2 (h^2 - h*^2)(0, m), all of g h^2 / 2 where HLL is dry, and a
-    // wet side's wall_ram_pressure there (the wall along +m from a, −m from b)
-    let (h_star_a, h_star_b) = (hll_dry.select(zero, h_l), hll_dry.select(zero, h_r));
-    let wall = |q: Side<S>, towards: f64| {
-        let un = f64x8::<S>::splat(simd, towards) * (q.u * nx + q.v * ny);
-        let un = max(un, zero);
-        let head = un * un / (two * g_v);
-        let sill = b_face - (q.h + q.b);
-        let ram = (one - head / sill) * q.h * un * (two * un + (g_v * q.h).sqrt());
-        (hll_dry & q.h.simd_gt(h_min_v) & sill.simd_gt(head)).select(ram, zero)
-    };
-    // (zero in every lane unless one is dry: two divisions and a square
-    // root per side that most batches do not need)
-    let (wall_a, wall_b) = if hll_dry.any_true() {
-        (wall(q_a, 1.0), wall(q_b, -1.0))
-    } else {
-        (zero, zero)
-    };
-    let dp_a = half_g * (q_a.h * q_a.h - h_star_a * h_star_a) + wall_a;
-    let dp_b = half_g * (q_b.h * q_b.h - h_star_b * h_star_b) + wall_b;
-    (
-        Flux {
-            h: flux.h + zero,
-            hu: flux.hu + dp_a * m.0,
-            hv: flux.hv + dp_a * m.1,
-        },
-        Flux {
-            h: flux.h + zero,
-            hu: flux.hu + dp_b * m.0,
-            hv: flux.hv + dp_b * m.1,
-        },
-    )
-}
-
-/// The state at distance `d` from the node `c` (with surface `eta`) along
-/// the limited slopes `[h, η, u, v]`, the depth kept ≥ 0 and the bed `η − h`.
-#[inline(always)]
-fn reconstructed<S: Simd>(
-    simd: S,
-    c: Side<S>,
-    eta: f64x8<S>,
-    [s_h, s_eta, s_u, s_v]: [f64x8<S>; 4],
-    d: f64x8<S>,
-) -> Side<S> {
-    let h = max(c.h + s_h * d, f64x8::<S>::splat(simd, 0.0));
-    Side {
-        h,
-        u: c.u + s_u * d,
-        v: c.v + s_v * d,
-        b: eta + s_eta * d - h,
-    }
-}
