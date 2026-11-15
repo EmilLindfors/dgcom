@@ -149,3 +149,25 @@ Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 a
     - With a 1 h ramp (`HarmonicTide::with_ramp_up`) there is no surge: flood peaks at 19 mm/s at the farm and the drag takes 0.35–0.65 mm/s (3–4 %) off it. Still inviscid, that deficit then does not decay after the flow reverses (−0.67 mm/s at 2 h).
     - Done 2026-09-28: the tide ramps up over 1 h in `examples/local_time_stepping_farm.rs` (`ramp=`) and in the viewer (`--ramp`). At 15 min, local stepping still does 2.60× less RHS work, and local and global agree to 1.6e-6 m/s.
     - To do: run farm cases with viscosity (affordable under LTS since 2026-09-28: `local_time_stepping_farm nu=1`, 2.1× the inviscid LTS cost), and choose ν (constant 1–10 m²/s or Smagorinsky with a background: at these shears Smagorinsky alone gives ν ≈ (0.1·20 m)²·|S| ≈ 5e-4 m²/s, i.e. nothing; the combination is `HorizontalViscosity2D::smagorinsky(cs).with_background(nu)` since 2026-10-02, P2.5). The real-site case (Kattholmen, 2026-10-24, below) ran with ν = 1 m²/s; the sweep there (2026-10-25) chose `cs=0.1 nu=0.1`, because ν ≥ 1 sets the farm's current.
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Parked
+
+- **F.1** A spread for the wake's floor: two 10 % controls (`farm_control=0.1`, `solidity=0.06`) differ by 10–20 % in wake area and 2× in residual change, so test the cage effect against several controls (different F or start times), not one, in runs longer than ≈ 6 h (within 6 h of a branch the 10 % control responds linearly, 0.13–0.19 of the cages).
+- **F.1** Kattholmen in 3D, the 6 h branches with the 10 % control (`output/kattholmen_3d/branches.ps1`, ≈ 6 h wall on 12 threads each): only a 2 h branch without a control has run (cages 0.82 inside the nets, wake inside the frame; `notes/farm.md`).
+- **F.1** Rerun Kattholmen when the island lee is settled (P3.1): at ν = 0.1 (with or without Smagorinsky) the farm's current is 0.08–0.09 m/s mean, 0.26–0.32 at most (0.04 at ν = 1), and the NorKyst point's M2 0.08–0.13 m/s against NorKyst's 0.25, 60–90° off in phase at every ν.
+- **F.1** Net-made wake TKE (`P = Σ λ_l |u_l|²`) as a source in GLS's `k` and `ψ` per caged layer (Beudin et al. 2017, `c_ψ4`).
+- **F.1** Compare the cage wake with a farm survey or flume data before trusting the default a = 4/(πR) (Løland's r = 1 − 0.46 C_d is left to the resolved flow).
+- **F.1** Angle dependence C_d(θ) and the lift term, for square cages in oblique flow.
+- **F.1** Net deformation in strong currents (the net lifts, d_net shrinks).
+
+### Dropped
+
+- **F.1** 3D particles from the cages in `froya_real_data` (`particles=` is the 2D tide's only): larvae in the surface layer at a real site (`ParticleTracker3D`, as in `farm_3d`). *(Dropped 2026-11-15: `froya_real_data` retires; particles go into case files (F.2).)*
+- **F.1** Let a stopped farm branch continue: `farm_runs` (`froya_real_data`) gives the open, control and caged sub-runs one `resume=` and starts the comparison window at the restart's time, so their own `restart_hours=` files (`<output>/no_cages/froya.restart`, …) cannot continue them; resume each sub-run from its own file and keep the window from the branch's start (a 3D branch is ≈ 6 h of wall time, lost whole in a reboot or a memory reap, 2026-11-04). *(Dropped 2026-11-15: `froya_real_data`'s restarts retire with it; case runs resume bit for bit (2026-11-08).)*
+- **F.1** Low priority: a sparse layer-drag buffer over `CageDrag2D::nodes` (`ModeSplitIntegrator` `layer_drag_rate` is dense and zeroed every step by `Hydrostatic3D::layer_drag_into`). *(Dropped 2026-11-15: low priority, as the line says.)*
+- **F.1** Low priority: drag on the feed raft and mooring lines (read by `io::farm_site`, not modelled). *(Dropped 2026-11-15: low priority, as the line says.)*
+- **F.1** Not worth it at farm steps: make the explicit `G` shear part of the 3D cage (and bottom) drag consistent with the implicit pass; at λΔt ≥ 10 it reverses stopped flow by < 1 % (keep λΔt ≲ 5). *(Dropped 2026-11-15: as the line says.)*

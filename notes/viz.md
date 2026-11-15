@@ -168,3 +168,35 @@ Asked for 2026-11-05: a video of the project to share on LinkedIn (16:9, ≈ 45 
   - **First 50 min:** a plume about 32.5 against 33–34 around 853's mouth.
   - **At 4 h** (`--at 14400 --screenshot`): the plume leaves the shore at 853's marker, about 29.5 at the mouth and 31.5 a kilometre out, and spreads northeast against 33–34.
 - [ ] A vertical section through a mouth (S over distance and depth along a line between two pins): the pinned point's profile shows one column, and a plume's mixing is a section's story.
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Parked
+
+- **F.3** Close-range land at a farm is coarse (large flat facets beside the cages in the `--record` farm shot): take the 2 m Kattholmen terrain patch for sites by default, or a finer terrain LOD under the camera.
+- **F.3** Separate physics from σ-truncation in the fjord3d rest-state flow under GLS (3.6e-5 m/s at 1 h, growing): halve level spacing and κ in turn, compare with Phillips's boundary-layer velocity.
+- **F.3** Compare the fjord3d cage wake at P1 on 40 m quads with the 2D 20 m run, a 3D P2 run and the integrated `CageDrag2D` drag (3D LTS would allow P2, see P1.3).
+- **F.3** Run → Save a snapshot file mid-run: hand a `SnapshotSink` to the running solver (it writes from the next frame) after writing the frames the playback holds; Run → Open a file by a dialog (`rfd`?) besides dropping one on the window.
+- **F.3** The viewer's working set grows ≈ 10–40 MB a run (527 MB in the menu, 682 → 720 → 732 MB back from three runs): find what a run leaves (assets, pipelines, allocator) with a longer `--menu --script` cycle.
+- **F.3** A system's `Local` outlives its run (the stale-cache bug fixed 2026-10-27): keep run state in run resources; `photo::switch`'s `chart_clear` and `minimap`/`camera` drag state are still `Local`s (harmless today).
+- **F.3** More menu options: threads, order, LTS levels, particles, sites (`data/sites/*.txt`), places, terrain patches.
+- **F.3** Report to Bevy: `pbr_fragment.wesl` reads `uv` with only `VERTEX_UVS_B` set (a mesh with `UV_1` and no `UV_0`; still so in 0.20.0); `terrain.rs` carries an unused `UV_0` until then.
+- **F.3** The 15-day Frøya run with 10-minute frames (≈ 4 h, 2.3k frames) for on-demand replay.
+- **F.3** A close-up of tidal flats wetting and drying: find a resolved flat, add a `--place`.
+- **F.3** Offline connectivity from `.dgsnap`/`.dgpart` (needs each particle's source cage and interpolation between frames), or record online.
+- **F.3** Save the solver state on live saves, not the viewer's f32 snapshot; add S to the viewer's `Layers`.
+- **F.3** The photo view's wind (short waves, whitecaps) from the run's weather: the 10 m wind as two more surface fields of the snapshot (`met=` runs), in place of `--wind`; ride the waves on the top σ-layer's current in 3D.
+- **F.3** A case run outside Norway in the viewer (Chiloé, `notes/viz.md`): the trace follows one station per start (`--station NAME`), with no key to step through a snapshot's stations and one `--gauge`; a recording's legend is unreadably small at 1080 px wide (`--ui legend`, the HUD's fixed pixel sizes), and it has no title, date or clock of its own (the Chiloé video's captions are ffmpeg's).
+- **F.3** A vertical section through a river mouth in the viewer: S over distance and depth along a line between two pins (`notes/viz.md`, river water).
+- **F.3** Builders in `viz/` for other live scenarios (nested runs, the Mausund sub-domain).
+- **F.3** Cut terrain patches out of coarser patches too, so overlapping patches work; a world-space label per farm site.
+- **F.3** The photo view costs ≈ 15 ms a frame over the chart view (21.6 against 5.4 ms at 4000 × 2250 on an RTX 4060 Laptop, `dg-viz --frame-times`): bake the waves into a tiled height/slope texture once per frame if a slower GPU or more waves need it. Make the wave-group noise periodic over the hourly `misc.z` wrap.
+- **F.3** Reflections of land, cages and frame (SSR or a planar reflection) and shadows for low sun; shallow-water optics (caustics, bed refraction, swash foam).
+- **F.3** Particle trails, and a density field instead of points for 10⁵+ particles.
+
+### Dropped
+
+- **F.3** Low priority: a bucket grid for terrain boundary snapping (0.2 s at 7k segments); `bracket` returning nothing on a far seek until both frames arrive. *(Dropped 2026-11-15: low priority, as the line says.)*
+- **F.3** Blocked: salmon in the cages (pfish-bevy, once the add-on has a salmon). *(Dropped 2026-11-15: blocked outside the project.)*

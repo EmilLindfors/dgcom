@@ -50,3 +50,33 @@
   - [ ] Thin columns (`with_min_column_depth`) get no heat or freshwater flux, as no stress: tidal flats neither warm nor cool. Their depth mean is the 2D module's, so a flux on T over the whole thin column would do.
   - [ ] Forecast radiation is accumulated from the run's start in MEPS/AROME (MET Nordic's are hourly integrals, which `met_forcing_subset` converts): `AtmosphereReader::from_file` reads only fluxes; de-accumulate there (by `cell_methods`) to take MEPS forecasts directly.
   - [ ] Low priority: the rain's sensible heat, COARE's cool skin and warm layer (`jcool`, `jwarm`; the warm layer matters under calm, clear days, as day 1), the latitude per column instead of the grid's mid-latitude.
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Folded
+
+- **P4.4** Surface stress and heat/freshwater fluxes in thin columns (`with_min_column_depth`): τ/ρ₀ through `G`, the flux over the whole thin column (tidal flats get no wind or heat in 3D today). *(Folded 2026-11-15 into `TODO.md`'s P4.5 3D tracers out of range at dry and thin columns.)*
+- **P4.4** Thin columns' temperature leaves the physical range in the 5–8 June 2026 runs: down to −2.00 °C (the bound) at low water and up to 21 °C (k-ε) or 36 °C (generic) at 54–58 h, while the ordinary columns stay at 6.9–14.8 °C. Find which flux or advection step does it (`notes/3d-validation.md` "The 2026 window"). *(Folded 2026-11-15 into `TODO.md`'s P4.5 3D tracers out of range at dry and thin columns.)*
+
+### Parked
+
+- **P4.4** The top 25 m runs 0.1–0.2 °C under NorKyst from day 1 (NorKyst's interior heats ≈ 20 % more than MET Nordic's weather can): run COARE on NorKyst's own MEPS forcing at its SST to tell the weather product from the model.
+- **P4.4** Weaker restratification than NorKyst after a wind drop (Frohavet 63–69 h, T(0) − T(10 m) +0.30 against +0.66 °C): GLS diffusivity under weak wind against NorKyst's `AKs`.
+- **P4.4** Wind stress from the same COARE iteration (stability-dependent, relative to the surface current) instead of `GriddedWindStress`'s Large & Pond.
+- **P4.4** De-accumulate forecast radiation (MEPS/AROME) in `AtmosphereReader::from_file`, so forecasts work without `met_forcing_subset`'s conversion.
+- **P4.4** Wave height for the surface roughness, z₀ₛ ≈ 0.6 H_s per column, from a MyWaveWAM reader or fetch-limited H_s(U₁₀, fetch).
+- **P4.4** Positivity-safe advected `k`/`ψ` (Zhang–Shu scaling toward the element mean, or a length cap); check on a real run with fronts.
+- **P4.4** k-ε with waves: σ_ε as a function of P/ε (Burchard 2001, GOTM `sig_peps`); until then k-ω or generic with waves.
+- **P4.4** One bed roughness: `with_bottom_drag` hands its z₀ to `GlsMixing` (κ 0.41 in the drag, 0.416 in the closure); a spatially varying z₀ and a C_d consistent with the 2D Manning n (2D/3D undisturbed currents differ, 0.31 against 0.34 m/s at the farm).
+- **P4.4** Thin columns take C_d,max = 0.1: check the 3D wet/dry front speed on a real beach against 2D `WetDry` with Manning.
+- **P4.4** GLS cost (`vertical_implicit` 2.1 ms against 0.8 for Pacanowski–Philander, mostly `powf`): a k-ε fast path, one ε per w-point.
+- **P4.4** Drop `PacanowskiPhilanderMixing`'s own `g`/`ρ₀` (API change).
+
+### Dropped
+
+- **P4.4** COARE cost: 10 iterations against ROMS's 3; exit on convergence (≈ 1 % of the 3D step now). *(Dropped 2026-11-15: ≈ 1 % of the 3D step.)*
+- **P4.4** Low priority: the rain's heat, COARE's cool skin and warm layer, the latitude per column. *(Dropped 2026-11-15: low priority, as the line says.)*
+- **P4.4** Turbulence-advection cost: average layer transports on the fly in `turbulence_transport_rhs`, the end-point override as a reconstruction BC. *(Dropped 2026-11-15: done 2026-11-13/14 (the w-cells averaged in the kernel, the end w-points as a condition; CHANGELOG).)*
+- **P4.4** Low priority: reset thin columns' `k`/`ψ` on re-wetting; second-order bottom drag; reuse `GriddedWindStress`'s `tⁿ⁺¹` evaluation. *(Dropped 2026-11-15: low priority, as the line says.)*

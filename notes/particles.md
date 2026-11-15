@@ -102,3 +102,31 @@
   - [ ] Ω at the layer centres is an average of the w-point values (`Solution3D::w`, output only); the tracker interpolates it with Ω = 0 at the ends. Keeping Ω at the w-points in the state (as the turbulence and now `eddy_diffusivity` are) would make `dσ/dt` exact to the model's continuity.
   - [ ] Stranding in 3D uses the column depth only; resuspension of settled particles (bed stress above a critical value) is not modelled.
   - [ ] Sampling cost: `Solution3DVelocity::diffusivity` runs the whole `blend` (u, v, Ω, depth and K of both snapshots) to return K, and the Visser walk calls it twice per step on top of the four RK stages' `velocity` calls (each also sampling K it discards). Split `Sample` by what the caller needs, and bracket σ once per call; measure on `farm_3d particles=N` first (tracking 1200 particles costs 0.6 s of a 163 s 3D run, so it matters only for 10⁵+ particles).
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Parked
+
+- **F.2** A physical basis for the horizontal K from a site's drifter or dye spreading (connectivity shares move by 9–73 over 0.01–1 m²/s).
+- **F.2** Check connectivity at the pens converges with mesh refinement under Smagorinsky K.
+- **F.2** Log K along the larvae's paths, to explain why `kh=smag` keeps more larvae at home (82.5 %) than a constant 0.01 (73.3 %).
+- **F.2** Draw release points per seed and per batch, so the seed spread measures release uncertainty, not only walk noise.
+- **F.2** Copepodid infectivity(age, T) (Skern-Mauritzen et al. 2020) next to `SalmonLice::survival`, as the `ConnectivityRecorder::record` weight.
+- **F.2** Light for lice from `AtmosphereReader` shortwave or cloud cover, salinity/CDOM-linked attenuation (Aksnes et al. 2009), a per-position sun for wide domains.
+- **F.2** Keep Ω at the w-points in `Solution3D`, so the tracker's dσ/dt matches continuity exactly (a layer-centre average today).
+- **F.2** Cubic time interpolation between snapshots for long output intervals.
+- **F.2** Resuspension of settled particles above a critical bed stress (3D stranding also uses column depth only).
+- **F.2** Locate lice cue crossings within the step, or keep √(2KΔt) ≪ K/w_s near haloclines (the light gate's χ² is 13/23/41 at Δt = 5/10/20 s).
+- **F.2** Polygon contact zones (point-in-polygon behind `ContactZone::covers`) for site polygons and whole farms.
+- **F.2** A bucket grid over contact zones in `ConnectivityRecorder::record` (O(particles × zones)) for region-wide registers.
+- **F.2** Parallel connectivity recording per particle (`FarmParticles::steps`); matters at 10⁵+ particles.
+- **F.2** Curved isoparametric elements in particle walking, `inverse_bilinear` and `PointLocator2D`'s Newton, once P1.3 has them.
+
+### Dropped
+
+- **F.2** Log the larvae's largest displacement in `farm_3d` before longer runs (the 6 km periodic channel is shorter than the 7.1 km tidal excursion). *(Dropped 2026-11-15: a check of an idealised example.)*
+- **F.2** Second-order contact exposure with the exact passage time (segment–circle intersection) if UΔt cannot be kept small against the cage. *(Dropped 2026-11-15: only if UΔt cannot be kept small, which it can.)*
+- **F.2** Low priority: split `Solution3DVelocity` sampling by what the caller needs (RK stages sample K they discard; 0.6 s of 163 s). *(Dropped 2026-11-15: 0.6 s of 163.)*
+- **F.2** Only if needed: pass `&Particle3D` to behaviours for per-particle traits; per-tidal-phase exposure bins (needs contact times beyond `Contact::first`). *(Dropped 2026-11-15: only if needed, as the line says.)*

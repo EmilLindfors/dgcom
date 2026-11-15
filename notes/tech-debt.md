@@ -46,3 +46,35 @@ The first two parts of issue #219 (part of #221, the coast-agnostic core). No nu
 - The reader refuses rows whose field count differs from the header's (an unquoted comma in a name used to shift the columns), empty names, longitudes outside ±180 and non-numbers (reported as such, not as out of range), and skips a UTF-8 byte-order mark.
 - `TidalPotential::cartesian` converts with `x * PI / 180`, as the deleted preset did, not `to_radians`, which can differ in the last bit.
 - The `CoriolisSource2D` doctest asserts its source terms (the comment still had the 1.2e-4 preset's numbers).
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Folded
+
+- **P6** `LandMask2D` has no users left (only `lib.rs`/`mesh` re-export it; the coastline meshes are water only): delete the type, or give it a caller (`notes/inputs-forcing.md` 2026-11-05). *(Folded 2026-11-15 into `TODO.md`'s P6 the code without callers.)*
+- **P6** Move `profile_cpu`, `quick_profile` and `high_res_benchmark` off `ssp_rk3_swe_2d`/`SWE2DTimeConfig` onto `Simulation` + `SWEPhysics2D` (precondition for the next item). *(Folded 2026-11-15 into `TODO.md`'s P6 the legacy 2D paths.)*
+- **P6** Delete the legacy integrators (`ssp_rk3*.rs`, `burn_ssp_rk3.rs`; the `coupled_swe_tracer` ones went with the 2D tracers, 2026-10-15); one time loop with `Simulation3D::run_with_callback` folded in, landing callbacks exactly (they drift today: 300 s asked, 316 s apart; `Simulation3D::with_landing_interval` lands steps on an interval since 2026-10-19, `froya_real_data` on its snapshot times). *(Folded 2026-11-15 into `TODO.md`'s P6 the legacy 2D paths.)*
+- **P6** `SillOverflow2D`/`SillWithFriction`/`SillDetector`, `StraitFriction2D` and `TidalPotential` have no caller outside their own tests (≈ 1,800 lines with their presets `gentle_sill`, `steep_sill`, `narrow_sound`, `ManningFriction2D::fjord`): delete them, or gate each on a case that needs it (`notes/tech-debt.md`). *(Folded 2026-11-15 into `TODO.md`'s P6 the code without callers.)*
+- **P6** Retire the mostly dead `solver/simd/` with the `Standard` kernel (P1.2). *(Folded 2026-11-15 into `TODO.md`'s P6 the legacy 2D paths.)*
+- **P6** `TidalConstituent::with_nodal_correction` and `tides::correct_amplitude_phase` bake a correction held constant into a constituent (tests and the `tides` docs only): delete them, or build on `NodalDrift`, so no forcing path freezes `f`, `u` again (P1.5, 2026-10-28). *(Folded 2026-11-15 into `TODO.md`'s P6 the code without callers.)*
+
+### Parked
+
+- **P6** `GriddedAtmosphere2D::split_for_3d` and its other configuration panic once the atmosphere is cloned (`inner_mut`); a case's domain has to split it before anything else holds it. Keep the switches (wind, pressure) per handle instead of in the shared `Inner`, so one sampled weather serves the 2D module, the columns, the waves and the boundary's level without an order to build them in.
+- **P6** Build the `netcdf` feature in CI with `--features netcdf/static` (~5.5 min cold); consider it the documented alternative to conda.
+- **P6** Collapse duplicate config types: `SWEFluxType2D`/`StandardFlux2D`, the three limiter enums, `HorizontalViscosity2D`/`3D` (differ only by `h_min`).
+- **P6** Error handling: `SimulationResult` → `Result<SimulationStats, SimulationError>`; reachable panics (`timeseries_reader.rs:198`, `geotiff.rs:239-245`); library `eprintln!` in `tide_gauge.rs`.
+- **P6** Prune ~200 root re-exports to a `prelude`; export `Simulation3D`.
+- **P6** Feature-gate `tiff`/`shapefile`/`geo` behind `geodata`.
+- **P6** The other examples still ignore options they do not read: `wave_growth` (its `fetch` reads keys during the run), `norkyst_boundary_tides`, `tide_gauge_fit` and `common/dap.rs`'s `arguments()` (whose users also drop bare flags). Move them onto `common/arguments.rs` (`Arguments::refuse_unread` after the last read). Its unit tests run only with `cargo test --example <name>`, not in CI.
+- **P6** Decide whether to split the DG core from the ocean model into a workspace (the name is settled: `dgcom`, 2026-11-07).
+- **P6** `Hydrostatic3D`'s configuration is 20 public fields and 23 consuming `with_*` builders, so it can change between steps while caches assume it fixed (the kept advection of `G` since 2026-10-16, keyed on the state only): make it private once built, or invalidate the caches on change.
+- **P6** One test-support constructor for a distorted quadrilateral mesh: eight test modules have their own `distorted_mesh` (`operators/geometric.rs`, `bathymetry_2d.rs`, `point_locator.rs`, `particles/walk.rs`, `solver/probe.rs`, `tests/cage_drag_test.rs`, `tests/curvilinear_3d_test.rs`, `tests/particle_tracking_test.rs`), and `transport_3d.rs`'s kernel gate a ninth inline.
+- **P6** The coastline-day bench as a script (`scripts/`): alternating A/B pairs from the 6 h restart with `DG_PROFILE=1`, and the byte comparison of two runs' restart files for bit-for-bit claims; each perf pass rebuilds it in a scratchpad.
+
+### Dropped
+
+- **P6** Characteristic-based limiting for 2D SWE (likely subsumed by P1.2). *(Dropped 2026-11-15: subsumed by P1.2.)*
+- **P6** Low priority: faer 0.23 → 0.24 (setup-time solves only). *(Dropped 2026-11-15: low priority, as the line says.)*

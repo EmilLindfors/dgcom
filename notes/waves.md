@@ -289,3 +289,63 @@ Goal (added 2026-10-03): the sea state at the farms and along the coast, coupled
   - [x] The surf-zone beach (2026-10-03): `cd viz && cargo run --release --bin surf_zone` runs both gates' cases in-process (≈ 8 s) and animates crests from the model's H_rms, mean direction and wavenumber per column, with bores and white water where a wave loses a share of its energy to breaking per period (`2 Q_b/β²`), the setup in the mean level, and floats on the longshore current. Keys 1/2 switch the case; `--screenshot` for headless checks.
   - [ ] The same for the main viewer's meshes: a wave state per snapshot, sampled per node (the beach is uniform alongshore, so its crests come from one phase integral `∫ k_y dy`; on a real mesh the phase needs an eikonal solve, or crests per component as Gerstner waves).
 - [ ] Diffraction behind islands and breakwaters (phase-decoupled refraction–diffraction, Holthuijsen et al. 2003), for farms sheltered by skerries.
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Parked
+
+- **F.4** Sweep `GrowthLimiter::Rate`'s C (3e-7 and 1e-6 against today's 5e-7) at the lee and Frohavet points and on the fetch/duration gates: is the lee's −9 % the cap or real?
+- **F.4** Retune whitecapping (Komen δ=1: E* 0.60× KC92, 1.5× Pierson–Moskowitz at 1000 h): try van der Westhuysen 2007 with Yan input or ST6, then tighten the gates.
+- **F.4** `c_σ` from a changing depth (∂σ/∂d ∂d/∂t): tides shift frequencies over flats.
+- **F.4** Diffraction behind islands (phase-decoupled, Holthuijsen et al. 2003) for farms sheltered by skerries.
+- **F.4** With substeps the boundary spectra and wind are held over the outer step; check against hourly forcing before ~10 min steps.
+- **F.4** `Quadruplets::source_and_diagonal` leaves out a component's share in its own gather on grids with frequency ratio ≥ 1+λ: assert or handle it.
+- **F.4** Drop `SourceIntegration::Midpoint` and `with_time_integrator` unless the midpoint helps with `Implicit`.
+- **F.4** Re-run the storm with `wave_depth_limit=0` on current code, for like-for-like and the limit's uncontended cost.
+- **F.4** Read the coupled storm's limiter counts by depth band (`depth_limit_bands`); if it binds in metres of water, count the removed variance as breaking in `dissipation()`.
+- **F.4** When a farm's own wind sensor (or a buoy in its fjord) is at hand: blend it into `met=` as Ålesund's attribution test did (F's SI 0.44 → 0.25), as a `froya_real_data` option rather than a scratch file. MEPS and MET Nordic carry along-fjord jets at half strength, and a mass-consistent downscaling does not recover them (2026-10-23).
+- **F.4** Ålesund's C: T_p 14 s against 9.1 on the 500 m grid at P1 and P2 alike, so not the grid. Candidates: the boundary's swell (≈ 1 s long at D) and diffraction. Also its first-day local sea from 190° (0.5–0.96 m against 0.3–0.5): check the buoy's wind as at F (THREDDS failed on 2026-10-22).
+- **F.4** A 500 m P2 wave grid (`wave_mesh=120,90,2`): are Frohavet (17 % low) and the lee (19 % low) the 1 km grid's or WAM's error?
+- **F.4** A reflection coefficient for walls (cliffs, quays); waves dying on the coast drive spurious coastal currents.
+- **F.4** Check which wave nodes along 63.75°N (8.22–8.28°E skerries) are dry at mean and low water (the reef point loses 7.5 cm more with absorbing land under SWAN's sources).
+- **F.4** Nest NorKyst for the storm days (`norkyst=`) for the remote surge (+0.29 m observed against +0.08 m), then compare the wave setup at Mausund with the gauge's residual. NorKyst's ζ lacks the inverse barometer of the domain-mean pressure, and MET does not use it for sea-level forecasts (`notes/norkyst-issues.md` §6). So add the P1.5 boundary-pressure level, or the remote surge stays short.
+- **F.4** Check MET's storm-surge model output as the non-tidal level source for storms, in place of NorKyst's ζ. That model is built for water level, which NorKyst is not. Check its availability (THREDDS, or Kartverket's API, which serves it at the gauges) and its resolution at the boundary.
+- **F.4** Waves with the 3D run: the wind stress the waves take from the columns' surface, their force and Stokes drift into the layers. Case files refuse `[waves]` with `[three_d]`, as the example couples the 2D tide only.
+- **F.4** Measure the coupling lag's error at Δ = 10 / 5 / 2.5 min; if it matters, extrapolate (`2q(t) − q(t−Δ)`) or a second pass.
+- **F.4** Make `WaveForceForm::Dissipation` the `CoupledWaves2D` default once a surf-zone case with a measured set-down is checked.
+- **F.4** A wave-dependent breaking flux into GLS: ρg × (whitecapping + breaking) per column from `WaveModel2D::dissipation` (COAWST `TKE_WAVEDISS`).
+- **F.4** 3D vertical structure (a): the Stokes transport in continuity (Eulerian return flow `D ū = −M_s`); changes the 2D model too.
+- **F.4** 3D vertical structure (b): the breaking force near the surface (Uchiyama 2010 `B(z)` or a roller), gated against the constant-ν undertow (Svendsen 1984, Stive & Wind 1986).
+- **F.4** 3D vertical structure (c): the vortex force and Bernoulli head (McWilliams et al. 2004; ROMS `WEC_VF`).
+- **F.4** Waves on the 3D bed: `BottomDrag3D` with Soulsby's enhancement or Grant–Madsen roughness (ROMS `SSW_BBL`).
+- **F.4** The maximum bed stress τ_max with the wave–current angle, for sediment and mooring loads.
+- **F.4** `farm_3d` with `wind=`: run the wave model on the farm mesh, couple the Stokes drift each output interval and use `surface_roughness` instead of the constant `waves=`.
+- **F.4** Cheaper Stokes drift sampling for 10⁵ particles: tabulate per node, or Breivik 2016's two-parameter profile.
+- **F.4** Sources without the DIA (84 ms on 1 thread, 9 of the 60 ms bench step at 24; libm 40 % of it, 2026-10-19): pass the cached `cg` into `advance`, cache the friction's `sinh(kd)` in `set_water_level`, try a vector `exp` (≈ 3 ms at 24 threads, not bit for bit).
+- **F.4** The implicit lanes kernels (`waves/implicit_lanes.rs`) zero or copy ≈ 11 arrays of 72 vectors per batch (memset/memcpy 18 % of the refraction's samples, 37 % of the shift's): build the Thomas coefficients in the sweep, reload the original from the spectrum, solve in place (≈ 2 ms of the 60 ms bench step).
+- **F.4** Fuse adjacent implicit half-passes across steps and between substeps (a pair was 9.6 ms of 141, now ≈ 9.7 of the 60 ms bench step, all of it the kernels: not bit for bit, a splitting change); measure first.
+- **F.4** Parallelise an exchange's per-node diagnostics (`parameters`, `bed_wave_stress`, `radiation_stress`, `StokesDriftField::new`, wavenumber tables) in one pass per spectrum (an exchange takes 148 ms, 2.7 wave steps, since 2026-10-19).
+- **F.4** L2 projection from circulation to waves in `WaveCoupling2D` (`M_c⁻¹ Pᵀ M_f`), replacing the cap in `WaveCoupling2D::currents`.
+- **F.4** Measure a 2 km P2 wave grid (`wave_mesh=30,23,2`) against 1 km P1 at Frøya, for cost and lee H_s.
+- **F.4** The 0.04 Hz bin in 150 m sets the 7 s step: check `f_min` 0.05 Hz (≈ 25 % longer step) against a 0.04 Hz run, or LTS by frequency group.
+- **F.4** Mask the wave grid to the coastline mesh's footprint (638 of 10,040 nodes lie outside it).
+- **F.4** Local time stepping in the waves (as `MultirateSSPRK3` for the tide): a coastline-fitted wave mesh (`wave_mesh=FILE.msh`) keeps ≈ 100 m edges in narrow sounds and cuts the global step 3–5× against a uniform 500 m grid (Ålesund C, `notes/waves.md`).
+- **F.4** Put the coast where the water ends in partly dry elements, with `WetDry`'s shoreline subcells (dry nodes are zeroed today).
+- **F.4** Then decide whether `WaveModel2D`'s default becomes absorbing land (changes the bits of every gate with land).
+- **F.4** Boundary spectra for past dates (the June 2025 runs) from MyWave 800 m's hourly partitions (wind sea + three swells, JONSWAP with cos^m), gated on days where both exist.
+- **F.4** The waves' force per node in the coupled run's snapshots (arrows of what drives the wave-driven currents); per-component amplitudes from each node's spectrum in the photo view, so directions can turn within a view (`notes/waves.md` Viewer).
+- **F.4** A wave model in the viewer's live Frøya scenario (`viz/src/solver.rs` runs `run_with_callback`; `CoupledWaves2D` and `run_with_exchange` as `froya_real_data`), so the wave colourings work live, not only in replays.
+
+### Dropped
+
+- **F.4** Triads (LTA, Eldeberky 1996) for the surf zone. *(Dropped 2026-11-15: the surf zone, not farm water.)*
+- **F.4** Low priority (not farm water): under 1 m depth the 56 s step has +8 % H_s bias; try moving the DIA's `quadruplet_scale` into the substeps. *(Dropped 2026-11-15: not farm water, as the line says.)*
+- **F.4** Low priority: SWAN's tail beyond σ_max in the whitecapping means (`Means::of`, `src/waves/sources.rs`). *(Dropped 2026-11-15: low priority, as the line says.)*
+- **F.4** Check the depth limit's γ against SWAN's very-shallow limiter before trusting the surf zone or a coarse grid's coastal nodes. *(Dropped 2026-11-15: the surf zone and coarse coastal nodes, not farm water.)*
+- **F.4** H_s, T_p and direction at the stations (gauges, NorKyst's point, farms) in the station files. *(Dropped 2026-11-15: done for case runs (`stations.csv`, 2026-11-08).)*
+- **F.4** Lateral mixing for the longshore current, and a runup case with `WetDry` at a real shoreline (the force on partly dry elements is untested). *(Dropped 2026-11-15: the surf zone.)*
+- **F.4** Low priority: the vertical Stokes velocity (left out, as in OpenDrift/LADiM). Later: cage drag from the orbital velocity. *(Dropped 2026-11-15: low priority, as the line says.)*
+- **F.4** Lower priority: implicit geographic stepping with Gauss–Seidel sweeps (SWAN), fewer components (24 × 25). *(Dropped 2026-11-15: lower priority, as the line says.)*
+- **F.4** Low priority: mask sources at dry nodes in mixed DIA chunks (≤ 2–3 ms of 105); a dry-node list for `absorb_on_land`; a wind-only atmosphere snapshot on the wave mesh. *(Dropped 2026-11-15: ≤ 2–3 ms.)*

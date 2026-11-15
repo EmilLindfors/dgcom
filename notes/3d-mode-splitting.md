@@ -77,3 +77,16 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [x] Wind setup: `wind_setup_balances_the_surface_stress`, slope 1.0001 × τ/(ρ₀gD).
 - [x] Ekman: `wind_drives_the_ekman_inertial_transport`, 3.9e-4 of τ/(ρ₀f) from the inertial-Ekman solution.
 - [x] Column momentum after one implicit diffusion step = Δt·(τ_s − τ_b)/ρ₀: `column_momentum_changes_by_the_stress_impulse`.
+
+## Out of TODO.md (2026-11-15)
+
+The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
+
+### Parked
+
+- **P4.1** Revisit the ROMS `rufrc`-style G (full PGF in the 3D RHS) now that the σ-pairs PGF has the DG face coupling of η.
+- **P4.1 / P4.2** Check whether the 3D kernels still read η rather than h (PR 1 left moving them to h to P4.2).
+
+### Dropped
+
+- **P4.1** Low priority: the internal seiche's small dt-dependent phase residual (+0.011 / −0.018 / −0.039 % at 240 / 120 / 60 s). *(Dropped 2026-11-15: ≤ 0.04 % of the phase.)*

@@ -38,11 +38,12 @@ This is a high-performance Discontinuous Galerkin (DG) solver for coastal ocean 
 
 ### Note Down Opportunities
 The crate is at an early stage, so experimenting is welcome. While working on any task, watch for opportunities: suboptimal code, better approaches, simplifications, in the numerics, performance (e.g. how parallel code is run), API shape or duplicated paths.
-- **Note them in `TODO.md`**: one checkbox line each, starting with the item's ID, under the matching area (not a separate list). Put the measurement or the concrete pointer (file, function) and the reasoning in that `notes/<area>.md` file when it needs more than the line.
-- **Report them**: list what you noted in the end-of-task summary.
+- **Note them in `notes/<area>.md`**, under "Out of TODO.md" → Parked: one line each, starting with the item's ID, with the measurement or the concrete pointer (file, function) and the reasoning.
+- **Put a line in `TODO.md` only when it beats the ones there**: it is on the path to the outcome its header names, or a defect of the runs we make, and you say why. `TODO.md` stays short (about 20–30 lines; it was cut from 399 on 2026-11-15).
+- **Report them**: list what you noted, and where, in the end-of-task summary.
 
 ### Roadmap and notes
-- `TODO.md` holds **open items only**, one line each, with an ID (P1.3, F.4, …) and a pointer into `notes/`.
+- `TODO.md` holds **what is worth doing next only**, one line each, with an ID (P1.3, F.4, …) and a pointer into `notes/`, under the outcome its header names.
 - `notes/` holds the context, one file per area (index in `notes/README.md`): findings, measurements, decisions, dead ends, finished work. Before starting on an item, read its notes file.
 - When an item is done, delete its `TODO.md` line and record the outcome (date, PR, numbers) under its heading in the notes file; notable changes also go in `CHANGELOG.md`.
 
