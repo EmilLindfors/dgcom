@@ -117,19 +117,6 @@ impl<T: Lane> SWENodeState2D<T> {
     pub fn eta(&self) -> T {
         self.h + self.b
     }
-
-    /// `if_true` in the lanes of `mask`, `if_false` in the others.
-    #[inline(always)]
-    pub fn select(mask: T::Mask, if_true: Self, if_false: Self) -> Self {
-        Self {
-            h: T::select(mask, if_true.h, if_false.h),
-            hu: T::select(mask, if_true.hu, if_false.hu),
-            hv: T::select(mask, if_true.hv, if_false.hv),
-            u: T::select(mask, if_true.u, if_false.u),
-            v: T::select(mask, if_true.v, if_false.v),
-            b: T::select(mask, if_true.b, if_false.b),
-        }
-    }
 }
 
 /// Wintermeyer et al. (2017) entropy-conservative two-point flux `F#(q_L, q_R)·m`.

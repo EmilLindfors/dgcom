@@ -61,8 +61,8 @@
 use fearless_simd::{Level, dispatch, f64x8, mask64x8, prelude::*};
 
 use super::{
-    ELEMENT_CHUNK, SplitFormSWE2D, SplitFormWorkspace, SurfaceFlux, VOLUME_BATCH, hydrostatic_hll,
-    reconstruct_subcell,
+    ELEMENT_CHUNK, Side, SplitFormSWE2D, SplitFormWorkspace, SurfaceFlux, VOLUME_BATCH,
+    hydrostatic_hll, reconstruct_subcell,
 };
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::flux::{SWENodeState2D, wintermeyer_flux_2d};
@@ -387,18 +387,16 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                         f64x8::<S>::from_slice(simd, &other[2]),
                     );
                     let wet = h.simd_gt(h_min_v);
-                    let neighbour = Node {
+                    let neighbour = Side {
                         h,
-                        hu,
-                        hv,
                         u: wet.select(hu / h, zero),
                         v: wet.select(hv / h, zero),
                         b: f64x8::<S>::from_slice(simd, &other[3]),
                     };
                     let this = data.side(node);
                     let (a, b) = (
-                        Node::select(is_left, this, neighbour),
-                        Node::select(is_left, neighbour, this),
+                        Side::select(is_left, this, neighbour),
+                        Side::select(is_left, neighbour, this),
                     );
                     // The edge's normal is its left side's
                     let (mut mx, mut my) = (is_left.select(nx, -nx), is_left.select(ny, -ny));
@@ -620,10 +618,8 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         let r0 = f64x8::<S>::splat(simd, ops.nodes_r[0]);
         let s0 = f64x8::<S>::splat(simd, ops.nodes_s[0]);
         let empty = Outer {
-            node: Node {
+            node: Side {
                 h: zero,
-                hu: zero,
-                hv: zero,
                 u: zero,
                 v: zero,
                 b: zero,
@@ -695,10 +691,8 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                     f64x8::<S>::from_slice(simd, &t[2]),
                 );
                 let wet = h.simd_gt(h_min);
-                let node = Node {
+                let node = Side {
                     h,
-                    hu,
-                    hv,
                     u: wet.select(hu / h, zero),
                     v: wet.select(hv / h, zero),
                     b: f64x8::<S>::from_slice(simd, &t[3]),
@@ -835,8 +829,8 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                     );
                     let complete = left_present & right_present;
                     faces[a] = (
-                        Node::select(complete, face_l, q),
-                        Node::select(complete, face_r, q),
+                        Side::select(complete, face_l, q),
+                        Side::select(complete, face_r, q),
                     );
                     x_left = x_right;
                 }
@@ -1005,8 +999,19 @@ struct Lanes<'a> {
 impl<S: Simd, const NN: usize> Batch<S, NN> {
     /// The state of node `i` as a face state.
     #[inline(always)]
-    fn side(&self, i: usize) -> Node<S> {
-        Node {
+    fn side(&self, i: usize) -> Side<f64x8<S>> {
+        Side {
+            h: self.h[i],
+            u: self.u[i],
+            v: self.v[i],
+            b: self.b[i],
+        }
+    }
+
+    /// The state of node `i` for the two-point flux.
+    #[inline(always)]
+    fn node(&self, i: usize) -> SWENodeState2D<f64x8<S>> {
+        SWENodeState2D {
             h: self.h[i],
             hu: self.hu[i],
             hv: self.hv[i],
@@ -1026,7 +1031,7 @@ impl<S: Simd, const NN: usize> Batch<S, NN> {
 /// element's reference coordinate, and the lanes where it exists.
 #[derive(Clone, Copy)]
 struct Outer<S: Simd> {
-    node: Node<S>,
+    node: Side<f64x8<S>>,
     distance: f64x8<S>,
     present: mask64x8<S>,
 }
@@ -1119,15 +1124,10 @@ impl<S: Simd, const NN: usize> Nodes<'_, S, NN> {
         mx: f64x8<S>,
         my: f64x8<S>,
     ) -> (f64x8<S>, f64x8<S>, f64x8<S>) {
-        let f = wintermeyer_flux_2d(&self.batch.side(l), &self.batch.side(r), (mx, my), self.g);
+        let f = wintermeyer_flux_2d(&self.batch.node(l), &self.batch.node(r), (mx, my), self.g);
         (f.h, f.hu, f.hv)
     }
 }
-
-/// A node state of a batch, one element per lane: the split form's
-/// pointwise physics (`wintermeyer_flux_2d`, `hydrostatic_hll`,
-/// `reconstruct_subcell`) runs on it as on one `f64` node (`crate::types::Lane`).
-type Node<S> = SWENodeState2D<f64x8<S>>;
 
 /// The components of [`VOLUME_BATCH`] fluxes, one per lane.
 type Flux<S> = SWEState2D<f64x8<S>>;

@@ -182,6 +182,49 @@ fn limited_slope<T: Lane>(q: [T; 3], xi: [T; 3], (x_l, x_r): (T, T)) -> T {
     T::select(extremum, zero, sign * central.abs().min(bound))
 }
 
+/// What the hydrostatic HLL flux and the subcells' reconstruction read of a
+/// node: its depth, velocity and bed (no momenta). Generic over [`Lane`]:
+/// one node, or one per SIMD lane in the batched kernel.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Side<T = f64> {
+    h: T,
+    u: T,
+    v: T,
+    b: T,
+}
+
+impl<T: Lane> Side<T> {
+    /// Free-surface elevation η = h + B.
+    #[inline(always)]
+    fn eta(&self) -> T {
+        self.h + self.b
+    }
+
+    /// `if_true` in the lanes of `mask`, `if_false` in the others.
+    #[cfg_attr(not(feature = "simd"), allow(dead_code))]
+    #[inline(always)]
+    fn select(mask: T::Mask, if_true: Self, if_false: Self) -> Self {
+        Self {
+            h: T::select(mask, if_true.h, if_false.h),
+            u: T::select(mask, if_true.u, if_false.u),
+            v: T::select(mask, if_true.v, if_false.v),
+            b: T::select(mask, if_true.b, if_false.b),
+        }
+    }
+}
+
+impl<T: Copy> From<&SWENodeState2D<T>> for Side<T> {
+    #[inline(always)]
+    fn from(q: &SWENodeState2D<T>) -> Self {
+        Self {
+            h: q.h,
+            u: q.u,
+            v: q.v,
+            b: q.b,
+        }
+    }
+}
+
 /// Face states `(q_L, q_R)` of the subcell `[x_l, x_r]` around node `ξ`, from
 /// a limited linear reconstruction of `h`, `η = h + B`, `u` and `v` between
 /// the nodes `ξ_m < ξ < ξ_p` (second-order Audusse et al. 2004). The bed at
@@ -209,11 +252,11 @@ fn limited_slope<T: Lane>(q: [T; 3], xi: [T; 3], (x_l, x_r): (T, T)) -> T {
 ///   these balance `S_a`: `½g(h_R² − h_L²) = −½g(h_L + h_R)(B_R − B_L)`.
 #[inline(always)]
 fn reconstruct_subcell<T: Lane>(
-    nodes: [SWENodeState2D<T>; 3],
+    nodes: [Side<T>; 3],
     xi: [T; 3],
     subcell: (T, T),
     h_dry: f64,
-) -> (SWENodeState2D<T>, SWENodeState2D<T>) {
+) -> (Side<T>, Side<T>) {
     let [m, c, p] = nodes;
     let zero = c.h.constant(0.0);
     let h_dry = c.h.constant(h_dry);
@@ -237,13 +280,10 @@ fn reconstruct_subcell<T: Lane>(
     let at = |x: T| {
         let d = x - xi[1];
         let h = (c.h + s_h * d).max(zero);
-        let (u, v) = (c.u + s_u * d, c.v + s_v * d);
-        SWENodeState2D {
+        Side {
             h,
-            hu: h * u,
-            hv: h * v,
-            u,
-            v,
+            u: c.u + s_u * d,
+            v: c.v + s_v * d,
             b: eta[1] + s_eta * d - h,
         }
     };
@@ -268,8 +308,8 @@ fn reconstruct_subcell<T: Lane>(
 /// Generic over [`Lane`]: the scalar, batched and GPU kernels share it.
 #[inline(always)]
 fn hydrostatic_hll<T: Lane>(
-    q_a: &SWENodeState2D<T>,
-    q_b: &SWENodeState2D<T>,
+    q_a: &Side<T>,
+    q_b: &Side<T>,
     m: (T, T),
     g: f64,
     h_min: f64,
@@ -279,7 +319,7 @@ fn hydrostatic_hll<T: Lane>(
     let norm = (m.0 * m.0 + m.1 * m.1).sqrt();
     let (nx, ny) = (m.0 / norm, m.1 / norm);
     let b_face = q_a.b.max(q_b.b);
-    let side = |q: &SWENodeState2D<T>| {
+    let side = |q: &Side<T>| {
         let h_star = (q.h + q.b - b_face).max(zero);
         let wet = q.h.greater_than(h_min_v);
         let (u, v) = (T::select(wet, q.u, zero), T::select(wet, q.v, zero));
@@ -307,7 +347,7 @@ fn hydrostatic_hll<T: Lane>(
     // (zero unless a side is dry: two divisions and a square root per side
     // that most faces do not need)
     let (wall_a, wall_b) = if T::any(hll_dry) {
-        let wall = |q: &SWENodeState2D<T>, towards: f64| {
+        let wall = |q: &Side<T>, towards: f64| {
             let un = q.u.constant(towards) * (q.u * nx + q.v * ny);
             let sill = b_face - (q.h + q.b);
             let ram = wall_ram_pressure(q.h, un, sill, g);
@@ -359,7 +399,7 @@ pub(super) struct SplitFormWorkspace {
     /// node metrics at the two line ends
     interfaces: Vec<(f64, f64)>,
     /// Reconstructed (left, right) face states of the subcells of one line
-    faces: Vec<(SWENodeState2D, SWENodeState2D)>,
+    faces: Vec<(Side, Side)>,
     /// Per face node (`face · n_1d + fi`): the first interior node of the
     /// neighbour element on the GLL line through it, and its distance from
     /// the face in this element's reference coordinate (`None` at boundaries)
@@ -568,7 +608,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     ) -> (SWEState2D, SWEState2D) {
         match self.surface {
             SurfaceFlux::HydrostaticHll => {
-                let (f_a, f_b) = hydrostatic_hll(q_a, q_b, n, g, self.reconstruction.h_min);
+                let (f_a, f_b) =
+                    hydrostatic_hll(&q_a.into(), &q_b.into(), n, g, self.reconstruction.h_min);
                 (f_a, -f_b)
             }
             surface => {
@@ -901,17 +942,17 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         // value, and take their outer slope neighbour from the next element.
         let mut x_left = -1.0;
         for a in 0..n1 {
-            let q = ws.nodes[idx(a)];
+            let q = Side::from(&ws.nodes[idx(a)]);
             let x_right = x_left + w[a];
             let left = if a > 0 {
-                Some((ws.nodes[idx(a - 1)], xi[a - 1]))
+                Some((Side::from(&ws.nodes[idx(a - 1)]), xi[a - 1]))
             } else {
-                ends[0].map(|(s, d)| (s, -1.0 - d))
+                ends[0].map(|(s, d)| (Side::from(&s), -1.0 - d))
             };
             let right = if a + 1 < n1 {
-                Some((ws.nodes[idx(a + 1)], xi[a + 1]))
+                Some((Side::from(&ws.nodes[idx(a + 1)]), xi[a + 1]))
             } else {
-                ends[1].map(|(s, d)| (s, 1.0 + d))
+                ends[1].map(|(s, d)| (Side::from(&s), 1.0 + d))
             };
             ws.faces[a] = match (left, right) {
                 (Some((l, x_l)), Some((r, x_r))) => {
