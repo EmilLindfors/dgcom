@@ -36,9 +36,10 @@ pub use swe_2d::{
     SWEFormulation2D, compute_dt_swe_2d, compute_dt_viscosity, compute_rhs_swe_2d,
     compute_rhs_swe_2d_face_mass_into, compute_rhs_swe_2d_into,
     compute_rhs_swe_2d_mass_fluxes_into, compute_rhs_swe_2d_subset_mass_fluxes_then,
-    compute_rhs_swe_2d_subset_then, compute_rhs_swe_2d_where_into, element_dt_swe_2d,
-    element_dt_viscous_swe_2d, face_mass_len, linear_cfl_subcells_swe_2d, linear_cfl_swe_2d,
-    min_element_dt_swe_2d, positivity_cfl_swe_2d, subcell_mass_len,
+    compute_rhs_swe_2d_subset_then, compute_rhs_swe_2d_where_into, dt_from_reference_rate,
+    element_dt_swe_2d, element_dt_viscous_swe_2d, face_mass_len, linear_cfl_subcells_swe_2d,
+    linear_cfl_swe_2d, min_element_dt_swe_2d, node_reference_rate, positivity_cfl_swe_2d,
+    subcell_mass_len,
 };
 #[cfg(feature = "parallel")]
 pub use swe_2d::{

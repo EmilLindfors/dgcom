@@ -2,7 +2,9 @@
 
 dgcom's GPU kernels, in Rust on NVIDIA's [cuda-oxide](https://github.com/NVIDIA/cuda-rust) (P2.7; the plan, the measurements and the toolchain are in [`../notes/gpu.md`](../notes/gpu.md)).
 
-Phase 0 is a test bed: the fully wet split-form 2D RHS (`SWEFormulation2D::EntropyStable`) on the GPU, calling dgcom's own pointwise physics, checked against `compute_rhs_swe_2d_parallel_into` on periodic P2 meshes (parallelograms and jittered quadrilaterals) and timed against it.
+- `src/swe2d.rs`: the kernels, a device-resident SWE state (`DeviceState`, dgcom's `Integrable`) and the GPU physics module (`GpuSWE2D`, dgcom's `PhysicsModule`; the fully wet split form, `SWEFormulation2D::EntropyStable`, on meshes without boundary faces so far). dgcom's own `Simulation` and SSP-RK steppers drive them.
+- `src/phase0.rs`: the RHS against `compute_rhs_swe_2d_parallel_into`, node for node, on periodic P2 meshes (parallelograms and jittered quadrilaterals), and timed.
+- `src/phase1.rs`: `Simulation` with SSP-RK(4,3) on the GPU against the same run on the CPU (`SWEPhysics2D`), the final states node for node, and the time per step.
 
 It is a workspace of its own, as `viz/`: it builds with cuda-oxide's pinned toolchain (`rust-toolchain.toml`), and the crate above with stable. CI does not build it (no GPU or CUDA toolkit on the runners).
 
@@ -17,6 +19,7 @@ $env:PATH = "$env:CUDA_PATH\bin\x64;$env:CUDA_PATH\bin;$env:LIBCLANG_PATH;$env:P
 cargo oxide run --no-fmad                   # the gate against the scalar CPU kernel
 cargo oxide run --no-fmad --features simd   # ... and against the 8-wide SIMD batch
 cargo oxide run --features simd             # multiply–adds fused: within ~1e-11; the timing
+target\release\dgcom-gpu.exe phase1         # one phase (phase0, phase1; all by default)
 ```
 
 The CPU has two copies of the physics: the scalar kernel, whose pointwise functions the GPU kernels call, and the SIMD batch that real runs use (`simd`), held to the scalar one bit for bit by its own gates. The gate runs against either.

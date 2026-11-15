@@ -81,6 +81,7 @@ pub use rhs::{
     compute_rhs_swe_2d_subset_then,
     compute_rhs_swe_2d_where_into,
     compute_transport_rhs_3d,
+    dt_from_reference_rate,
     element_dt_swe_2d,
     element_dt_viscous_swe_2d,
     face_mass_len,
@@ -88,6 +89,7 @@ pub use rhs::{
     linear_cfl_subcells_swe_2d,
     linear_cfl_swe_2d,
     min_element_dt_swe_2d,
+    node_reference_rate,
     positivity_cfl_swe_2d,
     subcell_mass_len,
 };
