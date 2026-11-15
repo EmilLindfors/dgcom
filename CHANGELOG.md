@@ -6,6 +6,9 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **A wet/dry run steps on the GPU, bit for bit with the CPU (P2.7 Phase 1, `notes/gpu.md`, 2026-11-15).** `gpu/`'s `GpuSWE2D` runs `SWEFormulation2D::WetDry` (the subcells, the hydrostatic HLL), walls (dgcom's own `Reflective2D` on the device), the wet/dry correction, Manning friction and the thin-layer relaxation point-implicit, and the positivity-bounded time step: dgcom's `Simulation` with SSP-RK(4,3) on a walled drying beach ends on the CPU's state bit for bit without multiply–add contraction, on 720 and 96,000 P2 elements.
+  - **API:** `solver::wet_dry_element` and `solver::damp_node` (generic over the friction law) are public; `SWESide2D` (the split form's face state), `hydrostatic_hll` and `reconstruct_subcell` are public; `PositivityBound::element_cfl` takes the element's nodal masses; `subcells::telescoped_interfaces` takes the GLL weights and D.
+
 - **dgcom's `Simulation` steps the GPU (P2.7 Phase 1, `notes/gpu.md`, 2026-11-15).** `gpu/` has a device-resident SWE state (`DeviceState`, an `Integrable`) and a GPU physics module (`GpuSWE2D`, a `PhysicsModule`: the fully wet split form so far), which dgcom's own `Simulation` and SSP-RK steppers drive unchanged. SSP-RK(4,3) on 96,000 P2 elements: the CPU's steps and the CPU's state bit for bit after 82 steps without multiply–add contraction, within 7e-14 with it; a step takes 11.2 ms on the laptop's RTX 4060 against 25.3 ms on its 24 threads.
   - **API:** `solver::node_reference_rate` (now with `g` and `h_min`) and `solver::dt_from_reference_rate` are public, the time step's pointwise rate shared with the GPU.
 
