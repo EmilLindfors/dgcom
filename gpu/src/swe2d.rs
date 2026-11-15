@@ -174,25 +174,40 @@ fn line_volume<const AFFINE: bool, I: Fn(usize) -> usize>(
 }
 
 /// `SplitFormSWE2D::line_subcells`: the subcell finite-volume update (times
-/// J) along the line of nodes `idx(0..N1)`, its end subcells taking their
-/// outer slope neighbour from `ends` (the node, its distance, whether there
-/// is one).
+/// J) along `line` of `direction` (0: an r-line, its nodes `line·N1 + a`;
+/// 1: an s-line, `a·N1 + line`), its end subcells taking their outer slope
+/// neighbour from `ends` (the node, its distance, whether there is one).
+/// Not generic, so that it inlines (a generic `#[device]` function stays a
+/// call), and the GLL data are arrays, so that its loops have constant trip
+/// counts.
 #[device]
+// The device backend makes this alwaysinline (no call in the PTX); the host
+// compiler, which sees an exported symbol, ignores it.
+#[allow(unused_attributes)]
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn line_subcells<I: Fn(usize) -> usize>(
+fn line_subcells(
     nodes: &[SWENodeState2D; NN],
     rhs: &mut [SWEState2D; NN],
     metric: &[(f64, f64); N1],
-    idx: I,
+    line: usize,
+    direction: usize,
     ends: [(SWENodeState2D, f64, bool); 2],
     affine: bool,
-    w: &[f64],
-    xi: &[f64],
-    d1: &[f64],
+    w: &[f64; N1],
+    xi: &[f64; N1],
+    d1: &[f64; NN],
     g: f64,
     h_min: f64,
     h_dry: f64,
 ) {
+    let idx = |a: usize| {
+        if direction == 0 {
+            line * N1 + a
+        } else {
+            a * N1 + line
+        }
+    };
     // Interface metrics (the telescoping sum of the flux-differencing term)
     let mut interfaces = [(0.0, 0.0); N1 + 1];
     telescoped_interfaces(w, d1, metric, affine, &mut interfaces);
@@ -714,27 +729,37 @@ pub mod kernels {
         }
         let mut rhs = [SWEState2D::zero(); NN];
 
-        let mut outer = [(SWENodeState2D::default(), 0.0, false); 4 * N1];
+        // The GLL weights, nodes and D as arrays: constant lengths for the
+        // loops of the subcells (telescoped_interfaces reads their length)
+        let (mut w_a, mut xi_a, mut d1_a) = ([0.0; N1], [0.0; N1], [0.0; NN]);
         #[unroll]
-        for face in 0..4 {
-            #[unroll]
-            for fi in 0..N1 {
-                outer[face * N1 + fi] = outer_node(
-                    k,
-                    face,
-                    fi,
-                    (h, hu, hv, bed),
-                    affine,
-                    egeom,
-                    jac,
-                    fgeom,
-                    element_edges,
-                    edges,
-                    xi,
-                    h_min,
-                );
-            }
+        for a in 0..N1 {
+            w_a[a] = w[a];
+            xi_a[a] = xi[a];
         }
+        #[unroll]
+        for a in 0..NN {
+            d1_a[a] = d1[a];
+        }
+        // The outer node of face node `fi` of `face`, read where its line
+        // needs it (each is the end of one line only): the 12 of an element
+        // need not be held at once
+        let outer = |face: usize, fi: usize| {
+            outer_node(
+                k,
+                face,
+                fi,
+                (h, hu, hv, bed),
+                affine,
+                egeom,
+                jac,
+                fgeom,
+                element_edges,
+                edges,
+                &xi_a,
+                h_min,
+            )
+        };
 
         let aff = affine[k] != 0;
         let eg = egeom[k];
@@ -756,9 +781,9 @@ pub mod kernels {
                     (c[0], c[1])
                 };
             }
-            let ends = [outer[3 * N1 + rev], outer[N1 + fwd]];
+            let ends = [outer(3, rev), outer(1, fwd)];
             line_subcells(
-                &nodes, &mut rhs, &metric, r_line, ends, aff, w, xi, d1, g, h_min, h_dry,
+                &nodes, &mut rhs, &metric, line, 0, ends, aff, &w_a, &xi_a, &d1_a, g, h_min, h_dry,
             );
             #[unroll]
             for j in 0..N1 {
@@ -769,9 +794,9 @@ pub mod kernels {
                     (c[2], c[3])
                 };
             }
-            let ends = [outer[fwd], outer[2 * N1 + rev]];
+            let ends = [outer(0, fwd), outer(2, rev)];
             line_subcells(
-                &nodes, &mut rhs, &metric, s_line, ends, aff, w, xi, d1, g, h_min, h_dry,
+                &nodes, &mut rhs, &metric, line, 1, ends, aff, &w_a, &xi_a, &d1_a, g, h_min, h_dry,
             );
         }
 

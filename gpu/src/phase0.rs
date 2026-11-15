@@ -206,6 +206,17 @@ impl Case {
         self.mesh.n_elements
     }
 
+    /// Elements on the subcells (a node shallower than the subcell depth).
+    pub fn subcell_elements(&self) -> usize {
+        let Formulation::WetDry { subcell_depth, .. } = self.formulation else {
+            return 0;
+        };
+        self.q.data[0]
+            .chunks(NN)
+            .filter(|h| h.iter().any(|&h| h < subcell_depth))
+            .count()
+    }
+
     pub fn affine_elements(&self) -> usize {
         (0..self.n_elements())
             .filter(|&k| self.geom.element_geometry(k).affine)

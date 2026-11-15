@@ -59,6 +59,7 @@ pub fn line_node(n_1d: usize, dir: usize, line: usize, a: usize) -> usize {
 /// form's on constant states; by summation by parts its last step lands on
 /// the end node's metric). On an affine element every interface takes the
 /// one metric.
+#[inline]
 pub fn telescoped_interfaces(
     w: &[f64],
     d1: &[f64],

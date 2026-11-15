@@ -27,6 +27,12 @@ fn run_case(
     t_end: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let n_el = case.n_elements();
+    if case.subcell_elements() > 0 {
+        println!(
+            "  {label}: {} of {n_el} elements on the subcells at the start",
+            case.subcell_elements()
+        );
+    }
 
     let cpu_sim = Simulation::new(case.cpu_physics(), SSPRK43).with_cfl(CFL);
     let mut cpu = case.q.clone();
@@ -68,6 +74,16 @@ fn run_case(
         per_element_stage(gpu_seconds, gpu_result.n_steps),
     );
     Ok(())
+}
+
+/// The wet/dry beach of 96,000 elements alone (for a profiler).
+pub fn run_beach(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
+    run_case(
+        "beach, jittered, timing",
+        &Case::beach(320, 300, 0.2, false),
+        gpu,
+        30.0,
+    )
 }
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {

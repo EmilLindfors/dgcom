@@ -92,7 +92,20 @@ A cuda-oxide kernel calling `dgcom::flux::wintermeyer_flux_2d` and `entropy_stab
 - **The stage:** `post_process` is dgcom's `wet_dry_element` on every element (the positivity limiter the case runner adds at `h_dry` is redundant), `implicit_damping` dgcom's `damp_node` at every node (now generic over the friction law: the CPU passes its trait object, the GPU a concrete `ManningFriction2D`), `compute_dt_ssp` the element step of `min_element_dt_swe_2d` (own nodes, neighbours' face nodes, `PositivityBound::element_cfl`, which now takes the element's nodal masses), reduced on the host. The CPU side is built as the case runner builds it (`swe_builder`).
 - **The gate:** `Simulation` with SSP-RK(4,3) on the beach with Manning 0.025: the GPU takes the CPU's steps (111, 171, 48, 74) and ends on its state bit for bit, against the scalar kernel and the batch.
 - **Kernels by element kind:** one element kernel with the subcells, the outer nodes and the walls in it put every thread on their registers and local memory (the fully wet RHS 31 → 152 ns on the RTX 4060). Now the edge kernels (entropy-stable, hydrostatic HLL) also write the walls' F*, a flux-differencing element kernel takes the wet elements and a subcell kernel the shallow ones, each returning at once for the other kind, as the CPU sorts its chunks. A `#[device]` helper is a real `.func` call unless marked `#[inline(always)]` (cuda-oxide makes it `alwaysinline`; the host compiler warns that it ignores it), and a call passing an element's arrays puts them in local memory: the flux-differencing kernel has no call and no local memory now. The subcell kernel still calls `line_subcells` (6 calls, some local memory): only shoreline elements take it.
-- **Timing open:** the RTX 4060 was busy with other work during these runs, so the numbers of this step are not comparable; time again with the GPU free.
+- **Timing, the GPU free** (RTX 4060 Laptop, FMA build, the CPU the batch on 24 threads; two runs agree):
+
+  | | CPU | GPU | |
+  |---|---|---|---|
+  | RHS, fully wet, jittered (per element) | 53–62 ns | 21–27 ns | 2.3–2.5× |
+  | RHS, fully wet, parallelograms | 48–54 ns | 18 ns | 2.7–3.0× |
+  | RHS, `WetDry`, shoreline beach | 39–40 ns | 63 ns | 0.6× |
+  | RHS, `WetDry`, films everywhere | 54–56 ns | 117 ns | 0.5× |
+  | `Simulation` step, fully wet, 96,000 elements | 26–27 ms | 11.0–12.7 ms | 2.1–2.35× |
+  | `Simulation` step, wet/dry beach, 96,000 elements | 24 ms | 30.6–33.6 ms | 0.73–0.78× |
+
+  The fully wet path is back where Phase 0 had it (the regression of the one-kernel version is gone); the wet/dry path is slower than the CPU on this card.
+- **Where a wet/dry step goes** (Nsight Systems, `dgcom-gpu.exe beach`: 96,000 elements of which 19,946, 21 %, are on the subcells; per stage): `element_rhs_subcells` 3.30 ms (44 %), `edge_fluxes_hll` 1.44 ms (19 %), `element_rhs_volume` 1.25 ms (17 %), `implicit_damping` 0.65 ms (9 %), `wet_dry_correction` 0.29 ms, the combinations 0.27 ms; `element_dt` 0.93 ms per step. Nsight Systems' kernel trace works without the performance counters Nsight Compute needs.
+- **The subcells are FP64-division bound on a 1:64 card:** a subcell element costs 165 ns on the GPU against 16.5 for a flux-differencing one (10×), while on the CPU both cost about the same. Per element the subcells take ≈ 300 divisions and square roots (12 limited reconstructions of 4 slopes with 3 divisions each, 12 hydrostatic HLLs with ≈ 5 roots and 4 divisions, the bed terms), which a CPU does in hardware and a 1:64 GPU in 10–20 operations on its few FP64 units each. Inlining `line_subcells` (a generic `#[device]` function stays a call: made it non-generic) and giving it the GLL data as arrays removed its 6 calls and two thirds of its local memory (186 → 57 stores) but not its time (3.47 → 3.30 ms), and reading the outer nodes per line instead of holding all 12 changed nothing: the arithmetic is the cost. On the 3090 (2.4× the 4060's FP64) the beach step would be ≈ 13 ms (≈ 1.8× the CPU), on the PRO 6000 (≈ 8.5×) ≈ 4 ms, on a full-rate FP64 card far less.
 
 ## One source for the physics (2026-11-15)
 
@@ -105,6 +118,7 @@ A cuda-oxide kernel calling `dgcom::flux::wintermeyer_flux_2d` and `entropy_stab
 ## Out of TODO.md
 
 ### Parked
+- **P2.7** Fewer divisions in the shared wet/dry physics (`limited_slope`, `hydrostatic_hll`): the GLL distances of `limited_slope` (`xi[2] − xi[0]`, the face and node distances) are constants for every inner subcell, so their reciprocals could be tables (the end subcells' outer distances vary), and HLL's `m / |m|`, `1 / (s_r − s_l)` could share one reciprocal. ≈ 200 of an element's ≈ 300 divisions, the GPU's wet/dry bottleneck on 1:64 cards (above). It changes the bits of every wet/dry run, on the CPU too (one source): a numerics change with its gates and a rerun of the scored cases.
 - **P2.7** Emulated double precision (double-float on the FP32 units) could beat native FP64 a few times on the 1:64 cards, at f32's exponent range: only if the PRO 6000's measured numbers disappoint.
 - **P2.7** Several runs in one set of launches (scenarios, ensembles, the 15-day runs side by side) for meshes too small to fill a GPU.
 - **P2.7** MI300X: a HIP or CubeCL backend over the shared physics crate, if production moves to AMD.
