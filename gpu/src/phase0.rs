@@ -12,8 +12,11 @@ use dgcom::compute_rhs_swe_2d_parallel_into;
 use dgcom::equations::ShallowWater2D;
 use dgcom::mesh::{Bathymetry2D, BoundaryTag, ElementFace, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
-use dgcom::physics::PhysicsModule;
-use dgcom::solver::{SWE2DRhsConfig, SWEFormulation2D, SWESolution2D};
+use dgcom::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D};
+use dgcom::solver::{
+    SWE2DRhsConfig, SWEFormulation2D, SWESolution2D, StandardLimiter2D, WetDryConfig,
+};
+use dgcom::source::ManningFriction2D;
 use dgcom::time::Integrable;
 use dgcom::types::ElementIndex;
 
@@ -92,6 +95,8 @@ pub struct Case {
     pub equation: ShallowWater2D,
     pub q: SWESolution2D,
     pub formulation: Formulation,
+    /// Manning's n of the bed friction, if any
+    pub manning: Option<f64>,
 }
 
 /// The wet/dry depth of the beach (`WetDryConfig::DEFAULT_H_DRY`).
@@ -130,6 +135,7 @@ impl Case {
             equation: ShallowWater2D::new(G),
             q,
             formulation: Formulation::EntropyStable,
+            manning: None,
         }
     }
 
@@ -177,6 +183,7 @@ impl Case {
                 subcell_depth: H_DRY,
                 h_dry: H_DRY,
             },
+            manning: Some(0.025),
         }
     }
 
@@ -207,7 +214,7 @@ impl Case {
 
     /// The GPU physics module of this case.
     pub fn gpu_physics(&self, gpu: &Arc<Gpu>) -> GpuSWE2D {
-        GpuSWE2D::new(
+        let mut physics = GpuSWE2D::new(
             gpu,
             self.mesh.clone(),
             self.ops.clone(),
@@ -217,7 +224,38 @@ impl Case {
             self.formulation,
             &Reflective2D::new(),
         )
-        .expect("GPU physics")
+        .expect("GPU physics");
+        if let Formulation::WetDry { .. } = self.formulation {
+            physics = physics.with_wet_dry(WetDryConfig::default());
+        }
+        if let Some(n) = self.manning {
+            physics = physics.with_friction(ManningFriction2D::new(G, n));
+        }
+        physics
+    }
+
+    /// The CPU physics module of this case, as the case runner builds it
+    /// (`swe_builder`: the positivity limiter and `WetDryConfig::default()`
+    /// for wetting and drying, Manning friction point-implicit).
+    pub fn cpu_physics(&self) -> SWEPhysics2D<Reflective2D> {
+        let mut builder = PhysicsBuilder::swe_2d(
+            self.mesh.clone(),
+            self.ops.clone(),
+            self.geom.clone(),
+            self.equation.clone(),
+            Reflective2D::new(),
+        )
+        .with_bathymetry(self.bathymetry.clone());
+        builder = match self.formulation {
+            Formulation::EntropyStable => builder.with_formulation(SWEFormulation2D::EntropyStable),
+            Formulation::WetDry { .. } => builder
+                .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
+                .with_wet_dry(WetDryConfig::default()),
+        };
+        if let Some(n) = self.manning {
+            builder = builder.with_implicit_friction(ManningFriction2D::new(G, n));
+        }
+        builder.build()
     }
 }
 

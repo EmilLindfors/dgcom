@@ -1,15 +1,15 @@
-//! Phase 1's first gate: dgcom's own `Simulation` and SSP-RK(4,3) stepping
-//! the GPU state ([`DeviceState`]) with the GPU physics ([`GpuSWE2D`]),
-//! against the same run on the CPU (`SWEPhysics2D`, EntropyStable), and the
-//! time per step of both.
+//! Phase 1's `Simulation` gate: dgcom's own `Simulation` and SSP-RK(4,3)
+//! stepping the GPU state ([`DeviceState`]) with the GPU physics
+//! ([`GpuSWE2D`]), against the same run on the CPU (`SWEPhysics2D` built as
+//! the case runner builds it), and the time per step of both: the fully wet
+//! split form on periodic beds, and the wet/dry stage (`WetDry`, the
+//! positivity-bounded step, the wet/dry correction, Manning friction and the
+//! thin-layer relaxation) on a walled drying beach.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use dgcom::boundary::Reflective2D;
-use dgcom::physics::PhysicsBuilder;
 use dgcom::simulation::Simulation;
-use dgcom::solver::SWEFormulation2D;
 use dgcom::time::SSPRK43;
 
 use crate::phase0::{Case, agreement, cpu_kernel};
@@ -28,17 +28,7 @@ fn run_case(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let n_el = case.n_elements();
 
-    let physics = PhysicsBuilder::swe_2d(
-        case.mesh.clone(),
-        case.ops.clone(),
-        case.geom.clone(),
-        case.equation.clone(),
-        Reflective2D::new(),
-    )
-    .with_bathymetry(case.bathymetry.clone())
-    .with_formulation(SWEFormulation2D::EntropyStable)
-    .build();
-    let cpu_sim = Simulation::new(physics, SSPRK43).with_cfl(CFL);
+    let cpu_sim = Simulation::new(case.cpu_physics(), SSPRK43).with_cfl(CFL);
     let mut cpu = case.q.clone();
     let start = Instant::now();
     let cpu_result = cpu_sim.run(&mut cpu, 0.0, t_end);
@@ -85,5 +75,30 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     run_case("parallelograms", &Case::new(48, 40, 0.0), gpu, 30.0)?;
     run_case("jittered", &Case::new(48, 40, 0.15), gpu, 30.0)?;
     run_case("jittered, timing", &Case::new(320, 300, 0.15), gpu, 30.0)?;
+    println!("== Phase 1: Simulation of a wet/dry beach on the GPU ==");
+    run_case(
+        "beach, parallelograms",
+        &Case::beach(36, 20, 0.0, false),
+        gpu,
+        120.0,
+    )?;
+    run_case(
+        "beach, jittered",
+        &Case::beach(36, 20, 0.2, false),
+        gpu,
+        120.0,
+    )?;
+    run_case(
+        "beach with films, jittered",
+        &Case::beach(36, 20, 0.2, true),
+        gpu,
+        30.0,
+    )?;
+    run_case(
+        "beach, jittered, timing",
+        &Case::beach(320, 300, 0.2, false),
+        gpu,
+        30.0,
+    )?;
     Ok(())
 }

@@ -2080,7 +2080,8 @@ fn element_dt(
         }
     }
     let cfl = positivity.map_or(cfl, |bound| {
-        cfl.min(bound.element_cfl(q.element_h(k_idx), geom, ops.n_1d, k))
+        let mass = &geom.mass[geom.node_index(k, 0)..][..ops.n_nodes];
+        cfl.min(bound.element_cfl(q.element_h(k_idx), mass, ops.n_1d))
     });
     dt_from_reference_rate(rate, order, cfl)
 }
@@ -2182,13 +2183,13 @@ impl PositivityBound {
         }
     }
 
-    /// The CFL of element `k` with nodal depths `h` (`n1` GLL nodes per
-    /// direction): `cfl` times the relaxation factor ρ ≥ 1, at most
+    /// The CFL of an element with nodal depths `h` and nodal masses `mass`
+    /// (GLL weight × J; `n1` GLL nodes per direction): `cfl` times the
+    /// relaxation factor ρ ≥ 1, at most
     /// `max_cfl`, or `max_cfl_subcells` if a node is at or below
     /// [`SUBCELL_CAP_DEPTH_FACTOR`] times `h_dry`.
     #[inline]
-    pub fn element_cfl(&self, h: &[f64], geom: &GeometricFactors2D, n1: usize, k: usize) -> f64 {
-        let mass = &geom.mass[geom.node_index(k, 0)..][..h.len()];
+    pub fn element_cfl(&self, h: &[f64], mass: &[f64], n1: usize) -> f64 {
         let shallow = SUBCELL_CAP_DEPTH_FACTOR * self.h_dry;
         let (rho, subcells) = positivity_relaxation(h, mass, n1, shallow);
         let cap = if subcells {
@@ -3966,7 +3967,7 @@ mod tests {
                 assert_eq!(bound.cfl, c * positivity_cfl_swe_2d(order));
                 let linear = LINEAR_CFL_SAFETY * linear_cfl_swe_2d(order, scheme).unwrap();
                 assert_eq!(bound.max_cfl, linear);
-                let cfl = bound.element_cfl(&uniform, &geom, ops.n_1d, 0);
+                let cfl = bound.element_cfl(&uniform, mass, ops.n_1d);
                 assert!(
                     (cfl - (bound.cfl * rho).min(linear)).abs() < 1e-14,
                     "N = {order}, {scheme:?}"
@@ -3976,7 +3977,7 @@ mod tests {
                 assert!(subcells < linear_cfl_swe_2d(order, scheme).unwrap());
                 let subcells = bound.cfl.max(LINEAR_CFL_SAFETY * subcells);
                 assert_eq!(bound.max_cfl_subcells, subcells);
-                let cfl = bound.element_cfl(&shore, &geom, ops.n_1d, 0);
+                let cfl = bound.element_cfl(&shore, mass, ops.n_1d);
                 assert!(
                     (cfl - (bound.cfl * rho_shore).min(subcells)).abs() < 1e-14,
                     "N = {order}, {scheme:?}"
@@ -3987,7 +3988,7 @@ mod tests {
                     let mut h = uniform.clone();
                     h[0] = corner;
                     let rho = positivity_relaxation(&h, mass, ops.n_1d, 0.0).0;
-                    let cfl = bound.element_cfl(&h, &geom, ops.n_1d, 0);
+                    let cfl = bound.element_cfl(&h, mass, ops.n_1d);
                     assert!(
                         (cfl - (bound.cfl * rho).min(cap)).abs() < 1e-14,
                         "N = {order}, {scheme:?}, corner {corner}: {cfl}"
@@ -3997,8 +3998,8 @@ mod tests {
             let plain = PositivityBound::new(order, None, 1e-3);
             assert_eq!(plain.max_cfl, plain.cfl);
             assert_eq!(plain.max_cfl_subcells, plain.cfl);
-            assert_eq!(plain.element_cfl(&uniform, &geom, ops.n_1d, 0), plain.cfl);
-            assert_eq!(plain.element_cfl(&shore, &geom, ops.n_1d, 0), plain.cfl);
+            assert_eq!(plain.element_cfl(&uniform, mass, ops.n_1d), plain.cfl);
+            assert_eq!(plain.element_cfl(&shore, mass, ops.n_1d), plain.cfl);
         }
     }
 }

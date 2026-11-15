@@ -32,10 +32,12 @@ use dgcom::operators::{DGOperators2D, GeometricFactors2D};
 use dgcom::physics::{PhysicsModule, PhysicsModuleInfo};
 use dgcom::solver::rhs::subcells::telescoped_interfaces;
 use dgcom::solver::{
-    SWESide2D, SWESolution2D, dt_from_reference_rate, hydrostatic_hll, node_reference_rate,
-    reconstruct_subcell,
+    PositivityBound, SWESide2D, SWESolution2D, WetDryConfig, damp_node, dt_from_reference_rate,
+    hydrostatic_hll, node_reference_rate, reconstruct_subcell, wet_dry_element,
 };
+use dgcom::source::{CageNode, ManningFriction2D};
 use dgcom::time::Integrable;
+use dgcom::time::SspScheme;
 use dgcom::types::{Depth, ElementIndex};
 
 /// Polynomial order of the kernels (P2).
@@ -792,6 +794,212 @@ pub mod kernels {
         );
     }
 
+    /// `apply_wet_dry_correction_all` of element `k` (one thread per
+    /// element): dgcom's `wet_dry_element` on its rows, with its nodal
+    /// masses and 1/area.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn wet_dry_correction(
+        h_dry: f64,
+        relaxation_time: f64,
+        max_velocity: f64,
+        g: f64,
+        mass: &[f64],
+        inv_area: &[f64],
+        mut h: DisjointSlice<f64>,
+        mut hu: DisjointSlice<f64>,
+        mut hv: DisjointSlice<f64>,
+    ) {
+        let k = thread::index_1d().get();
+        if k >= inv_area.len() {
+            return;
+        }
+        let config = WetDryConfig {
+            h_dry: Depth::new(h_dry),
+            relaxation_time,
+            max_velocity,
+            g,
+        };
+        let (mut eh, mut ehu, mut ehv, mut m) = ([0.0; NN], [0.0; NN], [0.0; NN], [0.0; NN]);
+        #[unroll]
+        for i in 0..NN {
+            let n = k * NN + i;
+            // SAFETY: thread k reads and writes only its own element's rows.
+            unsafe {
+                eh[i] = *h.get_unchecked_mut(n);
+                ehu[i] = *hu.get_unchecked_mut(n);
+                ehv[i] = *hv.get_unchecked_mut(n);
+            }
+            m[i] = mass[n];
+        }
+        wet_dry_element(&mut eh, &mut ehu, &mut ehv, &m, inv_area[k], &config);
+        #[unroll]
+        for i in 0..NN {
+            let n = k * NN + i;
+            // SAFETY: as above.
+            unsafe {
+                *h.get_unchecked_mut(n) = eh[i];
+                *hu.get_unchecked_mut(n) = ehu[i];
+                *hv.get_unchecked_mut(n) = ehv[i];
+            }
+        }
+    }
+
+    /// `apply_implicit_damping_2d` of node `n` (one thread per node):
+    /// dgcom's `damp_node` with Manning friction (if `friction`) and the
+    /// thin-layer relaxation (if `wet_dry`), no cages.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn implicit_damping(
+        dt: f64,
+        h_min: f64,
+        friction: u32,
+        g: f64,
+        manning_n: f64,
+        friction_h_min: f64,
+        wet_dry: u32,
+        h_dry: f64,
+        relaxation_time: f64,
+        max_velocity: f64,
+        wet_dry_g: f64,
+        h: &[f64],
+        from_h: &[f64],
+        from_hu: &[f64],
+        from_hv: &[f64],
+        mut hu: DisjointSlice<f64>,
+        mut hv: DisjointSlice<f64>,
+    ) {
+        let n = thread::index_1d().get();
+        if n >= h.len() {
+            return;
+        }
+        let law = ManningFriction2D {
+            g,
+            manning_n,
+            h_min: friction_h_min,
+        };
+        let config = WetDryConfig {
+            h_dry: Depth::new(h_dry),
+            relaxation_time,
+            max_velocity,
+            g: wet_dry_g,
+        };
+        let no_cages: &[CageNode] = &[];
+        // SAFETY: thread n reads and writes only node n.
+        let (mut u, mut v) = unsafe { (*hu.get_unchecked_mut(n), *hv.get_unchecked_mut(n)) };
+        damp_node(
+            if friction != 0 { Some(&law) } else { None },
+            no_cages,
+            if wet_dry != 0 { Some(&config) } else { None },
+            Depth::new(h_min),
+            n,
+            h[n],
+            &mut u,
+            &mut v,
+            SWEState2D::new(from_h[n], from_hu[n], from_hv[n]),
+            dt,
+        );
+        // SAFETY: as above.
+        unsafe {
+            *hu.get_unchecked_mut(n) = u;
+            *hv.get_unchecked_mut(n) = v;
+        }
+    }
+
+    /// `element_dt` of `min_element_dt_swe_2d` (one thread per element): the
+    /// largest reference rate of the element's nodes and of its neighbours'
+    /// face nodes (with the element's metric there), and the CFL capped by
+    /// the positivity bound (if `positive`).
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn element_dt(
+        g: f64,
+        h_min: f64,
+        cfl: f64,
+        order: u32,
+        positive: u32,
+        bound_cfl: f64,
+        bound_max_cfl: f64,
+        bound_max_cfl_subcells: f64,
+        bound_h_dry: f64,
+        h: &[f64],
+        hu: &[f64],
+        hv: &[f64],
+        affine: &[u32],
+        affine_grads: &[[f64; 4]],
+        grads: &[[f64; 4]],
+        mass: &[f64],
+        element_edges: &[[u32; 4]],
+        edges: &[[u32; 4]],
+        mut out: DisjointSlice<f64>,
+    ) {
+        let idx = thread::index_1d();
+        let k = idx.get();
+        if let Some(dt) = out.get_mut(idx) {
+            let h_min_depth = Depth::new(h_min);
+            // element_max_reference_rate
+            let aff = affine[k] != 0;
+            let affine_metric = rate_metric(affine_grads[k]);
+            let mut rate = 0.0f64;
+            #[unroll]
+            for i in 0..NN {
+                let n = k * NN + i;
+                let state = SWEState2D::new(h[n], hu[n], hv[n]);
+                let r = if state.h <= h_min {
+                    0.0
+                } else {
+                    let metric = if aff {
+                        affine_metric
+                    } else {
+                        rate_metric(grads[n])
+                    };
+                    node_reference_rate(&state, metric, g, h_min_depth)
+                };
+                rate = rate.max(r);
+            }
+            // The neighbours' face nodes, with this element's metric there
+            #[unroll]
+            for face in 0..4 {
+                let edge = edges[element_edges[k][face] as usize];
+                if edge[2] != NO_NEIGHBOUR {
+                    let (nb, nb_face) = if edge[0] as usize == k && edge[1] as usize == face {
+                        (edge[2] as usize, edge[3] as usize)
+                    } else {
+                        (edge[0] as usize, edge[1] as usize)
+                    };
+                    #[unroll]
+                    for fi in 0..N1 {
+                        let i = face_node(face, fi);
+                        let n = nb * NN + face_node(nb_face, N1 - 1 - fi);
+                        let state = SWEState2D::new(h[n], hu[n], hv[n]);
+                        if state.h > h_min {
+                            let metric = rate_metric(grads[k * NN + i]);
+                            rate = rate.max(node_reference_rate(&state, metric, g, h_min_depth));
+                        }
+                    }
+                }
+            }
+            let cfl = if positive != 0 {
+                let bound = PositivityBound {
+                    cfl: bound_cfl,
+                    max_cfl: bound_max_cfl,
+                    max_cfl_subcells: bound_max_cfl_subcells,
+                    h_dry: bound_h_dry,
+                };
+                let (mut eh, mut m) = ([0.0; NN], [0.0; NN]);
+                #[unroll]
+                for i in 0..NN {
+                    eh[i] = h[k * NN + i];
+                    m[i] = mass[k * NN + i];
+                }
+                cfl.min(bound.element_cfl(&eh, &m, N1))
+            } else {
+                cfl
+            };
+            *dt = dt_from_reference_rate(rate, order as usize, cfl);
+        }
+    }
+
     /// `Integrable::combine` with a base: `out = a·base + c₁x₁ (+ c₂x₂)`,
     /// in the order of `combine_values` (copy, scale unless `a = 1`, one
     /// multiply–add per term).
@@ -1140,6 +1348,9 @@ struct Statics {
     /// `[r_x, r_y, s_x, s_y]` of every node, and of every parallelogram
     grads: DeviceBuffer<[f64; 4]>,
     affine_grads: DeviceBuffer<[f64; 4]>,
+    /// Nodal masses (GLL weight × J) and every element's 1/area
+    mass: DeviceBuffer<f64>,
+    inv_area: DeviceBuffer<f64>,
 }
 
 impl Statics {
@@ -1205,6 +1416,11 @@ impl Statics {
             }
         }
         let lift: Vec<f64> = ops.lift_row_major.iter().flatten().copied().collect();
+        let mass: Vec<f64> = (0..n_el)
+            .flat_map(|k| (0..NN).map(move |i| (k, i)))
+            .map(|(k, i)| geom.mass[geom.node_index(k, i)])
+            .collect();
+        let inv_area: Vec<f64> = geom.area.iter().map(|a| 1.0 / a).collect();
         let element_edges: Vec<[u32; 4]> = mesh
             .element_edges
             .iter()
@@ -1236,6 +1452,8 @@ impl Statics {
             edges: DeviceBuffer::from_host(stream, &edges)?,
             grads: DeviceBuffer::from_host(stream, &grads)?,
             affine_grads: DeviceBuffer::from_host(stream, &affine_grads)?,
+            mass: DeviceBuffer::from_host(stream, &mass)?,
+            inv_area: DeviceBuffer::from_host(stream, &inv_area)?,
         })
     }
 }
@@ -1251,8 +1469,12 @@ pub enum Formulation {
 }
 
 /// The 2D SWE physics module on the GPU: `SWEPhysics2D` with a split
-/// formulation ([`Formulation`]), a bed, walls (`Reflective2D`), no sources
-/// yet (Phase 1, `notes/gpu.md`).
+/// formulation ([`Formulation`]), a bed, walls (`Reflective2D`), the wet/dry
+/// correction after every stage and the thin-layer relaxation
+/// ([`Self::with_wet_dry`]; its positivity limiter is the redundant one of
+/// the case runner, `Positivity(h_dry)`), Manning friction applied
+/// point-implicitly ([`Self::with_friction`]), the positivity-bounded time
+/// step; no sources yet (Phase 1, `notes/gpu.md`).
 pub struct GpuSWE2D {
     gpu: Arc<Gpu>,
     mesh: Arc<Mesh2D>,
@@ -1264,6 +1486,10 @@ pub struct GpuSWE2D {
     formulation: Formulation,
     /// The walls' `Reflective2D::h_min`
     wall_h_min: f64,
+    wet_dry: Option<WetDryConfig>,
+    friction: Option<ManningFriction2D>,
+    /// Every element's time step (`compute_dt_ssp` of a wet/dry run)
+    element_dts: Mutex<DeviceBuffer<f64>>,
     /// Both sides' F* of every edge, written by the edge kernel for the
     /// element kernel
     faces: Mutex<DeviceBuffer<[[f64; 3]; NF]>>,
@@ -1285,6 +1511,7 @@ impl GpuSWE2D {
         let statics = Statics::upload(gpu, &mesh, &ops, &geom, bathymetry)?;
         let faces = DeviceBuffer::zeroed(&gpu.stream, mesh.n_edges)?;
         let rates = DeviceBuffer::zeroed(&gpu.stream, mesh.n_elements)?;
+        let element_dts = DeviceBuffer::zeroed(&gpu.stream, mesh.n_elements)?;
         Ok(Self {
             gpu: gpu.clone(),
             mesh,
@@ -1295,9 +1522,30 @@ impl GpuSWE2D {
             h_min: equation.h_min.meters(),
             formulation,
             wall_h_min: wall.h_min,
+            wet_dry: None,
+            friction: None,
+            element_dts: Mutex::new(element_dts),
             faces: Mutex::new(faces),
             rates: Mutex::new(rates),
         })
+    }
+}
+
+impl GpuSWE2D {
+    /// Wetting and drying: the wet/dry correction after every stage, the
+    /// thin-layer relaxation in the implicit damping, the time step under
+    /// the positivity bound (`SWEPhysics2D::with_wet_dry` with the
+    /// positivity limiter at `config.h_dry`).
+    pub fn with_wet_dry(mut self, config: WetDryConfig) -> Self {
+        self.wet_dry = Some(config);
+        self
+    }
+
+    /// Manning bottom friction, point-implicit in every stage
+    /// (`SWEPhysics2D::with_implicit_friction`).
+    pub fn with_friction(mut self, friction: ManningFriction2D) -> Self {
+        self.friction = Some(friction);
+        self
     }
 }
 
@@ -1469,6 +1717,117 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
         let rates = rates.to_host_vec(&gpu.stream).expect("download");
         let max_rate = rates.iter().copied().fold(0.0_f64, f64::max);
         dt_from_reference_rate(max_rate, self.ops.order, cfl)
+    }
+
+    /// The wet/dry correction (`SWEPhysics2D::post_process` with a
+    /// redundant positivity limiter).
+    fn post_process(&self, state: &mut DeviceState) {
+        let Some(config) = &self.wet_dry else {
+            return;
+        };
+        let (gpu, s) = (&self.gpu, &self.statics);
+        let [h, hu, hv] = state.fields_mut();
+        // SAFETY: one thread per element of this mesh; the state's rows.
+        unsafe {
+            gpu.module.wet_dry_correction(
+                &gpu.stream,
+                per_element(self.mesh.n_elements),
+                config.h_dry.meters(),
+                config.relaxation_time,
+                config.max_velocity,
+                config.g,
+                &s.mass,
+                &s.inv_area,
+                h,
+                hu,
+                hv,
+            )
+        }
+        .expect("wet/dry correction");
+    }
+
+    /// Point-implicit Manning friction and thin-layer relaxation.
+    fn implicit_damping(&self, stage: &mut DeviceState, from: &DeviceState, dt: f64) {
+        if self.friction.is_none() && self.wet_dry.is_none() {
+            return;
+        }
+        let gpu = &self.gpu;
+        let (g, manning_n, friction_h_min) = self
+            .friction
+            .as_ref()
+            .map_or((0.0, 0.0, 0.0), |f| (f.g, f.manning_n, f.h_min));
+        let (h_dry, relaxation_time, max_velocity, wd_g) =
+            self.wet_dry.as_ref().map_or((0.0, 0.0, 0.0, 0.0), |c| {
+                (c.h_dry.meters(), c.relaxation_time, c.max_velocity, c.g)
+            });
+        let n_nodes = stage.h.len();
+        let DeviceState { h, hu, hv, .. } = stage;
+        // SAFETY: one thread per node of the state; `from` is another state.
+        unsafe {
+            gpu.module.implicit_damping(
+                &gpu.stream,
+                one_dimensional(n_nodes),
+                dt,
+                self.h_min,
+                u32::from(self.friction.is_some()),
+                g,
+                manning_n,
+                friction_h_min,
+                u32::from(self.wet_dry.is_some()),
+                h_dry,
+                relaxation_time,
+                max_velocity,
+                wd_g,
+                &*h,
+                &from.h,
+                &from.hu,
+                &from.hv,
+                hu,
+                hv,
+            )
+        }
+        .expect("implicit damping");
+    }
+
+    /// With wetting and drying, `min_element_dt_swe_2d` under the positivity
+    /// bound of `scheme`, the smallest element step reduced on the host
+    /// (exact in any order); else `compute_dt`.
+    fn compute_dt_ssp(&self, state: &DeviceState, cfl: f64, scheme: Option<SspScheme>) -> f64 {
+        let Some(config) = &self.wet_dry else {
+            return self.compute_dt(state, cfl);
+        };
+        let bound = PositivityBound::new(self.ops.order, scheme, config.h_dry.meters());
+        let (gpu, s) = (&self.gpu, &self.statics);
+        let mut dts = self.element_dts.lock().expect("time step buffer");
+        // SAFETY: one step per element; the state and statics are this mesh's.
+        unsafe {
+            gpu.module.element_dt(
+                &gpu.stream,
+                one_dimensional(self.mesh.n_elements),
+                self.g,
+                self.h_min,
+                cfl,
+                self.ops.order as u32,
+                1,
+                bound.cfl,
+                bound.max_cfl,
+                bound.max_cfl_subcells,
+                bound.h_dry,
+                &state.h,
+                &state.hu,
+                &state.hv,
+                &s.affine,
+                &s.affine_grads,
+                &s.grads,
+                &s.mass,
+                &s.element_edges,
+                &s.edges,
+                &mut *dts,
+            )
+        }
+        .expect("element time steps");
+        let dts = dts.to_host_vec(&gpu.stream).expect("download");
+        dts.iter().copied().fold(f64::INFINITY, f64::min)
     }
 
     fn mesh(&self) -> &Mesh2D {

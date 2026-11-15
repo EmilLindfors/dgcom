@@ -11,7 +11,7 @@ mod wetting_drying;
 
 pub use wetting_drying::{
     ImplicitDamping2D, WetDryConfig, apply_implicit_damping_2d, apply_wet_dry_correction,
-    apply_wet_dry_correction_all, apply_wet_dry_correction_element,
+    apply_wet_dry_correction_all, apply_wet_dry_correction_element, damp_node, wet_dry_element,
 };
 
 #[cfg(feature = "parallel")]
