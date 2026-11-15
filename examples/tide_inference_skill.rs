@@ -26,9 +26,11 @@
 //! - `equal lag`: the minor ones fitted where the window resolves them and
 //!   inferred by `Inference::theory` where not, an unresolved N2 at M2's
 //!   lag;
+//! - `n2 age`: `equal lag` with N2's lag from the age of the tide, Q1 still
+//!   at O1's lag (`fit_gauge_record` of 2026-11-14);
 //! - `theory`: `HarmonicAnalysis::fit_gauge_record`, which is `equal lag`
-//!   with N2's lag from the age of the tide (the same from 27.6 days, where
-//!   N2 is fitted);
+//!   with N2's and Q1's lags from the ages of their bands (the same from
+//!   27.6 days, where both are fitted);
 //! - `own`: `HarmonicAnalysis::fit_with_reference` with this gauge's own
 //!   year as the reference (not out of sample: the bound a perfect
 //!   inference would reach);
@@ -58,7 +60,7 @@ use dgcom::time::ModelClock;
 mod arguments;
 
 /// The constituents scored against UTide's
-const SCORED: [&str; 5] = ["M2", "S2", "N2", "K1", "O1"];
+const SCORED: [&str; 6] = ["M2", "S2", "N2", "K1", "O1", "Q1"];
 
 /// Constituents with a period over two days: fitted, never predicted
 fn long_period(name: &str) -> bool {
@@ -251,6 +253,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Inference::theory(),
             ),
             Variant {
+                name: "n2 age",
+                fit: Box::new(|t, v| {
+                    let analysis = HarmonicAnalysis::resolvable(
+                        &HarmonicAnalysis::GAUGE_RECORD,
+                        t[t.len() - 1] - t[0],
+                        1.0,
+                        &Inference::theory(),
+                    );
+                    let fit = analysis.fit(t, v)?;
+                    let Some(aged) = analysis.with_the_age_of_the_tide(&fit) else {
+                        return Ok(fit);
+                    };
+                    // Q1 back at O1's lag
+                    let inferences: Vec<Inference> = aged
+                        .inferences()
+                        .iter()
+                        .map(|i| match i.name {
+                            "Q1" => Inference::Q1_FROM_O1,
+                            _ => *i,
+                        })
+                        .collect();
+                    HarmonicAnalysis::new(aged.names())
+                        .with_inferences(&inferences)
+                        .fit(t, v)
+                }),
+            },
+            Variant {
                 name: "theory",
                 fit: Box::new(HarmonicAnalysis::fit_gauge_record),
             },
@@ -396,7 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "\n|ΔZ| against UTide's year (mm, RMS over the windows), and the predicted tide (cm, RMS)"
     );
     println!(
-        "variant      M2     S2     N2     K1     O1   | inside  outside  outside obs  later obs"
+        "variant      M2     S2     N2     K1     O1     Q1   | inside  outside  outside obs  later obs"
     );
     for &name in &names {
         let of: Vec<&Score> = scores.iter().filter(|s| s.variant == name).collect();

@@ -185,6 +185,19 @@ The tidal-comparison code path is complete: `HarmonicAnalysis::fit` gives refere
       - `HarmonicAnalysis::fit` itself still fits whatever it is given (`new(&["M2", "Ssa"])` on a month): TODO.
       - Gate: `a_constituent_longer_than_the_record_is_left_out` (40 days with a 2 cm sag in the level: a fitted Ssa is over 6 cm and the mean over 6 cm off; left out, the mean is right to 1 mm).
     - **The age of the tide for a fortnight's N2** (`HarmonicAnalysis::with_the_age_of_the_tide`, the second pass of `fit_with_reference` when no reference gives N2): N2 at its equilibrium ratio to M2, at the lag the M2-to-S2 slope implies, `G(N2) = G(M2) − 0.536 (G(S2) − G(M2))` (one age for the semidiurnal band, Garrett & Munk 1971). N2 leads M2 by 15–35° on most coasts, and at equal lag a fortnight puts that into M2. Better at 15 of the 17 Norwegian gauges (Stavanger +0.05 cm, Tregde +0.3 cm: beside the amphidrome the slope is another) and 5 of the other 6 (San Diego +0.14 cm). Bodø 7.35 → 4.0 cm, Vardø 10.2 → 4.9, Prince Rupert 14.8 → 8.1, Brest 13.6 → 8.8, Puerto Montt 22.1 → 17.7.
+    - **The same for Q1 (2026-11-15; was a TODO line).** A Q1 that the record cannot separate from O1 (under 27.6 days) is inferred at its equilibrium ratio and at the lag the O1-to-K1 slope implies, `G(Q1) = G(O1) − 0.496 (G(K1) − G(O1))`: `with_the_age_of_the_tide` does both bands. The rule was stated before it was scored and nothing was tuned. `tide_inference_skill` now scores Q1 and has the variant `n2 age` (N2 aged, Q1 at O1's lag: the fit of 2026-11-14). RMS over the windows, `|ΔZ|` in mm and the predicted tide in cm:
+
+      | windows | gauges | Q1 at O1's lag: Q1 | O1 | tide | aged: Q1 | O1 | tide | gauge's own ratio: Q1 |
+      |---|---|---|---|---|---|---|---|---|
+      | 15 d | Norway 17 | 14.5 | 13.8 | 3.81 | 13.7 | 13.4 | 3.76 | 5.4 |
+      | 20 d | Norway 17 | 14.2 | 10.0 | 3.55 | 13.4 | 10.3 | 3.53 | 4.2 |
+      | 15 d | other 6 | 13.7 | 20.6 | 10.68 | 9.9 | 19.7 | 10.64 | 4.8 |
+      | 20 d | other 6 | 13.5 | 17.5 | 10.19 | 9.5 | 17.0 | 10.15 | 4.2 |
+
+      - *Other coasts:* the tide is better at 5 of 6 on 15 and on 20 days (Darwin +0.007 cm). Q1 at 15 days: Valparaíso 9.7 → 2.4 mm, Puerto Montt 16.0 → 5.9, Brest 18.7 → 11.4, Prince Rupert 8.7 → 5.6, San Diego 6.3 → 3.4, Darwin 18.4 → 19.4.
+      - *Norway:* better at 13 of 17 on 15 days and 12 on 20 (Vardø +0.13 cm, Hammerfest +0.03 to +0.06, Stavanger +0.01 to +0.02). The lag is not Norway's problem: Q1 is 14 mm off by theory and 5 mm with the gauge's own ratio, because its ratio to O1 is far from 0.191 there (O1 lies near an amphidrome; NorKyst's Q1 is 1.7×, the TODO line on K2/S2 and P1/K1). Theory has no fix for that.
+      - From 27.6 days Q1 is fitted and nothing changes (30 days identical). A model's record takes the gauge's ratio and lag where the gauge has both, so this is for gauge records of 13.7–27.6 days.
+      - Gate: `a_fortnights_q1_takes_its_lag_from_the_diurnal_age`.
   - **Tried and dropped** (variants of the harness, not kept in it):
     - *μ2 from a fitted 2N2 at their equilibrium ratio, λ2 from L2* (each pair is 206 days apart, as K2 and S2): 0.03–0.09 cm better than the shipped rules in Norway at 35–90 days, and chosen on Norway alone. On the other coasts it was worse at every length (30 days: 9.65 against 8.52 cm; Puerto Montt 15.6 against 12.1, Brest 8.7 against 7.1). μ2 has the speed of the compound 2MS2 and L2 of 2MN2: at Puerto Montt μ2 (8.3 cm) lies 81° from 2N2 and 55° from its admittance. Hence the order in `GAUGE_RECORD`: fit the member of each pair that shallow water changes, infer the astronomical one.
     - *Leaving μ2 and L2 out until a record resolves them:* worse on both sets (30 days: 3.48 against 2.90 cm, 9.65 against 8.52). A poor inference still beats none.
