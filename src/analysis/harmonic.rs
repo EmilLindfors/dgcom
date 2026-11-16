@@ -381,6 +381,17 @@ impl HarmonicAnalysis {
             .map(|i| i.or_from(reference))
             .collect();
         let analysis = Self::resolvable(candidates, length, 1.0, &inferences);
+        if analysis.names.is_empty() {
+            let (first, period) = candidates
+                .iter()
+                .find_map(|&c| constituent_period(c).map(|p| (c, p)))
+                .unwrap_or(("none", f64::INFINITY));
+            return Err(AnalysisError::NothingResolved {
+                have_hours: length / 3600.0,
+                first,
+                needed_hours: period / 3600.0,
+            });
+        }
         let fit = analysis.fit(times, values)?;
         match analysis.with_the_age_of_the_tide(&fit) {
             Some(aged) => aged.fit(times, values),
@@ -995,6 +1006,35 @@ mod tests {
     /// Two weeks resolve M2/S2 and K1/O1 but not N2 (27.6 d) or P1 (182 d);
     /// a month adds N2 and Q1; a year everything. The inferences kept are
     /// those of left-out constituents with a kept source.
+    /// A record that resolves no candidate is not fitted: it used to give
+    /// an empty fit, the mean alone, whose |ΔZ| summed over nothing (a scored window of 12.42 h of 10-minute output spans
+    /// 12.25 h, under M2's period: Chiloé's `spinup_hours`, 2026-11-16).
+    #[test]
+    fn a_record_that_resolves_nothing_is_not_fitted() {
+        let times: Vec<f64> = (0..=73).map(|i| 1.7e9 + 600.0 * f64::from(i)).collect();
+        let period = constituent_period("M2").unwrap();
+        let values: Vec<f64> = times
+            .iter()
+            .map(|t| (2.0 * std::f64::consts::PI * t / period).cos())
+            .collect();
+        let err = HarmonicAnalysis::fit_with_reference(&["M2", "S2", "K1"], &times, &values, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, AnalysisError::NothingResolved { first: "M2", .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("12.2-hour record"), "{err}");
+        // Two hours more and M2 is resolved
+        let times: Vec<f64> = (0..=86).map(|i| 1.7e9 + 600.0 * f64::from(i)).collect();
+        let values: Vec<f64> = times
+            .iter()
+            .map(|t| (2.0 * std::f64::consts::PI * t / period).cos())
+            .collect();
+        let fit = HarmonicAnalysis::fit_with_reference(&["M2", "S2", "K1"], &times, &values, None)
+            .unwrap();
+        assert!(fit.get("M2").is_some());
+    }
+
     #[test]
     fn resolvable_constituents_follow_the_rayleigh_criterion() {
         let names = [

@@ -45,6 +45,20 @@ pub enum AnalysisError {
         /// The record's length (days)
         have_days: f64,
     },
+    /// A record that resolves no candidate, from the mean or from the
+    /// earlier candidates of its band: a fit would hold the mean alone.
+    #[error(
+        "a {have_hours:.1}-hour record resolves no constituent: the first candidate, \
+         {first}, needs {needed_hours:.1} h"
+    )]
+    NothingResolved {
+        /// The record's length (hours)
+        have_hours: f64,
+        /// The first candidate, which the record would fit first
+        first: &'static str,
+        /// Its period (hours): the record it needs
+        needed_hours: f64,
+    },
     /// An inference that rests on a constituent neither fitted nor inferred
     /// from fitted ones (or on itself, through a cycle of inferences).
     #[error("{name} is inferred from {from}, which is neither fitted nor inferred from what is")]
