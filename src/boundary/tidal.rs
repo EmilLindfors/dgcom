@@ -50,26 +50,6 @@ impl TidalConstituent {
         self.amplitude * (omega * t + self.phase).cos()
     }
 
-    /// Return a copy with a nodal/equilibrium correction applied.
-    ///
-    /// The amplitude is scaled by the nodal factor `f` and the internal phase is
-    /// shifted by the equilibrium argument plus nodal phase `(V₀ + u)`, so that
-    /// `evaluate(t)` becomes `f·A·cos(ω t + φ + V₀ + u)` — the Schureman-corrected
-    /// prediction for elapsed time `t` measured from the correction's epoch.
-    ///
-    /// Apply this **once**, to a raw catalogue constituent; applying it twice
-    /// double-counts the correction. See [`crate::tides`].
-    pub fn with_nodal_correction(&self, correction: &crate::tides::NodalCorrection) -> Self {
-        let (amplitude, phase) =
-            crate::tides::correct_amplitude_phase(self.amplitude, self.phase, correction);
-        Self {
-            name: self.name,
-            amplitude,
-            period: self.period,
-            phase,
-        }
-    }
-
     /// Principal lunar semidiurnal (M2) constituent.
     ///
     /// Period 12.4206 h (28.9841042°/h), the dominant tidal constituent in most locations.
@@ -477,35 +457,6 @@ mod tests {
 
         // At t=π/2: dη/dt = -0.5 * 1 * sin(π/2) = -0.5
         assert!((bc.elevation_rate(PI / 2.0) - (-0.5)).abs() < TOL);
-    }
-
-    #[test]
-    fn test_with_nodal_correction_scales_and_shifts() {
-        use crate::tides::NodalCorrection;
-
-        let raw = TidalConstituent::m2(0.5, 0.2);
-        let corr = NodalCorrection {
-            f: 1.04,
-            u_deg: 3.0,
-            v0_deg: 47.0,
-        };
-        let corrected = raw.with_nodal_correction(&corr);
-
-        assert!((corrected.amplitude - 1.04 * 0.5).abs() < TOL);
-        assert!((corrected.phase - (0.2 + 50.0_f64.to_radians())).abs() < TOL);
-        // Name and period are preserved.
-        assert_eq!(corrected.name, "M2");
-        assert!((corrected.period - raw.period).abs() < TOL);
-    }
-
-    #[test]
-    fn test_with_identity_nodal_correction_is_noop() {
-        use crate::tides::NodalCorrection;
-
-        let raw = TidalConstituent::s2(0.3, 0.9);
-        let corrected = raw.with_nodal_correction(&NodalCorrection::IDENTITY);
-        assert!((corrected.amplitude - raw.amplitude).abs() < TOL);
-        assert!((corrected.phase - raw.phase).abs() < TOL);
     }
 
     /// Regression: each named constructor must carry the exact period

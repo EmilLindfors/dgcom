@@ -234,11 +234,6 @@ impl ManningFriction2D {
         Self::standard(0.035)
     }
 
-    /// Typical values for rocky fjord bottoms.
-    pub fn fjord() -> Self {
-        Self::standard(0.025)
-    }
-
     /// Compute the friction coefficient C_f.
     ///
     /// τ = ρ C_f |u| u, where C_f = g n² h^{-1/3}
@@ -981,9 +976,6 @@ mod tests {
     fn test_preset_friction_values() {
         let natural = ManningFriction2D::natural_channel();
         assert!((natural.manning_n - 0.035).abs() < 1e-10);
-
-        let fjord = ManningFriction2D::fjord();
-        assert!((fjord.manning_n - 0.025).abs() < 1e-10);
     }
 
     #[test]

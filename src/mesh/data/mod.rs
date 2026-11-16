@@ -2,13 +2,11 @@
 //!
 //! This module contains data that lives on meshes:
 //! - [`Bathymetry1D`], [`Bathymetry2D`]: Bottom topography
-//! - [`LandMask2D`]: Wet/dry cell classification
 //! - [`BoundaryTag`]: Boundary condition labels
 
 mod bathymetry;
 mod bathymetry_2d;
 mod boundary_tags;
-mod land_mask;
 
 pub use bathymetry::{Bathymetry1D, profiles as bathymetry_profiles};
 pub use bathymetry_2d::{
@@ -16,4 +14,3 @@ pub use bathymetry_2d::{
     TidalPonds, WallLandLowering, profiles as bathymetry_profiles_2d,
 };
 pub use boundary_tags::BoundaryTag;
-pub use land_mask::{LandMask2D, LandMaskStatistics};
