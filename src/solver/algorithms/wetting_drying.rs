@@ -118,7 +118,8 @@ impl WetDryConfig {
         }
         let eps = self.h_dry.meters();
         if h >= eps {
-            return (hu / h, hv / h);
+            let inv_h = 1.0 / h;
+            return (hu * inv_h, hv * inv_h);
         }
         // √(h⁴ + ε⁴) = ε²√(1 + r⁴) with r = h/ε, so ε⁴ never underflows
         let r = h / eps;
@@ -155,9 +156,11 @@ impl WetDryConfig {
             *hu = h * u;
             *hv = h * v;
         }
-        let speed = (*hu * *hu + *hv * *hv).sqrt() / h;
-        if speed > self.max_velocity {
-            let scale = self.max_velocity / speed;
+        // |hu| > h·u_max rather than |hu|/h > u_max: the division only where
+        // the cap acts
+        let momentum = (*hu * *hu + *hv * *hv).sqrt();
+        if momentum > self.max_velocity * h {
+            let scale = self.max_velocity * h / momentum;
             *hu *= scale;
             *hv *= scale;
         }
@@ -501,8 +504,10 @@ fn damp_wet_block(
     }
     let (mut speed, mut rate) = ([0.0; WET_BLOCK], [0.0; WET_BLOCK]);
     for i in 0..n {
-        // |u| frozen at the RHS input keeps drag balances exact
-        let (u, v) = (fhu[i] / fh[i], fhv[i] / fh[i]);
+        // |u| frozen at the RHS input keeps drag balances exact; the
+        // velocity as `desingularized_velocity` takes it at h ≥ h_dry
+        let inv_h = 1.0 / fh[i];
+        let (u, v) = (fhu[i] * inv_h, fhv[i] * inv_h);
         speed[i] = (u * u + v * v).sqrt();
     }
     friction.damping_rates(first_node, h, &speed[..n], &mut rate[..n]);

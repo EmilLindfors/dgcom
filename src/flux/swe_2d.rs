@@ -285,12 +285,23 @@ pub(crate) fn hll_flux_face_aligned<T: Lane>(
     let h_min_v = h_l.constant(h_min);
     let dry = h_l.at_most(h_min_v) & h_r.at_most(h_min_v);
 
-    let g_v = h_l.constant(g);
-    let c_l = (g_v * h_l.max(zero)).sqrt();
-    let c_r = (g_v * h_r.max(zero)).sqrt();
+    // √h once per side: the celerity √(gh) = √g √h and the Roe weights
+    let (sqrt_h_l, sqrt_h_r) = (h_l.max(zero).sqrt(), h_r.max(zero).sqrt());
+    let sqrt_g = h_l.constant(g).sqrt();
+    let (c_l, c_r) = (sqrt_g * sqrt_h_l, sqrt_g * sqrt_h_r);
 
     // Wave speed estimates (Einfeldt)
-    let (s_l, s_r) = einfeldt_speeds_2d(h_l, h_r, l.un, r.un, c_l, c_r, g, h_min);
+    let (s_l, s_r) = einfeldt_speeds_2d(
+        h_l,
+        h_r,
+        (sqrt_h_l, sqrt_h_r),
+        l.un,
+        r.un,
+        c_l,
+        c_r,
+        g,
+        h_min,
+    );
 
     // Physical fluxes in rotated coordinates
     let half_g = h_l.constant(0.5 * g);
@@ -326,6 +337,7 @@ pub(crate) fn hll_flux_face_aligned<T: Lane>(
 fn einfeldt_speeds_2d<T: Lane>(
     h_l: T,
     h_r: T,
+    (sqrt_h_l, sqrt_h_r): (T, T),
     un_l: T,
     un_r: T,
     c_l: T,
@@ -337,9 +349,8 @@ fn einfeldt_speeds_2d<T: Lane>(
     let two = h_l.constant(2.0);
     let h_min = h_l.constant(h_min);
 
-    // Roe-averaged quantities (zero where both depths vanish)
-    let sqrt_h_l = h_l.max(zero).sqrt();
-    let sqrt_h_r = h_r.max(zero).sqrt();
+    // Roe-averaged quantities (zero where both depths vanish), from
+    // √max(h, 0) of each side
     let roe = (sqrt_h_l + sqrt_h_r).greater_than(h_l.constant(1e-10));
     let h_roe = h_l.constant(0.5) * (h_l + h_r);
     let un_roe = T::select(

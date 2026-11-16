@@ -95,11 +95,7 @@ impl SWENodeState2D {
     /// The velocity is set to zero for `h ≤ h_min`, as in the Riemann solvers.
     #[inline]
     pub fn new(q: &SWEState2D, b: f64, h_min: f64) -> Self {
-        let (u, v) = if q.h > h_min {
-            (q.hu / q.h, q.hv / q.h)
-        } else {
-            (0.0, 0.0)
-        };
+        let (u, v) = node_velocity(q.h, q.hu, q.hv, h_min);
         Self {
             h: q.h,
             hu: q.hu,
@@ -109,6 +105,22 @@ impl SWENodeState2D {
             b,
         }
     }
+}
+
+/// The velocity `(hu, hv)/h` of a node deeper than `h_min`, zero at the
+/// others (as the Riemann solvers take it): both components times one
+/// reciprocal of `h`, since on the GPUs with FP64 at 1:64 a division is
+/// about eight FP64 instructions (`notes/gpu.md`). Generic over [`Lane`]:
+/// the scalar, batched and GPU kernels share it.
+#[inline(always)]
+pub fn node_velocity<T: Lane>(h: T, hu: T, hv: T, h_min: f64) -> (T, T) {
+    let zero = h.constant(0.0);
+    let wet = h.greater_than(h.constant(h_min));
+    let inv_h = h.constant(1.0) / h;
+    (
+        T::select(wet, hu * inv_h, zero),
+        T::select(wet, hv * inv_h, zero),
+    )
 }
 
 impl<T: Lane> SWENodeState2D<T> {
