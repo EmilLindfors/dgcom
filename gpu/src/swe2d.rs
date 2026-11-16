@@ -434,25 +434,29 @@ fn line_volume<const AFFINE: bool, I: Fn(usize) -> usize>(
     }
 }
 
+/// The terms per node of a line's subcells: 3 for each of its nodes, in the
+/// order `SplitFormSWE2D::line_subcells` adds them to the node's RHS.
+pub const LINE_TERMS: usize = 3;
+
 /// `SplitFormSWE2D::line_subcells`: the subcell finite-volume update (times
-/// J) along `line` of `direction` (0: an r-line, its nodes `line·N1 + a`;
-/// 1: an s-line, `a·N1 + line`), its end subcells taking their outer slope
-/// neighbour from `ends` (the node, its distance, whether there is one).
-/// Not generic, so that it inlines (a generic `#[device]` function stays a
-/// call), and the GLL data are arrays, so that its loops have constant trip
-/// counts.
+/// J) along one GLL line of an element, its nodes `q` in order, the metric
+/// at them `metric`, its end subcells taking their outer slope neighbour
+/// from `ends` (the node, its distance, whether there is one); as the terms
+/// it adds to each node, in the CPU's order: node `a` gets `terms[a][0]`,
+/// then `[1]`, then `[2]` (the end flux or an interface's HLL flux, an
+/// interface's HLL flux, the bed and metric balance). A subtraction on the
+/// CPU is the negated term's sum here, the same bits. Not generic, so that
+/// it inlines (a generic `#[device]` function stays a call), and the GLL
+/// data are arrays, so that its loops have constant trip counts.
 #[allow(clippy::too_many_arguments)]
 #[device]
 // The device backend makes this alwaysinline (no call in the PTX); the host
 // compiler, which sees an exported symbol, ignores it.
 #[allow(unused_attributes)]
 #[inline(always)]
-fn line_subcells(
-    nodes: &[SWENodeState2D; NN],
-    rhs: &mut [SWEState2D; NN],
+fn line_terms(
+    q: &[SWENodeState2D; N1],
     metric: &[(f64, f64); N1],
-    line: usize,
-    direction: usize,
     ends: [(SWENodeState2D, f64, bool); 2],
     affine: bool,
     w: &[f64; N1],
@@ -461,68 +465,61 @@ fn line_subcells(
     g: f64,
     h_min: f64,
     h_dry: f64,
-) {
-    let idx = |a: usize| {
-        if direction == 0 {
-            line * N1 + a
-        } else {
-            a * N1 + line
-        }
-    };
+) -> [[SWEState2D; LINE_TERMS]; N1] {
+    let mut terms = [[SWEState2D::zero(); LINE_TERMS]; N1];
     // Interface metrics (the telescoping sum of the flux-differencing term)
     let mut interfaces = [(0.0, 0.0); N1 + 1];
     telescoped_interfaces(w, d1, metric, affine, &mut interfaces);
 
-    let (first, last) = (idx(0), idx(N1 - 1));
-    let (q_first, q_last) = (nodes[first], nodes[last]);
+    let (q_first, q_last) = (q[0], q[N1 - 1]);
     let (m_first, m_last) = (metric[0], metric[N1 - 1]);
-    rhs[first] = rhs[first] + (1.0 / w[0]) * wintermeyer_flux_2d(&q_first, &q_first, m_first, g);
-    rhs[last] = rhs[last] - (1.0 / w[N1 - 1]) * wintermeyer_flux_2d(&q_last, &q_last, m_last, g);
+    terms[0][0] = (1.0 / w[0]) * wintermeyer_flux_2d(&q_first, &q_first, m_first, g);
+    terms[N1 - 1][0] = -((1.0 / w[N1 - 1]) * wintermeyer_flux_2d(&q_last, &q_last, m_last, g));
 
     // Face states. Subcell a spans [x_a, x_a + w_a] with x_0 = −1
     let mut faces = [(SWESide2D::default(), SWESide2D::default()); N1];
     let mut x_left = -1.0;
     #[unroll]
     for a in 0..N1 {
-        let q = SWESide2D::from(&nodes[idx(a)]);
+        let side = SWESide2D::from(&q[a]);
         let x_right = x_left + w[a];
         let (left, x_l, has_left) = if a > 0 {
-            (SWESide2D::from(&nodes[idx(a - 1)]), xi[a - 1], true)
+            (SWESide2D::from(&q[a - 1]), xi[a - 1], true)
         } else {
             (SWESide2D::from(&ends[0].0), -1.0 - ends[0].1, ends[0].2)
         };
         let (right, x_r, has_right) = if a + 1 < N1 {
-            (SWESide2D::from(&nodes[idx(a + 1)]), xi[a + 1], true)
+            (SWESide2D::from(&q[a + 1]), xi[a + 1], true)
         } else {
             (SWESide2D::from(&ends[1].0), 1.0 + ends[1].1, ends[1].2)
         };
         faces[a] = if has_left && has_right {
             reconstruct_subcell(
-                [left, q, right],
+                [left, side, right],
                 [x_l, xi[a], x_r],
                 (x_left, x_right),
                 h_dry,
             )
         } else {
-            (q, q)
+            (side, side)
         };
         x_left = x_right;
     }
 
+    // Interface a + 1/2: node a's term after its first, node a + 1's after
+    // the end flux or the interface before it
     #[unroll]
     for a in 0..N1 - 1 {
-        let (ia, ib) = (idx(a), idx(a + 1));
         let m = interfaces[a + 1];
         let (f_a, f_b) = hydrostatic_hll(&faces[a].1, &faces[a + 1].0, m, g, h_min);
-        rhs[ia] = rhs[ia] - (1.0 / w[a]) * f_a;
-        rhs[ib] = rhs[ib] + (1.0 / w[a + 1]) * f_b;
+        terms[a][1] = -((1.0 / w[a]) * f_a);
+        terms[a + 1][if a + 1 == N1 - 1 { 1 } else { 0 }] = (1.0 / w[a + 1]) * f_b;
     }
 
     // Bed-slope term, zero in subcells without a slope (B_L = B_R), and the
     // metric balance term, zero on affine elements
     #[unroll]
     for a in 0..N1 {
-        let ia = idx(a);
         let (left, right) = faces[a];
         let w_a = w[a];
         let bed = -0.5 * g * (left.h + right.h) * (right.b - left.b) / w_a;
@@ -531,7 +528,7 @@ fn line_subcells(
             (bed * m.0, bed * m.1)
         } else {
             let (m_l, m_r) = (interfaces[a], interfaces[a + 1]);
-            let (h_a, b_a) = (nodes[ia].h, nodes[ia].b);
+            let (h_a, b_a) = (q[a].h, q[a].b);
             let balance =
                 0.25 * g * ((right.h + h_a) * (b_a - right.b) + (left.h + h_a) * (b_a - left.b))
                     / w_a;
@@ -540,8 +537,9 @@ fn line_subcells(
                 bed * 0.5 * (m_l.1 + m_r.1) + balance * (m_r.1 - m_l.1),
             )
         };
-        rhs[ia] = rhs[ia] + SWEState2D::new(0.0, force_x, force_y);
+        terms[a][2] = SWEState2D::new(0.0, force_x, force_y);
     }
+    terms
 }
 
 /// `SplitFormSWE2D::outer_node`: of face node `fi` of `face` of element `k`,
@@ -1170,7 +1168,10 @@ pub mod kernels {
     /// if `list` is empty) without a node shallower than `subcell_depth`
     /// (one thread per element; the others are `element_rhs_subcells`'):
     /// the flux-differencing volume term and the lifted face terms, divided
-    /// by J.
+    /// by J. One thread per element, not per line as the subcells: split
+    /// in two kernels through a buffer of each line's terms (2026-11-16), a
+    /// short pass took 25 + 34 µs against 66, but Chiloé's half hour 27.7 s
+    /// against 25.6 and the fully wet RHS 1.5× as long (`notes/gpu.md`).
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn element_rhs_volume(
@@ -1271,14 +1272,17 @@ pub mod kernels {
         );
     }
 
-    /// `SplitFormSWE2D::element_rhs` of the listed elements (every element
-    /// if `list` is empty) with a node shallower than `subcell_depth`
-    /// (`WetDry`, one thread per element; the others return at once): the
-    /// subcell finite volumes, with the neighbours' outer nodes, and the
-    /// lifted face terms, divided by J.
+    /// The subcell terms of the listed elements (every element if `list`
+    /// is empty) with a node shallower than `subcell_depth`: one thread per
+    /// element and GLL line (`2·N1` per element, line `l` of direction `d`
+    /// the element's `2l + d`), `line_terms` of the line into `terms`
+    /// (`LINE_TERMS` per node, at `((k·2N1 + 2l + d)·N1 + a)·LINE_TERMS`),
+    /// which `element_rhs_subcells` sums. A line is a sixth of an element's
+    /// subcell work: the chain each thread runs, which bounds a short pass
+    /// of local time stepping, is a sixth as long.
     #[kernel]
     #[allow(clippy::too_many_arguments)]
-    pub fn element_rhs_subcells(
+    pub fn subcell_terms(
         g: f64,
         h_min: f64,
         subcell_depth: f64,
@@ -1292,16 +1296,134 @@ pub mod kernels {
         affine: &[u32],
         egeom: &[[f64; EG]],
         contra: &[[f64; 4]],
-        jinv: &[f64],
         jac: &[f64],
         fgeom: &[[f64; 3]],
         d1: &[f64],
         w: &[f64],
         xi: &[f64],
+        element_edges: &[[u32; 4]],
+        edges: &[[u32; 4]],
+        mut terms: DisjointSlice<[f64; 3]>,
+    ) {
+        let t = thread::index_1d().get();
+        let (i, j) = (t / (2 * N1), t % (2 * N1));
+        let Some(k) = item(i, list, n) else {
+            return;
+        };
+        if !is_subcell_element(k, h, subcell_depth) {
+            return;
+        }
+        let (line, direction) = (j / 2, j % 2);
+        let node = |a: usize| {
+            if direction == 0 {
+                line * N1 + a
+            } else {
+                a * N1 + line
+            }
+        };
+        // The GLL weights, nodes and D as arrays: constant lengths for the
+        // loops of the subcells (telescoped_interfaces reads their length)
+        let (mut w_a, mut xi_a, mut d1_a) = ([0.0; N1], [0.0; N1], [0.0; NN]);
+        #[unroll]
+        for a in 0..N1 {
+            w_a[a] = w[a];
+            xi_a[a] = xi[a];
+        }
+        #[unroll]
+        for a in 0..NN {
+            d1_a[a] = d1[a];
+        }
+        let aff = affine[k] != 0;
+        let eg = &egeom[k];
+        let mut q = [SWENodeState2D::default(); N1];
+        let mut metric = [(0.0, 0.0); N1];
+        #[unroll]
+        for a in 0..N1 {
+            q[a] = node_state(h, hu, hv, bed, k * NN + node(a), h_min);
+            metric[a] = if aff {
+                if direction == 0 {
+                    (eg[0], eg[1])
+                } else {
+                    (eg[2], eg[3])
+                }
+            } else {
+                let c = contra[k * NN + node(a)];
+                if direction == 0 {
+                    (c[0], c[1])
+                } else {
+                    (c[2], c[3])
+                }
+            };
+        }
+        let outer = |face: usize, fi: usize| {
+            outer_node(
+                k,
+                face,
+                fi,
+                (h, hu, hv, bed),
+                affine,
+                egeom,
+                jac,
+                fgeom,
+                element_edges,
+                edges,
+                &xi_a,
+                h_min,
+            )
+        };
+        // Line ends on faces 3/1 (r-lines) and 0/2 (s-lines); faces 2 and 3
+        // list their nodes in reverse
+        let (rev, fwd) = (N1 - 1 - line, line);
+        let ends = if direction == 0 {
+            [outer(3, rev), outer(1, fwd)]
+        } else {
+            [outer(0, fwd), outer(2, rev)]
+        };
+        let line_t = line_terms(&q, &metric, ends, aff, &w_a, &xi_a, &d1_a, g, h_min, h_dry);
+        let first = (k * 2 * N1 + j) * N1 * LINE_TERMS;
+        #[unroll]
+        for a in 0..N1 {
+            #[unroll]
+            for t in 0..LINE_TERMS {
+                let s = line_t[a][t];
+                // SAFETY: thread (k, j) writes only its own line's terms
+                // (the listed elements are distinct), within the buffer's
+                // n_elements · 2N1 · N1 · LINE_TERMS.
+                unsafe {
+                    *terms.get_unchecked_mut(first + a * LINE_TERMS + t) = [s.h, s.hu, s.hv];
+                }
+            }
+        }
+    }
+
+    /// `SplitFormSWE2D::element_rhs` of the listed elements (every element
+    /// if `list` is empty) with a node shallower than `subcell_depth` (one
+    /// thread per element; the others are `element_rhs_volume`'s): the
+    /// subcell terms of its lines (`subcell_terms`) summed into each node in
+    /// the CPU's order (line by line, its r-line then its s-line, a node's
+    /// terms in turn), then the lifted face terms, divided by J, and the
+    /// Coriolis force.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn element_rhs_subcells(
+        g: f64,
+        h_min: f64,
+        subcell_depth: f64,
+        list: &[u32],
+        n: u32,
+        h: &[f64],
+        hu: &[f64],
+        hv: &[f64],
+        bed: &[f64],
+        affine: &[u32],
+        egeom: &[[f64; EG]],
+        jinv: &[f64],
+        fgeom: &[[f64; 3]],
         lift: &[f64],
         element_edges: &[[u32; 4]],
         edges: &[[u32; 4]],
         faces: &[[[f64; 3]; NF]],
+        terms: &[[f64; 3]],
         coriolis: u32,
         f0: f64,
         f_node: &[f64],
@@ -1321,78 +1443,29 @@ pub mod kernels {
             nodes[i] = node_state(h, hu, hv, bed, k * NN + i, h_min);
         }
         let mut rhs = [SWEState2D::zero(); NN];
-
-        // The GLL weights, nodes and D as arrays: constant lengths for the
-        // loops of the subcells (telescoped_interfaces reads their length)
-        let (mut w_a, mut xi_a, mut d1_a) = ([0.0; N1], [0.0; N1], [0.0; NN]);
         #[unroll]
-        for a in 0..N1 {
-            w_a[a] = w[a];
-            xi_a[a] = xi[a];
+        for line in 0..N1 {
+            #[unroll]
+            for direction in 0..2 {
+                let first = (k * 2 * N1 + 2 * line + direction) * N1 * LINE_TERMS;
+                #[unroll]
+                for a in 0..N1 {
+                    let node = if direction == 0 {
+                        line * N1 + a
+                    } else {
+                        a * N1 + line
+                    };
+                    #[unroll]
+                    for t in 0..LINE_TERMS {
+                        let [th, thu, thv] = terms[first + a * LINE_TERMS + t];
+                        rhs[node] = rhs[node] + SWEState2D::new(th, thu, thv);
+                    }
+                }
+            }
         }
-        #[unroll]
-        for a in 0..NN {
-            d1_a[a] = d1[a];
-        }
-        // The outer node of face node `fi` of `face`, read where its line
-        // needs it (each is the end of one line only): the 12 of an element
-        // need not be held at once
-        let outer = |face: usize, fi: usize| {
-            outer_node(
-                k,
-                face,
-                fi,
-                (h, hu, hv, bed),
-                affine,
-                egeom,
-                jac,
-                fgeom,
-                element_edges,
-                edges,
-                &xi_a,
-                h_min,
-            )
-        };
 
         let aff = affine[k] != 0;
         let eg = egeom[k];
-        let (affine_r, affine_s) = ((eg[0], eg[1]), (eg[2], eg[3]));
-        let mut metric = [(0.0, 0.0); N1];
-        #[unroll]
-        for line in 0..N1 {
-            let r_line = |a: usize| line * N1 + a;
-            let s_line = |j: usize| j * N1 + line;
-            // Line ends on faces 3/1 (r-lines) and 0/2 (s-lines); faces 2
-            // and 3 list their nodes in reverse
-            let (rev, fwd) = (N1 - 1 - line, line);
-            #[unroll]
-            for a in 0..N1 {
-                metric[a] = if aff {
-                    affine_r
-                } else {
-                    let c = contra[k * NN + r_line(a)];
-                    (c[0], c[1])
-                };
-            }
-            let ends = [outer(3, rev), outer(1, fwd)];
-            line_subcells(
-                &nodes, &mut rhs, &metric, line, 0, ends, aff, &w_a, &xi_a, &d1_a, g, h_min, h_dry,
-            );
-            #[unroll]
-            for j in 0..N1 {
-                metric[j] = if aff {
-                    affine_s
-                } else {
-                    let c = contra[k * NN + s_line(j)];
-                    (c[2], c[3])
-                };
-            }
-            let ends = [outer(0, fwd), outer(2, rev)];
-            line_subcells(
-                &nodes, &mut rhs, &metric, line, 1, ends, aff, &w_a, &xi_a, &d1_a, g, h_min, h_dry,
-            );
-        }
-
         finish_element(
             k,
             &nodes,
@@ -2391,6 +2464,9 @@ pub struct GpuSWE2D<'a> {
     /// Both sides' F* of every edge, written by the edge kernel for the
     /// element kernel
     faces: Mutex<DeviceBuffer<[[f64; 3]; NF]>>,
+    /// The subcell terms of every element's lines (`subcell_terms`), for
+    /// `element_rhs_subcells`; empty for the entropy-stable form
+    terms: Mutex<DeviceBuffer<[f64; 3]>>,
     /// Every element's largest reference rate (the time step)
     rates: Mutex<DeviceBuffer<f64>>,
     /// Local time stepping: the line-local depth and the positivity bound's
@@ -2916,6 +2992,16 @@ impl<'a> GpuSWE2D<'a> {
             faces: Mutex::new(
                 DeviceBuffer::zeroed(stream, mesh.n_edges).map_err(|e| e.to_string())?,
             ),
+            terms: Mutex::new(
+                DeviceBuffer::zeroed(
+                    stream,
+                    match formulation {
+                        Formulation::EntropyStable => 0,
+                        Formulation::WetDry { .. } => mesh.n_elements * 2 * N1 * N1 * LINE_TERMS,
+                    },
+                )
+                .map_err(|e| e.to_string())?,
+            ),
             rates: Mutex::new(zeroed(mesh.n_elements)?),
             line_local_depth: form.line_local_depth,
             positivity_h_dry: form.positivity_h_dry,
@@ -3158,11 +3244,13 @@ impl<'a> GpuSWE2D<'a> {
                 )
                 .expect("element RHS (volume)");
             if hll {
-                let [out_h, out_hu, out_hv] = out.fields_mut();
+                // The subcells: each line's terms (one thread per line), then
+                // each element's sum in the CPU's order (one per element)
+                let mut terms = self.terms.lock().expect("subcell terms");
                 gpu.module
-                    .element_rhs_subcells(
+                    .subcell_terms(
                         &gpu.stream,
-                        elements_cfg,
+                        one_dimensional(n_elements as usize * 2 * N1),
                         self.g,
                         self.h_min,
                         subcell_depth,
@@ -3176,16 +3264,39 @@ impl<'a> GpuSWE2D<'a> {
                         &s.affine,
                         &s.egeom,
                         &s.contra,
-                        &s.jinv,
                         &s.jac,
                         &s.fgeom,
                         &s.d1,
                         &s.w,
                         &s.xi,
+                        &s.element_edges,
+                        &s.edges,
+                        &mut terms,
+                    )
+                    .expect("subcell terms");
+                let [out_h, out_hu, out_hv] = out.fields_mut();
+                gpu.module
+                    .element_rhs_subcells(
+                        &gpu.stream,
+                        elements_cfg,
+                        self.g,
+                        self.h_min,
+                        subcell_depth,
+                        element_list,
+                        n_elements,
+                        &state.h,
+                        &state.hu,
+                        &state.hv,
+                        &s.bed,
+                        &s.affine,
+                        &s.egeom,
+                        &s.jinv,
+                        &s.fgeom,
                         &s.lift,
                         &s.element_edges,
                         &s.edges,
                         &faces,
+                        &terms,
                         coriolis,
                         f0,
                         &s.f_node,
