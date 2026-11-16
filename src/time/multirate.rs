@@ -130,7 +130,8 @@ use crate::mesh::Mesh2D;
 use crate::types::ElementIndex;
 
 use super::integrator::{
-    Integrable, IntegratorInfo, SSPRK3, SSPRK43, SspScheme, StageWorkspace, TimeIntegrator,
+    Integrable, IntegratorInfo, SSPRK3, SSPRK43, ShuOsherStage, SspScheme, StageWorkspace,
+    TimeIntegrator,
 };
 
 /// What one element does in one stage of [`LocalTimeStepping::stage_where`].
@@ -154,6 +155,91 @@ pub struct ElementStage {
     /// only if `keep ≠ 0`). Otherwise `out` is
     /// [post-processed](crate::physics::PhysicsModule::post_process).
     pub accumulate: Option<(f64, f64)>,
+}
+
+/// The stage of an element on level `level` whose stage RHS follows level
+/// `rate` (`rate ≥ level`), in finest substep `substep` (of `2^finest`) of
+/// depth `depth` of the coarse step of `dt` from `t`: Shu–Osher stage
+/// `stage` of the scheme, the `last` one summed into the substep's result.
+///
+/// [`StagePlan::at`] and a device's stage kernel both call it, so an
+/// element's stage time and weights are the same bits on either.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn element_stage(
+    (t, dt): (f64, f64),
+    finest: usize,
+    substep: usize,
+    depth: usize,
+    stage: ShuOsherStage,
+    last: bool,
+    level: u8,
+    rate: u8,
+) -> ElementStage {
+    // Start time and step of the element's current substep
+    let dt_l = dt / (1u64 << level) as f64;
+    let q = substep >> (finest - level as usize);
+    let t_k = t + q as f64 * dt_l;
+    // The last stage, H: the substep result is the mean of H over its
+    // 2^(r − ℓ) blocks; a block starting with the substep restarts the sum
+    let accumulate = if last {
+        let blocks = 1u64 << (rate - level);
+        let first = level as usize >= depth;
+        Some((1.0 / blocks as f64, if first { 0.0 } else { 1.0 }))
+    } else {
+        None
+    };
+    // Stage s + 1 = start·S + input·Yₛ + βΔt_ℓ F(Yₛ), with Y₀ = S
+    ElementStage {
+        time: t_k + stage.c * dt_l,
+        a: stage.start,
+        b: stage.input,
+        c: stage.beta * dt_l,
+        accumulate,
+    }
+}
+
+/// One stage pass of a coarse step ([`MultirateStepper::schedule`]): what
+/// every element of the pass does, as data ([`Self::at`]), so that a device
+/// can evaluate it per element ([`element_stage`]) from the levels and rates
+/// it was given at [`LocalTimeStepping::begin_coarse_step`].
+#[derive(Clone, Copy, Debug)]
+pub struct StagePlan<'a> {
+    /// Start and length of the coarse step (s)
+    pub step: (f64, f64),
+    /// Finest level of the coarse step (`2^finest` finest substeps)
+    pub finest: usize,
+    /// The finest substep, `0..2^finest`
+    pub substep: usize,
+    /// Its depth: the coarsest level whose substeps start at it; the pass's
+    /// elements are those whose `rate` is at least this
+    pub depth: usize,
+    /// The stage (0-based) and its Shu–Osher weights
+    pub stage: usize,
+    pub weights: ShuOsherStage,
+    /// Whether it is the scheme's last stage, summed into the substeps'
+    /// results
+    pub last: bool,
+    /// Every element's level, and the level its RHS of this stage follows
+    pub level: &'a [u8],
+    pub rate: &'a [u8],
+}
+
+impl StagePlan<'_> {
+    /// Element `k`'s stage.
+    #[inline]
+    pub fn at(&self, k: usize) -> ElementStage {
+        element_stage(
+            self.step,
+            self.finest,
+            self.substep,
+            self.depth,
+            self.weights,
+            self.last,
+            self.level[k],
+            self.rate[k],
+        )
+    }
 }
 
 /// The elements whose state the RHS of an element k reads
@@ -268,30 +354,40 @@ pub trait LocalTimeStepping<S>: Sync {
         true
     }
 
-    /// One stage for every listed element k, with stage `plan(k)` (see
+    /// The coarse step about to be taken has these levels and stage rates
+    /// ([`MultirateStepper::levels`], [`MultirateStepper::rates`]); the
+    /// passes of [`Self::stage_where`] and [`Self::finish_where`] follow.
+    /// Every pass's elements are those whose key is at least the pass's
+    /// depth: `rates[s]` for a stage-s pass, `level` for a finish. A device
+    /// takes them here once per coarse step (the default does nothing).
+    fn begin_coarse_step(&self, _level: &[u8], _rates: &[Vec<u8>]) {}
+
+    /// One stage for every listed element k, with stage `plan.at(k)` (see
     /// [`ElementStage`]): its RHS from `input`, which may read the values
     /// of its [`Self::stencil`], nothing further away (and, where
     /// [`Self::line_local`] marks elements, no more than it says: the nodes
     /// of the shared faces and one in from them, less for a line-local
     /// element); the new stage value
     /// into its rows of `out`, and its sum into `acc` when the stage
-    /// accumulates (`acc` must then be given). `plan` may also be called for
-    /// the face neighbours of the listed elements (their stage time, e.g. for
-    /// the boundary values of their gradients).
+    /// accumulates (`acc` must then be given). `plan.at` may also be called
+    /// for the face neighbours of the listed elements (their stage time, e.g.
+    /// for the boundary values of their gradients). The listed elements are
+    /// those with `plan.rate[k] ≥ plan.depth`.
     fn stage_where(
         &self,
         base: &S,
         input: &S,
         elements: &[u32],
-        plan: &(dyn Fn(usize) -> ElementStage + Sync),
+        plan: &StagePlan<'_>,
         out: &mut S,
         acc: Option<&mut S>,
     );
 
     /// `state ← acc` and
     /// [`PhysicsModule::post_process`](crate::physics::PhysicsModule::post_process)
-    /// on the listed elements: the end of their substep.
-    fn finish_where(&self, state: &mut S, acc: &S, elements: &[u32]);
+    /// on the listed elements: the end of their substep. They are the
+    /// elements whose level is at least `depth`.
+    fn finish_where(&self, state: &mut S, acc: &S, elements: &[u32], depth: usize);
 }
 
 // =============================================================================
@@ -1098,52 +1194,23 @@ impl<S: Integrable> MultirateStepper<S> {
         let finest = self.finest;
         let stages = self.scheme.stages();
         let n_stages = stages.len();
-        let (level, rate) = (&self.level, &self.rate);
-        let step_of = |l: u8| dt / (1u64 << l) as f64;
         for p in 0..1usize << finest {
             let d = depth(p, finest);
-            // Start time and step of element k's current substep
-            let substep = |k: usize| {
-                let l = level[k];
-                let dt_l = step_of(l);
-                let q = p >> (finest - l as usize);
-                (t + q as f64 * dt_l, dt_l)
-            };
-            for (s, stage) in stages.iter().enumerate() {
-                // Stage s + 1 = start·S + input·Yₛ + βΔt_ℓ F(Yₛ), with Y₀ = S
-                let plan = |k: usize| {
-                    let (t_k, dt_l) = substep(k);
-                    ElementStage {
-                        time: t_k + stage.c * dt_l,
-                        a: stage.start,
-                        b: stage.input,
-                        c: stage.beta * dt_l,
-                        accumulate: None,
-                    }
-                };
+            for (s, &weights) in stages.iter().enumerate() {
                 // The elements whose stage-(s + 1) RHS follows a level ≥ d
-                let elements = &self.active[s][d];
-                if s + 1 < n_stages {
-                    pass(MultiratePass::Stage {
-                        stage: s,
-                        elements,
-                        plan: &plan,
-                    });
-                    continue;
-                }
-                // The last stage, H: the substep result is the mean of H over
-                // its 2^(r − ℓ) blocks; a block starting with the substep
-                // restarts the sum
                 pass(MultiratePass::Stage {
                     stage: s,
-                    elements,
-                    plan: &|k| {
-                        let blocks = 1u64 << (rate[s][k] - level[k]);
-                        let first = level[k] as usize >= d;
-                        ElementStage {
-                            accumulate: Some((1.0 / blocks as f64, if first { 0.0 } else { 1.0 })),
-                            ..plan(k)
-                        }
+                    elements: &self.active[s][d],
+                    plan: &StagePlan {
+                        step: (t, dt),
+                        finest,
+                        substep: p,
+                        depth: d,
+                        stage: s,
+                        weights,
+                        last: s + 1 == n_stages,
+                        level: &self.level,
+                        rate: &self.rate[s],
                     },
                 });
             }
@@ -1151,6 +1218,7 @@ impl<S: Integrable> MultirateStepper<S> {
             let next = depth(p + 1, finest);
             pass(MultiratePass::Finish {
                 elements: &self.ending[next],
+                depth: next,
             });
         }
     }
@@ -1166,6 +1234,7 @@ impl<S: Integrable> MultirateStepper<S> {
         let mut values = std::mem::take(&mut self.values);
         let mut last = self.last.take().unwrap_or_else(|| state.clone());
         let mut acc = self.acc.take().unwrap_or_else(|| state.clone());
+        local.begin_coarse_step(&self.level, &self.rate);
         self.schedule(t, dt, |pass| match pass {
             MultiratePass::Stage {
                 stage: s,
@@ -1180,7 +1249,9 @@ impl<S: Integrable> MultirateStepper<S> {
                     local.stage_where(state, input, elements, plan, &mut last, Some(&mut acc));
                 }
             }
-            MultiratePass::Finish { elements } => local.finish_where(state, &acc, elements),
+            MultiratePass::Finish { elements, depth } => {
+                local.finish_where(state, &acc, elements, depth)
+            }
         });
         (self.values, self.last, self.acc) = (values, Some(last), Some(acc));
         self.count_step(dt);
@@ -1205,15 +1276,16 @@ impl<S: Integrable> MultirateStepper<S> {
 /// One pass of [`MultirateStepper::schedule`].
 pub enum MultiratePass<'a> {
     /// Stage `stage` (0-based) of the listed (distinct) elements, element k
-    /// as `plan(k)` says (its time, its Shu–Osher weights, and for the last
-    /// stage how it is summed into the substep's result).
+    /// as `plan.at(k)` says (its time, its Shu–Osher weights, and for the
+    /// last stage how it is summed into the substep's result).
     Stage {
         stage: usize,
         elements: &'a [u32],
-        plan: &'a (dyn Fn(usize) -> ElementStage + Sync),
+        plan: &'a StagePlan<'a>,
     },
     /// The substeps of the listed elements end: their result is their state.
-    Finish { elements: &'a [u32] },
+    /// They are the elements whose level is at least `depth`.
+    Finish { elements: &'a [u32], depth: usize },
 }
 
 #[cfg(test)]
@@ -1457,14 +1529,14 @@ mod tests {
             _: &Field,
             _: &Field,
             _: &[u32],
-            _: &(dyn Fn(usize) -> ElementStage + Sync),
+            _: &StagePlan<'_>,
             _: &mut Field,
             _: Option<&mut Field>,
         ) {
             unreachable!()
         }
 
-        fn finish_where(&self, _: &mut Field, _: &Field, _: &[u32]) {
+        fn finish_where(&self, _: &mut Field, _: &Field, _: &[u32], _: usize) {
             unreachable!()
         }
     }

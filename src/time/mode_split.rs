@@ -115,7 +115,7 @@ use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{DGSolution2D, SWESolution2D};
 use crate::source::{RiverInflow, RiverSources};
 use crate::time::multirate::{
-    ElementStage, Multirate, MultiratePass, MultirateStats, MultirateStepper, RhsStencil,
+    ElementStage, Multirate, MultiratePass, MultirateStats, MultirateStepper, RhsStencil, StagePlan,
 };
 use crate::time::{IntegratorInfo, SSPRK3, SspScheme};
 use crate::types::ElementIndex;
@@ -1156,7 +1156,7 @@ impl BarotropicMultirate {
                     .fill(0.0);
                 let shared_terms: &Mutex<Vec<f64>> = river_terms;
                 let then = |k: usize, [h, hu, hv]: [&mut [f64]; 3], mass: ElementMassFluxes<'_>| {
-                    let stage = plan(k);
+                    let stage = plan.at(k);
                     let nodes = k * nn..(k + 1) * nn;
                     let c = step.w_secondary * b_s / (step.n_bt as f64 * (1u64 << rates[k]) as f64);
                     if let Some(rivers) = step.rivers {
@@ -1249,14 +1249,14 @@ impl BarotropicMultirate {
                     }
                 };
                 profiling::scope(STAGE_SCOPES[s.min(3)], || {
-                    barotropic.stage_subset_then(input, elements, &|k| plan(k).time, out, &then)
+                    barotropic.stage_subset_then(input, elements, &|k| plan.at(k).time, out, &then)
                 });
                 let terms = river_terms.get_mut().unwrap_or_else(|e| e.into_inner());
                 for (mean, &term) in transport.discharge.iter_mut().zip(terms.iter()) {
                     *mean += term;
                 }
             }
-            MultiratePass::Finish { elements } => {
+            MultiratePass::Finish { elements, .. } => {
                 let finish_scope = profiling::start();
                 let [h, hu, hv] = &mut q.data;
                 let rows = [
@@ -1618,7 +1618,7 @@ fn shu_osher(base: f64, input: f64, rate: f64, a: f64, b: f64, c: f64) -> f64 {
     if c != 0.0 { sum + c * rate } else { sum }
 }
 
-/// Every element k of `elements`'s stage `plan(k)` of the [`stage_fields`]:
+/// Every element k of `elements`'s stage `plan.at(k)` of the [`stage_fields`]:
 /// `out = a·base + b·input + c·rate`.
 fn combine_stage(
     out: &mut Solution3D,
@@ -1626,7 +1626,7 @@ fn combine_stage(
     input: &Solution3D,
     rate: &Solution3D,
     elements: Blocks,
-    plan: &(dyn Fn(usize) -> ElementStage + Sync),
+    plan: &StagePlan<'_>,
 ) {
     let (base, input, rate) = (stage_fields(base), stage_fields(input), stage_fields(rate));
     for_each_block(
@@ -1634,7 +1634,7 @@ fn combine_stage(
         stage_fields_mut(out),
         || (),
         |_, k, rows| {
-            let ElementStage { a, b, c, .. } = plan(k);
+            let ElementStage { a, b, c, .. } = plan.at(k);
             for (field, row) in rows.into_iter().enumerate() {
                 let len = row.len();
                 let range = k * len..(k + 1) * len;
@@ -1651,13 +1651,13 @@ fn combine_stage(
 }
 
 /// The last stage `last` of every element k of `elements` into its
-/// substep's sum: `acc ← w·last + keep·acc` for `plan(k).accumulate =
+/// substep's sum: `acc ← w·last + keep·acc` for `plan.at(k).accumulate =
 /// Some((w, keep))`.
 fn accumulate_stage(
     acc: &mut Solution3D,
     last: &Solution3D,
     elements: Blocks,
-    plan: &(dyn Fn(usize) -> ElementStage + Sync),
+    plan: &StagePlan<'_>,
 ) {
     let last = stage_fields(last);
     for_each_block(
@@ -1665,7 +1665,7 @@ fn accumulate_stage(
         stage_fields_mut(acc),
         || (),
         |_, k, rows| {
-            let (w, keep) = plan(k).accumulate.expect("the last stage accumulates");
+            let (w, keep) = plan.at(k).accumulate.expect("the last stage accumulates");
             for (field, row) in rows.into_iter().enumerate() {
                 let len = row.len();
                 for (s, &v) in row.iter_mut().zip(&last[field][k * len..(k + 1) * len]) {
@@ -2490,7 +2490,7 @@ impl ModeSplitIntegrator {
             } => {
                 let elements = blocks_of(ne, list);
                 for &k in list {
-                    time[k as usize] = plan(k as usize).time;
+                    time[k as usize] = plan.at(k as usize).time;
                 }
                 let time: &[f64] = time;
                 let on = StageElements {
@@ -2573,7 +2573,7 @@ impl ModeSplitIntegrator {
                     accumulate_stage(acc, out, elements, plan);
                 }
             }
-            MultiratePass::Finish { elements: list } => {
+            MultiratePass::Finish { elements: list, .. } => {
                 let elements = blocks_of(ne, list);
                 // At one level the last stage is the step's result
                 let result = if one_level {

@@ -7,8 +7,11 @@
 //! (the subcells in elements with a node shallower than the subcell depth,
 //! the hydrostatic HLL at faces) with a bed, walls (`Reflective2D`, called
 //! as the CPU calls it), characteristic open boundaries with an external
-//! state uniform along each (a harmonic tide, still water), Coriolis, global
-//! steps; built from dgcom's own physics module
+//! state uniform along each (a harmonic tide, still water), Coriolis; global
+//! steps through the fused per-element stages, and local time stepping
+//! (dgcom's `Multirate`, [`LocalTimeStepping`]: each pass a prefix of the
+//! coarse step's elements and edges sorted by level, each element's stage
+//! from dgcom's `element_stage`); built from dgcom's own physics module
 //! ([`GpuSWE2D::from_form`], `SWEPhysics2D::device_form`). The kernels follow
 //! `SplitFormSWE2D` (`src/solver/rhs/swe_2d_split_form.rs`) operation for
 //! operation and call dgcom's pointwise physics (the two-point flux, the
@@ -17,6 +20,13 @@
 //! (`cargo oxide run --no-fmad`) gives the CPU's bits. One thread per edge and one per element; every loop unrolls (P2's
 //! bounds are constants, the face nodes a formula), so an element's nodes and
 //! RHS stay in registers.
+
+// The device code's loops index arrays by the loop variable: with `#[unroll]`
+// and constant bounds the indices are constants and the arrays stay in
+// registers (an iterator would not unroll). Its helpers take the arrays one
+// by one (a struct of them would be copied), and `#[device]` hides an item's
+// own `allow` from clippy.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 use std::sync::{Arc, Mutex};
 
@@ -34,18 +44,20 @@ use dgcom::flux::{
 };
 use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
+use dgcom::physics::builder::LINE_LOCAL_HEADROOM;
 use dgcom::physics::{PhysicsModule, PhysicsModuleInfo, SWEDeviceForm2D};
 use dgcom::solver::rhs::subcells::telescoped_interfaces;
 use dgcom::solver::{
-    PositivityBound, SWEFormulation2D, SWESide2D, SWESolution2D, WetDryConfig, damp_node,
-    dt_from_reference_rate, hydrostatic_hll, node_reference_rate, reconstruct_subcell,
-    wet_dry_element,
+    PositivityBound, SUBCELL_CAP_DEPTH_FACTOR, SWEFormulation2D, SWESide2D, SWESolution2D,
+    WetDryConfig, damp_node, dt_from_reference_rate, hydrostatic_hll, node_reference_rate,
+    reconstruct_subcell, wet_dry_element,
 };
 use dgcom::source::{
     CageNode, CoriolisSource2D, DeviceFriction2D, DeviceSource2D, ManningFriction2D,
 };
-use dgcom::time::Integrable;
-use dgcom::time::SspScheme;
+use dgcom::time::{
+    Integrable, LocalTimeStepping, NodeLines, ShuOsherStage, SspScheme, StagePlan, element_stage,
+};
 use dgcom::types::{Depth, ElementIndex};
 
 /// Polynomial order of the kernels (P2).
@@ -82,6 +94,116 @@ pub struct OpenStates {
     /// Bit 0: the state has a velocity (else elevation only); bit 1:
     /// elevation-only data enter as a wave (`ElevationOnly::IncomingWave`)
     pub flags: [u32; MAX_OPEN],
+}
+
+/// Local time stepping's levels below the coarsest that the kernels take
+/// (a stage's boundary data has an entry per level, [`StageLevel`]).
+pub const MAX_DEVICE_LEVELS: usize = 8;
+
+/// Entries of a stage's boundary data: one per level `0..=MAX_DEVICE_LEVELS`.
+const LEVELS: usize = MAX_DEVICE_LEVELS + 1;
+
+/// A stage's time and open boundaries' external states on one level: with
+/// local time stepping the elements of one pass are at different times, the
+/// same time for all elements of a level (`element_stage`); global steps use
+/// level 0 only. In a device buffer ([`BoundaryUploads`]): a kernel copies a
+/// by-value aggregate parameter into every thread's local memory.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StageLevel {
+    pub time: f64,
+    pub open: OpenStates,
+}
+
+// SAFETY: plain old data (f64s and u32s, `#[repr(C)]`).
+unsafe impl cuda_core::DeviceCopy for StageLevel {}
+
+/// The point-implicit damping of a stage (`damp_node`): Manning friction if
+/// `friction`, the thin-layer relaxation if `wet_dry` (its `WetDryConfig`
+/// also the wet/dry correction's).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Damping {
+    pub h_min: f64,
+    pub friction: u32,
+    pub g: f64,
+    pub manning_n: f64,
+    pub friction_h_min: f64,
+    pub wet_dry: u32,
+    pub h_dry: f64,
+    pub relaxation_time: f64,
+    pub max_velocity: f64,
+    pub wet_dry_g: f64,
+}
+
+impl Damping {
+    /// Whether it damps at all (`ImplicitDamping2D::is_active`).
+    #[inline]
+    fn is_active(&self) -> bool {
+        self.friction != 0 || self.wet_dry != 0
+    }
+
+    #[inline]
+    fn wet_dry_config(&self) -> WetDryConfig {
+        WetDryConfig {
+            h_dry: Depth::new(self.h_dry),
+            relaxation_time: self.relaxation_time,
+            max_velocity: self.max_velocity,
+            g: self.wet_dry_g,
+        }
+    }
+
+    /// `damp_node` of mesh node `n` with depth `h`, from `from`, over `dt`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn node(&self, n: usize, h: f64, u: &mut f64, v: &mut f64, from: SWEState2D, dt: f64) {
+        let law = ManningFriction2D {
+            g: self.g,
+            manning_n: self.manning_n,
+            h_min: self.friction_h_min,
+        };
+        let config = self.wet_dry_config();
+        let no_cages: &[CageNode] = &[];
+        damp_node(
+            if self.friction != 0 { Some(&law) } else { None },
+            no_cages,
+            if self.wet_dry != 0 {
+                Some(&config)
+            } else {
+                None
+            },
+            Depth::new(self.h_min),
+            n,
+            h,
+            u,
+            v,
+            from,
+            dt,
+        );
+    }
+}
+
+/// Thread `i`'s item of a launch over `n` items: `list[i]`, or `i` itself
+/// where the list is empty (every item); `None` past the end.
+#[inline]
+fn item(i: usize, list: &[u32], n: u32) -> Option<usize> {
+    if i >= n as usize {
+        None
+    } else if list.is_empty() {
+        Some(i)
+    } else {
+        Some(list[i] as usize)
+    }
+}
+
+/// The level of element `k` (`level` empty: global steps, level 0).
+#[inline]
+fn level_of(level: &[u32], k: usize) -> usize {
+    if level.is_empty() {
+        0
+    } else {
+        level[k] as usize
+    }
 }
 
 /// Threads per block of the element kernels (their registers bound the block).
@@ -209,12 +331,12 @@ fn line_volume<const AFFINE: bool, I: Fn(usize) -> usize>(
 /// Not generic, so that it inlines (a generic `#[device]` function stays a
 /// call), and the GLL data are arrays, so that its loops have constant trip
 /// counts.
+#[allow(clippy::too_many_arguments)]
 #[device]
 // The device backend makes this alwaysinline (no call in the PTX); the host
 // compiler, which sees an exported symbol, ignores it.
 #[allow(unused_attributes)]
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 fn line_subcells(
     nodes: &[SWENodeState2D; NN],
     rhs: &mut [SWEState2D; NN],
@@ -435,20 +557,15 @@ fn rate_metric(grads: [f64; 4]) -> ((f64, f64), (f64, f64), f64, f64) {
     ((grads[0], grads[1]), (grads[2], grads[3]), norm_r, norm_s)
 }
 
-/// `SplitFormSWE2D::edge_fluxes` of edge `e`, into `slot`: both sides' F*
-/// of an interior edge (left first, each in its own face-node order), the
-/// hydrostatic HLL if `HLL`, else the entropy-stable flux; at a boundary
-/// (`boundary_flux`) the left side's F*, from a wall's ghost state or an
-/// open boundary's state.
-#[device]
+/// `SplitFormSWE2D::edge_fluxes` of interior edge `e`, into `slot`: both
+/// sides' F* (left first, each in its own face-node order), the hydrostatic
+/// HLL if `HLL`, else the entropy-stable flux.
 #[allow(clippy::too_many_arguments)]
+#[device]
 fn edge_body<const HLL: bool>(
     e: usize,
     g: f64,
     h_min: f64,
-    wall_h_min: f64,
-    time: f64,
-    open: &OpenStates,
     (h, hu, hv, bed): (&[f64], &[f64], &[f64], &[f64]),
     affine: &[u32],
     egeom: &[[f64; EG]],
@@ -457,7 +574,7 @@ fn edge_body<const HLL: bool>(
     slot: &mut [[f64; 3]; NF],
 ) {
     let [le, lf, re, rf] = edges[e];
-    let (le, lf) = (le as usize, lf as usize);
+    let (le, lf, re, rf) = (le as usize, lf as usize, re as usize, rf as usize);
     #[unroll]
     for fi in 0..N1 {
         let normal = if affine[le] != 0 {
@@ -468,42 +585,72 @@ fn edge_body<const HLL: bool>(
         };
         let left = le * NN + face_node(lf, fi);
         let q_left = node_state(h, hu, hv, bed, left, h_min);
-        if re == NO_NEIGHBOUR {
-            let state = SWEState2D::new(h[left], hu[left], hv[left]);
-            let f = if rf == WALL {
-                wall_flux(
-                    &q_left, state, bed[left], normal, time, g, h_min, wall_h_min, HLL,
-                )
-            } else {
-                open_flux(
-                    &q_left,
-                    state,
-                    bed[left],
-                    normal,
-                    time,
-                    g,
-                    h_min,
-                    open,
-                    rf as usize,
-                )
-            };
-            slot[fi] = [f.h, f.hu, f.hv];
-        } else {
-            let (re, rf) = (re as usize, rf as usize);
-            let rfi = N1 - 1 - fi;
-            let right = re * NN + face_node(rf, rfi);
-            let (f_left, f_right) = surface_flux(
-                &q_left,
-                &node_state(h, hu, hv, bed, right, h_min),
-                normal,
-                g,
-                HLL,
-                h_min,
-            );
-            slot[fi] = [f_left.h, f_left.hu, f_left.hv];
-            slot[N1 + rfi] = [f_right.h, f_right.hu, f_right.hv];
-        }
+        let rfi = N1 - 1 - fi;
+        let right = re * NN + face_node(rf, rfi);
+        let (f_left, f_right) = surface_flux(
+            &q_left,
+            &node_state(h, hu, hv, bed, right, h_min),
+            normal,
+            g,
+            HLL,
+            h_min,
+        );
+        slot[fi] = [f_left.h, f_left.hu, f_left.hv];
+        slot[N1 + rfi] = [f_right.h, f_right.hu, f_right.hv];
     }
+}
+
+/// `SplitFormSWE2D::boundary_flux` at face node `fi` of boundary edge `e`:
+/// a wall's ghost state or an open boundary's state at its element's stage
+/// time (its level's entry of `boundary`), through the hydrostatic HLL if
+/// `hll`.
+#[allow(clippy::too_many_arguments)]
+#[device]
+fn boundary_node(
+    e: usize,
+    fi: usize,
+    hll: bool,
+    g: f64,
+    h_min: f64,
+    wall_h_min: f64,
+    boundary: &[StageLevel],
+    level: &[u32],
+    (h, hu, hv, bed): (&[f64], &[f64], &[f64], &[f64]),
+    affine: &[u32],
+    egeom: &[[f64; EG]],
+    fgeom: &[[f64; 3]],
+    edges: &[[u32; 4]],
+) -> [f64; 3] {
+    let [le, lf, _, rf] = edges[e];
+    let (le, lf) = (le as usize, lf as usize);
+    let StageLevel { time, open } = boundary[level_of(level, le)];
+    let normal = if affine[le] != 0 {
+        (egeom[le][5 + 3 * lf], egeom[le][6 + 3 * lf])
+    } else {
+        let f = fgeom[(le * 4 + lf) * N1 + fi];
+        (f[0], f[1])
+    };
+    let left = le * NN + face_node(lf, fi);
+    let q_left = node_state(h, hu, hv, bed, left, h_min);
+    let state = SWEState2D::new(h[left], hu[left], hv[left]);
+    let f = if rf == WALL {
+        wall_flux(
+            &q_left, state, bed[left], normal, time, g, h_min, wall_h_min, hll,
+        )
+    } else {
+        open_flux(
+            &q_left,
+            state,
+            bed[left],
+            normal,
+            time,
+            g,
+            h_min,
+            &open,
+            rf as usize,
+        )
+    };
+    [f.h, f.hu, f.hv]
 }
 
 /// Whether element `k` has a node shallower than `depth` (its volume term
@@ -528,12 +675,12 @@ fn is_subcell_element(k: usize, h: &[f64], depth: f64) -> bool {
 /// terms `LIFT sJ (F(q⁻)·n − F*)` with F* from `faces`, then `1/J`, into
 /// `out` (`[h, hu, hv]`); then the Coriolis force as `CoriolisSource2D`
 /// adds it (`coriolis` 1: f = `f0`, 2: f of each node from `f_node`).
+#[allow(clippy::too_many_arguments)]
 #[device]
 // The device backend makes this alwaysinline (no call in the PTX); the host
 // compiler, which sees an exported symbol, ignores it.
 #[allow(unused_attributes)]
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 fn finish_element(
     k: usize,
     nodes: &[SWENodeState2D; NN],
@@ -587,7 +734,8 @@ fn finish_element(
             out_v += -f * nodes[i].hu;
         }
         // SAFETY: thread k writes only its own element's rows
-        // (k·NN..(k + 1)·NN), and k < n_elements.
+        // (k·NN..(k + 1)·NN; the listed elements are distinct), and
+        // k < n_elements.
         unsafe {
             *out_h.get_unchecked_mut(n) = j_inv * r.h;
             *out_hu.get_unchecked_mut(n) = out_u;
@@ -604,15 +752,15 @@ fn finish_element(
 pub mod kernels {
     use super::*;
 
-    /// The entropy-stable F* of every edge (one thread per edge).
+    /// The entropy-stable F* of the listed interior edges (one thread per
+    /// edge).
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn edge_fluxes_entropy_stable(
         g: f64,
         h_min: f64,
-        wall_h_min: f64,
-        time: f64,
-        open: OpenStates,
+        list: &[u32],
+        n: u32,
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -623,35 +771,34 @@ pub mod kernels {
         edges: &[[u32; 4]],
         mut out: DisjointSlice<[[f64; 3]; NF]>,
     ) {
-        let idx = thread::index_1d();
-        let e = idx.get();
-        if let Some(slot) = out.get_mut(idx) {
-            edge_body::<false>(
-                e,
-                g,
-                h_min,
-                wall_h_min,
-                time,
-                &open,
-                (h, hu, hv, bed),
-                affine,
-                egeom,
-                fgeom,
-                edges,
-                slot,
-            );
-        }
+        let Some(e) = item(thread::index_1d().get(), list, n) else {
+            return;
+        };
+        // SAFETY: the listed edges are distinct, so thread i alone writes
+        // edge e's slots, and e < n_edges (the buffer's length).
+        let slot = unsafe { out.get_unchecked_mut(e) };
+        edge_body::<false>(
+            e,
+            g,
+            h_min,
+            (h, hu, hv, bed),
+            affine,
+            egeom,
+            fgeom,
+            edges,
+            slot,
+        );
     }
 
-    /// The hydrostatic HLL F* of every edge (`WetDry`, one thread per edge).
+    /// The hydrostatic HLL F* of the listed interior edges (`WetDry`, one
+    /// thread per edge).
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn edge_fluxes_hll(
         g: f64,
         h_min: f64,
-        wall_h_min: f64,
-        time: f64,
-        open: OpenStates,
+        list: &[u32],
+        n: u32,
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -662,36 +809,94 @@ pub mod kernels {
         edges: &[[u32; 4]],
         mut out: DisjointSlice<[[f64; 3]; NF]>,
     ) {
-        let idx = thread::index_1d();
-        let e = idx.get();
-        if let Some(slot) = out.get_mut(idx) {
-            edge_body::<true>(
-                e,
-                g,
-                h_min,
-                wall_h_min,
-                time,
-                &open,
-                (h, hu, hv, bed),
-                affine,
-                egeom,
-                fgeom,
-                edges,
-                slot,
-            );
+        let Some(e) = item(thread::index_1d().get(), list, n) else {
+            return;
+        };
+        // SAFETY: the listed edges are distinct, so thread i alone writes
+        // edge e's slots, and e < n_edges (the buffer's length).
+        let slot = unsafe { out.get_unchecked_mut(e) };
+        edge_body::<true>(
+            e,
+            g,
+            h_min,
+            (h, hu, hv, bed),
+            affine,
+            egeom,
+            fgeom,
+            edges,
+            slot,
+        );
+    }
+
+    /// The F* of the listed boundary edges (one thread per face node): walls
+    /// and open boundaries at their element's stage time, `boundary`'s
+    /// entry of its level.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn boundary_fluxes(
+        hll: u32,
+        g: f64,
+        h_min: f64,
+        wall_h_min: f64,
+        boundary: &[StageLevel],
+        level: &[u32],
+        list: &[u32],
+        n: u32,
+        h: &[f64],
+        hu: &[f64],
+        hv: &[f64],
+        bed: &[f64],
+        affine: &[u32],
+        egeom: &[[f64; EG]],
+        fgeom: &[[f64; 3]],
+        edges: &[[u32; 4]],
+        mut out: DisjointSlice<[[f64; 3]; NF]>,
+    ) {
+        // One thread per face node: few boundary edges, each a long FP64
+        // sequence, and a GPU has many SMs to keep busy
+        let t = thread::index_1d().get();
+        let (i, fi) = (t / N1, t % N1);
+        let Some(e) = item(i, list, n) else {
+            return;
+        };
+        let f = boundary_node(
+            e,
+            fi,
+            hll != 0,
+            g,
+            h_min,
+            wall_h_min,
+            boundary,
+            level,
+            (h, hu, hv, bed),
+            affine,
+            egeom,
+            fgeom,
+            edges,
+        );
+        // SAFETY: the listed edges are distinct and e < n_edges; thread
+        // (i, fi) alone writes slot fi of edge e (a boundary edge has only
+        // its left side), through a raw pointer, no reference to the edge's
+        // other slots.
+        unsafe {
+            let slots = out.as_mut_ptr().add(e) as *mut [f64; 3];
+            *slots.add(fi) = f;
         }
     }
 
-    /// `SplitFormSWE2D::element_rhs` of the elements without a node
-    /// shallower than `subcell_depth` (one thread per element; the others
-    /// are `element_rhs_subcells`'): the flux-differencing volume term and
-    /// the lifted face terms, divided by J.
+    /// `SplitFormSWE2D::element_rhs` of the listed elements (every element
+    /// if `list` is empty) without a node shallower than `subcell_depth`
+    /// (one thread per element; the others are `element_rhs_subcells`'):
+    /// the flux-differencing volume term and the lifted face terms, divided
+    /// by J.
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn element_rhs_volume(
         g: f64,
         h_min: f64,
         subcell_depth: f64,
+        list: &[u32],
+        n: u32,
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -713,8 +918,10 @@ pub mod kernels {
         mut out_hu: DisjointSlice<f64>,
         mut out_hv: DisjointSlice<f64>,
     ) {
-        let k = thread::index_1d().get();
-        if k >= element_edges.len() || is_subcell_element(k, h, subcell_depth) {
+        let Some(k) = item(thread::index_1d().get(), list, n) else {
+            return;
+        };
+        if is_subcell_element(k, h, subcell_depth) {
             return;
         }
         let mut nodes = [SWENodeState2D::default(); NN];
@@ -782,10 +989,11 @@ pub mod kernels {
         );
     }
 
-    /// `SplitFormSWE2D::element_rhs` of the elements with a node shallower
-    /// than `subcell_depth` (`WetDry`, one thread per element; the others
-    /// return at once): the subcell finite volumes, with the neighbours'
-    /// outer nodes, and the lifted face terms, divided by J.
+    /// `SplitFormSWE2D::element_rhs` of the listed elements (every element
+    /// if `list` is empty) with a node shallower than `subcell_depth`
+    /// (`WetDry`, one thread per element; the others return at once): the
+    /// subcell finite volumes, with the neighbours' outer nodes, and the
+    /// lifted face terms, divided by J.
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn element_rhs_subcells(
@@ -793,6 +1001,8 @@ pub mod kernels {
         h_min: f64,
         subcell_depth: f64,
         h_dry: f64,
+        list: &[u32],
+        n: u32,
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -817,8 +1027,10 @@ pub mod kernels {
         mut out_hu: DisjointSlice<f64>,
         mut out_hv: DisjointSlice<f64>,
     ) {
-        let k = thread::index_1d().get();
-        if k >= element_edges.len() || !is_subcell_element(k, h, subcell_depth) {
+        let Some(k) = item(thread::index_1d().get(), list, n) else {
+            return;
+        };
+        if !is_subcell_element(k, h, subcell_depth) {
             return;
         }
         let mut nodes = [SWENodeState2D::default(); NN];
@@ -977,22 +1189,13 @@ pub mod kernels {
     }
 
     /// `apply_implicit_damping_2d` of node `n` (one thread per node):
-    /// dgcom's `damp_node` with Manning friction (if `friction`) and the
-    /// thin-layer relaxation (if `wet_dry`), no cages.
+    /// dgcom's `damp_node` with Manning friction and the thin-layer
+    /// relaxation as `damping` says, no cages.
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn implicit_damping(
         dt: f64,
-        h_min: f64,
-        friction: u32,
-        g: f64,
-        manning_n: f64,
-        friction_h_min: f64,
-        wet_dry: u32,
-        h_dry: f64,
-        relaxation_time: f64,
-        max_velocity: f64,
-        wet_dry_g: f64,
+        damping: Damping,
         h: &[f64],
         from_h: &[f64],
         from_hu: &[f64],
@@ -1004,36 +1207,265 @@ pub mod kernels {
         if n >= h.len() {
             return;
         }
-        let law = ManningFriction2D {
-            g,
-            manning_n,
-            h_min: friction_h_min,
-        };
-        let config = WetDryConfig {
-            h_dry: Depth::new(h_dry),
-            relaxation_time,
-            max_velocity,
-            g: wet_dry_g,
-        };
-        let no_cages: &[CageNode] = &[];
         // SAFETY: thread n reads and writes only node n.
         let (mut u, mut v) = unsafe { (*hu.get_unchecked_mut(n), *hv.get_unchecked_mut(n)) };
-        damp_node(
-            if friction != 0 { Some(&law) } else { None },
-            no_cages,
-            if wet_dry != 0 { Some(&config) } else { None },
-            Depth::new(h_min),
-            n,
-            h[n],
-            &mut u,
-            &mut v,
-            SWEState2D::new(from_h[n], from_hu[n], from_hv[n]),
-            dt,
-        );
+        let from = SWEState2D::new(from_h[n], from_hu[n], from_hv[n]);
+        damping.node(n, h[n], &mut u, &mut v, from, dt);
         // SAFETY: as above.
         unsafe {
             *hu.get_unchecked_mut(n) = u;
             *hv.get_unchecked_mut(n) = v;
+        }
+    }
+
+    /// `SWEPhysics2D::stage_where`'s stage of every listed element k (every
+    /// element if `list` is empty; one thread per element), whose RHS is in
+    /// its rows of `out`: the stage `element_stage` gives it (its level and,
+    /// for the last stage, its rate), `out = a·base + b·input + c·F`, the
+    /// damping over `c`, then either `acc ← w·out + keep·acc` (the last
+    /// stage) or the wet/dry correction. A line-local element that went
+    /// shallower than `shallow` in a stage value the next stage reads is
+    /// counted in `breaks`.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_elements(
+        t: f64,
+        dt: f64,
+        finest: u32,
+        substep: u32,
+        depth: u32,
+        last: u32,
+        start: f64,
+        input: f64,
+        beta: f64,
+        c: f64,
+        level: &[u32],
+        rate: &[u32],
+        list: &[u32],
+        n: u32,
+        base_h: &[f64],
+        base_hu: &[f64],
+        base_hv: &[f64],
+        in_h: &[f64],
+        in_hu: &[f64],
+        in_hv: &[f64],
+        damping: Damping,
+        line_local: &[u32],
+        shallow: f64,
+        mass: &[f64],
+        inv_area: &[f64],
+        mut out_h: DisjointSlice<f64>,
+        mut out_hu: DisjointSlice<f64>,
+        mut out_hv: DisjointSlice<f64>,
+        mut acc_h: DisjointSlice<f64>,
+        mut acc_hu: DisjointSlice<f64>,
+        mut acc_hv: DisjointSlice<f64>,
+        mut clips: DisjointSlice<u32>,
+        mut breaks: DisjointSlice<u32>,
+    ) {
+        let Some(k) = item(thread::index_1d().get(), list, n) else {
+            return;
+        };
+        let stage = element_stage(
+            (t, dt),
+            finest as usize,
+            substep as usize,
+            depth as usize,
+            ShuOsherStage {
+                start,
+                input,
+                beta,
+                c,
+            },
+            last != 0,
+            level_of(level, k) as u8,
+            level_of(rate, k) as u8,
+        );
+        let (mut eh, mut ehu, mut ehv) = ([0.0; NN], [0.0; NN], [0.0; NN]);
+        // out = a·base + b·input + c·F, F in the rows (as scale + axpy
+        // round it)
+        let combine = |s: f64, x: f64, f: f64| {
+            let mut v = if stage.a != 0.0 { stage.a * s } else { 0.0 };
+            if stage.b != 0.0 {
+                v += stage.b * x;
+            }
+            if stage.c != 0.0 {
+                v += stage.c * f;
+            }
+            v
+        };
+        #[unroll]
+        for i in 0..NN {
+            let m = k * NN + i;
+            // SAFETY: thread k reads and writes only its own element's rows
+            // (the listed elements are distinct).
+            let (fh, fhu, fhv) = unsafe {
+                (
+                    *out_h.get_unchecked_mut(m),
+                    *out_hu.get_unchecked_mut(m),
+                    *out_hv.get_unchecked_mut(m),
+                )
+            };
+            eh[i] = combine(base_h[m], in_h[m], fh);
+            ehu[i] = combine(base_hu[m], in_hu[m], fhu);
+            ehv[i] = combine(base_hv[m], in_hv[m], fhv);
+        }
+        if damping.is_active() {
+            #[unroll]
+            for i in 0..NN {
+                let m = k * NN + i;
+                let from = SWEState2D::new(in_h[m], in_hu[m], in_hv[m]);
+                damping.node(m, eh[i], &mut ehu[i], &mut ehv[i], from, stage.c);
+            }
+        }
+        if stage.accumulate.is_none() && !line_local.is_empty() && line_local[k] != 0 {
+            let mut shallower = false;
+            #[unroll]
+            for i in 0..NN {
+                shallower |= eh[i] < shallow;
+            }
+            if shallower {
+                // SAFETY: thread k writes only its own element's count.
+                unsafe {
+                    *breaks.get_unchecked_mut(k) += 1;
+                }
+            }
+        }
+        match stage.accumulate {
+            Some((w, keep)) => {
+                #[unroll]
+                for i in 0..NN {
+                    let m = k * NN + i;
+                    // SAFETY: as above, the element's rows of the sum.
+                    unsafe {
+                        let sum = |s: &mut f64, v: f64| {
+                            *s = if keep != 0.0 {
+                                w * v + keep * *s
+                            } else {
+                                w * v
+                            };
+                        };
+                        sum(acc_h.get_unchecked_mut(m), eh[i]);
+                        sum(acc_hu.get_unchecked_mut(m), ehu[i]);
+                        sum(acc_hv.get_unchecked_mut(m), ehv[i]);
+                    }
+                }
+            }
+            None => {
+                if damping.wet_dry != 0 {
+                    let mut em = [0.0; NN];
+                    #[unroll]
+                    for i in 0..NN {
+                        em[i] = mass[k * NN + i];
+                    }
+                    let config = damping.wet_dry_config();
+                    if wet_dry_element(&mut eh, &mut ehu, &mut ehv, &em, inv_area[k], &config) {
+                        // SAFETY: thread k writes only its own element's count.
+                        unsafe {
+                            *clips.get_unchecked_mut(k) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        #[unroll]
+        for i in 0..NN {
+            let m = k * NN + i;
+            // SAFETY: as above.
+            unsafe {
+                *out_h.get_unchecked_mut(m) = eh[i];
+                *out_hu.get_unchecked_mut(m) = ehu[i];
+                *out_hv.get_unchecked_mut(m) = ehv[i];
+            }
+        }
+    }
+
+    /// `SWEPhysics2D::finish_where` of every listed element k (one thread
+    /// per element): its rows of the state from `acc`, the line-local check
+    /// as in `stage_elements`, then the wet/dry correction (if `wet_dry`).
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_elements(
+        list: &[u32],
+        n: u32,
+        acc_h: &[f64],
+        acc_hu: &[f64],
+        acc_hv: &[f64],
+        damping: Damping,
+        line_local: &[u32],
+        shallow: f64,
+        mass: &[f64],
+        inv_area: &[f64],
+        mut h: DisjointSlice<f64>,
+        mut hu: DisjointSlice<f64>,
+        mut hv: DisjointSlice<f64>,
+        mut clips: DisjointSlice<u32>,
+        mut breaks: DisjointSlice<u32>,
+    ) {
+        let Some(k) = item(thread::index_1d().get(), list, n) else {
+            return;
+        };
+        let (mut eh, mut ehu, mut ehv, mut em) = ([0.0; NN], [0.0; NN], [0.0; NN], [0.0; NN]);
+        let mut shallower = false;
+        #[unroll]
+        for i in 0..NN {
+            let m = k * NN + i;
+            eh[i] = acc_h[m];
+            ehu[i] = acc_hu[m];
+            ehv[i] = acc_hv[m];
+            em[i] = mass[m];
+            if eh[i] < shallow {
+                shallower = true;
+            }
+        }
+        if shallower && !line_local.is_empty() && line_local[k] != 0 {
+            // SAFETY: thread k writes only its own element's count.
+            unsafe {
+                *breaks.get_unchecked_mut(k) += 1;
+            }
+        }
+        if damping.wet_dry != 0 {
+            let config = damping.wet_dry_config();
+            if wet_dry_element(&mut eh, &mut ehu, &mut ehv, &em, inv_area[k], &config) {
+                // SAFETY: as above.
+                unsafe {
+                    *clips.get_unchecked_mut(k) += 1;
+                }
+            }
+        }
+        #[unroll]
+        for i in 0..NN {
+            let m = k * NN + i;
+            // SAFETY: thread k writes only its own element's rows (the
+            // listed elements are distinct).
+            unsafe {
+                *h.get_unchecked_mut(m) = eh[i];
+                *hu.get_unchecked_mut(m) = ehu[i];
+                *hv.get_unchecked_mut(m) = ehv[i];
+            }
+        }
+    }
+
+    /// Bit j of element k's flag: every node of k deeper than `dj`
+    /// (one thread per element; for `line_local` and `coarse_step_bound`).
+    #[kernel]
+    pub fn depth_flags(d0: f64, d1: f64, d2: f64, h: &[f64], mut out: DisjointSlice<u32>) {
+        let idx = thread::index_1d();
+        let k = idx.get();
+        let depths = [d0, d1, d2];
+        if let Some(flags) = out.get_mut(idx) {
+            let mut bits = 0u32;
+            #[unroll]
+            for j in 0..3 {
+                // Every node deeper (false at a NaN, as `all(h > depth)`)
+                let mut deeper = true;
+                #[unroll]
+                for i in 0..NN {
+                    deeper &= h[k * NN + i] > depths[j];
+                }
+                bits |= u32::from(deeper) << j;
+            }
+            *flags = bits;
         }
     }
 
@@ -1465,6 +1897,14 @@ impl Integrable for DeviceState {
     }
 }
 
+/// The boundary edges of `mesh` (`boundary`) or its interior edges, in
+/// order.
+fn edge_kinds(mesh: &Mesh2D, boundary: bool) -> Vec<u32> {
+    (0..mesh.n_edges as u32)
+        .filter(|&e| mesh.edges[e as usize].right.is_none() == boundary)
+        .collect()
+}
+
 /// The static data of a mesh, packed as the kernels read them, on the device.
 struct Statics {
     bed: DeviceBuffer<f64>,
@@ -1484,6 +1924,10 @@ struct Statics {
     /// Left element and face, right element and face (`NO_NEIGHBOUR` at a
     /// wall)
     edges: DeviceBuffer<[u32; 4]>,
+    /// The interior edges and the boundary edges, each in order (the edge
+    /// lists of global steps)
+    interior_edges: DeviceBuffer<u32>,
+    boundary_edges: DeviceBuffer<u32>,
     /// `[r_x, r_y, s_x, s_y]` of every node, and of every parallelogram
     grads: DeviceBuffer<[f64; 4]>,
     affine_grads: DeviceBuffer<[f64; 4]>,
@@ -1603,6 +2047,8 @@ impl Statics {
             lift: DeviceBuffer::from_host(stream, &lift)?,
             element_edges: DeviceBuffer::from_host(stream, &element_edges)?,
             edges: DeviceBuffer::from_host(stream, &edges)?,
+            interior_edges: DeviceBuffer::from_host(stream, &edge_kinds(mesh, false))?,
+            boundary_edges: DeviceBuffer::from_host(stream, &edge_kinds(mesh, true))?,
             grads: DeviceBuffer::from_host(stream, &grads)?,
             affine_grads: DeviceBuffer::from_host(stream, &affine_grads)?,
             mass: DeviceBuffer::from_host(stream, &mass)?,
@@ -1656,6 +2102,204 @@ pub struct GpuSWE2D<'a> {
     faces: Mutex<DeviceBuffer<[[f64; 3]; NF]>>,
     /// Every element's largest reference rate (the time step)
     rates: Mutex<DeviceBuffer<f64>>,
+    /// Local time stepping: the line-local depth and the positivity bound's
+    /// `h_dry` (`SWEDeviceForm2D`), the coarse step's lists
+    /// ([`Schedule`]), the line-local flags of the coarse step (bit 0, empty
+    /// while none are marked) and every element's count of broken promises
+    line_local_depth: Option<f64>,
+    positivity_h_dry: Option<f64>,
+    schedule: Mutex<Schedule>,
+    line_local: Mutex<DeviceBuffer<u32>>,
+    breaks: Mutex<DeviceBuffer<u32>>,
+    /// The stage's boundary data on the device
+    boundary: Mutex<BoundaryUploads>,
+    /// An empty list (every element or edge) and empty rows (the sum of a
+    /// stage that does not accumulate)
+    no_list: DeviceBuffer<u32>,
+    no_rows: Mutex<[DeviceBuffer<f64>; 3]>,
+}
+
+/// A stage's boundary data ([`StageLevel`] per level) on the device: each
+/// stage's copied from a host slot of a ring, which outlives its
+/// asynchronous copy (the stream is synchronized each time the ring wraps).
+struct BoundaryUploads {
+    device: DeviceBuffer<StageLevel>,
+    host: Vec<[StageLevel; LEVELS]>,
+    next: usize,
+}
+
+impl BoundaryUploads {
+    /// Host slots: stage passes between two synchronizations.
+    const SLOTS: usize = 1024;
+
+    fn new(gpu: &Gpu) -> Result<Self, String> {
+        Ok(Self {
+            device: DeviceBuffer::zeroed(&gpu.stream, LEVELS).map_err(|e| e.to_string())?,
+            host: vec![[StageLevel::default(); LEVELS]; Self::SLOTS],
+            next: 0,
+        })
+    }
+
+    /// `levels` on the device, for the kernels enqueued next on `stream`.
+    fn upload(
+        &mut self,
+        stream: &Stream,
+        levels: &[StageLevel; LEVELS],
+    ) -> &DeviceBuffer<StageLevel> {
+        if self.next == Self::SLOTS {
+            // Every copy from the slots has completed
+            stream.synchronize().expect("synchronize");
+            self.next = 0;
+        }
+        let slot = &mut self.host[self.next];
+        *slot = *levels;
+        self.next += 1;
+        // SAFETY: the slot is not written again before the stream is
+        // synchronized (above), so it outlives the copy; the buffer is
+        // LEVELS long. Copies and kernels are ordered on the stream, so the
+        // kernels of an earlier stage have read the buffer before it changes.
+        unsafe { self.device.copy_from_host_async_unchecked(stream, slot) }
+            .expect("boundary upload");
+        &self.device
+    }
+}
+
+/// The order of a coarse step's passes on the device
+/// ([`LocalTimeStepping::begin_coarse_step`]): for every key (the stage
+/// rates `rates[s]`, then the levels) the elements sorted by it, largest
+/// first, so that a pass's elements (those whose key is at least its depth)
+/// are a prefix; for every stage the edges by the larger key of their two
+/// elements (the edges whose fluxes the pass's elements read). With one
+/// level (global steps through the fused stages) there are no lists: every
+/// pass is every element.
+struct Schedule {
+    finest: usize,
+    /// The levels and stage rates of the lists, as uploaded
+    level_host: Vec<u8>,
+    rates_host: Vec<Vec<u8>>,
+    /// Every element's level and last-stage rate
+    level: DeviceBuffer<u32>,
+    last_rate: DeviceBuffer<u32>,
+    elements: Vec<DeviceBuffer<u32>>,
+    element_counts: Vec<Vec<usize>>,
+    /// Per stage, the interior edges (`[0]`) and the boundary edges (`[1]`)
+    /// by key
+    edges: Vec<[DeviceBuffer<u32>; 2]>,
+    edge_counts: Vec<[Vec<usize>; 2]>,
+}
+
+impl Schedule {
+    fn empty(gpu: &Gpu) -> Result<Self, String> {
+        let none = || DeviceBuffer::zeroed(&gpu.stream, 0).map_err(|e| e.to_string());
+        Ok(Self {
+            finest: 0,
+            level_host: Vec::new(),
+            rates_host: Vec::new(),
+            level: none()?,
+            last_rate: none()?,
+            elements: Vec::new(),
+            element_counts: Vec::new(),
+            edges: Vec::new(),
+            edge_counts: Vec::new(),
+        })
+    }
+
+    /// Items `0..keys.len()` by key, largest first (in index order within a
+    /// key), and how many have a key of at least `d`, for `d` in
+    /// `0..=finest`.
+    fn order(keys: impl Fn(usize) -> u8, n: usize, finest: usize) -> (Vec<u32>, Vec<usize>) {
+        let mut count = vec![0usize; finest + 1];
+        for i in 0..n {
+            count[keys(i) as usize] += 1;
+        }
+        // at_least[d] = Σ_{v ≥ d} count[v]; key v starts after the larger keys
+        let mut at_least = vec![0usize; finest + 2];
+        for d in (0..=finest).rev() {
+            at_least[d] = at_least[d + 1] + count[d];
+        }
+        let mut next: Vec<usize> = (0..=finest).map(|v| at_least[v + 1]).collect();
+        let mut order = vec![0u32; n];
+        for i in 0..n {
+            let v = keys(i) as usize;
+            order[next[v]] = i as u32;
+            next[v] += 1;
+        }
+        at_least.truncate(finest + 1);
+        (order, at_least)
+    }
+
+    /// The lists of the levels `level` and stage rates `rates` on `mesh`,
+    /// uploaded unless they are the last ones.
+    fn update(
+        &mut self,
+        gpu: &Gpu,
+        mesh: &Mesh2D,
+        level: &[u8],
+        rates: &[Vec<u8>],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.level_host == level && self.rates_host == rates {
+            return Ok(());
+        }
+        self.level_host = level.to_vec();
+        self.rates_host = rates.to_vec();
+        let finest = level
+            .iter()
+            .chain(rates.iter().flatten())
+            .copied()
+            .max()
+            .unwrap_or(0) as usize;
+        assert!(
+            finest <= MAX_DEVICE_LEVELS,
+            "{finest} levels: the device takes at most {MAX_DEVICE_LEVELS}"
+        );
+        self.finest = finest;
+        if finest == 0 {
+            return Ok(());
+        }
+        let n = mesh.n_elements;
+        let stream = &gpu.stream;
+        let upload = |buffer: &mut DeviceBuffer<u32>, host: &[u32]| {
+            if buffer.len() == host.len() {
+                buffer.copy_from_host(stream, host)
+            } else {
+                *buffer = DeviceBuffer::from_host(stream, host)?;
+                Ok(())
+            }
+        };
+        let widen = |keys: &[u8]| keys.iter().map(|&k| u32::from(k)).collect::<Vec<_>>();
+        upload(&mut self.level, &widen(level))?;
+        upload(&mut self.last_rate, &widen(rates.last().expect("a stage")))?;
+        let keys: Vec<&[u8]> = rates.iter().map(Vec::as_slice).chain([level]).collect();
+        self.elements.resize_with(keys.len(), || {
+            DeviceBuffer::zeroed(stream, 0).expect("allocation")
+        });
+        self.element_counts.resize(keys.len(), Vec::new());
+        for (j, key) in keys.iter().enumerate() {
+            let (order, counts) = Self::order(|k| key[k], n, finest);
+            upload(&mut self.elements[j], &order)?;
+            self.element_counts[j] = counts;
+        }
+        let kinds = [edge_kinds(mesh, false), edge_kinds(mesh, true)];
+        self.edges.resize_with(rates.len(), || {
+            [0, 1].map(|_| DeviceBuffer::zeroed(stream, 0).expect("allocation"))
+        });
+        self.edge_counts
+            .resize(rates.len(), [Vec::new(), Vec::new()]);
+        for (s, rate) in rates.iter().enumerate() {
+            for (kind, edges) in kinds.iter().enumerate() {
+                let edge_key = |i: usize| {
+                    let edge = &mesh.edges[edges[i] as usize];
+                    let left = rate[edge.left.element];
+                    edge.right.map_or(left, |r| left.max(rate[r.element]))
+                };
+                let (order, counts) = Self::order(edge_key, edges.len(), finest);
+                let order: Vec<u32> = order.iter().map(|&i| edges[i as usize]).collect();
+                upload(&mut self.edges[s][kind], &order)?;
+                self.edge_counts[s][kind] = counts;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'a> GpuSWE2D<'a> {
@@ -1752,6 +2396,16 @@ impl<'a> GpuSWE2D<'a> {
                 DeviceBuffer::zeroed(stream, mesh.n_edges).map_err(|e| e.to_string())?,
             ),
             rates: Mutex::new(zeroed(mesh.n_elements)?),
+            line_local_depth: form.line_local_depth,
+            positivity_h_dry: form.positivity_h_dry,
+            schedule: Mutex::new(Schedule::empty(gpu)?),
+            line_local: Mutex::new(DeviceBuffer::zeroed(stream, 0).map_err(|e| e.to_string())?),
+            breaks: Mutex::new(
+                DeviceBuffer::zeroed(stream, mesh.n_elements).map_err(|e| e.to_string())?,
+            ),
+            no_list: DeviceBuffer::zeroed(stream, 0).map_err(|e| e.to_string())?,
+            no_rows: Mutex::new([zeroed(0)?, zeroed(0)?, zeroed(0)?]),
+            boundary: Mutex::new(BoundaryUploads::new(gpu)?),
         })
     }
 
@@ -1787,6 +2441,226 @@ impl<'a> GpuSWE2D<'a> {
             Some(c) => (2, c.f0),
         }
     }
+
+    /// The point-implicit damping of a stage and the wet/dry correction.
+    fn damping(&self) -> Damping {
+        let (g, manning_n, friction_h_min) = self
+            .friction
+            .as_ref()
+            .map_or((0.0, 0.0, 0.0), |f| (f.g, f.manning_n, f.h_min));
+        let (h_dry, relaxation_time, max_velocity, wet_dry_g) =
+            self.wet_dry.as_ref().map_or((0.0, 0.0, 0.0, 0.0), |c| {
+                (c.h_dry.meters(), c.relaxation_time, c.max_velocity, c.g)
+            });
+        Damping {
+            h_min: self.h_min,
+            friction: u32::from(self.friction.is_some()),
+            g,
+            manning_n,
+            friction_h_min,
+            wet_dry: u32::from(self.wet_dry.is_some()),
+            h_dry,
+            relaxation_time,
+            max_velocity,
+            wet_dry_g,
+        }
+    }
+
+    /// The RHS of the listed elements into their rows of `out` (`edges` and
+    /// `elements`: the first `n` of a list, every edge or element where the
+    /// list is empty): the F* of the listed edges, then the element
+    /// kernels. `level` gives a boundary edge its element's entry of
+    /// `boundary` (empty: level 0).
+    fn rhs_where(
+        &self,
+        state: &DeviceState,
+        boundary: &[StageLevel; LEVELS],
+        level: &DeviceBuffer<u32>,
+        [(interior, n_interior), (boundary_list, n_boundary)]: [(&DeviceBuffer<u32>, usize); 2],
+        (element_list, n_elements): (&DeviceBuffer<u32>, usize),
+        out: &mut DeviceState,
+    ) {
+        let (gpu, s) = (&self.gpu, &self.statics);
+        // The element kernels split at the subcell depth (none for the
+        // entropy-stable form: no depth is below −∞)
+        let (hll, subcell_depth, h_dry) = match self.formulation {
+            Formulation::EntropyStable => (false, f64::NEG_INFINITY, 0.0),
+            Formulation::WetDry {
+                subcell_depth,
+                h_dry,
+            } => (true, subcell_depth, h_dry),
+        };
+        let mut faces = self.faces.lock().expect("face buffer");
+        let mut uploads = self.boundary.lock().expect("boundary data");
+        let uploaded = uploads.upload(&gpu.stream, boundary);
+        let (coriolis, f0) = self.coriolis_args();
+        let elements_cfg = per_element(n_elements);
+        let n_elements = n_elements as u32;
+        // SAFETY: every buffer is sized for this mesh (`Statics::upload`, the
+        // state's), the lists hold distinct edges and elements of it, and the
+        // kernels index within its elements, edges and nodes.
+        unsafe {
+            if n_interior > 0 {
+                let cfg = one_dimensional(n_interior);
+                let n = n_interior as u32;
+                if hll {
+                    gpu.module.edge_fluxes_hll(
+                        &gpu.stream,
+                        cfg,
+                        self.g,
+                        self.h_min,
+                        interior,
+                        n,
+                        &state.h,
+                        &state.hu,
+                        &state.hv,
+                        &s.bed,
+                        &s.affine,
+                        &s.egeom,
+                        &s.fgeom,
+                        &s.edges,
+                        &mut faces,
+                    )
+                } else {
+                    gpu.module.edge_fluxes_entropy_stable(
+                        &gpu.stream,
+                        cfg,
+                        self.g,
+                        self.h_min,
+                        interior,
+                        n,
+                        &state.h,
+                        &state.hu,
+                        &state.hv,
+                        &s.bed,
+                        &s.affine,
+                        &s.egeom,
+                        &s.fgeom,
+                        &s.edges,
+                        &mut faces,
+                    )
+                }
+                .expect("edge fluxes");
+            }
+            if n_boundary > 0 {
+                gpu.module
+                    .boundary_fluxes(
+                        &gpu.stream,
+                        one_dimensional(n_boundary * N1),
+                        u32::from(hll),
+                        self.g,
+                        self.h_min,
+                        self.wall_h_min,
+                        uploaded,
+                        level,
+                        boundary_list,
+                        n_boundary as u32,
+                        &state.h,
+                        &state.hu,
+                        &state.hv,
+                        &s.bed,
+                        &s.affine,
+                        &s.egeom,
+                        &s.fgeom,
+                        &s.edges,
+                        &mut faces,
+                    )
+                    .expect("boundary fluxes");
+            }
+            let [out_h, out_hu, out_hv] = out.fields_mut();
+            gpu.module
+                .element_rhs_volume(
+                    &gpu.stream,
+                    elements_cfg,
+                    self.g,
+                    self.h_min,
+                    subcell_depth,
+                    element_list,
+                    n_elements,
+                    &state.h,
+                    &state.hu,
+                    &state.hv,
+                    &s.bed,
+                    &s.affine,
+                    &s.egeom,
+                    &s.contra,
+                    &s.jinv,
+                    &s.fgeom,
+                    &s.d1,
+                    &s.lift,
+                    &s.element_edges,
+                    &s.edges,
+                    &faces,
+                    coriolis,
+                    f0,
+                    &s.f_node,
+                    out_h,
+                    out_hu,
+                    out_hv,
+                )
+                .expect("element RHS (volume)");
+            if hll {
+                let [out_h, out_hu, out_hv] = out.fields_mut();
+                gpu.module
+                    .element_rhs_subcells(
+                        &gpu.stream,
+                        elements_cfg,
+                        self.g,
+                        self.h_min,
+                        subcell_depth,
+                        h_dry,
+                        element_list,
+                        n_elements,
+                        &state.h,
+                        &state.hu,
+                        &state.hv,
+                        &s.bed,
+                        &s.affine,
+                        &s.egeom,
+                        &s.contra,
+                        &s.jinv,
+                        &s.jac,
+                        &s.fgeom,
+                        &s.d1,
+                        &s.w,
+                        &s.xi,
+                        &s.lift,
+                        &s.element_edges,
+                        &s.edges,
+                        &faces,
+                        coriolis,
+                        f0,
+                        &s.f_node,
+                        out_h,
+                        out_hu,
+                        out_hv,
+                    )
+                    .expect("element RHS (subcells)");
+            }
+        }
+    }
+
+    /// Every element's flags of `depth_flags` (bit j: every node deeper
+    /// than `depths[j]`), on the host.
+    fn depth_flags(&self, state: &DeviceState, depths: [f64; 3]) -> Vec<u32> {
+        let gpu = &self.gpu;
+        let n = self.mesh.n_elements;
+        let mut flags = DeviceBuffer::<u32>::zeroed(&gpu.stream, n).expect("allocation");
+        // SAFETY: one flag per element of the state.
+        unsafe {
+            gpu.module.depth_flags(
+                &gpu.stream,
+                one_dimensional(n),
+                depths[0],
+                depths[1],
+                depths[2],
+                &state.h,
+                &mut flags,
+            )
+        }
+        .expect("depth flags");
+        flags.to_host_vec(&gpu.stream).expect("download")
+    }
 }
 
 impl PhysicsModuleInfo for GpuSWE2D<'_> {
@@ -1815,131 +2689,23 @@ impl PhysicsModule<DeviceState> for GpuSWE2D<'_> {
     }
 
     fn compute_rhs_into(&self, state: &DeviceState, time: f64, out: &mut DeviceState) {
-        let (gpu, s) = (&self.gpu, &self.statics);
-        // The element kernels split at the subcell depth (none for the
-        // entropy-stable form: no depth is below −∞)
-        let (hll, subcell_depth, h_dry) = match self.formulation {
-            Formulation::EntropyStable => (false, f64::NEG_INFINITY, 0.0),
-            Formulation::WetDry {
-                subcell_depth,
-                h_dry,
-            } => (true, subcell_depth, h_dry),
+        let mut boundary = [StageLevel::default(); LEVELS];
+        boundary[0] = StageLevel {
+            time,
+            open: self.open_states(time),
         };
-        let mut faces = self.faces.lock().expect("face buffer");
-        let open = self.open_states(time);
-        let (coriolis, f0) = self.coriolis_args();
-        let edges_cfg = one_dimensional(self.mesh.n_edges);
-        let elements_cfg = per_element(self.mesh.n_elements);
-        // SAFETY: every buffer is sized for this mesh (`Statics::upload`, the
-        // state's), and the kernels index within its elements, edges and nodes.
-        unsafe {
-            if hll {
-                gpu.module.edge_fluxes_hll(
-                    &gpu.stream,
-                    edges_cfg,
-                    self.g,
-                    self.h_min,
-                    self.wall_h_min,
-                    time,
-                    open,
-                    &state.h,
-                    &state.hu,
-                    &state.hv,
-                    &s.bed,
-                    &s.affine,
-                    &s.egeom,
-                    &s.fgeom,
-                    &s.edges,
-                    &mut *faces,
-                )
-            } else {
-                gpu.module.edge_fluxes_entropy_stable(
-                    &gpu.stream,
-                    edges_cfg,
-                    self.g,
-                    self.h_min,
-                    self.wall_h_min,
-                    time,
-                    open,
-                    &state.h,
-                    &state.hu,
-                    &state.hv,
-                    &s.bed,
-                    &s.affine,
-                    &s.egeom,
-                    &s.fgeom,
-                    &s.edges,
-                    &mut *faces,
-                )
-            }
-            .expect("edge fluxes");
-            let [out_h, out_hu, out_hv] = out.fields_mut();
-            gpu.module
-                .element_rhs_volume(
-                    &gpu.stream,
-                    elements_cfg,
-                    self.g,
-                    self.h_min,
-                    subcell_depth,
-                    &state.h,
-                    &state.hu,
-                    &state.hv,
-                    &s.bed,
-                    &s.affine,
-                    &s.egeom,
-                    &s.contra,
-                    &s.jinv,
-                    &s.fgeom,
-                    &s.d1,
-                    &s.lift,
-                    &s.element_edges,
-                    &s.edges,
-                    &*faces,
-                    coriolis,
-                    f0,
-                    &s.f_node,
-                    out_h,
-                    out_hu,
-                    out_hv,
-                )
-                .expect("element RHS (volume)");
-            if hll {
-                let [out_h, out_hu, out_hv] = out.fields_mut();
-                gpu.module
-                    .element_rhs_subcells(
-                        &gpu.stream,
-                        elements_cfg,
-                        self.g,
-                        self.h_min,
-                        subcell_depth,
-                        h_dry,
-                        &state.h,
-                        &state.hu,
-                        &state.hv,
-                        &s.bed,
-                        &s.affine,
-                        &s.egeom,
-                        &s.contra,
-                        &s.jinv,
-                        &s.jac,
-                        &s.fgeom,
-                        &s.d1,
-                        &s.w,
-                        &s.xi,
-                        &s.lift,
-                        &s.element_edges,
-                        &s.edges,
-                        &*faces,
-                        coriolis,
-                        f0,
-                        &s.f_node,
-                        out_h,
-                        out_hu,
-                        out_hv,
-                    )
-                    .expect("element RHS (subcells)");
-            }
-        }
+        let s = &self.statics;
+        self.rhs_where(
+            state,
+            &boundary,
+            &self.no_list,
+            [
+                (&s.interior_edges, s.interior_edges.len()),
+                (&s.boundary_edges, s.boundary_edges.len()),
+            ],
+            (&self.no_list, self.mesh.n_elements),
+            out,
+        );
     }
 
     /// `compute_dt_swe_2d`: the largest element rate on the device, reduced
@@ -1960,7 +2726,7 @@ impl PhysicsModule<DeviceState> for GpuSWE2D<'_> {
                 &s.affine,
                 &s.affine_grads,
                 &s.grads,
-                &mut *rates,
+                &mut rates,
             )
         }
         .expect("element rates");
@@ -1992,7 +2758,7 @@ impl PhysicsModule<DeviceState> for GpuSWE2D<'_> {
                 h,
                 hu,
                 hv,
-                &mut *clips,
+                &mut clips,
             )
         }
         .expect("wet/dry correction");
@@ -2000,18 +2766,11 @@ impl PhysicsModule<DeviceState> for GpuSWE2D<'_> {
 
     /// Point-implicit Manning friction and thin-layer relaxation.
     fn implicit_damping(&self, stage: &mut DeviceState, from: &DeviceState, dt: f64) {
-        if self.friction.is_none() && self.wet_dry.is_none() {
+        let damping = self.damping();
+        if !damping.is_active() {
             return;
         }
         let gpu = &self.gpu;
-        let (g, manning_n, friction_h_min) = self
-            .friction
-            .as_ref()
-            .map_or((0.0, 0.0, 0.0), |f| (f.g, f.manning_n, f.h_min));
-        let (h_dry, relaxation_time, max_velocity, wd_g) =
-            self.wet_dry.as_ref().map_or((0.0, 0.0, 0.0, 0.0), |c| {
-                (c.h_dry.meters(), c.relaxation_time, c.max_velocity, c.g)
-            });
         let n_nodes = stage.h.len();
         let DeviceState { h, hu, hv, .. } = stage;
         // SAFETY: one thread per node of the state; `from` is another state.
@@ -2020,16 +2779,7 @@ impl PhysicsModule<DeviceState> for GpuSWE2D<'_> {
                 &gpu.stream,
                 one_dimensional(n_nodes),
                 dt,
-                self.h_min,
-                u32::from(self.friction.is_some()),
-                g,
-                manning_n,
-                friction_h_min,
-                u32::from(self.wet_dry.is_some()),
-                h_dry,
-                relaxation_time,
-                max_velocity,
-                wd_g,
+                damping,
                 &*h,
                 &from.h,
                 &from.hu,
@@ -2074,12 +2824,16 @@ impl PhysicsModule<DeviceState> for GpuSWE2D<'_> {
                 &s.mass,
                 &s.element_edges,
                 &s.edges,
-                &mut *dts,
+                &mut dts,
             )
         }
         .expect("element time steps");
         let dts = dts.to_host_vec(&gpu.stream).expect("download");
         dts.iter().copied().fold(f64::INFINITY, f64::min)
+    }
+
+    fn local_time_stepping(&self) -> Option<&dyn LocalTimeStepping<DeviceState>> {
+        Some(self)
     }
 
     fn mesh(&self) -> &Mesh2D {
@@ -2096,5 +2850,321 @@ impl PhysicsModule<DeviceState> for GpuSWE2D<'_> {
 
     fn order(&self) -> usize {
         self.ops.order
+    }
+}
+
+/// Local time stepping (dgcom's `Multirate`) and the fused stages of global
+/// steps, as `SWEPhysics2D` does them: every pass a list of the coarse
+/// step's [`Schedule`] (a prefix of the elements and edges by key), the
+/// stage of each element from its level ([`element_stage`], the CPU's
+/// arithmetic), the open boundaries' states per level.
+impl LocalTimeStepping<DeviceState> for GpuSWE2D<'_> {
+    /// `element_dt_swe_2d` under the positivity bound of `scheme` with
+    /// wetting and drying, on the device; the steps to the host.
+    fn element_dt(&self, state: &DeviceState, cfl: f64, scheme: SspScheme, out: &mut [f64]) {
+        let (gpu, s) = (&self.gpu, &self.statics);
+        let bound = self
+            .positivity_h_dry
+            .map(|h_dry| PositivityBound::new(self.ops.order, Some(scheme), h_dry));
+        let (positive, bound) = match bound {
+            Some(bound) => (1, bound),
+            None => (0, PositivityBound::new(self.ops.order, Some(scheme), 0.0)),
+        };
+        let mut dts = self.element_dts.lock().expect("time step buffer");
+        // SAFETY: one step per element; the state and statics are this mesh's.
+        unsafe {
+            gpu.module.element_dt(
+                &gpu.stream,
+                one_dimensional(self.mesh.n_elements),
+                self.g,
+                self.h_min,
+                cfl,
+                self.ops.order as u32,
+                positive,
+                bound.cfl,
+                bound.max_cfl,
+                bound.max_cfl_subcells,
+                bound.h_dry,
+                &state.h,
+                &state.hu,
+                &state.hv,
+                &s.affine,
+                &s.affine_grads,
+                &s.grads,
+                &s.mass,
+                &s.element_edges,
+                &s.edges,
+                &mut dts,
+            )
+        }
+        .expect("element time steps");
+        dts.copy_to_host(&gpu.stream, out).expect("download");
+    }
+
+    /// The elements whose every node is `LINE_LOCAL_HEADROOM` deeper than
+    /// the line-local depth (`SWEPhysics2D::line_local`).
+    fn line_local(&self, state: &DeviceState, out: &mut [bool]) -> Option<NodeLines<'_>> {
+        let mut kept = self.line_local.lock().expect("line-local flags");
+        let none = DeviceBuffer::zeroed(&self.gpu.stream, 0).expect("allocation");
+        let shallow = match self.line_local_depth {
+            Some(shallow) => shallow,
+            None => {
+                *kept = none;
+                return None;
+            }
+        };
+        let depth = if shallow == f64::NEG_INFINITY {
+            shallow
+        } else {
+            shallow + LINE_LOCAL_HEADROOM
+        };
+        let flags = self.depth_flags(state, [depth; 3]);
+        for (flag, &bits) in out.iter_mut().zip(&flags) {
+            *flag = bits & 1 != 0;
+        }
+        *kept = DeviceBuffer::from_host(&self.gpu.stream, &flags).expect("upload");
+        Some(NodeLines {
+            n_1d: self.ops.n_1d,
+            face_nodes: &self.ops.face_nodes,
+        })
+    }
+
+    fn line_local_breaks(&self) -> u64 {
+        let breaks = self.breaks.lock().expect("break counts");
+        let breaks = breaks.to_host_vec(&self.gpu.stream).expect("download");
+        breaks.iter().map(|&b| u64::from(b)).sum()
+    }
+
+    /// `SWEPhysics2D::coarse_step_bound`: the largest step of an element
+    /// whose every node is deeper than `SUBCELL_CAP_DEPTH_FACTOR` times
+    /// `h_dry`, else than `h_dry`.
+    fn coarse_step_bound(&self, state: &DeviceState, element_dt: &[f64]) -> f64 {
+        let Some(h_dry) = self.positivity_h_dry else {
+            return f64::INFINITY;
+        };
+        let flags = self.depth_flags(state, [SUBCELL_CAP_DEPTH_FACTOR * h_dry, h_dry, h_dry]);
+        let longest = |bit: u32| {
+            element_dt
+                .iter()
+                .zip(&flags)
+                .filter(|&(dt, &f)| dt.is_finite() && f & bit != 0)
+                .map(|(&dt, _)| dt)
+                .fold(0.0, f64::max)
+        };
+        [1, 2]
+            .into_iter()
+            .map(longest)
+            .find(|&dt| dt > 0.0)
+            .unwrap_or(f64::INFINITY)
+    }
+
+    fn begin_coarse_step(&self, level: &[u8], rates: &[Vec<u8>]) {
+        self.schedule
+            .lock()
+            .expect("schedule")
+            .update(&self.gpu, &self.mesh, level, rates)
+            .expect("the coarse step's lists");
+    }
+
+    /// The RHS of the pass's elements (a prefix of the schedule's order),
+    /// then per element the stage combination, the damping, and the sum
+    /// into `acc` or the wet/dry correction (`stage_elements`).
+    fn stage_where(
+        &self,
+        base: &DeviceState,
+        input: &DeviceState,
+        elements: &[u32],
+        plan: &StagePlan<'_>,
+        out: &mut DeviceState,
+        acc: Option<&mut DeviceState>,
+    ) {
+        if elements.is_empty() {
+            return;
+        }
+        let schedule = self.schedule.lock().expect("schedule");
+        let finest = schedule.finest;
+        assert_eq!(plan.finest, finest, "the plan is the coarse step's");
+        // Every level's stage time and open boundary states
+        let mut boundary = [StageLevel::default(); LEVELS];
+        for (l, entry) in boundary.iter_mut().enumerate().take(finest + 1) {
+            let time = element_stage(
+                plan.step,
+                plan.finest,
+                plan.substep,
+                plan.depth,
+                plan.weights,
+                false,
+                l as u8,
+                l as u8,
+            )
+            .time;
+            *entry = StageLevel {
+                time,
+                open: self.open_states(time),
+            };
+        }
+        let (s, d) = (plan.stage, plan.depth);
+        let all = finest == 0;
+        let n_elements = if all {
+            self.mesh.n_elements
+        } else {
+            schedule.element_counts[s][d]
+        };
+        assert_eq!(
+            elements.len(),
+            n_elements,
+            "the pass's elements are the schedule's"
+        );
+        // The first n of the schedule's orders (every element, and the
+        // static edge lists, with one level)
+        let element_list = if all {
+            &self.no_list
+        } else {
+            &schedule.elements[s]
+        };
+        let st = &self.statics;
+        let edges = if all {
+            [
+                (&st.interior_edges, st.interior_edges.len()),
+                (&st.boundary_edges, st.boundary_edges.len()),
+            ]
+        } else {
+            [0, 1].map(|kind| (&schedule.edges[s][kind], schedule.edge_counts[s][kind][d]))
+        };
+        let level = if all { &self.no_list } else { &schedule.level };
+        let last_rate = if all {
+            &self.no_list
+        } else {
+            &schedule.last_rate
+        };
+        self.rhs_where(
+            input,
+            &boundary,
+            level,
+            edges,
+            (element_list, n_elements),
+            out,
+        );
+
+        let gpu = &self.gpu;
+        let line_local = self.line_local.lock().expect("line-local flags");
+        let mut clips = self.clips.lock().expect("clip counts");
+        let mut breaks = self.breaks.lock().expect("break counts");
+        let mut no_rows = self.no_rows.lock().expect("empty rows");
+        let [no_h, no_hu, no_hv] = &mut *no_rows;
+        assert!(
+            acc.is_some() || !plan.last,
+            "an accumulating stage needs the sum buffer"
+        );
+        let (acc_h, acc_hu, acc_hv) = match acc {
+            Some(acc) => {
+                let DeviceState { h, hu, hv, .. } = acc;
+                (h, hu, hv)
+            }
+            None => (no_h, no_hu, no_hv),
+        };
+        let w = plan.weights;
+        let shallow = self.line_local_depth.unwrap_or(f64::NEG_INFINITY);
+        let [out_h, out_hu, out_hv] = out.fields_mut();
+        // SAFETY: the list holds distinct elements of this mesh; `out`,
+        // `acc` and the counts are this mesh's (or, for a stage that does not
+        // accumulate, `acc` is empty and unread), `base` and `input` other
+        // states.
+        unsafe {
+            gpu.module.stage_elements(
+                &gpu.stream,
+                per_element(n_elements),
+                plan.step.0,
+                plan.step.1,
+                plan.finest as u32,
+                plan.substep as u32,
+                plan.depth as u32,
+                u32::from(plan.last),
+                w.start,
+                w.input,
+                w.beta,
+                w.c,
+                level,
+                last_rate,
+                element_list,
+                n_elements as u32,
+                &base.h,
+                &base.hu,
+                &base.hv,
+                &input.h,
+                &input.hu,
+                &input.hv,
+                self.damping(),
+                &line_local,
+                shallow,
+                &st.mass,
+                &st.inv_area,
+                out_h,
+                out_hu,
+                out_hv,
+                acc_h,
+                acc_hu,
+                acc_hv,
+                &mut clips,
+                &mut breaks,
+            )
+        }
+        .expect("stage");
+    }
+
+    fn finish_where(
+        &self,
+        state: &mut DeviceState,
+        acc: &DeviceState,
+        elements: &[u32],
+        depth: usize,
+    ) {
+        if elements.is_empty() {
+            return;
+        }
+        let schedule = self.schedule.lock().expect("schedule");
+        let all = schedule.finest == 0;
+        let key = schedule.element_counts.len().saturating_sub(1);
+        let n = if all {
+            self.mesh.n_elements
+        } else {
+            schedule.element_counts[key][depth]
+        };
+        assert_eq!(elements.len(), n, "the pass's elements are the schedule's");
+        let list = if all {
+            &self.no_list
+        } else {
+            &schedule.elements[key]
+        };
+        let (gpu, st) = (&self.gpu, &self.statics);
+        let line_local = self.line_local.lock().expect("line-local flags");
+        let mut clips = self.clips.lock().expect("clip counts");
+        let mut breaks = self.breaks.lock().expect("break counts");
+        let shallow = self.line_local_depth.unwrap_or(f64::NEG_INFINITY);
+        let [h, hu, hv] = state.fields_mut();
+        // SAFETY: the list holds distinct elements of this mesh; the state,
+        // the sum and the counts are this mesh's.
+        unsafe {
+            gpu.module.finish_elements(
+                &gpu.stream,
+                per_element(n),
+                list,
+                n as u32,
+                &acc.h,
+                &acc.hu,
+                &acc.hv,
+                self.damping(),
+                &line_local,
+                shallow,
+                &st.mass,
+                &st.inv_area,
+                h,
+                hu,
+                hv,
+                &mut clips,
+                &mut breaks,
+            )
+        }
+        .expect("finish");
     }
 }
