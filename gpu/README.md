@@ -18,8 +18,11 @@ It is a workspace of its own, as `viz/`: it builds with cuda-oxide's pinned tool
 # 1. An R580+ driver (nvidia-smi's "CUDA Version" 13.x) and the CUDA 13 toolkit with
 #    cuRAND's headers, from NVIDIA's apt repository (developer.nvidia.com/cuda-downloads:
 #    Linux, x86_64, Ubuntu, deb (network)):
-sudo apt install cuda-toolkit-13-1
+sudo apt install cuda-toolkit-13-1       # or the driver's own 13.x: 13-0 on an R580 driver
 export PATH=/usr/local/cuda/bin:$PATH        # nvcc, and nsys if the toolkit brought it
+# If /usr/local/cuda stays on another version (12.x for other software), point at 13 instead,
+# or cargo-oxide mixes 12.x's libNVVM and nvJitLink with 13's headers (and so does time.sh):
+#   export CUDA_TOOLKIT_PATH=/usr/local/cuda-13 PATH=/usr/local/cuda-13/bin:$PATH
 
 # 2. Build tools and libclang for bindgen (cuda-oxide's host bindings). clang-21 comes
 #    from apt.llvm.org (`wget https://apt.llvm.org/llvm.sh && sudo bash llvm.sh 21`)
