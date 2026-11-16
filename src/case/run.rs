@@ -733,8 +733,9 @@ fn score_gauges<'a>(
 }
 
 /// `gauge_skill.csv` (each gauged station against the observations and
-/// the gauge's tidal prediction) and `gauge_constituents.csv` (its reference
-/// constants against the gauge's) in `dir`.
+/// the gauge's tidal prediction), `gauge_constituents.csv` (its reference
+/// constants against the gauge's) and `gauge_daily.csv` (each day's skill
+/// against the observations over its hours 3–24, `DailySkill`) in `dir`.
 fn write_gauge_scores(dir: &std::path::Path, stations: &[StationSeries]) -> Result<(), CaseError> {
     use std::fmt::Write as _;
     let mut skill = String::from(
@@ -743,8 +744,21 @@ fn write_gauge_scores(dir: &std::path::Path, stations: &[StationSeries]) -> Resu
     let mut constants = String::from(
         "station,constituent,model_amplitude_m,model_lag_deg,inferred,gauge_amplitude_m,gauge_lag_deg,amplitude_ratio,lag_difference_deg,abs_dz_m\n",
     );
+    let mut daily = String::from("station,day,samples,centred_rmse_m,bias_m\n");
     for s in stations {
         let Some(g) = &s.gauge else { continue };
+        for d in &g.daily {
+            let day = crate::time::ModelClock::new(d.day_unix).format(0.0);
+            let _ = writeln!(
+                daily,
+                "{},{},{},{},{}",
+                s.name,
+                &day[..10],
+                d.n,
+                d.centred_rmse,
+                d.bias
+            );
+        }
         for (reference, score) in [
             ("observations", &g.vs_observations),
             ("tidal_prediction", &g.vs_prediction),
@@ -778,6 +792,7 @@ fn write_gauge_scores(dir: &std::path::Path, stations: &[StationSeries]) -> Resu
     for (name, text) in [
         ("gauge_skill.csv", skill),
         ("gauge_constituents.csv", constants),
+        ("gauge_daily.csv", daily),
     ] {
         let path = dir.join(name);
         fs::write(&path, text).map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;

@@ -68,7 +68,7 @@ pub use metrics::{
 };
 pub use stability::{StabilityMonitor, StabilityStatus, StabilityThresholds, StabilityWarning};
 pub use tide_gauge::{
-    GaugeComparison, GaugeRecord, ModelExtractor, PrecomputedExtractor, SkillScore,
+    DailySkill, GaugeComparison, GaugeRecord, ModelExtractor, PrecomputedExtractor, SkillScore,
     StationValidationResult, TideGaugeStation, ValidationSummary, validate_stations,
 };
 

@@ -121,15 +121,21 @@ impl TideGaugeStation {
 /// Model values linearly interpolated to the observation times that lie
 /// inside the model's time span, paired with those observations.
 fn paired_by_time(model: &TimeSeries, obs: &TimeSeries) -> (Vec<f64>, Vec<f64>) {
+    paired(model, obs).map(|(_, m, o)| (m, o)).unzip()
+}
+
+/// [`paired_by_time`] with the times: `(time, model, observation)`.
+fn paired<'a>(
+    model: &'a TimeSeries,
+    obs: &'a TimeSeries,
+) -> impl Iterator<Item = (f64, f64, f64)> + 'a {
     let (mt, mv) = (model.times(), model.values());
-    let (Some(&first), Some(&last)) = (mt.first(), mt.last()) else {
-        return (Vec::new(), Vec::new());
-    };
+    let span = mt.first().zip(mt.last()).map(|(&a, &b)| a..=b);
     obs.times()
         .iter()
         .zip(obs.values())
-        .filter(|(t, _)| (first..=last).contains(*t))
-        .map(|(&t, v)| {
+        .filter(move |(t, _)| span.as_ref().is_some_and(|s| s.contains(*t)))
+        .map(move |(&t, &v)| {
             let i = mt.partition_point(|&m| m < t);
             let model_at = if mt[i] == t || i == 0 {
                 mv[i]
@@ -137,9 +143,77 @@ fn paired_by_time(model: &TimeSeries, obs: &TimeSeries) -> (Vec<f64>, Vec<f64>) 
                 let w = (t - mt[i - 1]) / (mt[i] - mt[i - 1]);
                 mv[i - 1] + w * (mv[i] - mv[i - 1])
             };
-            (model_at, v)
+            (t, model_at, v)
         })
-        .unzip()
+}
+
+/// One UTC day's skill against the observations, over its samples from
+/// [`Self::HOURS`]: the one-day score of `notes/validation.md` (P3.4) and of
+/// `parent_tide_check`, so a record of many days shows how the error moves
+/// through the spring–neap cycle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DailySkill {
+    /// The day's start, 00:00 UTC (Unix time)
+    pub day_unix: f64,
+    /// Paired samples
+    pub n: usize,
+    /// Root-mean-square difference about the day's mean difference (m)
+    pub centred_rmse: f64,
+    /// Mean difference, model minus observations (m)
+    pub bias: f64,
+}
+
+impl DailySkill {
+    /// The hours of each day scored: from 03:00 to before the next midnight
+    /// (a run's first three hours are its ramp)
+    pub const HOURS: [f64; 2] = [3.0, 24.0];
+    /// The fewest samples a day is scored on
+    pub const MIN_SAMPLES: usize = 12;
+
+    /// Each day of `model` against `obs` raised by `datum_offset` (the
+    /// gauge's, as [`StationValidationResult::compute`] applies it) that has
+    /// [`Self::MIN_SAMPLES`] paired samples within [`Self::HOURS`], in time
+    /// order.
+    pub fn per_day(model: &TimeSeries, obs: &TimeSeries, datum_offset: f64) -> Vec<Self> {
+        let mut days: Vec<Self> = Vec::new();
+        let mut current: Option<(f64, Vec<f64>)> = None;
+        let mut close = |day: Option<(f64, Vec<f64>)>| {
+            let Some((day_unix, d)) = day else { return };
+            if d.len() >= Self::MIN_SAMPLES {
+                let n = d.len() as f64;
+                let bias = d.iter().sum::<f64>() / n;
+                let var = d.iter().map(|x| (x - bias).powi(2)).sum::<f64>() / n;
+                days.push(Self {
+                    day_unix,
+                    n: d.len(),
+                    centred_rmse: var.sqrt(),
+                    bias,
+                });
+            }
+        };
+        for (t, m, o) in paired(model, obs) {
+            let day = (t / 86_400.0).floor() * 86_400.0;
+            let hour = (t - day) / 3600.0;
+            if !(Self::HOURS[0]..Self::HOURS[1]).contains(&hour) {
+                continue;
+            }
+            if current.as_ref().is_none_or(|(d, _)| *d != day) {
+                close(current.take());
+                current = Some((day, Vec::new()));
+            }
+            if let Some((_, d)) = &mut current {
+                d.push(m - (o + datum_offset));
+            }
+        }
+        close(current);
+        days
+    }
+
+    /// The root mean square of `days`' centred RMSE (m): a record's daily
+    /// error in one number; NaN without days.
+    pub fn rms(days: &[Self]) -> f64 {
+        (days.iter().map(|d| d.centred_rmse.powi(2)).sum::<f64>() / days.len() as f64).sqrt()
+    }
 }
 
 /// A tide gauge's record: its finite samples (Unix times) and their
@@ -233,6 +307,8 @@ pub struct GaugeComparison {
     pub vs_observations: Result<SkillScore, AnalysisError>,
     /// Against the gauge's tidal prediction at the model's times
     pub vs_prediction: Result<SkillScore, AnalysisError>,
+    /// Against the observations day by day ([`DailySkill`])
+    pub daily: Vec<DailySkill>,
 }
 
 impl GaugeComparison {
@@ -280,6 +356,7 @@ impl GaugeComparison {
             constituents,
             vs_observations: skill(&gauge.observed),
             vs_prediction,
+            daily: DailySkill::per_day(model, &gauge.observed, gauge.station.datum_offset),
         }
     }
 
@@ -1085,5 +1162,55 @@ mod tests {
             "the hourly samples within the model's span, 0 to 71 h"
         );
         assert!(comparison.rss_difference() > 0.2);
+        // Days 20–22 of the record, each scored on its hours 3–23
+        let daily = &comparison.daily;
+        assert_eq!(daily.len(), 3);
+        assert!(daily.iter().all(|d| d.n == 21), "{daily:?}");
+        assert_eq!(daily[1].day_unix - daily[0].day_unix, 86_400.0);
+    }
+
+    /// A day is scored on its samples from 03:00 to 23:00 and only with at
+    /// least twelve of them: a model 5 cm high with a 2 cm half-day swing
+    /// on hourly observations scores a bias of 5 cm and a centred RMSE of the
+    /// swing alone, day by day.
+    #[test]
+    fn days_are_scored_on_their_hours_after_the_ramp() {
+        let day0 = 1_780_272_000.0; // 2026-06-01T00:00:00Z
+        let hourly = |hours: std::ops::Range<i32>| -> Vec<f64> {
+            hours.map(|h| day0 + 3600.0 * f64::from(h)).collect()
+        };
+        // 2.5 days of observations, the last day half missing
+        let obs_t = hourly(0..60);
+        let obs = TimeSeries::new(&obs_t, &vec![0.0; obs_t.len()]);
+        let model_t = hourly(0..60);
+        let swing: Vec<f64> = model_t
+            .iter()
+            .map(|t| {
+                0.05 + 0.02
+                    * if ((t - day0) / 3600.0) as i64 % 2 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+            })
+            .collect();
+        let days = DailySkill::per_day(&TimeSeries::new(&model_t, &swing), &obs, 0.0);
+        // Day 3 has hours 3–11 only: 9 samples, not scored
+        assert_eq!(days.len(), 2);
+        for (i, d) in days.iter().enumerate() {
+            assert_eq!(d.day_unix, day0 + 86_400.0 * i as f64);
+            assert_eq!(d.n, 21);
+            // Eleven odd and ten even hours from 3 to 23
+            let bias = 0.05 + 0.02 * (10.0 - 11.0) / 21.0;
+            assert!((d.bias - bias).abs() < 1e-12, "{d:?}");
+            assert!(
+                (d.centred_rmse - 0.02 * (1.0 - (1.0_f64 / 21.0).powi(2)).sqrt()).abs() < 1e-12
+            );
+        }
+        assert!((DailySkill::rms(&days) - days[0].centred_rmse).abs() < 1e-15);
+        // A datum offset moves the bias only
+        let raised = DailySkill::per_day(&TimeSeries::new(&model_t, &swing), &obs, 0.05);
+        assert!((raised[0].bias - (days[0].bias - 0.05)).abs() < 1e-15);
+        assert!((raised[0].centred_rmse - days[0].centred_rmse).abs() < 1e-15);
     }
 }

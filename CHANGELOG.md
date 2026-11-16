@@ -6,6 +6,12 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **`[bathymetry.raster] sea_datum_m` lowers a topobathy raster's sea to mean sea level (`notes/inputs-forcing.md`, P1.6, 2026-11-15).** Kartverket's topobathy model holds its depths in chart datum (LAT), not NN2000: where the bed is flat its sea equals the chart's soundings to centimetres (91,000 chart points in the Frøya and Bodø boxes, `scripts/topobathy_datum_check.py`), so every Frøya and Bodø bed's sea has been 1.434 m (Mausund) to 1.688 m (Bodø) too shallow. `BedRaster::lower_sea_to_mean_sea_level` moves a pixel `b < 0` to `b + max(b, −offset)`, keeping the raster's coast. Default 0, so no case changes yet; the shipped Norwegian cases take it once a rerun has measured what it moves.
+  - **Also:** `scripts/farm_survey_depths.py` compares the depths measured at every farm's MOM-B survey stations (Fiskeridirektoratet's report register) with a raster: the Frøya topobathy is 5.1 m too shallow at the median over 41 farms (quartiles −3.5 to +15.9 m), Kattholmen's 10–35 m; Bodø's −1.2 m over 15.
+
+- **A gauged station's skill day by day: `gauge_daily.csv` (`notes/validation.md`, P3.4, 2026-11-15).** Each UTC day's centred RMSE and bias against the observations over its hours 3–24, the one-day score of the 2026-06-12 runs and of `parent_tide_check`, from at least 12 paired samples a day; the run's and `dgcom score`'s summary print their RMS and range. A record of many days then shows the error through the spring–neap cycle, beside the whole record's score, which also holds the weather.
+  - **API:** `DailySkill` (`per_day`, `rms`, `HOURS`, `MIN_SAMPLES`); `GaugeComparison::daily`.
+
 - **`dgcom score <case.toml>` scores a finished run against its tide gauges again from its `stations.csv`, without the mesh or the run (`notes/case-files.md`, P8.1, 2026-11-15).** A change of the harmonic fit, the window (`--set output.spinup_hours=…`) or the gauge record no longer needs the run again: the run's own `gauge_skill.csv` and `gauge_constituents.csv` come back byte for byte, a 49.7 h Mausund run is rescored in 0.3 s (212 s to run). The run's `case.resolved.toml` must agree with the case in what the score reads (`run.start`, the boundaries, the stations but their `gauge`), else it is refused, naming the keys.
   - **API:** `CaseFile::score` and `ScoreReport`; `CaseFile::tide_constituents`, the constituents a station's record is fitted with, from the case without its mesh (`Domain::tide_constituents` is built by it).
 

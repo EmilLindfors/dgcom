@@ -307,6 +307,35 @@ impl BedRaster {
         self
     }
 
+    /// Lower the sea part (the pixels below 0) from its own datum to mean sea
+    /// level, `offset` m below it, and return how many pixels moved.
+    ///
+    /// An elevation model may hold its land and its sea in different
+    /// datums: Kartverket's topobathy model has land heights in NN2000 (8 cm
+    /// above mean sea level at Mausund) and depths in chart datum (LAT), 1.43
+    /// m below mean sea level at Mausund and 1.69 m at Bodø
+    /// (`notes/inputs-forcing.md` P1.6: its flat beds equal the chart's
+    /// soundings to centimetres). A pixel `b < 0` becomes `b + max(b,
+    /// −offset)`: the full offset from `offset` m of chart depth down, and
+    /// half of it over the shallower band, so the 0 m line (the raster's
+    /// coast) stays where it is and the bed has no step there. The band is
+    /// where the raster's sea meets its land, whose datum it does not say.
+    ///
+    /// # Panics
+    /// If `offset` is negative or not finite.
+    pub fn lower_sea_to_mean_sea_level(&mut self, offset: f64) -> usize {
+        assert!(
+            offset.is_finite() && offset >= 0.0,
+            "a sea datum below mean sea level is a positive offset, not {offset}"
+        );
+        let mut moved = 0;
+        for b in self.elevation.iter_mut().filter(|b| **b < 0.0) {
+            *b += b.max(-offset);
+            moved += 1;
+        }
+        moved
+    }
+
     /// Extent (outer pixel edges).
     pub fn bbox(&self) -> &GeoBoundingBox {
         &self.bbox
@@ -456,6 +485,31 @@ mod tests {
         let projection = LocalProjection::new(63.72, 8.1);
         let bed = r.sampler(&projection);
         assert!((bed(0.0, 0.0) - (-16.0)).abs() < 1e-9);
+    }
+
+    /// The sea moves down by the datum's offset below its depth, by half of
+    /// it in the shallower band (so the coast and the bed's continuity stay),
+    /// and the land does not move.
+    #[test]
+    fn the_sea_part_is_lowered_to_mean_sea_level() {
+        #[rustfmt::skip]
+        let elevation = vec![
+            -40.0, -1.5, -1.43, -0.5,
+              0.0,  0.5,   2.0, -1e-9,
+        ];
+        let mut r = BedRaster::new(GeoBoundingBox::new(8.0, 63.7, 8.4, 63.72), 4, 2, elevation);
+        let moved = r.lower_sea_to_mean_sea_level(1.43);
+        assert_eq!(moved, 5);
+        let expected = [-41.43, -2.93, -2.86, -1.0, 0.0, 0.5, 2.0, -2e-9];
+        for (i, e) in expected.iter().enumerate() {
+            let got = r.pixel(i / 4, i % 4);
+            assert!((got - e).abs() < 1e-12, "pixel {i}: {got} against {e}");
+        }
+        // No offset, no change
+        let before = raster();
+        let mut same = raster();
+        same.lower_sea_to_mean_sea_level(0.0);
+        assert_eq!(same.elevation, before.elevation);
     }
 
     #[test]
