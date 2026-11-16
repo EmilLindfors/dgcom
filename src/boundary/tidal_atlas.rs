@@ -51,7 +51,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use super::BCContext2D;
-use super::characteristic::{ExternalState, ExternalStateProvider};
+use super::characteristic::{DeviceExternal2D, ExternalState, ExternalStateProvider};
 use super::harmonic_tide::tidal_ramp;
 use crate::analysis::{Inference, ReferenceFit};
 use crate::io::CoordinateProjection;
@@ -946,32 +946,93 @@ impl BoundaryTides {
     /// `(η, u, v)` at forced node `slot` and time `t`, with the nodal terms
     /// of `t`.
     pub fn evaluate(&self, slot: usize, t: f64) -> (f64, f64, f64) {
-        let n_c = self.names.len();
-        let coefficients = &self.coefficients[slot * n_c * 6..][..n_c * 6];
         let mut sum = [0.0; 3];
-        for (j, c) in coefficients.as_chunks::<6>().0.iter().enumerate() {
-            let (sin, cos) = (self.omega[j] * t).sin_cos();
-            let f = 1.0 + self.f_rate[j] * t;
-            for (q, s) in sum.iter_mut().enumerate() {
-                *s += f * (c[2 * q] * cos + c[2 * q + 1] * sin);
-            }
+        for (j, c) in self
+            .coefficients(slot)
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let [f, cos, sin] = self.phase(j, t);
+            tide_term(&mut sum, c, f, cos, sin);
         }
-        let ramp = tidal_ramp(t, self.ramp_duration);
-        let mean = if self.use_mean { self.mean[slot] } else { 0.0 };
-        (mean + ramp * sum[0], ramp * sum[1], ramp * sum[2])
+        tide_level(sum, tidal_ramp(t, self.ramp_duration), self.node_mean(slot))
     }
 
-    /// Slot of the node of `ctx`: by nodal index, or else the nearest forced
-    /// node by position.
-    fn slot(&self, ctx: &BCContext2D) -> usize {
-        if let Some(slot) = ctx
-            .node_index
+    /// Constituent `j`'s time factors at `t`, the same at every node:
+    /// `[f(t)/f₀, cos ω′t, sin ω′t]` ([`tide_term`]).
+    #[inline]
+    fn phase(&self, j: usize, t: f64) -> [f64; 3] {
+        let (sin, cos) = (self.omega[j] * t).sin_cos();
+        [1.0 + self.f_rate[j] * t, cos, sin]
+    }
+
+    /// Number of constituents.
+    pub fn n_constituents(&self) -> usize {
+        self.names.len()
+    }
+
+    /// The constants of forced node `slot`: `C, S` of η, u and v per
+    /// constituent (6 each, [`tide_term`]'s `c`), at the epoch's nodal terms.
+    pub fn coefficients(&self, slot: usize) -> &[f64] {
+        let n = 6 * self.names.len();
+        &self.coefficients[slot * n..][..n]
+    }
+
+    /// The mean level added at forced node `slot`: its `Z0` with
+    /// [`Self::with_mean_level`], else 0.
+    pub fn node_mean(&self, slot: usize) -> f64 {
+        if self.use_mean { self.mean[slot] } else { 0.0 }
+    }
+
+    /// The largest transport-scaling factor, if the velocity is scaled
+    /// ([`Self::with_transport_scaling`]).
+    pub fn max_transport_ratio(&self) -> Option<f64> {
+        self.max_transport_ratio
+    }
+
+    /// The time-dependent part of the tide at `t`, the same at every node,
+    /// into `moment` (`1 + 3 ×` [`Self::n_constituents`] values): the ramp,
+    /// then each constituent's `f(t)/f₀, cos ω′t, sin ω′t`. A device
+    /// evaluates the trigonometry here, on the host, once per stage time,
+    /// and the sums per node with [`tide_term`] and [`tide_state`], which
+    /// give [`ExternalStateProvider::external_state`]'s bits (P2.7,
+    /// `notes/gpu.md`).
+    pub fn moment(&self, t: f64, moment: &mut [f64]) {
+        moment[0] = tidal_ramp(t, self.ramp_duration);
+        for (j, phase) in moment[1..].as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            *phase = self.phase(j, t);
+        }
+    }
+
+    /// The external state at forced node `slot` over a child bed `bed`
+    /// from `sum` of the constituents' [`tide_term`]s and the ramp `ramp`.
+    #[inline]
+    fn state(&self, slot: usize, sum: [f64; 3], ramp: f64, bed: f64) -> ExternalState {
+        let transport = self
+            .max_transport_ratio
+            .map(|max| (max, self.source_depth[slot]));
+        tide_state(
+            sum,
+            ramp,
+            self.node_mean(slot),
+            self.velocity,
+            transport,
+            bed,
+        )
+    }
+
+    /// Slot of the node `node_index` (a flat mesh node) at `position`: by
+    /// nodal index, or else the nearest forced node by position.
+    pub fn slot_of(&self, node_index: Option<usize>, position: (f64, f64)) -> usize {
+        if let Some(slot) = node_index
             .and_then(|i| self.slot_of_node.get(i))
             .filter(|&&s| s != u32::MAX)
         {
             return *slot as usize;
         }
-        let (x, y) = ctx.position;
+        let (x, y) = position;
         self.positions
             .iter()
             .enumerate()
@@ -987,22 +1048,76 @@ impl BoundaryTides {
 
 impl ExternalStateProvider for BoundaryTides {
     fn external_state(&self, ctx: &BCContext2D) -> ExternalState {
-        let slot = self.slot(ctx);
-        let (eta, mut u, mut v) = self.evaluate(slot, ctx.time);
-        if !self.velocity {
-            return ExternalState::elevation(eta);
+        let slot = self.slot_of(ctx.node_index, ctx.position);
+        let t = ctx.time;
+        let mut sum = [0.0; 3];
+        for (j, c) in self
+            .coefficients(slot)
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let [f, cos, sin] = self.phase(j, t);
+            tide_term(&mut sum, c, f, cos, sin);
         }
-        if let Some(max) = self.max_transport_ratio {
-            let h_source = self.source_depth[slot];
-            let (d_source, d_child) = (h_source + eta, eta - ctx.bathymetry);
-            if h_source > 0.0 && d_source > 0.0 && d_child > 0.0 {
-                let ratio = (d_source / d_child).clamp(1.0 / max, max);
-                u *= ratio;
-                v *= ratio;
-            }
-        }
-        ExternalState::new(eta, u, v)
+        self.state(slot, sum, tidal_ramp(t, self.ramp_duration), ctx.bathymetry)
     }
+
+    fn device_external(&self) -> Option<DeviceExternal2D<'_>> {
+        Some(DeviceExternal2D::Tides(self))
+    }
+}
+
+/// Adds one constituent to a node's tide: `sum[q] += f (C_q cos + S_q sin)`
+/// for η, u and v (`q` = 0, 1, 2), with the node's constants `c = [C_η,
+/// S_η, C_u, S_u, C_v, S_v]` ([`BoundaryTides::coefficients`]) and the
+/// constituent's time factors `f = f(t)/f₀`, `cos ω′t`, `sin ω′t`
+/// ([`BoundaryTides::moment`]). Pointwise, for the CPU and a device.
+#[inline]
+pub fn tide_term(sum: &mut [f64; 3], c: &[f64; 6], f: f64, cos: f64, sin: f64) {
+    sum[0] += f * (c[0] * cos + c[1] * sin);
+    sum[1] += f * (c[2] * cos + c[3] * sin);
+    sum[2] += f * (c[4] * cos + c[5] * sin);
+}
+
+/// `(η, u, v)` of a node from the sum of its constituents' [`tide_term`]s,
+/// the ramp and the node's mean level ([`BoundaryTides::node_mean`]): the
+/// mean is not ramped.
+#[inline]
+pub fn tide_level(sum: [f64; 3], ramp: f64, mean: f64) -> (f64, f64, f64) {
+    (mean + ramp * sum[0], ramp * sum[1], ramp * sum[2])
+}
+
+/// The external state of a node of [`BoundaryTides`] from the sum of its
+/// constituents' [`tide_term`]s, the ramp and its mean level, over a child
+/// bed `bed`: elevation only unless the tides carry `velocity`; with
+/// `transport = (max_ratio, source_depth)` the velocity scaled to carry the
+/// source's transport, `u · D_source/D_child` limited to `max_ratio` either
+/// way ([`BoundaryTides::with_transport_scaling`]). Pointwise, for the CPU
+/// and a device.
+#[inline]
+pub fn tide_state(
+    sum: [f64; 3],
+    ramp: f64,
+    mean: f64,
+    velocity: bool,
+    transport: Option<(f64, f64)>,
+    bed: f64,
+) -> ExternalState {
+    let (eta, mut u, mut v) = tide_level(sum, ramp, mean);
+    if !velocity {
+        return ExternalState::elevation(eta);
+    }
+    if let Some((max, h_source)) = transport {
+        let (d_source, d_child) = (h_source + eta, eta - bed);
+        if h_source > 0.0 && d_source > 0.0 && d_child > 0.0 {
+            let ratio = (d_source / d_child).clamp(1.0 / max, max);
+            u *= ratio;
+            v *= ratio;
+        }
+    }
+    ExternalState::new(eta, u, v)
 }
 
 #[cfg(test)]
@@ -1457,6 +1572,75 @@ mod tests {
         assert!((ul - 3.0 * u).abs() < 1e-12 && (vl - 3.0 * v).abs() < 1e-12);
         // The same depth: unchanged
         assert_eq!(velocity(&scaled, -100.0), (u, v));
+    }
+
+    /// A device evaluates the tides as `Tides` says (P2.7): the moment of a
+    /// time on the host ([`BoundaryTides::moment`]), each node's sum of
+    /// [`tide_term`]s and [`tide_state`] from it. That must be
+    /// `external_state`'s bits at every node, in the ramp and after it,
+    /// with the mean level and with the velocity scaled and limited.
+    #[test]
+    fn a_device_evaluates_the_tides_from_their_moment() {
+        let atlas = TidalAtlas::parse(ATLAS).unwrap();
+        let (mesh, ops, projection) = setup();
+        let clock = ModelClock::at_datetime(2025, 6, 1, 0, 0);
+        let plain = atlas
+            .boundary_tides(&mesh, &ops, &projection, BoundaryTag::Open, &clock, 3000.0)
+            .unwrap()
+            .with_ramp_up(7200.0);
+        let full = plain
+            .clone()
+            .with_mean_level(true)
+            .with_transport_scaling(2.5);
+        let bits = |s: ExternalState| {
+            let (u, v) = s.velocity.unwrap_or((f64::NAN, f64::NAN));
+            [s.eta.to_bits(), u.to_bits(), v.to_bits()]
+        };
+        for tides in [&plain, &full] {
+            assert!(matches!(
+                tides.device_external(),
+                Some(DeviceExternal2D::Tides(_))
+            ));
+            let n_c = tides.n_constituents();
+            let mut moment = vec![0.0; 1 + 3 * n_c];
+            for t in [0.0, 1234.5, 7200.0, 20.0 * 86_400.0 + 4321.0] {
+                tides.moment(t, &mut moment);
+                for slot in 0..tides.n_nodes() {
+                    for bed in [-120.0, -60.0, -10.0, -0.5] {
+                        let ctx = BCContext2D::new(
+                            t,
+                            tides.positions()[slot],
+                            SWEState2D::new(5.0, 0.0, 0.0),
+                            bed,
+                            (0.0, -1.0),
+                            9.81,
+                            1e-6,
+                        );
+                        let mut sum = [0.0; 3];
+                        let coefficients = tides.coefficients(slot).as_chunks::<6>().0;
+                        for (c, phase) in coefficients.iter().zip(moment[1..].as_chunks::<3>().0) {
+                            tide_term(&mut sum, c, phase[0], phase[1], phase[2]);
+                        }
+                        let transport = tides
+                            .max_transport_ratio()
+                            .map(|max| (max, tides.source_depths()[slot]));
+                        let device = tide_state(
+                            sum,
+                            moment[0],
+                            tides.node_mean(slot),
+                            tides.has_velocity(),
+                            transport,
+                            bed,
+                        );
+                        assert_eq!(
+                            bits(device),
+                            bits(tides.external_state(&ctx)),
+                            "slot {slot}, t {t}, bed {bed}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

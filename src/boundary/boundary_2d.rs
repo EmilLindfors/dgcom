@@ -210,35 +210,21 @@ pub trait SWEBoundaryCondition2D: Send + Sync {
 
 /// A boundary condition as a device runs it
 /// ([`SWEBoundaryCondition2D::device_form`]): a closed set of forms, as data.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum DeviceBoundary2D<'a> {
     /// A free-slip wall: [`Reflective2D`] with this `h_min`
     Wall {
         /// [`Reflective2D::h_min`]
         h_min: f64,
     },
-    /// [`super::CharacteristicOBC`] whose external state is the same at
-    /// every point of the boundary
-    /// ([`super::ExternalStateProvider::uniform_state`], evaluated once per
-    /// stage)
+    /// [`super::CharacteristicOBC`] with external data a device evaluates
+    /// ([`super::ExternalStateProvider::device_external`])
     Characteristic {
         /// The external data
-        provider: &'a dyn super::ExternalStateProvider,
+        external: super::DeviceExternal2D<'a>,
         /// The velocity of elevation-only data
         elevation_only: super::ElevationOnly,
     },
-}
-
-impl std::fmt::Debug for DeviceBoundary2D<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Wall { h_min } => f.debug_struct("Wall").field("h_min", h_min).finish(),
-            Self::Characteristic { elevation_only, .. } => f
-                .debug_struct("Characteristic")
-                .field("elevation_only", elevation_only)
-                .finish_non_exhaustive(),
-        }
-    }
 }
 
 /// Reflective (wall) boundary condition for 2D.

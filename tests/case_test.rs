@@ -2552,6 +2552,10 @@ struct Recorded {
         dgcom::boundary::ElevationOnly,
         dgcom::boundary::ExternalState,
     )>,
+    /// Each open boundary forced node by node by atlas tides: its
+    /// constituents and nodes, whether it has a velocity and its largest
+    /// transport ratio
+    tides: Vec<(usize, usize, bool, Option<f64>)>,
     span: (f64, f64),
     /// Local time stepping's levels, the line-local depth and the
     /// positivity bound's h_dry
@@ -2574,7 +2578,7 @@ impl dgcom::case::CaseDevice for Recorder {
         run: &dgcom::case::DeviceRun<'_>,
         _callback: &mut dyn FnMut(&dgcom::solver::SWESolution2D, f64),
     ) -> Result<dgcom::case::DeviceRunReport, String> {
-        use dgcom::boundary::DeviceBoundary2D;
+        use dgcom::boundary::{DeviceBoundary2D, DeviceExternal2D};
         use dgcom::source::{DeviceFriction2D, DeviceSource2D};
         let mut seen = self.0.borrow_mut();
         seen.ordinal = ordinal;
@@ -2591,11 +2595,20 @@ impl dgcom::case::CaseDevice for Recorder {
             match boundary {
                 DeviceBoundary2D::Wall { .. } => seen.walls += 1,
                 DeviceBoundary2D::Characteristic {
-                    provider,
+                    external: DeviceExternal2D::Uniform(provider),
                     elevation_only,
                 } => seen.opens.push((
                     *elevation_only,
                     provider.uniform_state(10_800.0).expect("uniform"),
+                )),
+                DeviceBoundary2D::Characteristic {
+                    external: DeviceExternal2D::Tides(tides),
+                    ..
+                } => seen.tides.push((
+                    tides.n_constituents(),
+                    tides.n_nodes(),
+                    tides.has_velocity(),
+                    tides.max_transport_ratio(),
                 )),
             }
         }
@@ -2608,7 +2621,8 @@ impl dgcom::case::CaseDevice for Recorder {
 }
 
 /// `[compute] device`: the runner hands a device the case's physics as data
-/// (`SWEPhysics2D::device_form`) and its local time stepping, refuses a
+/// (`SWEPhysics2D::device_form`: a harmonic tide as a uniform state, an
+/// atlas as its tides per node) and its local time stepping, refuses a
 /// device case without a device, and refuses what a device does not run,
 /// naming it.
 #[test]
@@ -2675,6 +2689,26 @@ fn a_device_run_is_handed_the_cases_physics_as_data() {
     file.run_on_with(&domain, Some(&recorder), &mut |_| {})
         .unwrap_err();
     assert_eq!(recorder.0.into_inner().levels, 2);
+
+    // An atlas forces the device's boundary node by node: the example's
+    // atlas, 5 constituents and 6 minors inferred, at the mouth's 4 faces
+    // of 3 nodes, its current scaled by at most 1.5
+    let file = CaseFile::read(
+        Path::new(EXAMPLE).with_file_name("atlas.toml").as_path(),
+        &[
+            "run.duration_hours=1.0".into(),
+            "compute.device=cuda".into(),
+            format!("output.directory={:?}", dir.path().display().to_string()),
+        ],
+    )
+    .unwrap();
+    let domain = file.build_domain().unwrap();
+    let recorder = Recorder::default();
+    file.run_on_with(&domain, Some(&recorder), &mut |_| {})
+        .unwrap_err();
+    let seen = recorder.0.into_inner();
+    assert!(seen.opens.is_empty());
+    assert_eq!(seen.tides, [(11, 12, true, Some(1.5))]);
 
     // What a device does not run yet is refused, named, before the run
     let file = on(&["compute.device=cuda", "physics.viscosity_m2_s=1.0"]);

@@ -1,0 +1,70 @@
+# The tidal channel of `case.toml` forced by a tidal atlas: a tide and a
+# depth-mean current that vary along the mouth, needing no data.
+#
+# `boundary_tides.txt` is made up (five points off the mouth, M2, S2, N2, K1
+# and O1 with their currents; see its header), and `correction = "minors"`
+# adds 2N2, μ2, ν2, λ2, L2 and T2 by admittance, as for a global tide
+# model's atlas. Each node of the mouth takes the atlas's constants near it,
+# with the nodal corrections of `run.start`, and its current is scaled to
+# carry the atlas source's transport over the channel's bed. The channel is
+# placed at 63.5°N 8°E (`mesh.origin`) so that the atlas's longitudes and
+# latitudes fall on it.
+#
+#   dgcom run cases/tidal_channel/atlas.toml
+#
+# On the GPU (`gpu/`, P2.7) this is the gate of a boundary forced node by
+# node: `dgcom-gpu case cases/tidal_channel/atlas.toml` runs it on the CPU
+# and the GPU and compares every station record bit for bit.
+
+[run]
+name = "tidal_channel_atlas"
+start = "2025-06-15T00:00:00Z"
+duration_hours = 25.0
+
+[mesh]
+order = 2
+drop_land = false               # keep the flats above mean sea level: they flood
+origin = { lat = 63.5, lon = 8.0 }
+
+[mesh.rectangle]
+x_m = [0.0, 40000.0]
+y_m = [0.0, 4000.0]
+nx = 40
+ny = 4
+west = "open"                   # the other sides are walls
+
+[bathymetry.ramp]               # depth along the channel, constant across it
+from_m = [0.0, 2000.0]
+to_m = [40000.0, 2000.0]
+depth_m = [30.0, -2.0]          # negative: land at mean sea level
+
+[physics]
+coriolis = { latitude = 63.5 }
+friction = { manning = 0.025 }
+
+[[boundary]]
+tag = "open"
+[boundary.atlas]
+file = "boundary_tides.txt"
+correction = "minors"
+transport_scaling = 1.5
+ramp_hours = 2.0
+
+[output]
+interval_minutes = 30.0
+
+[[output.station]]
+name = "mouth"
+x_m = 2000.0
+y_m = 2000.0
+
+[[output.station]]
+name = "middle"
+x_m = 20000.0
+y_m = 2000.0
+
+[[output.station]]
+name = "head"
+x_m = 34000.0
+y_m = 2000.0
+open_water_depth_m = 1.0

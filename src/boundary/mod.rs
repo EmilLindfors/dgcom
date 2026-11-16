@@ -82,9 +82,9 @@ pub use boundary_2d::{
     Extrapolation2D, FixedState2D, HarmonicTidal2D, Reflective2D, SWEBoundaryCondition2D, Tidal2D,
 };
 pub use characteristic::{
-    BoundaryLevel, CharacteristicOBC, ElevationOnly, ExternalState, ExternalStateProvider,
-    InverseBarometer, ParentTimeSeries, StillWater, characteristic_boundary_state,
-    characteristic_state,
+    BoundaryLevel, CharacteristicOBC, DeviceExternal2D, ElevationOnly, ExternalState,
+    ExternalStateProvider, InverseBarometer, ParentTimeSeries, StillWater,
+    characteristic_boundary_state, characteristic_state,
 };
 pub use coverage::{BoundaryCoverage, CoverageError};
 pub use harmonic_tide::{HarmonicTide, tidal_ramp};
@@ -99,6 +99,7 @@ pub use ocean_nesting::{
 };
 pub use tidal_atlas::{
     AtlasConstituent, AtlasPoint, BoundaryTides, GaugeAdjustment, TidalAtlas, TidalAtlasError,
+    tide_level, tide_state, tide_term,
 };
 pub use tidal_config::{SpongeConfig, TidalBCType, TidalSimulationBuilder};
 
