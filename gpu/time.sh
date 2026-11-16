@@ -9,7 +9,7 @@
 #   FORCE=1 gpu/time.sh                          # time on a busy GPU anyway
 #
 # 1. The gates, built with --no-fmad, against the SIMD batch: the RHS and
-#    Simulation runs (`all`), the drying beach (`beach`) and
+#    Simulation runs and the nested runs (`all`), the drying beach (`beach`) and
 #    cases/tidal_channel through the case runner (`case`), also with local
 #    time stepping (`case_lts`) and forced by a tidal atlas (`case_atlas`).
 #    On any card each must be the CPU's bit for bit.

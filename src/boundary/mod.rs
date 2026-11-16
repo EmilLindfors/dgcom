@@ -96,6 +96,7 @@ pub use nesting_3d::{
 pub use ocean_columns::{DeepReference, OceanColumnsOptions, OceanModelColumns};
 pub use ocean_nesting::{
     NestingError, NestingOptions, NestingRelaxation2D, OceanModelState, ParentDatum,
+    parent_external_state, parent_state, parent_term, relaxation_source,
 };
 pub use tidal_atlas::{
     AtlasConstituent, AtlasPoint, BoundaryTides, GaugeAdjustment, TidalAtlas, TidalAtlasError,

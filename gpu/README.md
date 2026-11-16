@@ -2,13 +2,14 @@
 
 dgcom's GPU kernels, in Rust on NVIDIA's [cuda-oxide](https://github.com/NVIDIA/cuda-rust) (P2.7; the plan, the measurements and the toolchain are in [`../notes/gpu.md`](../notes/gpu.md)).
 
-- `src/swe2d.rs`: the kernels, a device-resident SWE state (`DeviceState`, dgcom's `Integrable`) and the GPU physics module (`GpuSWE2D`, dgcom's `PhysicsModule`), built from dgcom's own module (`SWEPhysics2D::device_form`): the split forms `EntropyStable` and `WetDry`, walls, characteristic open boundaries with a uniform external state (a harmonic tide, still water) or a tidal atlas's tides node by node, Coriolis, the wet/dry correction, Manning friction, the positivity-bounded step. dgcom's own `Simulation` and SSP-RK steppers drive them, with global steps or local time stepping (`Multirate`, up to 8 levels: `GpuSWE2D` is dgcom's `LocalTimeStepping`).
+- `src/swe2d.rs`: the kernels, a device-resident SWE state (`DeviceState`, dgcom's `Integrable`) and the GPU physics module (`GpuSWE2D`, dgcom's `PhysicsModule`), built from dgcom's own module (`SWEPhysics2D::device_form`): the split forms `EntropyStable` and `WetDry`, walls, characteristic open boundaries with a uniform external state (a harmonic tide, still water), a tidal atlas's tides or a parent model's state node by node (nesting, with its relaxation band), Coriolis, the wet/dry correction, Manning friction, the positivity-bounded step. dgcom's own `Simulation` and SSP-RK steppers drive them, with global steps or local time stepping (`Multirate`, up to 8 levels: `GpuSWE2D` is dgcom's `LocalTimeStepping`).
 - `src/case.rs`: the case runner's CUDA backend (`Cuda`, dgcom's `CaseDevice`, for `[compute] device`) and the case gate: a case file on the CPU and on the GPU, every station record compared.
 - `src/phase0.rs`: the RHS against `compute_rhs_swe_2d_parallel_into`, node for node, on periodic P2 meshes (parallelograms and jittered quadrilaterals) and walled drying beaches, and timed.
 - `src/phase1.rs`: `Simulation` with SSP-RK(4,3) on the GPU against the same run on the CPU (`SWEPhysics2D`), the final states node for node, and the time per step.
+- `src/nest.rs`: a run nested in a made-up parent held in memory (no NetCDF), its boundary and relaxation band, on the CPU and the GPU with global steps and local time stepping, the final states node for node (`nest`, also in `all`).
 - `time.sh`: the gates and the timing of a card in one go ([Timing a card](#timing-a-card)).
 
-It is a workspace of its own, as `viz/`: it builds with cuda-oxide's pinned toolchain (`rust-toolchain.toml`, Rust 1.99.1), dgcom included (without its NetCDF feature, so no HDF5 or netCDF-C). CI does not build it (no GPU or CUDA toolkit on the runners).
+It is a workspace of its own, as `viz/`: it builds with cuda-oxide's pinned toolchain (`rust-toolchain.toml`, Rust 1.99.1), dgcom included (without its NetCDF feature unless built with `--features netcdf`, so no HDF5 or netCDF-C by default). CI does not build it (no GPU or CUDA toolkit on the runners).
 
 ## Setting up a machine
 
@@ -43,7 +44,10 @@ cargo oxide doctor      # must pass: Rust, CUDA, LLVM, the backend
 
 # 5. dgcom
 git clone https://github.com/EmilLindfors/dgcom.git ~/dgcom
-cd ~/dgcom && git switch feat/gpu-tidal      # main, once #245 and #246 are merged
+
+# 6. For cases that read NetCDF (a nested boundary's parent, weather, NetCDF output):
+#    netCDF-C and HDF5 (1.x), then build with `--features simd,netcdf`
+sudo apt install libnetcdf-dev libhdf5-dev
 ```
 
 When gpu/Cargo.toml moves to another cuda-oxide revision, check that revision out in `~/cuda-rust` and run steps 4's `install` and `setup` again: the backend must be built from the revision the crates are.
@@ -66,7 +70,7 @@ In `gpu/` (on Windows the binary is `target\release\dgcom-gpu.exe`):
 cargo oxide run --no-fmad                   # the gates against the scalar CPU kernel
 cargo oxide run --no-fmad --features simd   # ... and against the 8-wide SIMD batch
 cargo oxide run --features simd             # multiply–adds fused: within ~1e-11; the timing
-target/release/dgcom-gpu phase1             # one gate (phase0, phase1, beach; all by default)
+target/release/dgcom-gpu phase1             # one gate (phase0, phase1, nest, beach; all by default)
 target/release/dgcom-gpu case ../cases/tidal_channel/case.toml
                                             # the case on the CPU and the GPU, compared
 target/release/dgcom-gpu run ../cases/tidal_channel/case.toml --set compute.device=cuda
@@ -85,7 +89,7 @@ SIZES="800x80 1600x160 3200x320" REPEATS=5 gpu/time.sh
 ```
 
 1. Refuses a GPU that is more than 10 % busy (the cards are shared; `FORCE=1` overrides).
-2. Builds with `--no-fmad` and runs the gates against the SIMD batch: `all` (the RHS and `Simulation` runs), `beach`, and `case` on `cases/tidal_channel` (25 h, every station record), global steps and local time stepping at 3 levels, and `case_atlas` on `cases/tidal_channel/atlas.toml` (the same channel forced by a tidal atlas node by node). On any card each must be bit for bit (`SKIP_GATES=1` skips them).
+2. Builds with `--no-fmad` and runs the gates against the SIMD batch: `all` (the RHS and `Simulation` runs, and the nested runs), `beach`, and `case` on `cases/tidal_channel` (25 h, every station record), global steps and local time stepping at 3 levels, and `case_atlas` on `cases/tidal_channel/atlas.toml` (the same channel forced by a tidal atlas node by node). On any card each must be bit for bit (`SKIP_GATES=1` skips them).
 3. Builds with FMA and runs `dgcom-gpu case` on the tidal channel refined to each of `SIZES` (`<nx>x<ny>` elements: 64,000 and 256,000 by default, about 1,150 steps each), on the CPU (the SIMD batch on all threads) and on the GPU, `REPEATS` times (3).
 4. Profiles the first size with Nsight Systems, if `nsys` is found (`SKIP_PROFILE=1` skips it): each kernel's time per step.
 

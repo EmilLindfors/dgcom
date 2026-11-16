@@ -175,7 +175,7 @@ impl SourceTerm2D for CoriolisSource2D {
         true
     }
 
-    fn device_form(&self) -> Option<DeviceSource2D> {
+    fn device_form(&self) -> Option<DeviceSource2D<'_>> {
         Some(DeviceSource2D::Coriolis(*self))
     }
 
