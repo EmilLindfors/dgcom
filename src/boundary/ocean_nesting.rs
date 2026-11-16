@@ -93,7 +93,8 @@ use thiserror::Error;
 
 use crate::boundary::band::boundary_distances;
 use crate::boundary::{
-    BCContext2D, ExternalState, ExternalStateProvider, TidalAtlas, TidalAtlasError, tidal_ramp,
+    BCContext2D, DeviceExternal2D, ExternalState, ExternalStateProvider, TidalAtlas,
+    TidalAtlasError, tidal_ramp,
 };
 use crate::io::{
     CoordinateProjection, OceanModelReader, Stencil, TimeInterpolation, TimeStencil, east_axis,
@@ -101,7 +102,7 @@ use crate::io::{
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::SWEState2D;
-use crate::source::{ElementSources, SourceContext2D, SourceTerm2D, SpongeProfile};
+use crate::source::{DeviceSource2D, ElementSources, SourceContext2D, SourceTerm2D, SpongeProfile};
 use crate::time::ModelClock;
 use crate::types::ElementIndex;
 
@@ -537,9 +538,9 @@ impl OceanModelState {
         self.inner.reader.bbox()
     }
 
-    /// Slot of the node of `ctx`: by nodal index, or else the nearest
-    /// open-boundary node by position.
-    fn slot(&self, node_index: Option<usize>, (x, y): (f64, f64)) -> usize {
+    /// Slot of the node `node_index` (a flat mesh node) at `(x, y)`: by
+    /// nodal index, or else the nearest open-boundary node by position.
+    pub fn slot_of(&self, node_index: Option<usize>, (x, y): (f64, f64)) -> usize {
         if let Some(&slot) = node_index
             .and_then(|i| self.inner.slot_of_node.get(i))
             .filter(|&&s| s != u32::MAX)
@@ -561,7 +562,7 @@ impl OceanModelState {
     }
 
     /// Snapshot weights and ramp at simulation time `t`.
-    fn moment(&self, t: f64) -> Moment {
+    fn moment_at(&self, t: f64) -> Moment {
         let inner = &self.inner;
         let time = inner
             .reader
@@ -581,32 +582,106 @@ impl OceanModelState {
     /// none.
     fn evaluate(&self, slot: usize, moment: &Moment, bed: f64) -> (f64, Option<(f64, f64)>) {
         let inner = &self.inner;
-        let node = &inner.nodes[slot];
-        let series = &inner.series[slot * inner.reader.n_times() * 3..];
+        let series = self.slot_series(slot);
         let mut sum = [0.0; 3];
         for (t, w) in moment.time.terms() {
-            for (q, s) in sum.iter_mut().enumerate() {
-                *s += w * series[3 * t + q] as f64;
-            }
+            parent_term(&mut sum, w, &series[t]);
         }
-        let [zeta, u, v] = sum.map(|x| moment.ramp * x);
-        // The datum shift ramps with ζ: the run starts at rest at 0
-        let eta = zeta + moment.ramp * inner.reference_level;
-        if !inner.has_velocity {
-            return (eta, None);
-        }
-        let (mut um, mut vm) = (u, v);
-        if inner.options.transport_scaling && node.parent_depth.is_finite() {
-            let (d_parent, d_child) = (zeta + node.parent_depth, eta - bed);
-            if d_parent > 0.0 && d_child > 0.0 {
-                let max = inner.options.max_transport_ratio;
-                let ratio = (d_parent / d_child).clamp(1.0 / max, max);
-                um *= ratio;
-                vm *= ratio;
-            }
-        }
-        (eta, Some((um, vm)))
+        parent_state(
+            sum,
+            moment.ramp,
+            inner.reference_level,
+            inner.has_velocity,
+            self.transport(slot),
+            bed,
+        )
     }
+
+    /// Slot `slot`'s `(ζ, u, v)` per snapshot (the velocity in the mesh axes).
+    pub fn slot_series(&self, slot: usize) -> &[[f32; 3]] {
+        let n = self.inner.reader.n_times();
+        &self.inner.series.as_chunks::<3>().0[slot * n..(slot + 1) * n]
+    }
+
+    /// [`parent_state`]'s `transport` at slot `slot`: the largest ratio
+    /// and the parent depth there, with transport scaling.
+    #[inline]
+    fn transport(&self, slot: usize) -> Option<(f64, f64)> {
+        let inner = &self.inner;
+        inner.options.transport_scaling.then(|| {
+            (
+                inner.options.max_transport_ratio,
+                inner.nodes[slot].parent_depth,
+            )
+        })
+    }
+
+    /// Number of sampled nodes (open-boundary and band nodes), the slots.
+    pub fn n_slots(&self) -> usize {
+        self.inner.nodes.len()
+    }
+
+    /// Slot of every flat mesh node (`u32::MAX`: not sampled).
+    pub fn slot_of_node(&self) -> &[u32] {
+        &self.inner.slot_of_node
+    }
+
+    /// Whether each element has a node in the relaxation band.
+    pub fn band_elements(&self) -> &[bool] {
+        &self.inner.band_elements
+    }
+
+    /// The parent's still-water depth at slot `slot` (m, NaN if unknown).
+    pub fn parent_depth(&self, slot: usize) -> f64 {
+        self.inner.nodes[slot].parent_depth
+    }
+
+    /// The relaxation weight at slot `slot` (1 on the boundary, 0 outside
+    /// the band).
+    pub fn band_weight(&self, slot: usize) -> f64 {
+        self.inner.nodes[slot].weight
+    }
+
+    /// Whether the parent has a depth-mean velocity.
+    pub fn has_velocity(&self) -> bool {
+        self.inner.has_velocity
+    }
+
+    /// The largest transport-scaling factor, with transport scaling.
+    pub fn max_transport_ratio(&self) -> Option<f64> {
+        let options = &self.inner.options;
+        options
+            .transport_scaling
+            .then_some(options.max_transport_ratio)
+    }
+
+    /// Whether `other` is this parent (a clone of it: the same samples).
+    pub fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The time-dependent part of the parent at simulation time `t`, the
+    /// same at every node, into `moment` ([`Self::MOMENT`] values): the
+    /// ramp, the number of snapshots, their indices and their weights (4
+    /// each, the unused ones 0). A device takes it from the host once per
+    /// stage time and evaluates each node with [`parent_term`] and
+    /// [`parent_state`], which give [`ExternalStateProvider::external_state`]'s
+    /// bits (P2.7, `notes/gpu.md`).
+    ///
+    /// # Panics
+    /// Outside the parent's time range, as the external state does.
+    pub fn moment(&self, t: f64, moment: &mut [f64]) {
+        let Moment { time, ramp } = self.moment_at(t);
+        moment[0] = ramp;
+        moment[1] = time.len as f64;
+        for i in 0..4 {
+            moment[2 + i] = time.idx[i] as f64;
+            moment[6 + i] = time.w[i];
+        }
+    }
+
+    /// The values of a [`Self::moment`].
+    pub const MOMENT: usize = 10;
 
     /// Relaxation band source term with timescale `timescale` (s) at the
     /// boundary; see the module docs. Needs `NestingOptions::band_width > 0`
@@ -746,11 +821,66 @@ impl OceanModelState {
 impl ExternalStateProvider for OceanModelState {
     /// Parent `(η, u, v)` in the mesh axes, the velocity transport-scaled.
     fn external_state(&self, ctx: &BCContext2D) -> ExternalState {
-        let slot = self.slot(ctx.node_index, ctx.position);
-        match self.evaluate(slot, &self.moment(ctx.time), ctx.bathymetry) {
-            (eta, Some((u, v))) => ExternalState::new(eta, u, v),
-            (eta, None) => ExternalState::elevation(eta),
+        let slot = self.slot_of(ctx.node_index, ctx.position);
+        parent_external_state(self.evaluate(slot, &self.moment_at(ctx.time), ctx.bathymetry))
+    }
+
+    fn device_external(&self) -> Option<DeviceExternal2D<'_>> {
+        Some(DeviceExternal2D::Parent(self))
+    }
+}
+
+/// Adds one snapshot of a node's parent series to its sum: `sum[q] += w ·
+/// values[q]` for ζ, u and v, with the snapshot's time weight `w`
+/// ([`OceanModelState::moment`]). Pointwise, for the CPU and a device.
+#[inline]
+pub fn parent_term(sum: &mut [f64; 3], w: f64, values: &[f32; 3]) {
+    sum[0] += w * values[0] as f64;
+    sum[1] += w * values[1] as f64;
+    sum[2] += w * values[2] as f64;
+}
+
+/// The parent's `(η, velocity)` at a node from the sum of its snapshots'
+/// [`parent_term`]s, the ramp, the datum shift `reference_level` (which
+/// ramps with ζ: the run starts at rest at 0) over a child bed `bed`: no
+/// velocity unless the parent has one (`velocity`); with `transport =
+/// (max_ratio, parent_depth)` and a known parent depth the velocity scaled
+/// by `D_parent/D_child`, limited to `max_ratio` either way. Pointwise, for
+/// the CPU and a device.
+#[inline]
+pub fn parent_state(
+    sum: [f64; 3],
+    ramp: f64,
+    reference_level: f64,
+    velocity: bool,
+    transport: Option<(f64, f64)>,
+    bed: f64,
+) -> (f64, Option<(f64, f64)>) {
+    let [zeta, u, v] = [ramp * sum[0], ramp * sum[1], ramp * sum[2]];
+    let eta = zeta + ramp * reference_level;
+    if !velocity {
+        return (eta, None);
+    }
+    let (mut um, mut vm) = (u, v);
+    if let Some((max, parent_depth)) = transport
+        && parent_depth.is_finite()
+    {
+        let (d_parent, d_child) = (zeta + parent_depth, eta - bed);
+        if d_parent > 0.0 && d_child > 0.0 {
+            let ratio = (d_parent / d_child).clamp(1.0 / max, max);
+            um *= ratio;
+            vm *= ratio;
         }
+    }
+    (eta, Some((um, vm)))
+}
+
+/// The external state of a parent's `(η, velocity)` ([`parent_state`]).
+#[inline]
+pub fn parent_external_state((eta, velocity): (f64, Option<(f64, f64)>)) -> ExternalState {
+    match velocity {
+        Some((u, v)) => ExternalState::new(eta, u, v),
+        None => ExternalState::elevation(eta),
     }
 }
 
@@ -789,35 +919,82 @@ impl NestingRelaxation2D {
     /// The source at a slot for state `q` over bed `bed`.
     #[inline]
     fn relax(&self, slot: usize, moment: &Moment, q: &SWEState2D, bed: f64) -> SWEState2D {
-        let weight = self.parent.inner.nodes[slot].weight;
-        if weight <= 0.0 || q.h < self.wet_depth {
-            return SWEState2D::zero();
-        }
-        let (eta, velocity) = self.parent.evaluate(slot, moment, bed);
-        let h = eta - bed;
-        if h < self.wet_depth {
-            return SWEState2D::zero();
-        }
-        let gamma = weight * self.rate;
-        let (u, v) = velocity.unwrap_or((q.hu / q.h, q.hv / q.h));
-        let dh = if self.momentum_only { 0.0 } else { h - q.h };
-        let depth = if self.momentum_only { q.h } else { h };
-        SWEState2D::new(
-            gamma * dh,
-            gamma * (depth * u - q.hu),
-            gamma * (depth * v - q.hv),
+        relaxation_source(
+            self.parent.inner.nodes[slot].weight,
+            self.rate,
+            self.wet_depth,
+            self.momentum_only,
+            q,
+            bed,
+            || self.parent.evaluate(slot, moment, bed),
         )
     }
+
+    /// The parent it relaxes towards.
+    pub fn parent(&self) -> &OceanModelState {
+        &self.parent
+    }
+
+    /// The relaxation rate at the boundary, `1/τ` (1/s).
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    /// The depth below which a node is not relaxed (m).
+    pub fn wet_depth(&self) -> f64 {
+        self.wet_depth
+    }
+
+    /// Whether only the momentum is relaxed.
+    pub fn momentum_only(&self) -> bool {
+        self.momentum_only
+    }
+}
+
+/// The relaxation source `γ (q_parent − q)` at a node of band weight
+/// `weight` (`γ = weight · rate`) for state `q` over bed `bed`, the parent's
+/// `(η, velocity)` there from `parent` ([`parent_state`]; without a velocity
+/// the child's): zero where the band weight is 0 or the child or the parent
+/// is shallower than `wet_depth`; with `momentum_only` the depth is kept
+/// and the momentum relaxed at the child's depth. Pointwise, for the CPU and
+/// a device.
+#[inline]
+pub fn relaxation_source(
+    weight: f64,
+    rate: f64,
+    wet_depth: f64,
+    momentum_only: bool,
+    q: &SWEState2D,
+    bed: f64,
+    parent: impl FnOnce() -> (f64, Option<(f64, f64)>),
+) -> SWEState2D {
+    if weight <= 0.0 || q.h < wet_depth {
+        return SWEState2D::zero();
+    }
+    let (eta, velocity) = parent();
+    let h = eta - bed;
+    if h < wet_depth {
+        return SWEState2D::zero();
+    }
+    let gamma = weight * rate;
+    let (u, v) = velocity.unwrap_or((q.hu / q.h, q.hv / q.h));
+    let dh = if momentum_only { 0.0 } else { h - q.h };
+    let depth = if momentum_only { q.h } else { h };
+    SWEState2D::new(
+        gamma * dh,
+        gamma * (depth * u - q.hu),
+        gamma * (depth * v - q.hv),
+    )
 }
 
 impl SourceTerm2D for NestingRelaxation2D {
     /// Per-node evaluation by position (slow: a search over the boundary
     /// nodes). The RHS kernels use [`SourceTerm2D::add_element`].
     fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D {
-        let slot = self.parent.slot(None, ctx.position);
+        let slot = self.parent.slot_of(None, ctx.position);
         self.relax(
             slot,
-            &self.parent.moment(ctx.time),
+            &self.parent.moment_at(ctx.time),
             &ctx.state,
             ctx.bathymetry,
         )
@@ -835,7 +1012,7 @@ impl SourceTerm2D for NestingRelaxation2D {
         if !inner.band_elements[k] {
             return;
         }
-        let moment = self.parent.moment(element.time);
+        let moment = self.parent.moment_at(element.time);
         let base = k * inner.n_nodes;
         for i in 0..element.n_nodes() {
             let slot = inner.slot_of_node[base + i];
@@ -856,6 +1033,10 @@ impl SourceTerm2D for NestingRelaxation2D {
         true
     }
 
+    fn device_form(&self) -> Option<DeviceSource2D<'_>> {
+        Some(DeviceSource2D::NestingRelaxation(self))
+    }
+
     fn name(&self) -> &'static str {
         "nesting_relaxation_2d"
     }
@@ -870,7 +1051,7 @@ impl SourceTerm2D for NestingRelaxation2D {
         if self.momentum_only || !inner.band_elements[k] {
             return;
         }
-        let moment = self.parent.moment(element.time);
+        let moment = self.parent.moment_at(element.time);
         let base = k * inner.n_nodes;
         for (i, h) in h.iter_mut().enumerate().take(element.n_nodes()) {
             let slot = inner.slot_of_node[base + i];
@@ -1184,7 +1365,7 @@ mod tests {
         assert!(!inner.band_elements[12]);
         assert!(inner.band_elements[0]);
         let relax = parent.relaxation(600.0);
-        let time = parent.moment(0.0);
+        let time = parent.moment_at(0.0);
         let slot = inner.slot_of_node[0] as usize;
         let at_parent = SWEState2D::from_primitives(DEPTH + 0.1, 0.2, -0.1);
         let s = relax.relax(slot, &time, &at_parent, -DEPTH);
@@ -1198,6 +1379,101 @@ mod tests {
         let dry = relax.relax(slot, &time, &SWEState2D::new(0.01, 0.0, 0.0), -DEPTH);
         assert_eq!(dry, SWEState2D::zero());
         let _ = (mesh, ops);
+    }
+
+    /// A device evaluates the parent as `Parent` and `NestingRelaxation`
+    /// say (P2.7): the moment of a time on the host
+    /// ([`OceanModelState::moment`]), each node's sum of [`parent_term`]s,
+    /// [`parent_state`] and [`relaxation_source`] from it. That must be
+    /// `external_state`'s and the relaxation's bits at every slot, in the
+    /// ramp and after it, cubic and linear in time, with the velocity
+    /// scaled and limited, unscaled, and with the momentum alone relaxed.
+    #[test]
+    fn a_device_evaluates_the_parent_from_its_moment() {
+        let projection = LocalProjection::new(63.5, 8.5);
+        // A varying ζ, so that every stencil weight counts
+        let times: Vec<f64> = (0..6).map(|k| T0 + 3600.0 * k as f64).collect();
+        let zeta = [0.1, 0.35, 0.62, 0.48, 0.05, -0.3];
+        let bits = |s: ExternalState| {
+            let (u, v) = s.velocity.unwrap_or((f64::NAN, f64::NAN));
+            [s.eta.to_bits(), u.to_bits(), v.to_bits()]
+        };
+        let state_bits = |s: SWEState2D| [s.h.to_bits(), s.hu.to_bits(), s.hv.to_bits()];
+        for options in [
+            as_is().with_band(2000.0).with_ramp_up(5400.0),
+            as_is()
+                .with_band(2000.0)
+                .with_time_interpolation(TimeInterpolation::Linear)
+                .with_datum(ParentDatum::Shift(0.12)),
+            as_is().with_band(2000.0).with_transport_scaling(false),
+        ] {
+            let (_, _, parent) =
+                setup_with(reader_with(&projection, times.clone(), &zeta), &options).unwrap();
+            assert!(matches!(
+                parent.device_external(),
+                Some(DeviceExternal2D::Parent(_))
+            ));
+            let relaxations = [
+                parent.relaxation(900.0),
+                parent.relaxation(600.0).with_momentum_only(true),
+            ];
+            let mut moment = [0.0; OceanModelState::MOMENT];
+            for t in [0.0, 1000.0, 3600.0, 9000.0, 18_000.0] {
+                parent.moment(t, &mut moment);
+                for slot in 0..parent.n_slots() {
+                    let flat = parent
+                        .slot_of_node()
+                        .iter()
+                        .position(|&s| s as usize == slot)
+                        .unwrap();
+                    for bed in [-60.0, -DEPTH, -12.0, -0.5] {
+                        let device = || {
+                            let series = parent.slot_series(slot);
+                            let mut sum = [0.0; 3];
+                            for i in 0..moment[1] as usize {
+                                let at = moment[2 + i] as usize;
+                                parent_term(&mut sum, moment[6 + i], &series[at]);
+                            }
+                            let transport = parent
+                                .max_transport_ratio()
+                                .map(|max| (max, parent.parent_depth(slot)));
+                            parent_state(
+                                sum,
+                                moment[0],
+                                parent.reference_level(),
+                                parent.has_velocity(),
+                                transport,
+                                bed,
+                            )
+                        };
+                        let c = ctx(t, bed).with_node_index(flat);
+                        assert_eq!(
+                            bits(parent_external_state(device())),
+                            bits(parent.external_state(&c)),
+                            "slot {slot}, t {t}, bed {bed}"
+                        );
+                        for relax in &relaxations {
+                            for q in [
+                                SWEState2D::new(-bed + 0.3, 1.2, -0.4),
+                                SWEState2D::new(0.02, 0.0, 0.0),
+                            ] {
+                                let on_device = relaxation_source(
+                                    parent.band_weight(slot),
+                                    relax.rate(),
+                                    relax.wet_depth(),
+                                    relax.momentum_only(),
+                                    &q,
+                                    bed,
+                                    device,
+                                );
+                                let on_cpu = relax.relax(slot, &parent.moment_at(t), &q, bed);
+                                assert_eq!(state_bits(on_device), state_bits(on_cpu));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Blending pulls the child bed to the parent's at the boundary and

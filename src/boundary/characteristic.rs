@@ -64,7 +64,10 @@
 use std::sync::atomic::AtomicBool;
 
 use super::bathymetry_validation::warn_once_if_misconfigured;
-use super::{BCContext2D, BoundaryState, BoundaryTides, DeviceBoundary2D, SWEBoundaryCondition2D};
+use super::{
+    BCContext2D, BoundaryState, BoundaryTides, DeviceBoundary2D, OceanModelState,
+    SWEBoundaryCondition2D,
+};
 use crate::io::BoundaryTimeSeries;
 use crate::mesh::BoundaryTag;
 use crate::solver::SWEState2D;
@@ -133,6 +136,12 @@ pub enum DeviceExternal2D<'a> {
     /// ([`BoundaryTides::moment`]), the device sums them per node
     /// ([`super::tide_term`], [`super::tide_state`])
     Tides(&'a BoundaryTides),
+    /// A parent model's state per boundary node (`OceanModelState`): the
+    /// device holds each node's series of snapshots, the host evaluates the
+    /// time weights and the ramp once per stage time
+    /// ([`OceanModelState::moment`]), the device sums them per node
+    /// ([`super::parent_term`], [`super::parent_state`])
+    Parent(&'a OceanModelState),
 }
 
 impl std::fmt::Debug for DeviceExternal2D<'_> {
@@ -143,6 +152,10 @@ impl std::fmt::Debug for DeviceExternal2D<'_> {
                 .debug_struct("Tides")
                 .field("constituents", &tides.names())
                 .field("nodes", &tides.n_nodes())
+                .finish_non_exhaustive(),
+            Self::Parent(parent) => f
+                .debug_struct("Parent")
+                .field("slots", &parent.n_slots())
                 .finish_non_exhaustive(),
         }
     }

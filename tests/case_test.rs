@@ -2545,6 +2545,8 @@ struct Recorded {
     wet_dry: bool,
     manning_n: Option<f64>,
     coriolis_f: Option<f64>,
+    /// The nesting's relaxation bands' rates
+    relaxation_rates: Vec<f64>,
     walls: usize,
     /// Each open boundary's elevation-only velocity, and its external
     /// state at 3 h
@@ -2556,6 +2558,8 @@ struct Recorded {
     /// constituents and nodes, whether it has a velocity and its largest
     /// transport ratio
     tides: Vec<(usize, usize, bool, Option<f64>)>,
+    /// Open boundaries nested in a parent
+    parents: usize,
     span: (f64, f64),
     /// Local time stepping's levels, the line-local depth and the
     /// positivity bound's h_dry
@@ -2588,9 +2592,12 @@ impl dgcom::case::CaseDevice for Recorder {
         seen.manning_n = form.friction.as_ref().map(|f| match f {
             DeviceFriction2D::Manning(m) => m.manning_n,
         });
-        seen.coriolis_f = form.source.map(|s| match s {
-            DeviceSource2D::Coriolis(c) => c.f0,
-        });
+        for source in &form.sources {
+            match source {
+                DeviceSource2D::Coriolis(c) => seen.coriolis_f = Some(c.f0),
+                DeviceSource2D::NestingRelaxation(r) => seen.relaxation_rates.push(r.rate()),
+            }
+        }
         for (_, boundary) in &form.boundaries {
             match boundary {
                 DeviceBoundary2D::Wall { .. } => seen.walls += 1,
@@ -2601,6 +2608,10 @@ impl dgcom::case::CaseDevice for Recorder {
                     *elevation_only,
                     provider.uniform_state(10_800.0).expect("uniform"),
                 )),
+                DeviceBoundary2D::Characteristic {
+                    external: DeviceExternal2D::Parent(_),
+                    ..
+                } => seen.parents += 1,
                 DeviceBoundary2D::Characteristic {
                     external: DeviceExternal2D::Tides(tides),
                     ..

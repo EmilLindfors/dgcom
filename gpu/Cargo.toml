@@ -25,3 +25,7 @@ dgcom = { path = "..", default-features = false, features = ["parallel"] }
 # (`swe_2d_split_form_batch.rs`) that real runs use, a second copy of the
 # physics that its own gates hold bit for bit to the scalar one.
 simd = ["dgcom/simd"]
+# Cases that read NetCDF (`[boundary.nesting]` parents, weather, NetCDF
+# output): dgcom's `netcdf`, which needs netCDF-C and HDF5 on the machine
+# (`gpu/README.md`).
+netcdf = ["dgcom/netcdf"]

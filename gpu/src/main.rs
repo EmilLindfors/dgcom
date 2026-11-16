@@ -6,7 +6,7 @@
 //! cargo oxide run --no-fmad                   # the gates, against the scalar CPU kernel
 //! cargo oxide run --no-fmad --features simd   # ... against the SIMD batch
 //! cargo oxide run --features simd             # multiply–adds fused: the timing
-//! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, beach; all by default)
+//! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, beach; all by default)
 //! target\release\dgcom-gpu.exe case <case.toml> [--set key.path=value]...
 //!                                             # a case on the CPU and the GPU, compared
 //! target\release\dgcom-gpu.exe run <case.toml> [--set ...]
@@ -18,6 +18,8 @@
 //! - **Phase 1:** dgcom's `Simulation` stepping the device state with the GPU
 //!   physics module, against the same run on the CPU; a case file through
 //!   dgcom's case runner (`case`).
+//! - **Phase 2:** a run nested in a parent model, its boundary and
+//!   relaxation band, with global steps and local time stepping (`nest`).
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
 //! must be the CPU's bit for bit; that is the gate.
@@ -26,6 +28,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod case;
+mod nest;
 mod phase0;
 mod phase1;
 mod swe2d;
@@ -69,6 +72,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if which == "all" || which == "phase1" {
         phase1::run(&gpu)?;
+    }
+    if which == "all" || which == "nest" {
+        nest::run_gates(&gpu)?;
     }
     if which == "beach" {
         phase1::run_beach(&gpu)?;

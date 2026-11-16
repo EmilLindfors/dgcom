@@ -7,9 +7,12 @@
 //! (the subcells in elements with a node shallower than the subcell depth,
 //! the hydrostatic HLL at faces) with a bed, walls (`Reflective2D`, called
 //! as the CPU calls it), characteristic open boundaries with an external
-//! state uniform along each (a harmonic tide, still water) or atlas tides
+//! state uniform along each (a harmonic tide, still water), atlas tides
 //! node by node (`BoundaryTides`: each constituent's time factors from the
-//! host once per stage time, the sums per node on the device), Coriolis; global
+//! host once per stage time, the sums per node on the device) or a parent
+//! model node by node (`OceanModelState`: its series per node on the device,
+//! the time stencil from the host), Coriolis, the nesting's relaxation band
+//! (`NestingRelaxation2D`, a kernel after the element kernels); global
 //! steps through the fused per-element stages, and local time stepping
 //! (dgcom's `Multirate`, [`LocalTimeStepping`]: each pass a prefix of the
 //! coarse step's elements and edges sorted by level, each element's stage
@@ -37,8 +40,10 @@ use cuda_device::{DisjointSlice, device, kernel, thread};
 use cuda_host::cuda_module;
 use dgcom::SWEState2D;
 use dgcom::boundary::{
-    BCContext2D, DeviceBoundary2D, DeviceExternal2D, ElevationOnly, ExternalState, Reflective2D,
-    SWEBoundaryCondition2D, characteristic_boundary_state, tide_state, tide_term,
+    BCContext2D, DeviceBoundary2D, DeviceExternal2D, ElevationOnly, ExternalState,
+    NestingRelaxation2D, OceanModelState, Reflective2D, SWEBoundaryCondition2D,
+    characteristic_boundary_state, parent_external_state, parent_state, parent_term,
+    relaxation_source, tide_state, tide_term,
 };
 use dgcom::flux::{
     SWENodeState2D, entropy_stable_dissipation_2d, wintermeyer_bed_interface_term_2d,
@@ -99,27 +104,107 @@ pub struct OpenStates {
     pub flags: [u32; MAX_OPEN],
 }
 
+/// [`OpenForm::kind`]: a uniform state, its level's [`OpenStates`] entry.
+const UNIFORM: u32 = 0;
+/// [`OpenForm::kind`]: atlas tides per face node (`BoundaryTides`).
+const TIDES: u32 = 1;
+/// [`OpenForm::kind`]: a parent model per face node (`OceanModelState`).
+const PARENT: u32 = 2;
+
 /// An open boundary's external data as the boundary kernel evaluates it
-/// (`DeviceExternal2D`), in a device buffer: a uniform state (its level's
-/// [`OpenStates`] entry) if `constituents` is 0, else atlas tides per face
-/// node (`BoundaryTides`): the constants of a face node's row of the tide
-/// tables, the time factors of its level's row of the moments.
+/// (`DeviceExternal2D`), in a device buffer: a uniform state, atlas tides
+/// (the constants of a face node's row of the tide tables, the time factors
+/// of its level's row of the moments) or a parent (the slot of a face
+/// node's row, the parent's [`ParentForm`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenForm {
-    /// The tides' constituents (0: a uniform state)
+    /// [`UNIFORM`], [`TIDES`] or [`PARENT`]
+    pub kind: u32,
+    /// The tides' constituents
     pub constituents: u32,
     /// The tides' moment in a level's row of the moments
     /// (`BoundaryTides::moment`: the ramp, then 3 per constituent)
     pub moment: u32,
     /// The tides carry a velocity
     pub velocity: u32,
-    /// The largest transport-scaling factor (0: not scaled)
+    /// The parent's index in the parent forms
+    pub parent: u32,
+    /// The tides' largest transport-scaling factor (0: not scaled)
     pub max_transport_ratio: f64,
 }
 
 // SAFETY: plain old data (u32s and an f64, `#[repr(C)]`).
 unsafe impl cuda_core::DeviceCopy for OpenForm {}
+
+/// A parent model on the device (`OceanModelState`), in a device buffer:
+/// where its slots' series and data start in the parent tables, and its
+/// moment in a level's row of the moments (`OceanModelState::moment`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParentForm {
+    /// Snapshots per slot
+    pub n_times: u32,
+    /// Its slot 0's first snapshot in the series
+    pub series: u32,
+    /// Its slot 0 in the slot data (`[parent depth, band weight]`)
+    pub slots: u32,
+    /// Its moment in a level's row of the moments
+    pub moment: u32,
+    /// The parent has a depth-mean velocity
+    pub velocity: u32,
+    /// The largest transport-scaling factor (0: not scaled)
+    pub max_transport_ratio: f64,
+    /// Added to ζ, ramped with it
+    pub reference_level: f64,
+}
+
+// SAFETY: plain old data (u32s and f64s, `#[repr(C)]`).
+unsafe impl cuda_core::DeviceCopy for ParentForm {}
+
+/// The parent tables as the kernels read them ([`Forcing`]): the parents'
+/// forms, every slot's snapshots and its `[parent depth, band weight]`.
+type ParentRows<'a> = (&'a [ParentForm], &'a [[f32; 3]], &'a [[f64; 2]]);
+
+/// Parent `form`'s `(η, velocity)` at its slot `slot` over bed `bed`, the
+/// time weights and ramp from `moment` (a level's row): dgcom's
+/// `parent_term` and `parent_state`, as `OceanModelState::evaluate`.
+#[inline]
+fn parent_at(
+    form: &ParentForm,
+    slot: usize,
+    moment: &[f64],
+    series: &[[f32; 3]],
+    slots: &[[f64; 2]],
+    bed: f64,
+) -> (f64, Option<(f64, f64)>) {
+    let m = form.moment as usize;
+    let first = form.series as usize + slot * form.n_times as usize;
+    let mut sum = [0.0; 3];
+    for i in 0..moment[m + 1] as usize {
+        parent_term(
+            &mut sum,
+            moment[m + 6 + i],
+            &series[first + moment[m + 2 + i] as usize],
+        );
+    }
+    let transport = if form.max_transport_ratio > 0.0 {
+        Some((
+            form.max_transport_ratio,
+            slots[form.slots as usize + slot][0],
+        ))
+    } else {
+        None
+    };
+    parent_state(
+        sum,
+        moment[m],
+        form.reference_level,
+        form.velocity != 0,
+        transport,
+        bed,
+    )
+}
 
 /// Local time stepping's levels below the coarsest that the kernels take
 /// (a stage's boundary data has an entry per level, [`StageLevel`]).
@@ -539,10 +624,11 @@ fn wall_flux(
 }
 
 /// The external state of open boundary `i` at a face node over bed `bed`:
-/// its level's uniform state (`open`), or its atlas tides from the node's
-/// row of the tide tables (`row`; `coefficients` and `nodes`, `[mean,
-/// source depth]`, with `max_constituents` per row) and the level's moment
-/// (`moment`), dgcom's `tide_term` and `tide_state`.
+/// its level's uniform state (`open`); or from the node's row `row` of its
+/// form's table and the level's moments (`moment`), its atlas tides
+/// (`tides`: `coefficients` and `nodes`, `[mean, source depth]`, with
+/// `max_constituents` per row; dgcom's `tide_term` and `tide_state`) or its
+/// parent (the row's slot, `parents`; [`parent_at`]).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn open_external(
@@ -552,17 +638,22 @@ fn open_external(
     bed: f64,
     row: usize,
     moment: &[f64],
-    coefficients: &[[f64; 6]],
-    nodes: &[[f64; 2]],
-    max_constituents: usize,
+    (_, coefficients, nodes, max_constituents): TideRows<'_>,
+    (parents, series, slots): ParentRows<'_>,
+    parent_slot: &[u32],
 ) -> ExternalState {
-    if form.constituents == 0 {
+    if form.kind == UNIFORM {
         let [eta, u, v] = open.state[i];
         return if open.flags[i] & 1 != 0 {
             ExternalState::new(eta, u, v)
         } else {
             ExternalState::elevation(eta)
         };
+    }
+    if form.kind == PARENT {
+        let parent = &parents[form.parent as usize];
+        let slot = parent_slot[row] as usize;
+        return parent_external_state(parent_at(parent, slot, moment, series, slots, bed));
     }
     let m = form.moment as usize;
     let mut sum = [0.0; 3];
@@ -668,9 +759,9 @@ fn edge_body<const HLL: bool>(
     }
 }
 
-/// The tide tables as the boundary kernel reads them ([`TideTables`]):
-/// every edge's first row, each row's constants and `[mean, source depth]`,
-/// and the constituents per row.
+/// The tide tables as the boundary kernel reads them ([`Forcing`]): every
+/// edge's first row in its form's table, each tide row's constants and
+/// `[mean, source depth]`, and the constituents per row.
 type TideRows<'a> = (&'a [u32], &'a [[f64; 6]], &'a [[f64; 2]], usize);
 
 /// `SplitFormSWE2D::boundary_flux` at face node `fi` of boundary edge `e`:
@@ -691,7 +782,9 @@ fn boundary_node(
     wall_h_min: f64,
     boundary: &[StageLevel],
     (opens, moments, width): (&[OpenForm], &[f64], usize),
-    (tide_row, coefficients, nodes, max_constituents): TideRows<'_>,
+    tides: TideRows<'_>,
+    parents: ParentRows<'_>,
+    parent_slot: &[u32],
     level: &[u32],
     (h, hu, hv, bed): (&[f64], &[f64], &[f64], &[f64]),
     affine: &[u32],
@@ -721,21 +814,23 @@ fn boundary_node(
     } else {
         let i = rf as usize;
         let form = &opens[i];
-        let external = if form.constituents == 0 {
-            open_external(open, form, i, bed[left], 0, &[], &[], &[], 0)
+        // The edge's rows in its form's table (none for a uniform state)
+        let row = if form.kind == UNIFORM {
+            0
         } else {
-            open_external(
-                open,
-                form,
-                i,
-                bed[left],
-                tide_row[e] as usize + fi,
-                &moments[l * width..(l + 1) * width],
-                coefficients,
-                nodes,
-                max_constituents,
-            )
+            tides.0[e] as usize + fi
         };
+        let external = open_external(
+            open,
+            form,
+            i,
+            bed[left],
+            row,
+            &moments[l * width..(l + 1) * width],
+            tides,
+            parents,
+            parent_slot,
+        );
         open_flux(
             &q_left, state, bed[left], normal, time, g, h_min, external, open, i,
         )
@@ -921,9 +1016,9 @@ pub mod kernels {
     /// The F* of the listed boundary edges (one thread per face node): walls
     /// and open boundaries at their element's stage time, `boundary`'s
     /// entry of its level (and the tides' `moments`, a row of `width` per
-    /// level); an open boundary's data is its form's (`opens`), atlas tides
-    /// the face node's row of the tide tables (`tide_row` of its edge plus
-    /// the face node).
+    /// level); an open boundary's data is its form's (`opens`): atlas tides
+    /// or a parent from the face node's row of its form's table (`row` of
+    /// its edge plus the face node).
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn boundary_fluxes(
@@ -935,10 +1030,14 @@ pub mod kernels {
         opens: &[OpenForm],
         moments: &[f64],
         width: u32,
-        tide_row: &[u32],
+        row: &[u32],
         tide_coefficients: &[[f64; 6]],
         tide_nodes: &[[f64; 2]],
         max_constituents: u32,
+        parents: &[ParentForm],
+        parent_series: &[[f32; 3]],
+        parent_slots: &[[f64; 2]],
+        parent_row_slot: &[u32],
         level: &[u32],
         list: &[u32],
         n: u32,
@@ -969,11 +1068,13 @@ pub mod kernels {
             boundary,
             (opens, moments, width as usize),
             (
-                tide_row,
+                row,
                 tide_coefficients,
                 tide_nodes,
                 max_constituents as usize,
             ),
+            (parents, parent_series, parent_slots),
+            parent_row_slot,
             level,
             (h, hu, hv, bed),
             affine,
@@ -988,6 +1089,80 @@ pub mod kernels {
         unsafe {
             let slots = out.as_mut_ptr().add(e) as *mut [f64; 3];
             *slots.add(fi) = f;
+        }
+    }
+
+    /// The nesting's relaxation band towards parent `p` (`NestingRelaxation2D`
+    /// with `rate`, `wet_depth`, `momentum_only`), added to the RHS `out`
+    /// of the listed elements (one thread per element), after the element
+    /// kernels: as the CPU adds its sources after the Coriolis force, its
+    /// `add_element` node by node over the band's elements (`band`, every
+    /// node with a slot, `slot_of_node`; both parent `p`'s of
+    /// `n_elements` elements), dgcom's `relaxation_source` at the element's
+    /// level's time ([`parent_at`]).
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn nesting_relaxation(
+        p: u32,
+        rate: f64,
+        wet_depth: f64,
+        momentum_only: u32,
+        parents: &[ParentForm],
+        series: &[[f32; 3]],
+        slots: &[[f64; 2]],
+        slot_of_node: &[u32],
+        band: &[u32],
+        n_elements: u32,
+        moments: &[f64],
+        width: u32,
+        level: &[u32],
+        list: &[u32],
+        n: u32,
+        h: &[f64],
+        hu: &[f64],
+        hv: &[f64],
+        bed: &[f64],
+        mut out_h: DisjointSlice<f64>,
+        mut out_hu: DisjointSlice<f64>,
+        mut out_hv: DisjointSlice<f64>,
+    ) {
+        let Some(k) = item(thread::index_1d().get(), list, n) else {
+            return;
+        };
+        let p = p as usize;
+        let n_el = n_elements as usize;
+        if band[p * n_el + k] == 0 {
+            return;
+        }
+        let form = &parents[p];
+        let width = width as usize;
+        let l = level_of(level, k);
+        let moment = &moments[l * width..(l + 1) * width];
+        for i in 0..NN {
+            let node = k * NN + i;
+            let slot = slot_of_node[p * n_el * NN + node];
+            if slot == u32::MAX {
+                continue;
+            }
+            let slot = slot as usize;
+            let q = SWEState2D::new(h[node], hu[node], hv[node]);
+            let b = bed[node];
+            let s = relaxation_source(
+                slots[form.slots as usize + slot][1],
+                rate,
+                wet_depth,
+                momentum_only != 0,
+                &q,
+                b,
+                || parent_at(form, slot, moment, series, slots, b),
+            );
+            // SAFETY: thread k writes only its own element's rows (the
+            // listed elements are distinct), and k < n_elements.
+            unsafe {
+                *out_h.get_unchecked_mut(node) += s.h;
+                *out_hu.get_unchecked_mut(node) += s.hu;
+                *out_hv.get_unchecked_mut(node) += s.hv;
+            }
         }
     }
 
@@ -2178,8 +2353,9 @@ pub enum Formulation {
 /// The 2D SWE physics module on the GPU: dgcom's `SWEPhysics2D` as a device
 /// runs it ([`Self::from_form`]): a split formulation ([`Formulation`]), a
 /// bed, walls (`Reflective2D`) and characteristic open boundaries
-/// (`CharacteristicOBC` with a uniform external state or atlas tides per
-/// node, `DeviceExternal2D`), the Coriolis force,
+/// (`CharacteristicOBC` with a uniform external state, atlas tides or a
+/// parent per node, `DeviceExternal2D`), the Coriolis force, the nesting's
+/// relaxation band,
 /// the wet/dry correction after every stage and the thin-layer relaxation
 /// (its positivity limiter the redundant one of the case runner,
 /// `Positivity(h_dry)`), Manning friction applied point-implicitly, the
@@ -2199,7 +2375,12 @@ pub struct GpuSWE2D<'a> {
     /// elevation-only data, in the order of [`OpenStates`], and their forms
     /// and atlas tides on the device
     opens: Vec<(DeviceExternal2D<'a>, ElevationOnly)>,
-    tides: TideTables,
+    /// The parents of the open boundaries and the relaxation bands (each
+    /// once), and the bands, each with its parent's index, in the order the
+    /// CPU adds them (after the Coriolis force)
+    parents: Vec<&'a OceanModelState>,
+    relaxations: Vec<(usize, &'a NestingRelaxation2D)>,
+    forcing: Forcing,
     coriolis: Option<CoriolisSource2D>,
     wet_dry: Option<WetDryConfig>,
     friction: Option<ManningFriction2D>,
@@ -2229,81 +2410,157 @@ pub struct GpuSWE2D<'a> {
     no_rows: Mutex<[DeviceBuffer<f64>; 3]>,
 }
 
-/// The open boundaries' atlas tides on the device (`DeviceExternal2D::Tides`):
-/// every open boundary's form, and a row per face node of a tide-forced
-/// boundary edge: its constants (`BoundaryTides::coefficients`, padded to
-/// the most constituents of any boundary) and `[mean, source depth]`.
-struct TideTables {
+/// The open boundaries' external data and the parents on the device
+/// (`DeviceExternal2D`, `DeviceSource2D::NestingRelaxation`): every open
+/// boundary's form; a row per face node of a tide- or parent-forced
+/// boundary edge, in its form's table: a tide row's constants
+/// (`BoundaryTides::coefficients`, padded to the most constituents of any
+/// boundary) and `[mean, source depth]`, a parent row's slot; and every
+/// parent's form, its slots' snapshots and `[parent depth, band weight]`,
+/// its slot of every mesh node and its band elements. A level's moments
+/// are the tides' (`1 + 3 n_c` each), then the parents' (`OceanModelState::MOMENT`
+/// each).
+struct Forcing {
     /// Every open boundary's form, on the host and on the device
     host: Vec<OpenForm>,
     forms: DeviceBuffer<OpenForm>,
-    /// Every edge's first row (`u32::MAX` but on a tide-forced boundary;
-    /// empty without tides)
+    /// Every edge's first row in its form's table (`u32::MAX` but on a
+    /// tide- or parent-forced boundary; empty without either)
     row: DeviceBuffer<u32>,
     coefficients: DeviceBuffer<[f64; 6]>,
     nodes: DeviceBuffer<[f64; 2]>,
     max_constituents: usize,
-    /// The values of a level's moments (`OpenForm::moment`)
+    /// Every parent's form, on the host and on the device
+    parents_host: Vec<ParentForm>,
+    parents: DeviceBuffer<ParentForm>,
+    series: DeviceBuffer<[f32; 3]>,
+    slots: DeviceBuffer<[f64; 2]>,
+    /// Each parent's slot of every mesh node and its band elements (a
+    /// mesh's worth per parent)
+    slot_of_node: DeviceBuffer<u32>,
+    band: DeviceBuffer<u32>,
+    /// A parent row's slot
+    parent_row_slot: DeviceBuffer<u32>,
+    /// The values of a level's moments
     width: usize,
 }
 
-impl TideTables {
-    /// The tables of `opens` (by index, as the edges' codes), on `mesh`
-    /// with `ops`; `code` gives each boundary tag's code.
+impl Forcing {
+    /// The tables of `opens` (by index, as the edges' codes; `code` gives
+    /// each boundary tag's) and of `parents`, on `mesh` with `ops`.
     fn upload(
         gpu: &Gpu,
         mesh: &Mesh2D,
         ops: &DGOperators2D,
         opens: &[(DeviceExternal2D<'_>, ElevationOnly)],
         code: impl Fn(Option<BoundaryTag>) -> u32,
+        parents: &[&OceanModelState],
     ) -> Result<Self, String> {
         let stream = &gpu.stream;
         let device = |e: cuda_core::DriverError| e.to_string();
-        let mut forms = Vec::with_capacity(opens.len());
+        let parent_of = |parent: &OceanModelState| {
+            parents
+                .iter()
+                .position(|p| p.is(parent))
+                .expect("every open boundary's parent is listed")
+        };
+        // The moments: the tides', then the parents'
         let mut width = 0;
         let mut max_constituents = 0;
+        let mut forms = Vec::with_capacity(opens.len());
         for (external, _) in opens {
             forms.push(match external {
                 DeviceExternal2D::Uniform(_) => OpenForm::default(),
                 DeviceExternal2D::Tides(tides) => {
                     let n = tides.n_constituents();
                     let form = OpenForm {
+                        kind: TIDES,
                         constituents: n as u32,
                         moment: width as u32,
                         velocity: u32::from(tides.has_velocity()),
                         max_transport_ratio: tides.max_transport_ratio().unwrap_or(0.0),
+                        ..OpenForm::default()
                     };
                     width += 1 + 3 * n;
                     max_constituents = max_constituents.max(n);
                     form
                 }
+                DeviceExternal2D::Parent(parent) => OpenForm {
+                    kind: PARENT,
+                    parent: parent_of(parent) as u32,
+                    ..OpenForm::default()
+                },
             });
         }
-        let (mut row, mut coefficients, mut nodes) = (Vec::new(), Vec::new(), Vec::new());
-        if max_constituents > 0 {
+        let n_flat = mesh.n_elements * NN;
+        let mut parent_forms = Vec::with_capacity(parents.len());
+        let (mut series, mut slots) = (Vec::new(), Vec::new());
+        let (mut slot_of_node, mut band) = (Vec::new(), Vec::new());
+        for parent in parents {
+            parent_forms.push(ParentForm {
+                n_times: parent.reader().n_times() as u32,
+                series: u32::try_from(series.len()).map_err(|_| "a parent too long")?,
+                slots: slots.len() as u32,
+                moment: width as u32,
+                velocity: u32::from(parent.has_velocity()),
+                max_transport_ratio: parent.max_transport_ratio().unwrap_or(0.0),
+                reference_level: parent.reference_level(),
+            });
+            width += OceanModelState::MOMENT;
+            for slot in 0..parent.n_slots() {
+                series.extend_from_slice(parent.slot_series(slot));
+                slots.push([parent.parent_depth(slot), parent.band_weight(slot)]);
+            }
+            assert_eq!(
+                parent.slot_of_node().len(),
+                n_flat,
+                "the parent of this mesh"
+            );
+            slot_of_node.extend_from_slice(parent.slot_of_node());
+            band.extend(parent.band_elements().iter().map(|&b| u32::from(b)));
+        }
+
+        // A row per face node of a tide- or parent-forced edge
+        let (mut row, mut coefficients, mut nodes, mut parent_row_slot) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        if forms.iter().any(|f| f.kind != UNIFORM) {
             row = vec![u32::MAX; mesh.n_edges];
-            for (e, edge) in mesh.edges.iter().enumerate() {
-                if edge.right.is_some() {
-                    continue;
+        }
+        for (e, edge) in mesh.edges.iter().enumerate() {
+            if edge.right.is_some() {
+                continue;
+            }
+            let Some((external, _)) = opens.get(code(edge.boundary_tag) as usize) else {
+                continue;
+            };
+            let k = ElementIndex::new(edge.left.element);
+            // The node and position of the CPU's boundary context
+            // (`boundary_state`) at face node `fi`
+            let node = |fi: usize| {
+                let node = face_node(edge.left.face, fi);
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[node], ops.nodes_s[node]);
+                (Some(k.as_usize() * ops.n_nodes + node), (x, y))
+            };
+            match external {
+                DeviceExternal2D::Uniform(_) => {}
+                DeviceExternal2D::Tides(tides) => {
+                    row[e] = nodes.len() as u32;
+                    for fi in 0..N1 {
+                        let (index, position) = node(fi);
+                        let slot = tides.slot_of(index, position);
+                        let constants = tides.coefficients(slot).as_chunks::<6>().0;
+                        coefficients.extend_from_slice(constants);
+                        coefficients
+                            .resize(nodes.len() * max_constituents + max_constituents, [0.0; 6]);
+                        nodes.push([tides.node_mean(slot), tides.source_depths()[slot]]);
+                    }
                 }
-                let open = code(edge.boundary_tag);
-                let Some((DeviceExternal2D::Tides(tides), _)) = opens.get(open as usize) else {
-                    continue;
-                };
-                row[e] = nodes.len() as u32;
-                let k = ElementIndex::new(edge.left.element);
-                for fi in 0..N1 {
-                    // The node and position of the CPU's boundary context
-                    // (`boundary_state`)
-                    let node = face_node(edge.left.face, fi);
-                    let [x, y] =
-                        mesh.reference_to_physical(k, ops.nodes_r[node], ops.nodes_s[node]);
-                    let slot = tides.slot_of(Some(k.as_usize() * ops.n_nodes + node), (x, y));
-                    let constants = tides.coefficients(slot).as_chunks::<6>().0;
-                    coefficients.extend_from_slice(constants);
-                    coefficients
-                        .resize(nodes.len() * max_constituents + max_constituents, [0.0; 6]);
-                    nodes.push([tides.node_mean(slot), tides.source_depths()[slot]]);
+                DeviceExternal2D::Parent(parent) => {
+                    row[e] = parent_row_slot.len() as u32;
+                    for fi in 0..N1 {
+                        let (index, position) = node(fi);
+                        parent_row_slot.push(parent.slot_of(index, position) as u32);
+                    }
                 }
             }
         }
@@ -2314,13 +2571,20 @@ impl TideTables {
             coefficients: DeviceBuffer::from_host(stream, &coefficients).map_err(device)?,
             nodes: DeviceBuffer::from_host(stream, &nodes).map_err(device)?,
             max_constituents,
+            parents: DeviceBuffer::from_host(stream, &parent_forms).map_err(device)?,
+            parents_host: parent_forms,
+            series: DeviceBuffer::from_host(stream, &series).map_err(device)?,
+            slots: DeviceBuffer::from_host(stream, &slots).map_err(device)?,
+            slot_of_node: DeviceBuffer::from_host(stream, &slot_of_node).map_err(device)?,
+            band: DeviceBuffer::from_host(stream, &band).map_err(device)?,
+            parent_row_slot: DeviceBuffer::from_host(stream, &parent_row_slot).map_err(device)?,
             width,
         })
     }
 }
 
 /// A stage's boundary data on the device: [`StageLevel`] per level and the
-/// tides' moments per level (rows of [`TideTables::width`]), each stage's
+/// moments per level (rows of [`Forcing::width`]), each stage's
 /// copied from a host slot of a ring, which outlives its asynchronous copy
 /// (the stream is synchronized each time the ring wraps).
 struct BoundaryUploads {
@@ -2577,9 +2841,43 @@ impl<'a> GpuSWE2D<'a> {
                 .find_map(|&(t, code)| (t == tag).then_some(code))
                 .expect("every boundary tag has a form")
         };
-        let coriolis = form.source.map(|source| match source {
-            DeviceSource2D::Coriolis(c) => c,
-        });
+        // The sources: the Coriolis force (in the element kernels) first,
+        // then the relaxation bands (a kernel each, after them)
+        let mut coriolis = None;
+        let mut relaxations: Vec<&NestingRelaxation2D> = Vec::new();
+        for source in &form.sources {
+            match *source {
+                DeviceSource2D::Coriolis(c) => {
+                    if coriolis.is_some() || !relaxations.is_empty() {
+                        return Err(
+                            "a Coriolis force after another source (the device adds it first)"
+                                .into(),
+                        );
+                    }
+                    coriolis = Some(c);
+                }
+                DeviceSource2D::NestingRelaxation(r) => relaxations.push(r),
+            }
+        }
+        // Every parent once
+        let mut parents: Vec<&OceanModelState> = Vec::new();
+        let mut parent_index =
+            |parent: &'a OceanModelState| match parents.iter().position(|p| p.is(parent)) {
+                Some(i) => i,
+                None => {
+                    parents.push(parent);
+                    parents.len() - 1
+                }
+            };
+        for (external, _) in &opens {
+            if let DeviceExternal2D::Parent(parent) = external {
+                parent_index(parent);
+            }
+        }
+        let relaxations: Vec<(usize, &NestingRelaxation2D)> = relaxations
+            .into_iter()
+            .map(|r| (parent_index(r.parent()), r))
+            .collect();
         let friction = form.friction.as_ref().map(|law| match law {
             DeviceFriction2D::Manning(m) => m.clone(),
         });
@@ -2594,7 +2892,7 @@ impl<'a> GpuSWE2D<'a> {
             coriolis.as_ref(),
         )
         .map_err(device)?;
-        let tides = TideTables::upload(gpu, mesh, ops, &opens, boundary)?;
+        let forcing = Forcing::upload(gpu, mesh, ops, &opens, boundary, &parents)?;
         let stream = &gpu.stream;
         let zeroed = |n| DeviceBuffer::zeroed(stream, n).map_err(|e| e.to_string());
         Ok(Self {
@@ -2628,8 +2926,10 @@ impl<'a> GpuSWE2D<'a> {
             ),
             no_list: DeviceBuffer::zeroed(stream, 0).map_err(|e| e.to_string())?,
             no_rows: Mutex::new([zeroed(0)?, zeroed(0)?, zeroed(0)?]),
-            boundary: Mutex::new(BoundaryUploads::new(gpu, tides.width)?),
-            tides,
+            boundary: Mutex::new(BoundaryUploads::new(gpu, forcing.width)?),
+            parents,
+            relaxations,
+            forcing,
         })
     }
 
@@ -2642,8 +2942,8 @@ impl<'a> GpuSWE2D<'a> {
     }
 
     /// The open boundaries' data at `time`: the uniform external states
-    /// and every boundary's elevation-only velocity, and the tides' moments
-    /// into `moments` (a level's row).
+    /// and every boundary's elevation-only velocity, and the tides' and the
+    /// parents' moments into `moments` (a level's row).
     fn open_states(&self, time: f64, moments: &mut [f64]) -> OpenStates {
         let mut open = OpenStates::default();
         for (i, (external, elevation_only)) in self.opens.iter().enumerate() {
@@ -2658,11 +2958,16 @@ impl<'a> GpuSWE2D<'a> {
                     open.flags[i] = u32::from(state.velocity.is_some()) | incoming;
                 }
                 DeviceExternal2D::Tides(tides) => {
-                    let m = self.tides.host[i].moment as usize;
+                    let m = self.forcing.host[i].moment as usize;
                     tides.moment(time, &mut moments[m..m + 1 + 3 * tides.n_constituents()]);
                     open.flags[i] = incoming;
                 }
+                DeviceExternal2D::Parent(_) => open.flags[i] = incoming,
             }
+        }
+        for (parent, form) in self.parents.iter().zip(&self.forcing.parents_host) {
+            let m = form.moment as usize;
+            parent.moment(time, &mut moments[m..m + OceanModelState::MOMENT]);
         }
         open
     }
@@ -2728,7 +3033,7 @@ impl<'a> GpuSWE2D<'a> {
         };
         let mut faces = self.faces.lock().expect("face buffer");
         let mut uploads = self.boundary.lock().expect("boundary data");
-        let width = self.tides.width;
+        let width = self.forcing.width;
         let (boundary, moments) = uploads.upload(&gpu.stream, |levels, moments| {
             for (l, &time) in times.iter().enumerate() {
                 let open = self.open_states(time, &mut moments[l * width..(l + 1) * width]);
@@ -2794,13 +3099,17 @@ impl<'a> GpuSWE2D<'a> {
                         self.h_min,
                         self.wall_h_min,
                         boundary,
-                        &self.tides.forms,
+                        &self.forcing.forms,
                         moments,
                         width as u32,
-                        &self.tides.row,
-                        &self.tides.coefficients,
-                        &self.tides.nodes,
-                        self.tides.max_constituents as u32,
+                        &self.forcing.row,
+                        &self.forcing.coefficients,
+                        &self.forcing.nodes,
+                        self.forcing.max_constituents as u32,
+                        &self.forcing.parents,
+                        &self.forcing.series,
+                        &self.forcing.slots,
+                        &self.forcing.parent_row_slot,
                         level,
                         boundary_list,
                         n_boundary as u32,
@@ -2885,6 +3194,40 @@ impl<'a> GpuSWE2D<'a> {
                         out_hv,
                     )
                     .expect("element RHS (subcells)");
+            }
+            // The relaxation bands, in the CPU's order, after the Coriolis
+            // force of the element kernels
+            let f = &self.forcing;
+            for &(p, relaxation) in &self.relaxations {
+                let [out_h, out_hu, out_hv] = out.fields_mut();
+                gpu.module
+                    .nesting_relaxation(
+                        &gpu.stream,
+                        one_dimensional(n_elements as usize),
+                        p as u32,
+                        relaxation.rate(),
+                        relaxation.wet_depth(),
+                        u32::from(relaxation.momentum_only()),
+                        &f.parents,
+                        &f.series,
+                        &f.slots,
+                        &f.slot_of_node,
+                        &f.band,
+                        self.mesh.n_elements as u32,
+                        moments,
+                        width as u32,
+                        level,
+                        element_list,
+                        n_elements,
+                        &state.h,
+                        &state.hu,
+                        &state.hv,
+                        &s.bed,
+                        out_h,
+                        out_hu,
+                        out_hv,
+                    )
+                    .expect("nesting relaxation");
             }
         }
     }

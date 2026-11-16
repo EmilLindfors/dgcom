@@ -23,7 +23,7 @@ use crate::source::{DeviceFriction2D, DeviceSource2D};
 
 /// [`SWEPhysics2D`] as a device runs it: the mesh and operators, the bed, the
 /// equation, the split form, the wet/dry treatment, the friction law, the
-/// source and the boundary condition of each boundary tag of the mesh.
+/// sources and the boundary condition of each boundary tag of the mesh.
 pub struct SWEDeviceForm2D<'a> {
     /// The mesh
     pub mesh: &'a Arc<Mesh2D>,
@@ -46,8 +46,8 @@ pub struct SWEDeviceForm2D<'a> {
     pub wet_dry: Option<WetDryConfig>,
     /// Bottom friction, point-implicit in every stage
     pub friction: Option<DeviceFriction2D>,
-    /// The source term
-    pub source: Option<DeviceSource2D>,
+    /// The source terms, in the order the CPU adds them
+    pub sources: Vec<DeviceSource2D<'a>>,
     /// The boundary condition of each boundary tag of the mesh's boundary
     /// faces
     pub boundaries: Vec<(Option<BoundaryTag>, DeviceBoundary2D<'a>)>,
@@ -104,13 +104,11 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
             ),
             None => None,
         };
-        let source = match &self.source {
-            Some(source) => Some(
-                source
-                    .device_form()
-                    .ok_or_else(|| format!("the source term {}", source.name()))?,
-            ),
-            None => None,
+        let sources = match &self.source {
+            Some(source) => source
+                .device_forms()
+                .map_err(|name| format!("the source term {name}"))?,
+            None => Vec::new(),
         };
         let mut boundaries: Vec<(Option<BoundaryTag>, DeviceBoundary2D<'_>)> = Vec::new();
         for edge in self.mesh.edges.iter().filter(|e| e.right.is_none()) {
@@ -136,7 +134,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
             subcells: config.subcells(),
             wet_dry: self.wet_dry.clone(),
             friction,
-            source,
+            sources,
             boundaries,
             line_local_depth: self.line_local_depth(),
             positivity_h_dry: self.positivity_bound(None).map(|bound| bound.h_dry),

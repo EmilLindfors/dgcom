@@ -139,10 +139,27 @@ impl ElementSources<'_> {
 
 /// A source term as a device runs it ([`SourceTerm2D::device_form`]): a
 /// closed set of forms, as data.
-#[derive(Clone, Copy, Debug)]
-pub enum DeviceSource2D {
+#[derive(Clone, Copy)]
+pub enum DeviceSource2D<'a> {
     /// The Coriolis force, f- or β-plane
     Coriolis(crate::source::CoriolisSource2D),
+    /// The nesting's relaxation band towards its parent: the device holds
+    /// the parent's series per node and evaluates the source with
+    /// [`crate::boundary::relaxation_source`]
+    NestingRelaxation(&'a crate::boundary::NestingRelaxation2D),
+}
+
+impl std::fmt::Debug for DeviceSource2D<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Coriolis(c) => f.debug_tuple("Coriolis").field(c).finish(),
+            Self::NestingRelaxation(r) => f
+                .debug_struct("NestingRelaxation")
+                .field("rate", &r.rate())
+                .field("slots", &r.parent().n_slots())
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Trait for 2D source terms in shallow water equations.
@@ -208,8 +225,15 @@ pub trait SourceTerm2D: Send + Sync {
 
     /// This source as a device runs it, if it has a device form (P2.7,
     /// `notes/gpu.md`): a run on a device refuses a source without one.
-    fn device_form(&self) -> Option<DeviceSource2D> {
+    fn device_form(&self) -> Option<DeviceSource2D<'_>> {
         None
+    }
+
+    /// The device forms of this source in the order it adds them (one for
+    /// a single source, [`Self::device_form`]; each of a combination's), or
+    /// the name of the first without one.
+    fn device_forms(&self) -> Result<Vec<DeviceSource2D<'_>>, &'static str> {
+        self.device_form().map(|form| vec![form]).ok_or(self.name())
     }
 
     /// Whether this source term discretizes the bed-slope force `−g h ∇B`.
@@ -325,6 +349,14 @@ impl<'a> SourceTerm2D for CombinedSource2D<'a> {
             source.add_mass_element(element, h);
         }
     }
+
+    fn device_forms(&self) -> Result<Vec<DeviceSource2D<'_>>, &'static str> {
+        let mut forms = Vec::with_capacity(self.sources.len());
+        for source in &self.sources {
+            forms.extend(source.device_forms()?);
+        }
+        Ok(forms)
+    }
 }
 
 /// Owned counterpart of [`CombinedSource2D`]: sums source terms held by
@@ -400,6 +432,14 @@ impl SourceTerm2D for SourceTerms2D {
         for source in &self.sources {
             source.add_mass_element(element, h);
         }
+    }
+
+    fn device_forms(&self) -> Result<Vec<DeviceSource2D<'_>>, &'static str> {
+        let mut forms = Vec::with_capacity(self.sources.len());
+        for source in &self.sources {
+            forms.extend(source.device_forms()?);
+        }
+        Ok(forms)
     }
 }
 
