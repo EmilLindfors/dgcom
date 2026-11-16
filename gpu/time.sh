@@ -11,8 +11,8 @@
 # 1. The gates, built with --no-fmad, against the SIMD batch: the RHS and
 #    Simulation runs (`all`), the drying beach (`beach`) and
 #    cases/tidal_channel through the case runner (`case`), also with local
-#    time stepping (`case_lts`). On any card each must be the CPU's bit for
-#    bit.
+#    time stepping (`case_lts`) and forced by a tidal atlas (`case_atlas`).
+#    On any card each must be the CPU's bit for bit.
 # 2. The timing, built with FMA: the refined tidal channel at each size, on
 #    the CPU and on the GPU, REPEATS times.
 # 3. Nsight Systems' kernel times on the first size, if nsys is found.
@@ -31,6 +31,7 @@ FORCE=${FORCE:-0}
 gpu_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(dirname "$gpu_dir")
 case_file="$repo/cases/tidal_channel/case.toml"
+atlas_file="$repo/cases/tidal_channel/atlas.toml"
 exe="$gpu_dir/target/release/dgcom-gpu"
 case $(uname -s) in MINGW* | MSYS*) exe+=".exe" ;; esac
 
@@ -108,11 +109,13 @@ if ((SKIP_GATES == 0)); then
     say ""
     say "| gate | result |"
     say "|---|---|"
-    for gate in all beach case case_lts; do
+    for gate in all beach case case_lts case_atlas; do
         if [[ $gate == case ]]; then
             run_logged "gate_$gate" "$exe" case "$case_file"
         elif [[ $gate == case_lts ]]; then
             run_logged "gate_$gate" "$exe" case "$case_file" --set numerics.local_time_stepping_levels=3
+        elif [[ $gate == case_atlas ]]; then
+            run_logged "gate_$gate" "$exe" case "$atlas_file"
         else
             run_logged "gate_$gate" "$exe" "$gate"
         fi
@@ -126,6 +129,8 @@ if ((SKIP_GATES == 0)); then
             what="steps, volume, clips and station records"
         elif [[ $gate == case_lts ]]; then
             what="the same with local time stepping (3 levels)"
+        elif [[ $gate == case_atlas ]]; then
+            what="the same forced by a tidal atlas node by node"
         else
             what="every node of $compared state$( ((compared == 1)) || echo s)"
         fi

@@ -14,7 +14,7 @@
 
 use super::BCContext2D;
 use super::TidalConstituent;
-use super::characteristic::{ExternalState, ExternalStateProvider};
+use super::characteristic::{DeviceExternal2D, ExternalState, ExternalStateProvider};
 use crate::io::ConstituentData;
 use crate::tides::{NodalDrift, canonical_name};
 use crate::time::ModelClock;
@@ -143,6 +143,10 @@ impl ExternalStateProvider for HarmonicTide {
 
     fn uniform_state(&self, t: f64) -> Option<ExternalState> {
         Some(ExternalState::elevation(self.elevation(t)))
+    }
+
+    fn device_external(&self) -> Option<DeviceExternal2D<'_>> {
+        Some(DeviceExternal2D::Uniform(self))
     }
 }
 

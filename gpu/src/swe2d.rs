@@ -7,7 +7,9 @@
 //! (the subcells in elements with a node shallower than the subcell depth,
 //! the hydrostatic HLL at faces) with a bed, walls (`Reflective2D`, called
 //! as the CPU calls it), characteristic open boundaries with an external
-//! state uniform along each (a harmonic tide, still water), Coriolis; global
+//! state uniform along each (a harmonic tide, still water) or atlas tides
+//! node by node (`BoundaryTides`: each constituent's time factors from the
+//! host once per stage time, the sums per node on the device), Coriolis; global
 //! steps through the fused per-element stages, and local time stepping
 //! (dgcom's `Multirate`, [`LocalTimeStepping`]: each pass a prefix of the
 //! coarse step's elements and edges sorted by level, each element's stage
@@ -35,8 +37,8 @@ use cuda_device::{DisjointSlice, device, kernel, thread};
 use cuda_host::cuda_module;
 use dgcom::SWEState2D;
 use dgcom::boundary::{
-    BCContext2D, DeviceBoundary2D, ElevationOnly, ExternalState, ExternalStateProvider,
-    Reflective2D, SWEBoundaryCondition2D, characteristic_boundary_state,
+    BCContext2D, DeviceBoundary2D, DeviceExternal2D, ElevationOnly, ExternalState, Reflective2D,
+    SWEBoundaryCondition2D, characteristic_boundary_state, tide_state, tide_term,
 };
 use dgcom::flux::{
     SWENodeState2D, entropy_stable_dissipation_2d, wintermeyer_bed_interface_term_2d,
@@ -83,18 +85,41 @@ const WALL: u32 = u32::MAX;
 /// kernels take.
 pub const MAX_OPEN: usize = 4;
 
-/// The external state of every open boundary at the time of a stage,
-/// evaluated on the host (`ExternalStateProvider::uniform_state`) and passed
-/// to the edge kernels by value.
+/// The open boundaries at the time of a stage on one level: the external
+/// state of each boundary with a uniform one, evaluated on the host
+/// (`ExternalStateProvider::uniform_state`), and every boundary's flags.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenStates {
-    /// η, u, v of each boundary's external state
+    /// η, u, v of each boundary's uniform external state (unused for
+    /// atlas tides, [`OpenForm`])
     pub state: [[f64; 3]; MAX_OPEN],
     /// Bit 0: the state has a velocity (else elevation only); bit 1:
     /// elevation-only data enter as a wave (`ElevationOnly::IncomingWave`)
     pub flags: [u32; MAX_OPEN],
 }
+
+/// An open boundary's external data as the boundary kernel evaluates it
+/// (`DeviceExternal2D`), in a device buffer: a uniform state (its level's
+/// [`OpenStates`] entry) if `constituents` is 0, else atlas tides per face
+/// node (`BoundaryTides`): the constants of a face node's row of the tide
+/// tables, the time factors of its level's row of the moments.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenForm {
+    /// The tides' constituents (0: a uniform state)
+    pub constituents: u32,
+    /// The tides' moment in a level's row of the moments
+    /// (`BoundaryTides::moment`: the ramp, then 3 per constituent)
+    pub moment: u32,
+    /// The tides carry a velocity
+    pub velocity: u32,
+    /// The largest transport-scaling factor (0: not scaled)
+    pub max_transport_ratio: f64,
+}
+
+// SAFETY: plain old data (u32s and an f64, `#[repr(C)]`).
+unsafe impl cuda_core::DeviceCopy for OpenForm {}
 
 /// Local time stepping's levels below the coarsest that the kernels take
 /// (a stage's boundary data has an entry per level, [`StageLevel`]).
@@ -513,9 +538,57 @@ fn wall_flux(
     surface_flux(q_int, &q_ext, normal, g, hll, h_min).0
 }
 
+/// The external state of open boundary `i` at a face node over bed `bed`:
+/// its level's uniform state (`open`), or its atlas tides from the node's
+/// row of the tide tables (`row`; `coefficients` and `nodes`, `[mean,
+/// source depth]`, with `max_constituents` per row) and the level's moment
+/// (`moment`), dgcom's `tide_term` and `tide_state`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn open_external(
+    open: &OpenStates,
+    form: &OpenForm,
+    i: usize,
+    bed: f64,
+    row: usize,
+    moment: &[f64],
+    coefficients: &[[f64; 6]],
+    nodes: &[[f64; 2]],
+    max_constituents: usize,
+) -> ExternalState {
+    if form.constituents == 0 {
+        let [eta, u, v] = open.state[i];
+        return if open.flags[i] & 1 != 0 {
+            ExternalState::new(eta, u, v)
+        } else {
+            ExternalState::elevation(eta)
+        };
+    }
+    let m = form.moment as usize;
+    let mut sum = [0.0; 3];
+    for j in 0..form.constituents as usize {
+        let p = m + 1 + 3 * j;
+        tide_term(
+            &mut sum,
+            &coefficients[row * max_constituents + j],
+            moment[p],
+            moment[p + 1],
+            moment[p + 2],
+        );
+    }
+    let [mean, source_depth] = nodes[row];
+    let transport = if form.max_transport_ratio > 0.0 {
+        Some((form.max_transport_ratio, source_depth))
+    } else {
+        None
+    };
+    tide_state(sum, moment[m], mean, form.velocity != 0, transport, bed)
+}
+
 /// `SplitFormSWE2D::boundary_flux` at a characteristic open boundary:
 /// dgcom's `characteristic_boundary_state` from the interior trace and the
-/// external state of open boundary `i`, its physical flux `F(q_b)·n`.
+/// external state `external` of open boundary `i` (its elevation-only data's
+/// velocity from `open`), its physical flux `F(q_b)·n`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn open_flux(
@@ -526,22 +599,17 @@ fn open_flux(
     time: f64,
     g: f64,
     h_min: f64,
+    external: ExternalState,
     open: &OpenStates,
     i: usize,
 ) -> SWEState2D {
-    let [eta, u, v] = open.state[i];
     let flags = open.flags[i];
-    let external = if flags & 1 != 0 {
-        ExternalState::new(eta, u, v)
-    } else {
-        ExternalState::elevation(eta)
-    };
     let elevation_only = if flags & 2 != 0 {
         ElevationOnly::IncomingWave
     } else {
         ElevationOnly::AtRest
     };
-    // The position is not read by a uniform external state
+    // The position is not read with the external state given
     let ctx = BCContext2D::new(time, (0.0, 0.0), state, bed, normal, g, h_min);
     let q = characteristic_boundary_state(&ctx, external, elevation_only);
     let q_b = SWENodeState2D::new(&q, q_int.b, h_min);
@@ -600,10 +668,18 @@ fn edge_body<const HLL: bool>(
     }
 }
 
+/// The tide tables as the boundary kernel reads them ([`TideTables`]):
+/// every edge's first row, each row's constants and `[mean, source depth]`,
+/// and the constituents per row.
+type TideRows<'a> = (&'a [u32], &'a [[f64; 6]], &'a [[f64; 2]], usize);
+
 /// `SplitFormSWE2D::boundary_flux` at face node `fi` of boundary edge `e`:
 /// a wall's ghost state or an open boundary's state at its element's stage
-/// time (its level's entry of `boundary`), through the hydrostatic HLL if
-/// `hll`.
+/// time (its level's entry of `boundary`, and of the tides' `moments`, rows
+/// of `width`), through the hydrostatic HLL if `hll`. An open boundary's
+/// external data is its form's (`opens`); atlas tides read the face node's
+/// row of the tide tables (`tides`: every edge's first row, the constants,
+/// `[mean, source depth]` and the constituents per row).
 #[allow(clippy::too_many_arguments)]
 #[device]
 fn boundary_node(
@@ -614,6 +690,8 @@ fn boundary_node(
     h_min: f64,
     wall_h_min: f64,
     boundary: &[StageLevel],
+    (opens, moments, width): (&[OpenForm], &[f64], usize),
+    (tide_row, coefficients, nodes, max_constituents): TideRows<'_>,
     level: &[u32],
     (h, hu, hv, bed): (&[f64], &[f64], &[f64], &[f64]),
     affine: &[u32],
@@ -623,7 +701,10 @@ fn boundary_node(
 ) -> [f64; 3] {
     let [le, lf, _, rf] = edges[e];
     let (le, lf) = (le as usize, lf as usize);
-    let StageLevel { time, open } = boundary[level_of(level, le)];
+    let l = level_of(level, le);
+    // By reference: a copy, indexed by the boundary, would be local memory
+    let StageLevel { time, open } = &boundary[l];
+    let time = *time;
     let normal = if affine[le] != 0 {
         (egeom[le][5 + 3 * lf], egeom[le][6 + 3 * lf])
     } else {
@@ -638,16 +719,25 @@ fn boundary_node(
             &q_left, state, bed[left], normal, time, g, h_min, wall_h_min, hll,
         )
     } else {
+        let i = rf as usize;
+        let form = &opens[i];
+        let external = if form.constituents == 0 {
+            open_external(open, form, i, bed[left], 0, &[], &[], &[], 0)
+        } else {
+            open_external(
+                open,
+                form,
+                i,
+                bed[left],
+                tide_row[e] as usize + fi,
+                &moments[l * width..(l + 1) * width],
+                coefficients,
+                nodes,
+                max_constituents,
+            )
+        };
         open_flux(
-            &q_left,
-            state,
-            bed[left],
-            normal,
-            time,
-            g,
-            h_min,
-            &open,
-            rf as usize,
+            &q_left, state, bed[left], normal, time, g, h_min, external, open, i,
         )
     };
     [f.h, f.hu, f.hv]
@@ -830,7 +920,10 @@ pub mod kernels {
 
     /// The F* of the listed boundary edges (one thread per face node): walls
     /// and open boundaries at their element's stage time, `boundary`'s
-    /// entry of its level.
+    /// entry of its level (and the tides' `moments`, a row of `width` per
+    /// level); an open boundary's data is its form's (`opens`), atlas tides
+    /// the face node's row of the tide tables (`tide_row` of its edge plus
+    /// the face node).
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn boundary_fluxes(
@@ -839,6 +932,13 @@ pub mod kernels {
         h_min: f64,
         wall_h_min: f64,
         boundary: &[StageLevel],
+        opens: &[OpenForm],
+        moments: &[f64],
+        width: u32,
+        tide_row: &[u32],
+        tide_coefficients: &[[f64; 6]],
+        tide_nodes: &[[f64; 2]],
+        max_constituents: u32,
         level: &[u32],
         list: &[u32],
         n: u32,
@@ -867,6 +967,13 @@ pub mod kernels {
             h_min,
             wall_h_min,
             boundary,
+            (opens, moments, width as usize),
+            (
+                tide_row,
+                tide_coefficients,
+                tide_nodes,
+                max_constituents as usize,
+            ),
             level,
             (h, hu, hv, bed),
             affine,
@@ -2071,7 +2178,8 @@ pub enum Formulation {
 /// The 2D SWE physics module on the GPU: dgcom's `SWEPhysics2D` as a device
 /// runs it ([`Self::from_form`]): a split formulation ([`Formulation`]), a
 /// bed, walls (`Reflective2D`) and characteristic open boundaries
-/// (`CharacteristicOBC` with a uniform external state), the Coriolis force,
+/// (`CharacteristicOBC` with a uniform external state or atlas tides per
+/// node, `DeviceExternal2D`), the Coriolis force,
 /// the wet/dry correction after every stage and the thin-layer relaxation
 /// (its positivity limiter the redundant one of the case runner,
 /// `Positivity(h_dry)`), Manning friction applied point-implicitly, the
@@ -2088,8 +2196,10 @@ pub struct GpuSWE2D<'a> {
     /// The walls' `Reflective2D::h_min`
     wall_h_min: f64,
     /// The open boundaries' external data and the velocity of their
-    /// elevation-only data, in the order of [`OpenStates`]
-    opens: Vec<(&'a dyn ExternalStateProvider, ElevationOnly)>,
+    /// elevation-only data, in the order of [`OpenStates`], and their forms
+    /// and atlas tides on the device
+    opens: Vec<(DeviceExternal2D<'a>, ElevationOnly)>,
+    tides: TideTables,
     coriolis: Option<CoriolisSource2D>,
     wet_dry: Option<WetDryConfig>,
     friction: Option<ManningFriction2D>,
@@ -2119,12 +2229,106 @@ pub struct GpuSWE2D<'a> {
     no_rows: Mutex<[DeviceBuffer<f64>; 3]>,
 }
 
-/// A stage's boundary data ([`StageLevel`] per level) on the device: each
-/// stage's copied from a host slot of a ring, which outlives its
-/// asynchronous copy (the stream is synchronized each time the ring wraps).
+/// The open boundaries' atlas tides on the device (`DeviceExternal2D::Tides`):
+/// every open boundary's form, and a row per face node of a tide-forced
+/// boundary edge: its constants (`BoundaryTides::coefficients`, padded to
+/// the most constituents of any boundary) and `[mean, source depth]`.
+struct TideTables {
+    /// Every open boundary's form, on the host and on the device
+    host: Vec<OpenForm>,
+    forms: DeviceBuffer<OpenForm>,
+    /// Every edge's first row (`u32::MAX` but on a tide-forced boundary;
+    /// empty without tides)
+    row: DeviceBuffer<u32>,
+    coefficients: DeviceBuffer<[f64; 6]>,
+    nodes: DeviceBuffer<[f64; 2]>,
+    max_constituents: usize,
+    /// The values of a level's moments (`OpenForm::moment`)
+    width: usize,
+}
+
+impl TideTables {
+    /// The tables of `opens` (by index, as the edges' codes), on `mesh`
+    /// with `ops`; `code` gives each boundary tag's code.
+    fn upload(
+        gpu: &Gpu,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        opens: &[(DeviceExternal2D<'_>, ElevationOnly)],
+        code: impl Fn(Option<BoundaryTag>) -> u32,
+    ) -> Result<Self, String> {
+        let stream = &gpu.stream;
+        let device = |e: cuda_core::DriverError| e.to_string();
+        let mut forms = Vec::with_capacity(opens.len());
+        let mut width = 0;
+        let mut max_constituents = 0;
+        for (external, _) in opens {
+            forms.push(match external {
+                DeviceExternal2D::Uniform(_) => OpenForm::default(),
+                DeviceExternal2D::Tides(tides) => {
+                    let n = tides.n_constituents();
+                    let form = OpenForm {
+                        constituents: n as u32,
+                        moment: width as u32,
+                        velocity: u32::from(tides.has_velocity()),
+                        max_transport_ratio: tides.max_transport_ratio().unwrap_or(0.0),
+                    };
+                    width += 1 + 3 * n;
+                    max_constituents = max_constituents.max(n);
+                    form
+                }
+            });
+        }
+        let (mut row, mut coefficients, mut nodes) = (Vec::new(), Vec::new(), Vec::new());
+        if max_constituents > 0 {
+            row = vec![u32::MAX; mesh.n_edges];
+            for (e, edge) in mesh.edges.iter().enumerate() {
+                if edge.right.is_some() {
+                    continue;
+                }
+                let open = code(edge.boundary_tag);
+                let Some((DeviceExternal2D::Tides(tides), _)) = opens.get(open as usize) else {
+                    continue;
+                };
+                row[e] = nodes.len() as u32;
+                let k = ElementIndex::new(edge.left.element);
+                for fi in 0..N1 {
+                    // The node and position of the CPU's boundary context
+                    // (`boundary_state`)
+                    let node = face_node(edge.left.face, fi);
+                    let [x, y] =
+                        mesh.reference_to_physical(k, ops.nodes_r[node], ops.nodes_s[node]);
+                    let slot = tides.slot_of(Some(k.as_usize() * ops.n_nodes + node), (x, y));
+                    let constants = tides.coefficients(slot).as_chunks::<6>().0;
+                    coefficients.extend_from_slice(constants);
+                    coefficients
+                        .resize(nodes.len() * max_constituents + max_constituents, [0.0; 6]);
+                    nodes.push([tides.node_mean(slot), tides.source_depths()[slot]]);
+                }
+            }
+        }
+        Ok(Self {
+            forms: DeviceBuffer::from_host(stream, &forms).map_err(device)?,
+            host: forms,
+            row: DeviceBuffer::from_host(stream, &row).map_err(device)?,
+            coefficients: DeviceBuffer::from_host(stream, &coefficients).map_err(device)?,
+            nodes: DeviceBuffer::from_host(stream, &nodes).map_err(device)?,
+            max_constituents,
+            width,
+        })
+    }
+}
+
+/// A stage's boundary data on the device: [`StageLevel`] per level and the
+/// tides' moments per level (rows of [`TideTables::width`]), each stage's
+/// copied from a host slot of a ring, which outlives its asynchronous copy
+/// (the stream is synchronized each time the ring wraps).
 struct BoundaryUploads {
     device: DeviceBuffer<StageLevel>,
     host: Vec<[StageLevel; LEVELS]>,
+    moments: DeviceBuffer<f64>,
+    moments_host: Vec<f64>,
+    width: usize,
     next: usize,
 }
 
@@ -2132,35 +2336,53 @@ impl BoundaryUploads {
     /// Host slots: stage passes between two synchronizations.
     const SLOTS: usize = 1024;
 
-    fn new(gpu: &Gpu) -> Result<Self, String> {
+    /// The ring of a run whose tides' moments are `width` values per level.
+    fn new(gpu: &Gpu, width: usize) -> Result<Self, String> {
+        let zeroed = |n| DeviceBuffer::zeroed(&gpu.stream, n).map_err(|e| e.to_string());
         Ok(Self {
             device: DeviceBuffer::zeroed(&gpu.stream, LEVELS).map_err(|e| e.to_string())?,
             host: vec![[StageLevel::default(); LEVELS]; Self::SLOTS],
+            moments: zeroed(LEVELS * width)?,
+            moments_host: vec![0.0; Self::SLOTS * LEVELS * width],
+            width,
             next: 0,
         })
     }
 
-    /// `levels` on the device, for the kernels enqueued next on `stream`.
+    /// A stage's boundary data on the device, for the kernels enqueued next
+    /// on `stream`, as `fill` writes them into a cleared slot: the levels
+    /// and the moments.
     fn upload(
         &mut self,
         stream: &Stream,
-        levels: &[StageLevel; LEVELS],
-    ) -> &DeviceBuffer<StageLevel> {
+        fill: impl FnOnce(&mut [StageLevel; LEVELS], &mut [f64]),
+    ) -> (&DeviceBuffer<StageLevel>, &DeviceBuffer<f64>) {
         if self.next == Self::SLOTS {
             // Every copy from the slots has completed
             stream.synchronize().expect("synchronize");
             self.next = 0;
         }
+        let n = LEVELS * self.width;
         let slot = &mut self.host[self.next];
-        *slot = *levels;
+        let moments = &mut self.moments_host[self.next * n..][..n];
+        *slot = [StageLevel::default(); LEVELS];
+        moments.fill(0.0);
+        fill(slot, moments);
         self.next += 1;
         // SAFETY: the slot is not written again before the stream is
-        // synchronized (above), so it outlives the copy; the buffer is
-        // LEVELS long. Copies and kernels are ordered on the stream, so the
-        // kernels of an earlier stage have read the buffer before it changes.
-        unsafe { self.device.copy_from_host_async_unchecked(stream, slot) }
-            .expect("boundary upload");
-        &self.device
+        // synchronized (above), so it outlives the copies; the buffers are
+        // LEVELS and LEVELS × width long. Copies and kernels are ordered on
+        // the stream, so the kernels of an earlier stage have read the
+        // buffers before they change.
+        unsafe {
+            self.device
+                .copy_from_host_async_unchecked(stream, slot)
+                .expect("boundary upload");
+            self.moments
+                .copy_from_host_async_unchecked(stream, moments)
+                .expect("moment upload");
+        }
+        (&self.device, &self.moments)
     }
 }
 
@@ -2337,13 +2559,13 @@ impl<'a> GpuSWE2D<'a> {
                     WALL
                 }
                 DeviceBoundary2D::Characteristic {
-                    provider,
+                    external,
                     elevation_only,
                 } => {
                     if opens.len() == MAX_OPEN {
                         return Err(format!("more than {MAX_OPEN} open boundaries"));
                     }
-                    opens.push((provider, elevation_only));
+                    opens.push((external, elevation_only));
                     (opens.len() - 1) as u32
                 }
             };
@@ -2372,6 +2594,7 @@ impl<'a> GpuSWE2D<'a> {
             coriolis.as_ref(),
         )
         .map_err(device)?;
+        let tides = TideTables::upload(gpu, mesh, ops, &opens, boundary)?;
         let stream = &gpu.stream;
         let zeroed = |n| DeviceBuffer::zeroed(stream, n).map_err(|e| e.to_string());
         Ok(Self {
@@ -2405,7 +2628,8 @@ impl<'a> GpuSWE2D<'a> {
             ),
             no_list: DeviceBuffer::zeroed(stream, 0).map_err(|e| e.to_string())?,
             no_rows: Mutex::new([zeroed(0)?, zeroed(0)?, zeroed(0)?]),
-            boundary: Mutex::new(BoundaryUploads::new(gpu)?),
+            boundary: Mutex::new(BoundaryUploads::new(gpu, tides.width)?),
+            tides,
         })
     }
 
@@ -2417,17 +2641,28 @@ impl<'a> GpuSWE2D<'a> {
         clips.iter().map(|&c| c as usize).sum()
     }
 
-    /// The open boundaries' external states at `time`.
-    fn open_states(&self, time: f64) -> OpenStates {
+    /// The open boundaries' data at `time`: the uniform external states
+    /// and every boundary's elevation-only velocity, and the tides' moments
+    /// into `moments` (a level's row).
+    fn open_states(&self, time: f64, moments: &mut [f64]) -> OpenStates {
         let mut open = OpenStates::default();
-        for (i, (provider, elevation_only)) in self.opens.iter().enumerate() {
-            let state = provider
-                .uniform_state(time)
-                .expect("a uniform external state (DeviceBoundary2D::Characteristic)");
-            let (u, v) = state.velocity.unwrap_or((0.0, 0.0));
-            open.state[i] = [state.eta, u, v];
-            open.flags[i] = u32::from(state.velocity.is_some())
-                | (u32::from(*elevation_only == ElevationOnly::IncomingWave) << 1);
+        for (i, (external, elevation_only)) in self.opens.iter().enumerate() {
+            let incoming = u32::from(*elevation_only == ElevationOnly::IncomingWave) << 1;
+            match external {
+                DeviceExternal2D::Uniform(provider) => {
+                    let state = provider
+                        .uniform_state(time)
+                        .expect("a uniform external state (DeviceExternal2D::Uniform)");
+                    let (u, v) = state.velocity.unwrap_or((0.0, 0.0));
+                    open.state[i] = [state.eta, u, v];
+                    open.flags[i] = u32::from(state.velocity.is_some()) | incoming;
+                }
+                DeviceExternal2D::Tides(tides) => {
+                    let m = self.tides.host[i].moment as usize;
+                    tides.moment(time, &mut moments[m..m + 1 + 3 * tides.n_constituents()]);
+                    open.flags[i] = incoming;
+                }
+            }
         }
         open
     }
@@ -2469,12 +2704,13 @@ impl<'a> GpuSWE2D<'a> {
     /// The RHS of the listed elements into their rows of `out` (`edges` and
     /// `elements`: the first `n` of a list, every edge or element where the
     /// list is empty): the F* of the listed edges, then the element
-    /// kernels. `level` gives a boundary edge its element's entry of
-    /// `boundary` (empty: level 0).
+    /// kernels. The boundary data of level `l` are at its stage time
+    /// `times[l]`; `level` gives a boundary edge its element's level (empty:
+    /// level 0).
     fn rhs_where(
         &self,
         state: &DeviceState,
-        boundary: &[StageLevel; LEVELS],
+        times: &[f64],
         level: &DeviceBuffer<u32>,
         [(interior, n_interior), (boundary_list, n_boundary)]: [(&DeviceBuffer<u32>, usize); 2],
         (element_list, n_elements): (&DeviceBuffer<u32>, usize),
@@ -2492,7 +2728,13 @@ impl<'a> GpuSWE2D<'a> {
         };
         let mut faces = self.faces.lock().expect("face buffer");
         let mut uploads = self.boundary.lock().expect("boundary data");
-        let uploaded = uploads.upload(&gpu.stream, boundary);
+        let width = self.tides.width;
+        let (boundary, moments) = uploads.upload(&gpu.stream, |levels, moments| {
+            for (l, &time) in times.iter().enumerate() {
+                let open = self.open_states(time, &mut moments[l * width..(l + 1) * width]);
+                levels[l] = StageLevel { time, open };
+            }
+        });
         let (coriolis, f0) = self.coriolis_args();
         let elements_cfg = per_element(n_elements);
         let n_elements = n_elements as u32;
@@ -2551,7 +2793,14 @@ impl<'a> GpuSWE2D<'a> {
                         self.g,
                         self.h_min,
                         self.wall_h_min,
-                        uploaded,
+                        boundary,
+                        &self.tides.forms,
+                        moments,
+                        width as u32,
+                        &self.tides.row,
+                        &self.tides.coefficients,
+                        &self.tides.nodes,
+                        self.tides.max_constituents as u32,
                         level,
                         boundary_list,
                         n_boundary as u32,
@@ -2689,15 +2938,10 @@ impl PhysicsModule<DeviceState> for GpuSWE2D<'_> {
     }
 
     fn compute_rhs_into(&self, state: &DeviceState, time: f64, out: &mut DeviceState) {
-        let mut boundary = [StageLevel::default(); LEVELS];
-        boundary[0] = StageLevel {
-            time,
-            open: self.open_states(time),
-        };
         let s = &self.statics;
         self.rhs_where(
             state,
-            &boundary,
+            &[time],
             &self.no_list,
             [
                 (&s.interior_edges, s.interior_edges.len()),
@@ -2984,10 +3228,10 @@ impl LocalTimeStepping<DeviceState> for GpuSWE2D<'_> {
         let schedule = self.schedule.lock().expect("schedule");
         let finest = schedule.finest;
         assert_eq!(plan.finest, finest, "the plan is the coarse step's");
-        // Every level's stage time and open boundary states
-        let mut boundary = [StageLevel::default(); LEVELS];
-        for (l, entry) in boundary.iter_mut().enumerate().take(finest + 1) {
-            let time = element_stage(
+        // Every level's stage time
+        let mut times = [0.0; LEVELS];
+        for (l, time) in times.iter_mut().enumerate().take(finest + 1) {
+            *time = element_stage(
                 plan.step,
                 plan.finest,
                 plan.substep,
@@ -2998,10 +3242,6 @@ impl LocalTimeStepping<DeviceState> for GpuSWE2D<'_> {
                 l as u8,
             )
             .time;
-            *entry = StageLevel {
-                time,
-                open: self.open_states(time),
-            };
         }
         let (s, d) = (plan.stage, plan.depth);
         let all = finest == 0;
@@ -3039,7 +3279,7 @@ impl LocalTimeStepping<DeviceState> for GpuSWE2D<'_> {
         };
         self.rhs_where(
             input,
-            &boundary,
+            &times[..=finest],
             level,
             edges,
             (element_list, n_elements),

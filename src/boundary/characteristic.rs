@@ -64,7 +64,7 @@
 use std::sync::atomic::AtomicBool;
 
 use super::bathymetry_validation::warn_once_if_misconfigured;
-use super::{BCContext2D, BoundaryState, DeviceBoundary2D, SWEBoundaryCondition2D};
+use super::{BCContext2D, BoundaryState, BoundaryTides, DeviceBoundary2D, SWEBoundaryCondition2D};
 use crate::io::BoundaryTimeSeries;
 use crate::mesh::BoundaryTag;
 use crate::solver::SWEState2D;
@@ -110,6 +110,42 @@ pub trait ExternalStateProvider: Send + Sync {
     fn uniform_state(&self, _t: f64) -> Option<ExternalState> {
         None
     }
+
+    /// This external data as a device evaluates it (P2.7, `notes/gpu.md`),
+    /// if it has a device form: a device cannot call a trait object, so a
+    /// run on a device refuses a boundary whose data has none. `None` by
+    /// default.
+    fn device_external(&self) -> Option<DeviceExternal2D<'_>> {
+        None
+    }
+}
+
+/// The external data of a [`CharacteristicOBC`] as a device evaluates it
+/// ([`ExternalStateProvider::device_external`]): a closed set of forms.
+#[derive(Clone, Copy)]
+pub enum DeviceExternal2D<'a> {
+    /// The same state at every point of the boundary
+    /// ([`ExternalStateProvider::uniform_state`], which must be `Some`),
+    /// evaluated on the host once per stage time
+    Uniform(&'a dyn ExternalStateProvider),
+    /// Harmonic constants per boundary node: the host evaluates each
+    /// constituent's time factors once per stage time
+    /// ([`BoundaryTides::moment`]), the device sums them per node
+    /// ([`super::tide_term`], [`super::tide_state`])
+    Tides(&'a BoundaryTides),
+}
+
+impl std::fmt::Debug for DeviceExternal2D<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Uniform(_) => f.write_str("Uniform"),
+            Self::Tides(tides) => f
+                .debug_struct("Tides")
+                .field("constituents", &tides.names())
+                .field("nodes", &tides.n_nodes())
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Any closure `(x, y, t) → ExternalState`.
@@ -144,6 +180,10 @@ impl ExternalStateProvider for StillWater {
 
     fn uniform_state(&self, _t: f64) -> Option<ExternalState> {
         Some(ExternalState::new(self.eta, 0.0, 0.0))
+    }
+
+    fn device_external(&self) -> Option<DeviceExternal2D<'_>> {
+        Some(DeviceExternal2D::Uniform(self))
     }
 }
 
@@ -371,12 +411,13 @@ impl<P: ExternalStateProvider> SWEBoundaryCondition2D for CharacteristicOBC<P> {
         "characteristic_obc"
     }
 
-    /// With a uniform external state only (a harmonic tide, still water).
+    /// With external data that has a device form
+    /// ([`ExternalStateProvider::device_external`]).
     fn device_form(&self, _tag: Option<BoundaryTag>) -> Option<DeviceBoundary2D<'_>> {
         self.provider
-            .uniform_state(0.0)
-            .map(|_| DeviceBoundary2D::Characteristic {
-                provider: &self.provider,
+            .device_external()
+            .map(|external| DeviceBoundary2D::Characteristic {
+                external,
                 elevation_only: self.elevation_only,
             })
     }
@@ -565,8 +606,9 @@ mod tests {
     }
 
     /// A device evaluates a uniform external state once per stage
-    /// (`uniform_state`): it must be the state every boundary point gets, and
-    /// a provider that varies along the boundary has none.
+    /// (`uniform_state`, the `Uniform` device form): it must be the state
+    /// every boundary point gets, and a provider that varies along the
+    /// boundary has none.
     #[test]
     fn a_uniform_state_is_the_external_state_of_every_point() {
         let tide = crate::boundary::HarmonicTide::m2(0.8, 0.3)
@@ -580,8 +622,13 @@ mod tests {
                 (c.time, c.position) = (t, (x, y));
                 for provider in [&tide as &dyn ExternalStateProvider, &still] {
                     assert_eq!(provider.uniform_state(t), Some(provider.external_state(&c)));
+                    assert!(matches!(
+                        provider.device_external(),
+                        Some(DeviceExternal2D::Uniform(_))
+                    ));
                 }
                 assert_eq!(varying.uniform_state(t), None);
+                assert!(varying.device_external().is_none());
             }
         }
     }
