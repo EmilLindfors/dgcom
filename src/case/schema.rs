@@ -569,6 +569,14 @@ pub struct Raster {
     /// surface (Kartverket's topobathy model does; default false).
     #[serde(default)]
     pub fill_zero_holes: bool,
+    /// For `"topobathy"`: how far mean sea level lies above the datum of the
+    /// raster's sea part (m, default 0). The sea is lowered by it
+    /// (`BedRaster::lower_sea_to_mean_sea_level`, by half of it in the
+    /// shallowest band, so the coast stays). Kartverket's topobathy model
+    /// holds its depths in chart datum (LAT): 1.434 m at Mausund and 1.688 m
+    /// at Bodø (Kartverket's tide levels; `notes/inputs-forcing.md` P1.6).
+    #[serde(default)]
+    pub sea_datum_m: f64,
     /// How the raster reaches the nodes (default `"projected"`).
     #[serde(default)]
     pub sampling: Sampling,
@@ -1419,6 +1427,15 @@ pub struct Nesting {
     pub atlas_coverage_m: f64,
     /// Correct the parent's tide (default `"none"`): the parent gets
     /// (corrected atlas − atlas) added, which keeps its residual flow.
+    ///
+    /// A correction mends a parent's own faults, so the default is none:
+    /// it is the parent's property, not the coast's. For NorKyst-800, whose
+    /// tide forcing lacks K2's nodal factor and the minor semidiurnals,
+    /// `"theory"` lowered the monthly error of its tide at 68 of 75
+    /// gauge-months out of sample (15 Norwegian gauges, April–September 2026
+    /// without June, median 6.1 → 5.3 cm; `notes/validation.md` P3.4), so a
+    /// NorKyst nest without a gauge correction should state it. A parent
+    /// that carries K2 and the minors would be made worse by it.
     #[serde(default)]
     pub correction: AtlasCorrection,
     /// Correct the parent's tide at a tide gauge instead (default: no
@@ -2129,6 +2146,20 @@ impl Case {
                     return invalid(
                         "bathymetry.raster.fill_zero_holes is for a \"topobathy\" raster".into(),
                     );
+                }
+                if r.kind == RasterKind::Bathymetry && r.sea_datum_m != 0.0 {
+                    return invalid(
+                        "bathymetry.raster.sea_datum_m is for a \"topobathy\" raster; a \
+                         \"bathymetry\" raster's depths are below mean sea level"
+                            .into(),
+                    );
+                }
+                if !(r.sea_datum_m.is_finite() && r.sea_datum_m >= 0.0) {
+                    return invalid(format!(
+                        "bathymetry.raster.sea_datum_m is how far mean sea level lies above \
+                         the raster's sea datum (m, ≥ 0), not {}",
+                        r.sea_datum_m
+                    ));
                 }
             }
             _ => {
