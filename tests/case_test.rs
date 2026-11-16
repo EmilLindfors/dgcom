@@ -1439,6 +1439,50 @@ fn a_topobathy_sea_in_chart_datum_is_lowered_to_mean_sea_level() {
     );
 }
 
+/// `[bathymetry.raster.soundings]` deepens the bay near a station that
+/// measures 30 m where the raster has 15.5, the bay still holds still
+/// water, and a station is never exact: `noise_m` must be positive.
+#[test]
+fn soundings_correct_a_raster_bed_and_it_stays_at_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = bay_case(dir.path(), "").unwrap().build_domain().unwrap();
+    std::fs::write(
+        dir.path().join("survey.csv"),
+        "# one station, and one on the island\nlon,lat,depth_m\n8.03,63.57,30\n8.07,63.55,40\n",
+    )
+    .unwrap();
+    let table =
+        "\n[bathymetry.raster.soundings]\nfile = \"survey.csv\"\nrange_m = 1500\nnoise_m = 1\n";
+    let file = bay_case(dir.path(), table).unwrap();
+    let sounded = file.build_domain().unwrap();
+    println!(
+        "deepest bed: {:.2} m plain, {:.2} m sounded",
+        plain.bathymetry.min(),
+        sounded.bathymetry.min()
+    );
+    assert!(sounded.bathymetry.min() < plain.bathymetry.min() - 3.0);
+    let note = sounded
+        .notes
+        .iter()
+        .find(|n| n.starts_with("soundings "))
+        .unwrap_or_else(|| panic!("{:?}", sounded.notes));
+    println!("{note}");
+    assert!(
+        note.contains("1 of 2 stations on the raster's sea (0 off it, 1 on its land)")
+            && note.contains("depth +14.5 m"),
+        "{note}"
+    );
+    let (speed, eta, _) = rest_departure(&file);
+    assert!(speed < 1e-9 && eta < 1e-9, "|u| {speed}, |η| {eta}");
+
+    let path = dir.path().join("case.toml");
+    let err = CaseFile::read(&path, &["bathymetry.raster.soundings.noise_m=0".into()])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("noise_m must be positive"), "{err}");
+}
+
 #[test]
 fn a_raster_that_misses_the_mesh_is_refused() {
     let dir = tempfile::tempdir().unwrap();

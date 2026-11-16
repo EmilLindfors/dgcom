@@ -587,6 +587,32 @@ pub struct Raster {
     /// another box states it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crop: Option<[f64; 4]>,
+    /// Measured depths to correct the raster's sea to, after its holes are
+    /// filled and its datum moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soundings: Option<Soundings>,
+}
+
+/// `[bathymetry.raster.soundings]`: measured depths at points (a survey's
+/// stations, `io::read_soundings_file`'s CSV of `lon`, `lat`, `depth_m`
+/// below mean sea level), which correct the raster's sea within `range_m`
+/// of them by simple kriging of their residuals
+/// (`BedRaster::correct_to_soundings`). Beyond the range the raster stands,
+/// and the coast does not move.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Soundings {
+    /// The CSV file.
+    pub file: PathBuf,
+    /// How far a station's residual reaches (m): the range of the spherical
+    /// covariance, where the residuals stop being correlated. Frøya's 654
+    /// farm stations level off at about 800 m, Bodø's 198 at 400–800
+    /// (`notes/inputs-forcing.md` P1.6).
+    pub range_m: f64,
+    /// A station's own error (m, standard deviation): its position, the tide
+    /// when it was sounded and the bed's slope inside a pixel. The farms'
+    /// stations under 25 m apart differ by 3.2 m RMS at Frøya.
+    pub noise_m: f64,
 }
 
 /// What a raster's pixels hold.
@@ -2160,6 +2186,21 @@ impl Case {
                          the raster's sea datum (m, ≥ 0), not {}",
                         r.sea_datum_m
                     ));
+                }
+                if let Some(s) = &r.soundings {
+                    if !positive(s.range_m) {
+                        return invalid(format!(
+                            "bathymetry.raster.soundings.range_m must be positive, not {}",
+                            s.range_m
+                        ));
+                    }
+                    if !positive(s.noise_m) {
+                        return invalid(format!(
+                            "bathymetry.raster.soundings.noise_m must be positive (a station \
+                             is never exact), not {}",
+                            s.noise_m
+                        ));
+                    }
                 }
             }
             _ => {
