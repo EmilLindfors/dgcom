@@ -122,7 +122,8 @@ src/
 │                     # matrix per release group, spread across seeds
 │                     # (connectivity.rs)
 ├── case/             # Case files (TOML/JSON, strict serde schema) built into
-│                     # a 2D run; `src/bin/dgcom.rs` runs them (TODO P8)
+│                     # a 2D run; cli.rs is `dgcom` (src/bin/dgcom.rs; gpu/'s
+│                     # dgcom-gpu with CUDA for `[compute] device`, P2.7)
 ├── io/               # NetCDF output; parent-ocean and weather-model readers
 │                     # on lon/lat grids (GeoGrid, FieldSeries); VTK, GeoTIFF
 │                     # bathymetry, GSHHS coastline, projections, observations;

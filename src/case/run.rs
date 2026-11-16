@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::domain::Domain;
-use super::schema::{BoundaryVelocity, Friction, SideTag};
+use super::schema::{BoundaryVelocity, ComputeDevice, Friction, SideTag};
 use super::{CaseError, CaseFile};
 use crate::boundary::{
     CharacteristicOBC, ExternalStateProvider, HarmonicTide, InverseBarometer,
@@ -39,7 +39,7 @@ use crate::source::{
     CageDrag2D, ChezyFriction2D, GriddedAtmosphere2D, HorizontalViscosity2D, ManningFriction2D,
 };
 use crate::tides::{canonical_name, constituent_period};
-use crate::time::{Multirate, TimeIntegrator};
+use crate::time::{Multirate, StandardIntegrator, TimeIntegrator};
 use crate::types::ElementIndex;
 
 /// Depth below which the velocity is reported as 0 (m).
@@ -161,6 +161,54 @@ pub struct StationSeries {
     pub gauge: Option<GaugeComparison>,
 }
 
+/// A device backend for a case's 2D run (`[compute] device`, P2.7,
+/// `notes/gpu.md`): `gpu/` implements it for CUDA (`dgcom-gpu`); dgcom itself
+/// computes on the CPU. dgcom describes the physics as data
+/// ([`crate::physics::SWEDeviceForm2D`]) and the backend steps it with
+/// dgcom's own `Simulation`.
+pub trait CaseDevice {
+    /// Step `form` on CUDA device `ordinal` from `q` over `run.span`, as
+    /// `Simulation::run_with_callback` with `run`'s stepper, CFL, interval,
+    /// largest step and stop flag, calling `callback` with the state on the
+    /// host at the start, every interval and the end; `q` is left with the
+    /// state at the end.
+    fn run_2d(
+        &self,
+        ordinal: usize,
+        form: &crate::physics::SWEDeviceForm2D<'_>,
+        q: &mut SWESolution2D,
+        run: &DeviceRun<'_>,
+        callback: &mut dyn FnMut(&SWESolution2D, f64),
+    ) -> Result<DeviceRunReport, String>;
+}
+
+/// The settings of a run on a device, as the CPU's `Simulation` takes them.
+pub struct DeviceRun<'a> {
+    /// The time stepper
+    pub integrator: StandardIntegrator,
+    /// CFL number
+    pub cfl: f64,
+    /// Interval of the callbacks (s)
+    pub interval: f64,
+    /// Upper bound of the time step (s)
+    pub dt_max: Option<f64>,
+    /// Set to stop the run at its next step
+    pub stop: &'a Arc<AtomicBool>,
+    /// Start and end (s)
+    pub span: (f64, f64),
+}
+
+/// What a run on a device reports.
+pub struct DeviceRunReport {
+    /// The `Simulation`'s result
+    pub result: SimulationResult,
+    /// Elements emptied because their mean depth went negative
+    /// (`SWEPhysics2D::negative_depth_clips`)
+    pub negative_depth_clips: usize,
+    /// The device, for the run's notes
+    pub device: String,
+}
+
 /// The outcome of a run.
 #[derive(Clone, Debug)]
 pub struct RunReport {
@@ -194,8 +242,50 @@ impl CaseFile {
         domain: &Domain,
         progress: &mut dyn FnMut(&Progress),
     ) -> Result<RunReport, CaseError> {
+        self.run_on_with(domain, None, progress)
+    }
+
+    /// [`Self::run_on`], stepping the 2D run on `device` if the case asks
+    /// for one (`[compute] device`): refused without a device, and for
+    /// what a device does not run yet (3D, waves, local time stepping, and
+    /// the physics `SWEPhysics2D::device_form` names).
+    pub fn run_on_with(
+        &self,
+        domain: &Domain,
+        device: Option<&dyn CaseDevice>,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<RunReport, CaseError> {
+        let on = self.case.compute.device;
+        let refuse = |what: &str| {
+            Err(CaseError::Invalid(format!(
+                "compute.device = \"{on}\" does not run {what} yet; run the case with \
+                 --set compute.device=cpu"
+            )))
+        };
+        let device = match (on, device) {
+            (ComputeDevice::Cpu, _) => None,
+            (ComputeDevice::Cuda(ordinal), Some(device)) => Some((ordinal, device)),
+            (ComputeDevice::Cuda(_), None) => {
+                return Err(CaseError::Invalid(format!(
+                    "compute.device = \"{on}\": this build of dgcom computes on the CPU \
+                     only; run the case with gpu/'s dgcom-gpu, or with --set \
+                     compute.device=cpu"
+                )));
+            }
+        };
         if self.case.three_d.is_some() {
+            if device.is_some() {
+                return refuse("a 3D run");
+            }
             return self.run_3d(domain, progress);
+        }
+        if device.is_some() {
+            if self.case.waves.is_some() {
+                return refuse("waves");
+            }
+            if self.case.numerics.local_time_stepping_levels > 0 {
+                return refuse("local time stepping");
+            }
         }
         let case = &self.case;
         let clock = case.clock()?;
@@ -210,6 +300,11 @@ impl CaseFile {
         let opens = self.open_boundaries(domain, clock.as_ref())?;
         let wall = Reflective2D::new();
         let physics = self.physics(domain, boundary_conditions(&wall, &opens));
+        if device.is_some()
+            && let Err(what) = physics.device_form()
+        {
+            return refuse(&what);
+        }
         let mut notes = Vec::new();
         // A resumed run: the restart's state, time and records
         let resumed = match self.resume_path() {
@@ -288,7 +383,7 @@ impl CaseFile {
         // stopped run wrote out: only the files that start with this run
         // take it
         let mut at_restart = resumed.is_some();
-        let callback = |q: &SWESolution2D, t: f64| {
+        let mut callback = |q: &SWESolution2D, t: f64| {
             if failure.is_some() {
                 return;
             }
@@ -346,8 +441,24 @@ impl CaseFile {
             }),
             _ => None,
         };
-        let (result, clips) = match numerics.local_time_stepping_levels {
-            0 => drive(
+        let (result, clips) = match (device, numerics.local_time_stepping_levels) {
+            (Some((ordinal, device)), _) => {
+                let form = physics.device_form().map_err(CaseError::Invalid)?;
+                let run = DeviceRun {
+                    integrator: stepper,
+                    cfl,
+                    interval,
+                    dt_max: numerics.dt_max_s,
+                    stop: &stop,
+                    span: (t_start, t_end),
+                };
+                let report = device
+                    .run_2d(ordinal, &form, &mut q, &run, &mut callback)
+                    .map_err(|e| CaseError::Run(format!("on {on}: {e}")))?;
+                notes.push(format!("computed on {on}, {}", report.device));
+                (report.result, report.negative_depth_clips)
+            }
+            (None, 0) => drive(
                 Simulation::new(physics, stepper),
                 cfl,
                 interval,
@@ -358,7 +469,7 @@ impl CaseFile {
                 exchange,
                 callback,
             ),
-            levels => drive(
+            (None, levels) => drive(
                 Simulation::new(physics, Multirate::with_base(stepper, levels)),
                 cfl,
                 interval,

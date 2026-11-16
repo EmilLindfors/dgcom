@@ -137,9 +137,12 @@ impl HarmonicTide {
 }
 
 impl ExternalStateProvider for HarmonicTide {
-    /// Elevation only; the characteristic OBC chooses the velocity.
     fn external_state(&self, ctx: &BCContext2D) -> ExternalState {
         ExternalState::elevation(self.elevation(ctx.time))
+    }
+
+    fn uniform_state(&self, t: f64) -> Option<ExternalState> {
+        Some(ExternalState::elevation(self.elevation(t)))
     }
 }
 

@@ -28,8 +28,8 @@ pub mod wellbalanced;
 
 // Re-export traits
 pub use traits::{
-    CombinedSource, CombinedSource2D, ElementSources, SourceContext2D, SourceTerm, SourceTerm2D,
-    SourceTerms2D,
+    CombinedSource, CombinedSource2D, DeviceSource2D, ElementSources, SourceContext2D, SourceTerm,
+    SourceTerm2D, SourceTerms2D,
 };
 
 // Re-export 1D source terms
@@ -38,11 +38,11 @@ pub use swe_1d::{BathymetrySource, ChezyFriction, HydrostaticReconstruction, Man
 // Re-export 2D SWE source terms
 pub use swe_2d::{
     AtmosphericPressure2D, BathymetrySource2D, BottomFriction2D, CageDrag2D, CageFootprint,
-    CageNode, ChezyFriction2D, CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D,
-    GriddedSurfaceFluxes, GriddedWindStress, HorizontalViscosity2D, ManningFriction2D, NetCage,
-    P_STANDARD, RHO_AIR, RHO_WATER, RHO_WATER_PRESSURE, SpatiallyVaryingManning2D, TidalPotential,
-    TidalPotentialConstituent, WaveCurrentFriction2D, WaveForce2D, WindStress2D, coriolis_beta,
-    coriolis_parameter, loland_drag_coefficient,
+    CageNode, ChezyFriction2D, CoriolisSource2D, DeviceFriction2D, DragCoefficient,
+    GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress, HorizontalViscosity2D,
+    ManningFriction2D, NetCage, P_STANDARD, RHO_AIR, RHO_WATER, RHO_WATER_PRESSURE,
+    SpatiallyVaryingManning2D, TidalPotential, TidalPotentialConstituent, WaveCurrentFriction2D,
+    WaveForce2D, WindStress2D, coriolis_beta, coriolis_parameter, loland_drag_coefficient,
 };
 
 // Re-export boundary sources

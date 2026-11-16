@@ -19,7 +19,7 @@
 
 use crate::mesh::Mesh2D;
 use crate::solver::SWEState2D;
-use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
+use crate::source::{DeviceSource2D, ElementSources, SourceContext2D, SourceTerm2D};
 
 /// Earth's rotation rate, one turn per sidereal day (rad/s)
 pub const EARTH_ROTATION_RATE: f64 = 7.292_115e-5;
@@ -173,6 +173,10 @@ impl SourceTerm2D for CoriolisSource2D {
 
     fn is_node_local(&self) -> bool {
         true
+    }
+
+    fn device_form(&self) -> Option<DeviceSource2D> {
+        Some(DeviceSource2D::Coriolis(*self))
     }
 
     fn name(&self) -> &'static str {

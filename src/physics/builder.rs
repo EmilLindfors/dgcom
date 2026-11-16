@@ -254,7 +254,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     /// element with a node below h_dry, which includes every element a
     /// positivity limiter with a threshold ≤ h_dry changes: that pass can be
     /// skipped.
-    fn positivity_pass_is_redundant(&self) -> bool {
+    pub(super) fn positivity_pass_is_redundant(&self) -> bool {
         matches!(
             (&self.limiter, &self.wet_dry),
             (StandardLimiter2D::Positivity(h), Some(config)) if *h <= config.h_dry.meters()
@@ -374,7 +374,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     }
 
     /// RHS configuration for this module's components.
-    fn rhs_config(&self) -> crate::solver::SWE2DRhsConfig<'_, BC> {
+    pub(super) fn rhs_config(&self) -> crate::solver::SWE2DRhsConfig<'_, BC> {
         use crate::solver::SWE2DRhsConfig;
 
         let mut config = SWE2DRhsConfig::new(&self.equation, &self.bc)

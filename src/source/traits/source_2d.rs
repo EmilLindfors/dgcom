@@ -137,6 +137,14 @@ impl ElementSources<'_> {
     }
 }
 
+/// A source term as a device runs it ([`SourceTerm2D::device_form`]): a
+/// closed set of forms, as data.
+#[derive(Clone, Copy, Debug)]
+pub enum DeviceSource2D {
+    /// The Coriolis force, f- or β-plane
+    Coriolis(crate::source::CoriolisSource2D),
+}
+
 /// Trait for 2D source terms in shallow water equations.
 ///
 /// Source terms modify the RHS of the equations:
@@ -196,6 +204,12 @@ pub trait SourceTerm2D: Send + Sync {
     /// default) keeps every element of the run on whole-element stage rates.
     fn is_node_local(&self) -> bool {
         false
+    }
+
+    /// This source as a device runs it, if it has a device form (P2.7,
+    /// `notes/gpu.md`): a run on a device refuses a source without one.
+    fn device_form(&self) -> Option<DeviceSource2D> {
+        None
     }
 
     /// Whether this source term discretizes the bed-slope force `−g h ∇B`.

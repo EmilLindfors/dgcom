@@ -6,7 +6,10 @@
 //! The split-form RHS of `SWEFormulation2D::EntropyStable` and of `WetDry`
 //! (the subcells in elements with a node shallower than the subcell depth,
 //! the hydrostatic HLL at faces) with a bed, walls (`Reflective2D`, called
-//! as the CPU calls it), no sources yet, global steps. The kernels follow
+//! as the CPU calls it), characteristic open boundaries with an external
+//! state uniform along each (a harmonic tide, still water), Coriolis, global
+//! steps; built from dgcom's own physics module
+//! ([`GpuSWE2D::from_form`], `SWEPhysics2D::device_form`). The kernels follow
 //! `SplitFormSWE2D` (`src/solver/rhs/swe_2d_split_form.rs`) operation for
 //! operation and call dgcom's pointwise physics (the two-point flux, the
 //! hydrostatic HLL, the subcell reconstruction, the interface metrics, the
@@ -21,21 +24,26 @@ use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig, Stream};
 use cuda_device::{DisjointSlice, device, kernel, thread};
 use cuda_host::cuda_module;
 use dgcom::SWEState2D;
-use dgcom::boundary::{BCContext2D, Reflective2D, SWEBoundaryCondition2D};
-use dgcom::equations::ShallowWater2D;
+use dgcom::boundary::{
+    BCContext2D, DeviceBoundary2D, ElevationOnly, ExternalState, ExternalStateProvider,
+    Reflective2D, SWEBoundaryCondition2D, characteristic_boundary_state,
+};
 use dgcom::flux::{
     SWENodeState2D, entropy_stable_dissipation_2d, wintermeyer_bed_interface_term_2d,
     wintermeyer_flux_2d,
 };
 use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
-use dgcom::physics::{PhysicsModule, PhysicsModuleInfo};
+use dgcom::physics::{PhysicsModule, PhysicsModuleInfo, SWEDeviceForm2D};
 use dgcom::solver::rhs::subcells::telescoped_interfaces;
 use dgcom::solver::{
-    PositivityBound, SWESide2D, SWESolution2D, WetDryConfig, damp_node, dt_from_reference_rate,
-    hydrostatic_hll, node_reference_rate, reconstruct_subcell, wet_dry_element,
+    PositivityBound, SWEFormulation2D, SWESide2D, SWESolution2D, WetDryConfig, damp_node,
+    dt_from_reference_rate, hydrostatic_hll, node_reference_rate, reconstruct_subcell,
+    wet_dry_element,
 };
-use dgcom::source::{CageNode, ManningFriction2D};
+use dgcom::source::{
+    CageNode, CoriolisSource2D, DeviceFriction2D, DeviceSource2D, ManningFriction2D,
+};
 use dgcom::time::Integrable;
 use dgcom::time::SspScheme;
 use dgcom::types::{Depth, ElementIndex};
@@ -54,6 +62,27 @@ const EG: usize = 18;
 
 /// The right side of a boundary edge (`edges`).
 const NO_NEIGHBOUR: u32 = u32::MAX;
+
+/// A boundary edge's condition in the place of its right face (`edges`): a
+/// wall, else the index of its open boundary in [`OpenStates`].
+const WALL: u32 = u32::MAX;
+
+/// Open boundaries (boundary tags with a characteristic condition) the
+/// kernels take.
+pub const MAX_OPEN: usize = 4;
+
+/// The external state of every open boundary at the time of a stage,
+/// evaluated on the host (`ExternalStateProvider::uniform_state`) and passed
+/// to the edge kernels by value.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenStates {
+    /// η, u, v of each boundary's external state
+    pub state: [[f64; 3]; MAX_OPEN],
+    /// Bit 0: the state has a velocity (else elevation only); bit 1:
+    /// elevation-only data enter as a wave (`ElevationOnly::IncomingWave`)
+    pub flags: [u32; MAX_OPEN],
+}
 
 /// Threads per block of the element kernels (their registers bound the block).
 const ELEMENT_BLOCK: u32 = 128;
@@ -362,6 +391,41 @@ fn wall_flux(
     surface_flux(q_int, &q_ext, normal, g, hll, h_min).0
 }
 
+/// `SplitFormSWE2D::boundary_flux` at a characteristic open boundary:
+/// dgcom's `characteristic_boundary_state` from the interior trace and the
+/// external state of open boundary `i`, its physical flux `F(q_b)·n`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn open_flux(
+    q_int: &SWENodeState2D,
+    state: SWEState2D,
+    bed: f64,
+    normal: (f64, f64),
+    time: f64,
+    g: f64,
+    h_min: f64,
+    open: &OpenStates,
+    i: usize,
+) -> SWEState2D {
+    let [eta, u, v] = open.state[i];
+    let flags = open.flags[i];
+    let external = if flags & 1 != 0 {
+        ExternalState::new(eta, u, v)
+    } else {
+        ExternalState::elevation(eta)
+    };
+    let elevation_only = if flags & 2 != 0 {
+        ElevationOnly::IncomingWave
+    } else {
+        ElevationOnly::AtRest
+    };
+    // The position is not read by a uniform external state
+    let ctx = BCContext2D::new(time, (0.0, 0.0), state, bed, normal, g, h_min);
+    let q = characteristic_boundary_state(&ctx, external, elevation_only);
+    let q_b = SWENodeState2D::new(&q, q_int.b, h_min);
+    wintermeyer_flux_2d(&q_b, &q_b, normal, g)
+}
+
 /// `(∇r, ∇s, |∇r|, |∇s|)` of a node from `[r_x, r_y, s_x, s_y]`, as
 /// `element_max_reference_rate` forms it.
 #[inline]
@@ -373,8 +437,9 @@ fn rate_metric(grads: [f64; 4]) -> ((f64, f64), (f64, f64), f64, f64) {
 
 /// `SplitFormSWE2D::edge_fluxes` of edge `e`, into `slot`: both sides' F*
 /// of an interior edge (left first, each in its own face-node order), the
-/// hydrostatic HLL if `HLL`, else the entropy-stable flux; at a wall
-/// (`boundary_flux`) the left side's F* from the wall's ghost state.
+/// hydrostatic HLL if `HLL`, else the entropy-stable flux; at a boundary
+/// (`boundary_flux`) the left side's F*, from a wall's ghost state or an
+/// open boundary's state.
 #[device]
 #[allow(clippy::too_many_arguments)]
 fn edge_body<const HLL: bool>(
@@ -383,6 +448,7 @@ fn edge_body<const HLL: bool>(
     h_min: f64,
     wall_h_min: f64,
     time: f64,
+    open: &OpenStates,
     (h, hu, hv, bed): (&[f64], &[f64], &[f64], &[f64]),
     affine: &[u32],
     egeom: &[[f64; EG]],
@@ -404,9 +470,23 @@ fn edge_body<const HLL: bool>(
         let q_left = node_state(h, hu, hv, bed, left, h_min);
         if re == NO_NEIGHBOUR {
             let state = SWEState2D::new(h[left], hu[left], hv[left]);
-            let f = wall_flux(
-                &q_left, state, bed[left], normal, time, g, h_min, wall_h_min, HLL,
-            );
+            let f = if rf == WALL {
+                wall_flux(
+                    &q_left, state, bed[left], normal, time, g, h_min, wall_h_min, HLL,
+                )
+            } else {
+                open_flux(
+                    &q_left,
+                    state,
+                    bed[left],
+                    normal,
+                    time,
+                    g,
+                    h_min,
+                    open,
+                    rf as usize,
+                )
+            };
             slot[fi] = [f.h, f.hu, f.hv];
         } else {
             let (re, rf) = (re as usize, rf as usize);
@@ -446,7 +526,8 @@ fn is_subcell_element(k: usize, h: &[f64], depth: f64) -> bool {
 
 /// The end of `SplitFormSWE2D::element_rhs` for element `k`: the lifted face
 /// terms `LIFT sJ (F(q⁻)·n − F*)` with F* from `faces`, then `1/J`, into
-/// `out` (`[h, hu, hv]`).
+/// `out` (`[h, hu, hv]`); then the Coriolis force as `CoriolisSource2D`
+/// adds it (`coriolis` 1: f = `f0`, 2: f of each node from `f_node`).
 #[device]
 // The device backend makes this alwaysinline (no call in the PTX); the host
 // compiler, which sees an exported symbol, ignores it.
@@ -466,6 +547,7 @@ fn finish_element(
     element_edges: &[[u32; 4]],
     edges: &[[u32; 4]],
     faces: &[[[f64; 3]; NF]],
+    (coriolis, f0, f_node): (u32, f64, &[f64]),
     out_h: &mut DisjointSlice<f64>,
     out_hu: &mut DisjointSlice<f64>,
     out_hv: &mut DisjointSlice<f64>,
@@ -498,12 +580,18 @@ fn finish_element(
         let r = rhs[i];
         let j_inv = if aff { eg[4] } else { jinv[k * NN + i] };
         let n = k * NN + i;
+        let (mut out_u, mut out_v) = (j_inv * r.hu, j_inv * r.hv);
+        if coriolis != 0 {
+            let f = if coriolis == 1 { f0 } else { f_node[n] };
+            out_u += f * nodes[i].hv;
+            out_v += -f * nodes[i].hu;
+        }
         // SAFETY: thread k writes only its own element's rows
         // (k·NN..(k + 1)·NN), and k < n_elements.
         unsafe {
             *out_h.get_unchecked_mut(n) = j_inv * r.h;
-            *out_hu.get_unchecked_mut(n) = j_inv * r.hu;
-            *out_hv.get_unchecked_mut(n) = j_inv * r.hv;
+            *out_hu.get_unchecked_mut(n) = out_u;
+            *out_hv.get_unchecked_mut(n) = out_v;
         }
     }
 }
@@ -524,6 +612,7 @@ pub mod kernels {
         h_min: f64,
         wall_h_min: f64,
         time: f64,
+        open: OpenStates,
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -543,6 +632,7 @@ pub mod kernels {
                 h_min,
                 wall_h_min,
                 time,
+                &open,
                 (h, hu, hv, bed),
                 affine,
                 egeom,
@@ -561,6 +651,7 @@ pub mod kernels {
         h_min: f64,
         wall_h_min: f64,
         time: f64,
+        open: OpenStates,
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -580,6 +671,7 @@ pub mod kernels {
                 h_min,
                 wall_h_min,
                 time,
+                &open,
                 (h, hu, hv, bed),
                 affine,
                 egeom,
@@ -614,6 +706,9 @@ pub mod kernels {
         element_edges: &[[u32; 4]],
         edges: &[[u32; 4]],
         faces: &[[[f64; 3]; NF]],
+        coriolis: u32,
+        f0: f64,
+        f_node: &[f64],
         mut out_h: DisjointSlice<f64>,
         mut out_hu: DisjointSlice<f64>,
         mut out_hv: DisjointSlice<f64>,
@@ -680,6 +775,7 @@ pub mod kernels {
             element_edges,
             edges,
             faces,
+            (coriolis, f0, f_node),
             &mut out_h,
             &mut out_hu,
             &mut out_hv,
@@ -714,6 +810,9 @@ pub mod kernels {
         element_edges: &[[u32; 4]],
         edges: &[[u32; 4]],
         faces: &[[[f64; 3]; NF]],
+        coriolis: u32,
+        f0: f64,
+        f_node: &[f64],
         mut out_h: DisjointSlice<f64>,
         mut out_hu: DisjointSlice<f64>,
         mut out_hv: DisjointSlice<f64>,
@@ -813,6 +912,7 @@ pub mod kernels {
             element_edges,
             edges,
             faces,
+            (coriolis, f0, f_node),
             &mut out_h,
             &mut out_hu,
             &mut out_hv,
@@ -821,7 +921,7 @@ pub mod kernels {
 
     /// `apply_wet_dry_correction_all` of element `k` (one thread per
     /// element): dgcom's `wet_dry_element` on its rows, with its nodal
-    /// masses and 1/area.
+    /// masses and 1/area; an element it empties is counted in `clips`.
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn wet_dry_correction(
@@ -834,6 +934,7 @@ pub mod kernels {
         mut h: DisjointSlice<f64>,
         mut hu: DisjointSlice<f64>,
         mut hv: DisjointSlice<f64>,
+        mut clips: DisjointSlice<u32>,
     ) {
         let k = thread::index_1d().get();
         if k >= inv_area.len() {
@@ -857,7 +958,12 @@ pub mod kernels {
             }
             m[i] = mass[n];
         }
-        wet_dry_element(&mut eh, &mut ehu, &mut ehv, &m, inv_area[k], &config);
+        if wet_dry_element(&mut eh, &mut ehu, &mut ehv, &m, inv_area[k], &config) {
+            // SAFETY: thread k writes only its own element's count.
+            unsafe {
+                *clips.get_unchecked_mut(k) += 1;
+            }
+        }
         #[unroll]
         for i in 0..NN {
             let n = k * NN + i;
@@ -1154,15 +1260,23 @@ pub mod kernels {
 pub struct Gpu {
     pub stream: Arc<Stream>,
     module: kernels::LoadedModule,
+    /// The device's name and compute capability
+    pub name: String,
 }
 
 impl Gpu {
-    /// Device 0, its default stream and the kernels.
-    pub fn new() -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        let ctx = CudaContext::new(0)?;
+    /// CUDA device `ordinal`, its default stream and the kernels.
+    pub fn on(ordinal: usize) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        let ctx = CudaContext::new(ordinal)?;
+        let (major, minor) = ctx.compute_capability()?;
+        let name = format!("{} (sm_{major}{minor})", ctx.device_name()?);
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
-        Ok(Arc::new(Self { stream, module }))
+        Ok(Arc::new(Self {
+            stream,
+            module,
+            name,
+        }))
     }
 }
 
@@ -1376,26 +1490,26 @@ struct Statics {
     /// Nodal masses (GLL weight × J) and every element's 1/area
     mass: DeviceBuffer<f64>,
     inv_area: DeviceBuffer<f64>,
+    /// The Coriolis parameter of every node on a β-plane (empty otherwise)
+    f_node: DeviceBuffer<f64>,
 }
 
 impl Statics {
+    /// The static data, with the condition of each boundary edge from its
+    /// tag (`boundary`: [`WALL`] or an open boundary's index) and the
+    /// Coriolis parameter of every node on a β-plane.
     fn upload(
         gpu: &Gpu,
         mesh: &Mesh2D,
         ops: &DGOperators2D,
         geom: &GeometricFactors2D,
-        bathymetry: &Bathymetry2D,
+        bathymetry: Option<&Bathymetry2D>,
+        boundary: impl Fn(Option<BoundaryTag>) -> u32,
+        coriolis: Option<&CoriolisSource2D>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = &gpu.stream;
         let n_el = mesh.n_elements;
         assert_eq!(ops.n_1d, N1, "the kernels are compiled for P{ORDER}");
-        assert!(
-            mesh.edges
-                .iter()
-                .all(|e| e.right.is_some()
-                    || e.boundary_tag.unwrap_or_default() == BoundaryTag::Wall),
-            "the kernels take walls only so far: no open boundaries"
-        );
         for (face, nodes) in ops.face_nodes.iter().enumerate() {
             for (fi, &node) in nodes.iter().enumerate() {
                 assert_eq!(face_node(face, fi), node, "face node {fi} of face {face}");
@@ -1431,7 +1545,7 @@ impl Statics {
                 grads.push([rx, ry, sx, sy]);
                 jinv.push(geom.jacobian_inv(k, i));
                 jac.push(geom.jacobian(k, i));
-                bed.push(bathymetry.get(ElementIndex::new(k), i));
+                bed.push(bathymetry.map_or(0.0, |b| b.get(ElementIndex::new(k), i)));
             }
             for face in 0..4 {
                 for fi in 0..N1 {
@@ -1455,12 +1569,26 @@ impl Statics {
             .edges
             .iter()
             .map(|e| {
-                let (right, right_face) = e.right.map_or((NO_NEIGHBOUR, NO_NEIGHBOUR), |r| {
-                    (r.element as u32, r.face as u32)
-                });
+                let (right, right_face) = e.right.map_or_else(
+                    || (NO_NEIGHBOUR, boundary(e.boundary_tag)),
+                    |r| (r.element as u32, r.face as u32),
+                );
                 [e.left.element as u32, e.left.face as u32, right, right_face]
             })
             .collect();
+        // `CoriolisSource2D::add_element` on a β-plane: f at each node's y
+        let f_node: Vec<f64> = match coriolis {
+            Some(c) if c.beta != 0.0 => (0..n_el)
+                .flat_map(|k| {
+                    let corners = mesh.element_vertices(ElementIndex::new(k));
+                    (0..NN).map(move |i| {
+                        let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
+                        c.f_at(Mesh2D::bilinear(&corners, r, s)[1])
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         Ok(Self {
             bed: DeviceBuffer::from_host(stream, &bed)?,
             affine: DeviceBuffer::from_host(stream, &affine)?,
@@ -1479,6 +1607,7 @@ impl Statics {
             affine_grads: DeviceBuffer::from_host(stream, &affine_grads)?,
             mass: DeviceBuffer::from_host(stream, &mass)?,
             inv_area: DeviceBuffer::from_host(stream, &inv_area)?,
+            f_node: DeviceBuffer::from_host(stream, &f_node)?,
         })
     }
 }
@@ -1493,14 +1622,15 @@ pub enum Formulation {
     WetDry { subcell_depth: f64, h_dry: f64 },
 }
 
-/// The 2D SWE physics module on the GPU: `SWEPhysics2D` with a split
-/// formulation ([`Formulation`]), a bed, walls (`Reflective2D`), the wet/dry
-/// correction after every stage and the thin-layer relaxation
-/// ([`Self::with_wet_dry`]; its positivity limiter is the redundant one of
-/// the case runner, `Positivity(h_dry)`), Manning friction applied
-/// point-implicitly ([`Self::with_friction`]), the positivity-bounded time
-/// step; no sources yet (Phase 1, `notes/gpu.md`).
-pub struct GpuSWE2D {
+/// The 2D SWE physics module on the GPU: dgcom's `SWEPhysics2D` as a device
+/// runs it ([`Self::from_form`]): a split formulation ([`Formulation`]), a
+/// bed, walls (`Reflective2D`) and characteristic open boundaries
+/// (`CharacteristicOBC` with a uniform external state), the Coriolis force,
+/// the wet/dry correction after every stage and the thin-layer relaxation
+/// (its positivity limiter the redundant one of the case runner,
+/// `Positivity(h_dry)`), Manning friction applied point-implicitly, the
+/// positivity-bounded time step (Phase 1, `notes/gpu.md`).
+pub struct GpuSWE2D<'a> {
     gpu: Arc<Gpu>,
     mesh: Arc<Mesh2D>,
     ops: Arc<DGOperators2D>,
@@ -1511,8 +1641,14 @@ pub struct GpuSWE2D {
     formulation: Formulation,
     /// The walls' `Reflective2D::h_min`
     wall_h_min: f64,
+    /// The open boundaries' external data and the velocity of their
+    /// elevation-only data, in the order of [`OpenStates`]
+    opens: Vec<(&'a dyn ExternalStateProvider, ElevationOnly)>,
+    coriolis: Option<CoriolisSource2D>,
     wet_dry: Option<WetDryConfig>,
     friction: Option<ManningFriction2D>,
+    /// Every element's count of the wet/dry correction's clips
+    clips: Mutex<DeviceBuffer<u32>>,
     /// Every element's time step (`compute_dt_ssp` of a wet/dry run)
     element_dts: Mutex<DeviceBuffer<f64>>,
     /// Both sides' F* of every edge, written by the edge kernel for the
@@ -1522,65 +1658,144 @@ pub struct GpuSWE2D {
     rates: Mutex<DeviceBuffer<f64>>,
 }
 
-impl GpuSWE2D {
-    pub fn new(
-        gpu: &Arc<Gpu>,
-        mesh: Arc<Mesh2D>,
-        ops: Arc<DGOperators2D>,
-        geom: Arc<GeometricFactors2D>,
-        bathymetry: &Bathymetry2D,
-        equation: &ShallowWater2D,
-        formulation: Formulation,
-        wall: &Reflective2D,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let statics = Statics::upload(gpu, &mesh, &ops, &geom, bathymetry)?;
-        let faces = DeviceBuffer::zeroed(&gpu.stream, mesh.n_edges)?;
-        let rates = DeviceBuffer::zeroed(&gpu.stream, mesh.n_elements)?;
-        let element_dts = DeviceBuffer::zeroed(&gpu.stream, mesh.n_elements)?;
-        Ok(Self {
-            gpu: gpu.clone(),
+impl<'a> GpuSWE2D<'a> {
+    /// dgcom's physics module as its device form describes it
+    /// (`SWEPhysics2D::device_form`), on `gpu`; what the kernels do not run
+    /// is refused, named.
+    pub fn from_form(gpu: &Arc<Gpu>, form: &SWEDeviceForm2D<'a>) -> Result<Self, String> {
+        let (mesh, ops) = (form.mesh, form.ops);
+        if ops.n_1d != N1 {
+            return Err(format!(
+                "a mesh of order {}: the kernels are compiled for P{ORDER}",
+                ops.order
+            ));
+        }
+        let formulation = match (form.formulation, form.subcells) {
+            (SWEFormulation2D::EntropyStable, _) => Formulation::EntropyStable,
+            (SWEFormulation2D::WetDry, Some((subcell_depth, h_dry))) => Formulation::WetDry {
+                subcell_depth,
+                h_dry,
+            },
+            (other, _) => return Err(format!("the {other:?} formulation")),
+        };
+        // Each boundary tag's condition: walls (one h_min), open boundaries
+        // by index
+        let mut wall_h_min = None;
+        let mut opens = Vec::new();
+        let mut codes = Vec::new();
+        for &(tag, boundary) in &form.boundaries {
+            let code = match boundary {
+                DeviceBoundary2D::Wall { h_min } => {
+                    if wall_h_min.is_some_and(|w| w != h_min) {
+                        return Err("walls of two h_min".into());
+                    }
+                    wall_h_min = Some(h_min);
+                    WALL
+                }
+                DeviceBoundary2D::Characteristic {
+                    provider,
+                    elevation_only,
+                } => {
+                    if opens.len() == MAX_OPEN {
+                        return Err(format!("more than {MAX_OPEN} open boundaries"));
+                    }
+                    opens.push((provider, elevation_only));
+                    (opens.len() - 1) as u32
+                }
+            };
+            codes.push((tag, code));
+        }
+        let boundary = |tag| {
+            codes
+                .iter()
+                .find_map(|&(t, code)| (t == tag).then_some(code))
+                .expect("every boundary tag has a form")
+        };
+        let coriolis = form.source.map(|source| match source {
+            DeviceSource2D::Coriolis(c) => c,
+        });
+        let friction = form.friction.as_ref().map(|law| match law {
+            DeviceFriction2D::Manning(m) => m.clone(),
+        });
+        let device = |e: Box<dyn std::error::Error>| e.to_string();
+        let statics = Statics::upload(
+            gpu,
             mesh,
             ops,
-            geom,
+            form.geom,
+            form.bathymetry,
+            boundary,
+            coriolis.as_ref(),
+        )
+        .map_err(device)?;
+        let stream = &gpu.stream;
+        let zeroed = |n| DeviceBuffer::zeroed(stream, n).map_err(|e| e.to_string());
+        Ok(Self {
+            gpu: gpu.clone(),
+            mesh: mesh.clone(),
+            ops: ops.clone(),
+            geom: form.geom.clone(),
             statics,
-            g: equation.g,
-            h_min: equation.h_min.meters(),
+            g: form.equation.g,
+            h_min: form.equation.h_min.meters(),
             formulation,
-            wall_h_min: wall.h_min,
-            wet_dry: None,
-            friction: None,
-            element_dts: Mutex::new(element_dts),
-            faces: Mutex::new(faces),
-            rates: Mutex::new(rates),
+            wall_h_min: wall_h_min.unwrap_or(Reflective2D::new().h_min),
+            opens,
+            coriolis,
+            wet_dry: form.wet_dry.clone(),
+            friction,
+            clips: Mutex::new(
+                DeviceBuffer::zeroed(stream, mesh.n_elements).map_err(|e| e.to_string())?,
+            ),
+            element_dts: Mutex::new(zeroed(mesh.n_elements)?),
+            faces: Mutex::new(
+                DeviceBuffer::zeroed(stream, mesh.n_edges).map_err(|e| e.to_string())?,
+            ),
+            rates: Mutex::new(zeroed(mesh.n_elements)?),
         })
     }
-}
 
-impl GpuSWE2D {
-    /// Wetting and drying: the wet/dry correction after every stage, the
-    /// thin-layer relaxation in the implicit damping, the time step under
-    /// the positivity bound (`SWEPhysics2D::with_wet_dry` with the
-    /// positivity limiter at `config.h_dry`).
-    pub fn with_wet_dry(mut self, config: WetDryConfig) -> Self {
-        self.wet_dry = Some(config);
-        self
+    /// Elements the wet/dry correction emptied, over every stage so far
+    /// (`SWEPhysics2D::negative_depth_clips`).
+    pub fn negative_depth_clips(&self) -> usize {
+        let clips = self.clips.lock().expect("clip counts");
+        let clips = clips.to_host_vec(&self.gpu.stream).expect("download");
+        clips.iter().map(|&c| c as usize).sum()
     }
 
-    /// Manning bottom friction, point-implicit in every stage
-    /// (`SWEPhysics2D::with_implicit_friction`).
-    pub fn with_friction(mut self, friction: ManningFriction2D) -> Self {
-        self.friction = Some(friction);
-        self
+    /// The open boundaries' external states at `time`.
+    fn open_states(&self, time: f64) -> OpenStates {
+        let mut open = OpenStates::default();
+        for (i, (provider, elevation_only)) in self.opens.iter().enumerate() {
+            let state = provider
+                .uniform_state(time)
+                .expect("a uniform external state (DeviceBoundary2D::Characteristic)");
+            let (u, v) = state.velocity.unwrap_or((0.0, 0.0));
+            open.state[i] = [state.eta, u, v];
+            open.flags[i] = u32::from(state.velocity.is_some())
+                | (u32::from(*elevation_only == ElevationOnly::IncomingWave) << 1);
+        }
+        open
+    }
+
+    /// The Coriolis parameters of the element kernels: none (0), f-plane (1)
+    /// or a β-plane's f per node (2), and f₀.
+    fn coriolis_args(&self) -> (u32, f64) {
+        match &self.coriolis {
+            None => (0, 0.0),
+            Some(c) if c.beta == 0.0 => (1, c.f0),
+            Some(c) => (2, c.f0),
+        }
     }
 }
 
-impl PhysicsModuleInfo for GpuSWE2D {
+impl PhysicsModuleInfo for GpuSWE2D<'_> {
     fn name(&self) -> &'static str {
         "swe-2d-gpu"
     }
 
     fn description(&self) -> &str {
-        "2D Shallow Water Equations on the GPU (fully wet split form)"
+        "2D Shallow Water Equations on the GPU"
     }
 
     fn n_variables(&self) -> usize {
@@ -1592,7 +1807,7 @@ impl PhysicsModuleInfo for GpuSWE2D {
     }
 }
 
-impl PhysicsModule<DeviceState> for GpuSWE2D {
+impl PhysicsModule<DeviceState> for GpuSWE2D<'_> {
     fn compute_rhs(&self, state: &DeviceState, time: f64) -> DeviceState {
         let mut out = state.zeroed_like();
         self.compute_rhs_into(state, time, &mut out);
@@ -1611,6 +1826,8 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
             } => (true, subcell_depth, h_dry),
         };
         let mut faces = self.faces.lock().expect("face buffer");
+        let open = self.open_states(time);
+        let (coriolis, f0) = self.coriolis_args();
         let edges_cfg = one_dimensional(self.mesh.n_edges);
         let elements_cfg = per_element(self.mesh.n_elements);
         // SAFETY: every buffer is sized for this mesh (`Statics::upload`, the
@@ -1624,6 +1841,7 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
                     self.h_min,
                     self.wall_h_min,
                     time,
+                    open,
                     &state.h,
                     &state.hu,
                     &state.hv,
@@ -1642,6 +1860,7 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
                     self.h_min,
                     self.wall_h_min,
                     time,
+                    open,
                     &state.h,
                     &state.hu,
                     &state.hv,
@@ -1676,6 +1895,9 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
                     &s.element_edges,
                     &s.edges,
                     &*faces,
+                    coriolis,
+                    f0,
+                    &s.f_node,
                     out_h,
                     out_hu,
                     out_hv,
@@ -1708,6 +1930,9 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
                         &s.element_edges,
                         &s.edges,
                         &*faces,
+                        coriolis,
+                        f0,
+                        &s.f_node,
                         out_h,
                         out_hu,
                         out_hv,
@@ -1752,6 +1977,7 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
         };
         let (gpu, s) = (&self.gpu, &self.statics);
         let [h, hu, hv] = state.fields_mut();
+        let mut clips = self.clips.lock().expect("clip counts");
         // SAFETY: one thread per element of this mesh; the state's rows.
         unsafe {
             gpu.module.wet_dry_correction(
@@ -1766,6 +1992,7 @@ impl PhysicsModule<DeviceState> for GpuSWE2D {
                 h,
                 hu,
                 hv,
+                &mut *clips,
             )
         }
         .expect("wet/dry correction");
