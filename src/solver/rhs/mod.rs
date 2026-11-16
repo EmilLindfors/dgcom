@@ -13,6 +13,7 @@ pub mod subcells;
 mod swe_1d;
 mod swe_2d;
 mod swe_2d_split_form;
+pub use swe_2d_split_form::{SWESide2D, hydrostatic_hll, reconstruct_subcell};
 mod swe_2d_viscosity;
 
 // 1D scalar

@@ -28,5 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if which == "all" || which == "phase1" {
         phase1::run(&gpu)?;
     }
+    if which == "beach" {
+        phase1::run_beach(&gpu)?;
+    }
     Ok(())
 }

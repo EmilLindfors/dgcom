@@ -1,5 +1,7 @@
-//! Phase 0's gate: the fully wet RHS on the GPU ([`GpuSWE2D`]) against
-//! `compute_rhs_swe_2d_parallel_into` on the CPU, node for node, and timed.
+//! The RHS gate: the split-form RHS on the GPU ([`GpuSWE2D`]) against
+//! `compute_rhs_swe_2d_parallel_into` on the CPU, node for node, and timed:
+//! the fully wet `EntropyStable` on periodic beds (Phase 0), and `WetDry` on
+//! a drying beach with walls (Phase 1).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,12 +12,15 @@ use dgcom::compute_rhs_swe_2d_parallel_into;
 use dgcom::equations::ShallowWater2D;
 use dgcom::mesh::{Bathymetry2D, BoundaryTag, ElementFace, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
-use dgcom::physics::PhysicsModule;
-use dgcom::solver::{SWE2DRhsConfig, SWEFormulation2D, SWESolution2D};
+use dgcom::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D};
+use dgcom::solver::{
+    SWE2DRhsConfig, SWEFormulation2D, SWESolution2D, StandardLimiter2D, WetDryConfig,
+};
+use dgcom::source::ManningFriction2D;
 use dgcom::time::Integrable;
 use dgcom::types::ElementIndex;
 
-use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, NN, ORDER};
+use crate::swe2d::{DeviceState, Formulation, Gpu, GpuSWE2D, NN, ORDER};
 
 const G: f64 = 9.81;
 
@@ -35,9 +40,10 @@ impl Lcg {
 /// Element size (m).
 const DX: f64 = 100.0;
 
-/// A doubly periodic `nx × ny` mesh of 100 m quadrilaterals, its interior
-/// vertices moved by up to `jitter · DX` (0: parallelograms throughout).
-fn periodic_mesh(nx: usize, ny: usize, jitter: f64) -> Mesh2D {
+/// An `nx × ny` mesh of 100 m quadrilaterals, doubly periodic or walled,
+/// its interior vertices moved by up to `jitter · DX` (0: parallelograms
+/// throughout).
+fn quad_mesh(nx: usize, ny: usize, jitter: f64, periodic: bool) -> Mesh2D {
     let mut rng = Lcg(2026_11_15);
     let mut vertices = Vec::with_capacity((nx + 1) * (ny + 1));
     for j in 0..=ny {
@@ -58,26 +64,29 @@ fn periodic_mesh(nx: usize, ny: usize, jitter: f64) -> Mesh2D {
             })
         })
         .collect();
-    let periodic: Vec<_> = (0..ny)
-        .map(|j| {
-            (
-                ElementFace::new(j * nx + nx - 1, 1),
-                ElementFace::new(j * nx, 3),
-            )
-        })
-        .chain((0..nx).map(|i| {
-            (
-                ElementFace::new((ny - 1) * nx + i, 2),
-                ElementFace::new(i, 0),
-            )
-        }))
-        .collect();
-    Mesh2D::from_quads(vertices, elements, &periodic, |_| BoundaryTag::Wall)
+    let pairs: Vec<_> = if !periodic {
+        Vec::new()
+    } else {
+        (0..ny)
+            .map(|j| {
+                (
+                    ElementFace::new(j * nx + nx - 1, 1),
+                    ElementFace::new(j * nx, 3),
+                )
+            })
+            .chain((0..nx).map(|i| {
+                (
+                    ElementFace::new((ny - 1) * nx + i, 2),
+                    ElementFace::new(i, 0),
+                )
+            }))
+            .collect()
+    };
+    Mesh2D::from_quads(vertices, elements, &pairs, |_| BoundaryTag::Wall)
         .expect("a structured grid is a valid quad mesh")
 }
 
-/// A mesh with its operators, geometry, a smooth periodic bed 12–28 m deep
-/// and a smooth wet state on it.
+/// A mesh with its operators, geometry, bed, state and formulation.
 pub struct Case {
     pub mesh: Arc<Mesh2D>,
     pub ops: Arc<DGOperators2D>,
@@ -85,11 +94,19 @@ pub struct Case {
     pub bathymetry: Arc<Bathymetry2D>,
     pub equation: ShallowWater2D,
     pub q: SWESolution2D,
+    pub formulation: Formulation,
+    /// Manning's n of the bed friction, if any
+    pub manning: Option<f64>,
 }
 
+/// The wet/dry depth of the beach (`WetDryConfig::DEFAULT_H_DRY`).
+const H_DRY: f64 = 1e-3;
+
 impl Case {
+    /// A doubly periodic mesh, a smooth bed 12–28 m deep and a smooth wet
+    /// state on it: `EntropyStable`.
     pub fn new(nx: usize, ny: usize, jitter: f64) -> Self {
-        let mesh = periodic_mesh(nx, ny, jitter);
+        let mesh = quad_mesh(nx, ny, jitter, true);
         let ops = DGOperators2D::new(ORDER);
         let geom = GeometricFactors2D::compute(&mesh, &ops);
         let (kx, ky) = (
@@ -117,11 +134,87 @@ impl Case {
             bathymetry: Arc::new(bathymetry),
             equation: ShallowWater2D::new(G),
             q,
+            formulation: Formulation::EntropyStable,
+            manning: None,
+        }
+    }
+
+    /// A walled drying beach: a bed from −8 m to +2 m along x with bumps, a
+    /// wavy surface and flow towards the shore, which dries a band along the
+    /// shoreline; with `films`, films (≤ 0.2 mm) and dry nodes scattered over
+    /// all of it too (5 % each, most elements on the subcells): `WetDry`.
+    pub fn beach(nx: usize, ny: usize, jitter: f64, films: bool) -> Self {
+        let mesh = quad_mesh(nx, ny, jitter, false);
+        let ops = DGOperators2D::new(ORDER);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let lx = nx as f64 * DX;
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            -8.0 + 10.0 * x / lx + 0.6 * (0.01 * y).sin() * (0.004 * x).cos()
+        });
+        let mut rng = Lcg(11);
+        let mut q = SWESolution2D::new(mesh.n_elements, NN);
+        for k in 0..mesh.n_elements {
+            let ki = ElementIndex::new(k);
+            for i in 0..NN {
+                let [x, y] = mesh.reference_to_physical(ki, ops.nodes_r[i], ops.nodes_s[i]);
+                let eta = 0.1 + 0.25 * (0.003 * x + 0.002 * y).sin();
+                let b = bathymetry.get(ki, i);
+                let r = rng.next();
+                let h = if films && r < 0.05 {
+                    0.0
+                } else if films && r < 0.1 {
+                    2e-4 * rng.next()
+                } else {
+                    (eta - b).max(0.0)
+                };
+                let u = 0.8 * (1.0 + 0.5 * (0.01 * y).sin()) + 0.3 * (rng.next() - 0.5);
+                let v = 0.3 * (0.005 * x).cos() + 0.2 * (rng.next() - 0.5);
+                q.set_state(ki, i, SWEState2D::new(h, h * u, h * v));
+            }
+        }
+        Self {
+            mesh: Arc::new(mesh),
+            ops: Arc::new(ops),
+            geom: Arc::new(geom),
+            bathymetry: Arc::new(bathymetry),
+            equation: ShallowWater2D::new(G),
+            q,
+            formulation: Formulation::WetDry {
+                subcell_depth: H_DRY,
+                h_dry: H_DRY,
+            },
+            manning: Some(0.025),
+        }
+    }
+
+    /// The CPU's RHS configuration of this case, its walls `wall`.
+    pub fn rhs_config<'a>(&'a self, wall: &'a Reflective2D) -> SWE2DRhsConfig<'a, Reflective2D> {
+        let config = SWE2DRhsConfig::new(&self.equation, wall).with_bathymetry(&self.bathymetry);
+        match self.formulation {
+            Formulation::EntropyStable => config.with_formulation(SWEFormulation2D::EntropyStable),
+            Formulation::WetDry {
+                subcell_depth,
+                h_dry,
+            } => config
+                .with_formulation(SWEFormulation2D::WetDry)
+                .with_dry_threshold(h_dry)
+                .with_subcell_depth(subcell_depth),
         }
     }
 
     pub fn n_elements(&self) -> usize {
         self.mesh.n_elements
+    }
+
+    /// Elements on the subcells (a node shallower than the subcell depth).
+    pub fn subcell_elements(&self) -> usize {
+        let Formulation::WetDry { subcell_depth, .. } = self.formulation else {
+            return 0;
+        };
+        self.q.data[0]
+            .chunks(NN)
+            .filter(|h| h.iter().any(|&h| h < subcell_depth))
+            .count()
     }
 
     pub fn affine_elements(&self) -> usize {
@@ -132,15 +225,48 @@ impl Case {
 
     /// The GPU physics module of this case.
     pub fn gpu_physics(&self, gpu: &Arc<Gpu>) -> GpuSWE2D {
-        GpuSWE2D::new(
+        let mut physics = GpuSWE2D::new(
             gpu,
             self.mesh.clone(),
             self.ops.clone(),
             self.geom.clone(),
             &self.bathymetry,
             &self.equation,
+            self.formulation,
+            &Reflective2D::new(),
         )
-        .expect("GPU physics")
+        .expect("GPU physics");
+        if let Formulation::WetDry { .. } = self.formulation {
+            physics = physics.with_wet_dry(WetDryConfig::default());
+        }
+        if let Some(n) = self.manning {
+            physics = physics.with_friction(ManningFriction2D::new(G, n));
+        }
+        physics
+    }
+
+    /// The CPU physics module of this case, as the case runner builds it
+    /// (`swe_builder`: the positivity limiter and `WetDryConfig::default()`
+    /// for wetting and drying, Manning friction point-implicit).
+    pub fn cpu_physics(&self) -> SWEPhysics2D<Reflective2D> {
+        let mut builder = PhysicsBuilder::swe_2d(
+            self.mesh.clone(),
+            self.ops.clone(),
+            self.geom.clone(),
+            self.equation.clone(),
+            Reflective2D::new(),
+        )
+        .with_bathymetry(self.bathymetry.clone());
+        builder = match self.formulation {
+            Formulation::EntropyStable => builder.with_formulation(SWEFormulation2D::EntropyStable),
+            Formulation::WetDry { .. } => builder
+                .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
+                .with_wet_dry(WetDryConfig::default()),
+        };
+        if let Some(n) = self.manning {
+            builder = builder.with_implicit_friction(ManningFriction2D::new(G, n));
+        }
+        builder.build()
     }
 }
 
@@ -194,9 +320,7 @@ fn run_case(
     iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let wall = Reflective2D::new();
-    let config = SWE2DRhsConfig::new(&case.equation, &wall)
-        .with_formulation(SWEFormulation2D::EntropyStable)
-        .with_bathymetry(&case.bathymetry);
+    let config = case.rhs_config(&wall);
     let n_el = case.n_elements();
     let rhs_cpu = |out: &mut SWESolution2D| {
         compute_rhs_swe_2d_parallel_into(
@@ -253,10 +377,30 @@ fn run_case(
 }
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
-    println!("== Phase 0: the fully wet RHS ==");
+    println!("== The RHS: EntropyStable, periodic ==");
     run_case("parallelograms", &Case::new(48, 40, 0.0), gpu, 0)?;
     run_case("jittered", &Case::new(48, 40, 0.15), gpu, 0)?;
     run_case("jittered, timing", &Case::new(320, 300, 0.15), gpu, 20)?;
     run_case("parallelograms, timing", &Case::new(320, 300, 0.0), gpu, 20)?;
+    println!("== The RHS: WetDry, a drying beach with walls ==");
+    run_case(
+        "films, parallelograms",
+        &Case::beach(36, 20, 0.0, true),
+        gpu,
+        0,
+    )?;
+    run_case("films, jittered", &Case::beach(36, 20, 0.2, true), gpu, 0)?;
+    run_case(
+        "films, jittered, timing",
+        &Case::beach(320, 300, 0.2, true),
+        gpu,
+        20,
+    )?;
+    run_case(
+        "shoreline, jittered, timing",
+        &Case::beach(320, 300, 0.2, false),
+        gpu,
+        20,
+    )?;
     Ok(())
 }

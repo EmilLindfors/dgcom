@@ -181,10 +181,14 @@ pub fn apply_wet_dry_correction(state: &mut SWEState2D, config: &WetDryConfig) {
     config.correct_node(state.h, &mut state.hu, &mut state.hv);
 }
 
-/// Wet/dry correction of one element (SoA slices). Returns `true` if its mean
-/// depth was negative (see `positivity_limit_element`).
+/// Wet/dry correction of one element (SoA slices), with its nodal masses
+/// `weights` (GLL weight × J) and `inv_total_weight` = 1/area: the
+/// Zhang–Shu positivity step where a node is shallower than `h_dry`, then
+/// the desingularization and the velocity cap at every node. Returns `true`
+/// if its mean depth was negative (see `positivity_limit_element`). The
+/// element kernel the GPU shares (`notes/gpu.md`).
 #[inline]
-fn wet_dry_element(
+pub fn wet_dry_element(
     h: &mut [f64],
     hu: &mut [f64],
     hv: &mut [f64],
@@ -290,34 +294,69 @@ impl ImplicitDamping2D<'_> {
         dt: f64,
         cages: &[CageNode],
     ) {
-        if h <= 0.0 {
-            *hu = 0.0;
-            *hv = 0.0;
-            return;
-        }
-        let mut rate = 0.0;
-        if self.friction.is_some() || !cages.is_empty() {
-            // |u| frozen at the RHS input keeps drag balances exact
-            let (u, v) = match self.wet_dry {
-                Some(wd) => wd.desingularized_velocity(from.h, from.hu, from.hv),
-                None => from.velocity(self.h_min),
-            };
-            let speed = (u * u + v * v).sqrt();
-            if speed > 0.0 {
-                if let Some(friction) = self.friction {
-                    rate += friction.damping_rate(node, h, speed);
-                }
-                rate += CageDrag2D::damping_rate(cages, h, speed);
-            }
-        }
-        if let Some(wet_dry) = self.wet_dry {
-            rate += wet_dry.thin_layer_rate(h);
-        }
-        // rate may be +inf (factor 0); dt > 0 keeps dt·rate from being NaN
-        let factor = 1.0 / (1.0 + dt * rate);
-        *hu *= factor;
-        *hv *= factor;
+        damp_node(
+            self.friction,
+            cages,
+            self.wet_dry,
+            self.h_min,
+            node,
+            h,
+            hu,
+            hv,
+            from,
+            dt,
+        );
     }
+}
+
+/// The point-implicit damping of one node ([`ImplicitDamping2D`]): of a
+/// stage value with depth `h` and momentum `(hu, hv)` at mesh node `node`,
+/// whose RHS was evaluated at `from` with weight `dt`, under the bottom
+/// friction `friction`, the node's cage-drag entries `cages` and the
+/// thin-layer relaxation of `wet_dry`. Generic over the friction law: the
+/// CPU passes its trait object, the GPU kernels a concrete law
+/// (`notes/gpu.md`).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn damp_node<F: BottomFriction2D + ?Sized>(
+    friction: Option<&F>,
+    cages: &[CageNode],
+    wet_dry: Option<&WetDryConfig>,
+    h_min: Depth,
+    node: usize,
+    h: f64,
+    hu: &mut f64,
+    hv: &mut f64,
+    from: SWEState2D,
+    dt: f64,
+) {
+    if h <= 0.0 {
+        *hu = 0.0;
+        *hv = 0.0;
+        return;
+    }
+    let mut rate = 0.0;
+    if friction.is_some() || !cages.is_empty() {
+        // |u| frozen at the RHS input keeps drag balances exact
+        let (u, v) = match wet_dry {
+            Some(wd) => wd.desingularized_velocity(from.h, from.hu, from.hv),
+            None => from.velocity(h_min),
+        };
+        let speed = (u * u + v * v).sqrt();
+        if speed > 0.0 {
+            if let Some(friction) = friction {
+                rate += friction.damping_rate(node, h, speed);
+            }
+            rate += CageDrag2D::damping_rate(cages, h, speed);
+        }
+    }
+    if let Some(wet_dry) = wet_dry {
+        rate += wet_dry.thin_layer_rate(h);
+    }
+    // rate may be +inf (factor 0); dt > 0 keeps dt·rate from being NaN
+    let factor = 1.0 / (1.0 + dt * rate);
+    *hu *= factor;
+    *hv *= factor;
 }
 
 /// Apply stiff momentum damping point-implicitly to the RK stage value

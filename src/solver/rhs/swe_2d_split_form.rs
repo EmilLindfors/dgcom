@@ -182,28 +182,33 @@ fn limited_slope<T: Lane>(q: [T; 3], xi: [T; 3], (x_l, x_r): (T, T)) -> T {
     T::select(extremum, zero, sign * central.abs().min(bound))
 }
 
-/// What the hydrostatic HLL flux and the subcells' reconstruction read of a
-/// node: its depth, velocity and bed (no momenta). Generic over [`Lane`]:
-/// one node, or one per SIMD lane in the batched kernel.
+/// One side of a face as the hydrostatic HLL flux and the subcells'
+/// reconstruction read it: a node's depth, velocity and bed (no momenta).
+/// Generic over [`Lane`]: one node (the scalar and GPU kernels), or one per
+/// SIMD lane (the batched kernel).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Side<T = f64> {
-    h: T,
-    u: T,
-    v: T,
-    b: T,
+pub struct SWESide2D<T = f64> {
+    /// Water depth h
+    pub h: T,
+    /// x-velocity
+    pub u: T,
+    /// y-velocity
+    pub v: T,
+    /// Bed elevation B
+    pub b: T,
 }
 
-impl<T: Lane> Side<T> {
+impl<T: Lane> SWESide2D<T> {
     /// Free-surface elevation η = h + B.
     #[inline(always)]
-    fn eta(&self) -> T {
+    pub fn eta(&self) -> T {
         self.h + self.b
     }
 
     /// `if_true` in the lanes of `mask`, `if_false` in the others.
     #[cfg_attr(not(feature = "simd"), allow(dead_code))]
     #[inline(always)]
-    fn select(mask: T::Mask, if_true: Self, if_false: Self) -> Self {
+    pub fn select(mask: T::Mask, if_true: Self, if_false: Self) -> Self {
         Self {
             h: T::select(mask, if_true.h, if_false.h),
             u: T::select(mask, if_true.u, if_false.u),
@@ -213,7 +218,7 @@ impl<T: Lane> Side<T> {
     }
 }
 
-impl<T: Copy> From<&SWENodeState2D<T>> for Side<T> {
+impl<T: Copy> From<&SWENodeState2D<T>> for SWESide2D<T> {
     #[inline(always)]
     fn from(q: &SWENodeState2D<T>) -> Self {
         Self {
@@ -251,12 +256,12 @@ impl<T: Copy> From<&SWENodeState2D<T>> for Side<T> {
 /// - each side of an interface then sees the flux `½g h_face² (0, m)`, and
 ///   these balance `S_a`: `½g(h_R² − h_L²) = −½g(h_L + h_R)(B_R − B_L)`.
 #[inline(always)]
-fn reconstruct_subcell<T: Lane>(
-    nodes: [Side<T>; 3],
+pub fn reconstruct_subcell<T: Lane>(
+    nodes: [SWESide2D<T>; 3],
     xi: [T; 3],
     subcell: (T, T),
     h_dry: f64,
-) -> (Side<T>, Side<T>) {
+) -> (SWESide2D<T>, SWESide2D<T>) {
     let [m, c, p] = nodes;
     let zero = c.h.constant(0.0);
     let h_dry = c.h.constant(h_dry);
@@ -280,7 +285,7 @@ fn reconstruct_subcell<T: Lane>(
     let at = |x: T| {
         let d = x - xi[1];
         let h = (c.h + s_h * d).max(zero);
-        Side {
+        SWESide2D {
             h,
             u: c.u + s_u * d,
             v: c.v + s_v * d,
@@ -307,9 +312,9 @@ fn reconstruct_subcell<T: Lane>(
 ///
 /// Generic over [`Lane`]: the scalar, batched and GPU kernels share it.
 #[inline(always)]
-fn hydrostatic_hll<T: Lane>(
-    q_a: &Side<T>,
-    q_b: &Side<T>,
+pub fn hydrostatic_hll<T: Lane>(
+    q_a: &SWESide2D<T>,
+    q_b: &SWESide2D<T>,
     m: (T, T),
     g: f64,
     h_min: f64,
@@ -319,7 +324,7 @@ fn hydrostatic_hll<T: Lane>(
     let norm = (m.0 * m.0 + m.1 * m.1).sqrt();
     let (nx, ny) = (m.0 / norm, m.1 / norm);
     let b_face = q_a.b.max(q_b.b);
-    let side = |q: &Side<T>| {
+    let side = |q: &SWESide2D<T>| {
         let h_star = (q.h + q.b - b_face).max(zero);
         let wet = q.h.greater_than(h_min_v);
         let (u, v) = (T::select(wet, q.u, zero), T::select(wet, q.v, zero));
@@ -347,7 +352,7 @@ fn hydrostatic_hll<T: Lane>(
     // (zero unless a side is dry: two divisions and a square root per side
     // that most faces do not need)
     let (wall_a, wall_b) = if T::any(hll_dry) {
-        let wall = |q: &Side<T>, towards: f64| {
+        let wall = |q: &SWESide2D<T>, towards: f64| {
             let un = q.u.constant(towards) * (q.u * nx + q.v * ny);
             let sill = b_face - (q.h + q.b);
             let ram = wall_ram_pressure(q.h, un, sill, g);
@@ -399,7 +404,7 @@ pub(super) struct SplitFormWorkspace {
     /// node metrics at the two line ends
     interfaces: Vec<(f64, f64)>,
     /// Reconstructed (left, right) face states of the subcells of one line
-    faces: Vec<(Side, Side)>,
+    faces: Vec<(SWESide2D, SWESide2D)>,
     /// Per face node (`face · n_1d + fi`): the first interior node of the
     /// neighbour element on the GLL line through it, and its distance from
     /// the face in this element's reference coordinate (`None` at boundaries)
@@ -927,7 +932,13 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let h_dry = self.subcells.map_or(0.0, |(_, h_dry)| h_dry);
 
         // Interface metrics (the telescoping sum of the flux-differencing term)
-        telescoped_interfaces(self.ops, &ws.metric, affine, &mut ws.interfaces);
+        telescoped_interfaces(
+            &self.ops.weights_1d,
+            &self.ops.dr_1d_row_major,
+            &ws.metric,
+            affine,
+            &mut ws.interfaces,
+        );
 
         let (first, last) = (idx(0), idx(n1 - 1));
         let (q_first, q_last) = (ws.nodes[first], ws.nodes[last]);
@@ -942,17 +953,17 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         // value, and take their outer slope neighbour from the next element.
         let mut x_left = -1.0;
         for a in 0..n1 {
-            let q = Side::from(&ws.nodes[idx(a)]);
+            let q = SWESide2D::from(&ws.nodes[idx(a)]);
             let x_right = x_left + w[a];
             let left = if a > 0 {
-                Some((Side::from(&ws.nodes[idx(a - 1)]), xi[a - 1]))
+                Some((SWESide2D::from(&ws.nodes[idx(a - 1)]), xi[a - 1]))
             } else {
-                ends[0].map(|(s, d)| (Side::from(&s), -1.0 - d))
+                ends[0].map(|(s, d)| (SWESide2D::from(&s), -1.0 - d))
             };
             let right = if a + 1 < n1 {
-                Some((Side::from(&ws.nodes[idx(a + 1)]), xi[a + 1]))
+                Some((SWESide2D::from(&ws.nodes[idx(a + 1)]), xi[a + 1]))
             } else {
-                ends[1].map(|(s, d)| (Side::from(&s), 1.0 + d))
+                ends[1].map(|(s, d)| (SWESide2D::from(&s), 1.0 + d))
             };
             ws.faces[a] = match (left, right) {
                 (Some((l, x_l)), Some((r, x_r))) => {
