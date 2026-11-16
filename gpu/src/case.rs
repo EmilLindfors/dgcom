@@ -10,10 +10,11 @@ use std::time::Instant;
 
 use dgcom::case::{CaseDevice, CaseFile, DeviceRun, DeviceRunReport, RunReport, StationSeries};
 use dgcom::physics::SWEDeviceForm2D;
-use dgcom::simulation::Simulation;
+use dgcom::simulation::{Simulation, SimulationResult};
 use dgcom::solver::SWESolution2D;
+use dgcom::time::{IntegratorInfo, Multirate, TimeIntegrator};
 
-use crate::swe2d::{DeviceState, Gpu, GpuSWE2D};
+use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, MAX_DEVICE_LEVELS};
 
 /// The CUDA backend of the case runner: a 2D run's state and physics on a
 /// CUDA GPU, stepped by dgcom's own `Simulation`; the state comes back to
@@ -29,26 +30,59 @@ impl CaseDevice for Cuda {
         run: &DeviceRun<'_>,
         callback: &mut dyn FnMut(&SWESolution2D, f64),
     ) -> Result<DeviceRunReport, String> {
+        if run.levels > MAX_DEVICE_LEVELS {
+            return Err(format!(
+                "{} levels of local time stepping: the device takes at most {MAX_DEVICE_LEVELS}",
+                run.levels
+            ));
+        }
         let gpu = Gpu::on(ordinal).map_err(|e| e.to_string())?;
         let physics = GpuSWE2D::from_form(&gpu, form)?;
         let mut state = DeviceState::upload(&gpu, q);
-        let mut sim = Simulation::new(physics, run.integrator)
-            .with_cfl(run.cfl)
-            .with_callback_interval(run.interval)
-            .with_stop(Arc::clone(run.stop));
-        if let Some(dt) = run.dt_max {
-            sim = sim.with_dt_max(dt);
-        }
-        let result = sim.run_with_callback(&mut state, run.span.0, run.span.1, |s, t| {
-            callback(&s.download(), t)
-        });
+        let (result, clips) = if run.levels > 0 {
+            let integrator = Multirate::with_base(run.integrator, run.levels);
+            drive(
+                Simulation::new(physics, integrator),
+                run,
+                &mut state,
+                callback,
+            )
+        } else {
+            drive(
+                Simulation::new(physics, run.integrator),
+                run,
+                &mut state,
+                callback,
+            )
+        };
         *q = state.download();
         Ok(DeviceRunReport {
             result,
-            negative_depth_clips: sim.physics().negative_depth_clips(),
+            negative_depth_clips: clips,
             device: gpu.name.clone(),
         })
     }
+}
+
+/// `sim` from the state over the run's span with its settings, the state to
+/// the host at every callback; the result and the wet/dry clips.
+fn drive<I: TimeIntegrator<DeviceState> + IntegratorInfo>(
+    sim: Simulation<DeviceState, GpuSWE2D<'_>, I>,
+    run: &DeviceRun<'_>,
+    state: &mut DeviceState,
+    callback: &mut dyn FnMut(&SWESolution2D, f64),
+) -> (SimulationResult, usize) {
+    let mut sim = sim
+        .with_cfl(run.cfl)
+        .with_callback_interval(run.interval)
+        .with_stop(Arc::clone(run.stop));
+    if let Some(dt) = run.dt_max {
+        sim = sim.with_dt_max(dt);
+    }
+    let result = sim.run_with_callback(state, run.span.0, run.span.1, |s, t| {
+        callback(&s.download(), t)
+    });
+    (result, sim.physics().negative_depth_clips())
 }
 
 /// The case gate: the case at `path` (with `overrides`) on the CPU and on

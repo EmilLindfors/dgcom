@@ -186,6 +186,9 @@ pub trait CaseDevice {
 pub struct DeviceRun<'a> {
     /// The time stepper
     pub integrator: StandardIntegrator,
+    /// Local time stepping's levels below the coarsest (`Multirate` on the
+    /// stepper), 0 for global steps
+    pub levels: usize,
     /// CFL number
     pub cfl: f64,
     /// Interval of the callbacks (s)
@@ -247,8 +250,8 @@ impl CaseFile {
 
     /// [`Self::run_on`], stepping the 2D run on `device` if the case asks
     /// for one (`[compute] device`): refused without a device, and for
-    /// what a device does not run yet (3D, waves, local time stepping, and
-    /// the physics `SWEPhysics2D::device_form` names).
+    /// what a device does not run yet (3D, waves, and the physics
+    /// `SWEPhysics2D::device_form` names).
     pub fn run_on_with(
         &self,
         domain: &Domain,
@@ -279,13 +282,8 @@ impl CaseFile {
             }
             return self.run_3d(domain, progress);
         }
-        if device.is_some() {
-            if self.case.waves.is_some() {
-                return refuse("waves");
-            }
-            if self.case.numerics.local_time_stepping_levels > 0 {
-                return refuse("local time stepping");
-            }
+        if device.is_some() && self.case.waves.is_some() {
+            return refuse("waves");
         }
         let case = &self.case;
         let clock = case.clock()?;
@@ -446,6 +444,7 @@ impl CaseFile {
                 let form = physics.device_form().map_err(CaseError::Invalid)?;
                 let run = DeviceRun {
                     integrator: stepper,
+                    levels: numerics.local_time_stepping_levels,
                     cfl,
                     interval,
                     dt_max: numerics.dt_max_s,

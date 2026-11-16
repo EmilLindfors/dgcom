@@ -2553,6 +2553,11 @@ struct Recorded {
         dgcom::boundary::ExternalState,
     )>,
     span: (f64, f64),
+    /// Local time stepping's levels, the line-local depth and the
+    /// positivity bound's h_dry
+    levels: usize,
+    line_local_depth: Option<f64>,
+    positivity_h_dry: Option<f64>,
 }
 
 /// A device that records the run it is handed (`CaseDevice`) and refuses
@@ -2595,13 +2600,17 @@ impl dgcom::case::CaseDevice for Recorder {
             }
         }
         seen.span = run.span;
+        seen.levels = run.levels;
+        seen.line_local_depth = form.line_local_depth;
+        seen.positivity_h_dry = form.positivity_h_dry;
         Err("the recorder does not step".into())
     }
 }
 
 /// `[compute] device`: the runner hands a device the case's physics as data
-/// (`SWEPhysics2D::device_form`), refuses a device case without a device,
-/// and refuses what a device does not run, naming it.
+/// (`SWEPhysics2D::device_form`) and its local time stepping, refuses a
+/// device case without a device, and refuses what a device does not run,
+/// naming it.
 #[test]
 fn a_device_run_is_handed_the_cases_physics_as_data() {
     let dir = tempfile::tempdir().unwrap();
@@ -2651,28 +2660,33 @@ fn a_device_run_is_handed_the_cases_physics_as_data() {
     assert_eq!(velocity, dgcom::boundary::ElevationOnly::AtRest);
     assert!(tide.velocity.is_none() && tide.eta.abs() > 0.1 && tide.eta.abs() < 1.35);
     assert_eq!(seen.span, (0.0, 3600.0));
+    // Global steps; the wet/dry run's line-local depth and positivity bound
+    assert_eq!(seen.levels, 0);
+    assert_eq!(seen.line_local_depth, Some(h_dry));
+    assert_eq!(seen.positivity_h_dry, Some(h_dry));
+
+    // Local time stepping: handed its levels
+    let file = on(&[
+        "compute.device=cuda",
+        "numerics.local_time_stepping_levels=2",
+    ]);
+    let domain = file.build_domain().unwrap();
+    let recorder = Recorder::default();
+    file.run_on_with(&domain, Some(&recorder), &mut |_| {})
+        .unwrap_err();
+    assert_eq!(recorder.0.into_inner().levels, 2);
 
     // What a device does not run yet is refused, named, before the run
-    for (overrides, named) in [
-        (
-            &["numerics.local_time_stepping_levels=2"][..],
-            "local time stepping",
-        ),
-        (&["physics.viscosity_m2_s=1.0"][..], "horizontal viscosity"),
-    ] {
-        let mut all = vec!["compute.device=cuda"];
-        all.extend(overrides);
-        let file = on(&all);
-        let domain = file.build_domain().unwrap();
-        let refused = file
-            .run_on_with(&domain, Some(&Recorder::default()), &mut |_| {})
-            .unwrap_err()
-            .to_string();
-        assert!(
-            refused.contains(&format!("compute.device = \"cuda:0\" does not run {named}")),
-            "{refused}"
-        );
-    }
+    let file = on(&["compute.device=cuda", "physics.viscosity_m2_s=1.0"]);
+    let domain = file.build_domain().unwrap();
+    let refused = file
+        .run_on_with(&domain, Some(&Recorder::default()), &mut |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("compute.device = \"cuda:0\" does not run horizontal viscosity"),
+        "{refused}"
+    );
 }
 
 /// `[compute] device` reads `"cpu"`, `"cuda"` and `"cuda:N"`, and writes back

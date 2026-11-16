@@ -51,6 +51,14 @@ pub struct SWEDeviceForm2D<'a> {
     /// The boundary condition of each boundary tag of the mesh's boundary
     /// faces
     pub boundaries: Vec<(Option<BoundaryTag>, DeviceBoundary2D<'a>)>,
+    /// Local time stepping: the depth below which a node takes its element
+    /// out of the line-local form (`LocalTimeStepping::line_local`), `None`
+    /// if no element is line-local
+    pub line_local_depth: Option<f64>,
+    /// The `h_dry` of the positivity bound on the element steps and the
+    /// coarse step (`LocalTimeStepping::coarse_step_bound`), `None` without
+    /// wetting and drying
+    pub positivity_h_dry: Option<f64>,
 }
 
 impl<'a> SWEDeviceForm2D<'a> {
@@ -130,6 +138,8 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
             friction,
             source,
             boundaries,
+            line_local_depth: self.line_local_depth(),
+            positivity_h_dry: self.positivity_bound(None).map(|bound| bound.h_dry),
         })
     }
 }

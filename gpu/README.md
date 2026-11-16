@@ -2,7 +2,7 @@
 
 dgcom's GPU kernels, in Rust on NVIDIA's [cuda-oxide](https://github.com/NVIDIA/cuda-rust) (P2.7; the plan, the measurements and the toolchain are in [`../notes/gpu.md`](../notes/gpu.md)).
 
-- `src/swe2d.rs`: the kernels, a device-resident SWE state (`DeviceState`, dgcom's `Integrable`) and the GPU physics module (`GpuSWE2D`, dgcom's `PhysicsModule`), built from dgcom's own module (`SWEPhysics2D::device_form`): the split forms `EntropyStable` and `WetDry`, walls, characteristic open boundaries with a uniform external state (a harmonic tide, still water), Coriolis, the wet/dry correction, Manning friction, the positivity-bounded step. dgcom's own `Simulation` and SSP-RK steppers drive them.
+- `src/swe2d.rs`: the kernels, a device-resident SWE state (`DeviceState`, dgcom's `Integrable`) and the GPU physics module (`GpuSWE2D`, dgcom's `PhysicsModule`), built from dgcom's own module (`SWEPhysics2D::device_form`): the split forms `EntropyStable` and `WetDry`, walls, characteristic open boundaries with a uniform external state (a harmonic tide, still water), Coriolis, the wet/dry correction, Manning friction, the positivity-bounded step. dgcom's own `Simulation` and SSP-RK steppers drive them, with global steps or local time stepping (`Multirate`, up to 8 levels: `GpuSWE2D` is dgcom's `LocalTimeStepping`).
 - `src/case.rs`: the case runner's CUDA backend (`Cuda`, dgcom's `CaseDevice`, for `[compute] device`) and the case gate: a case file on the CPU and on the GPU, every station record compared.
 - `src/phase0.rs`: the RHS against `compute_rhs_swe_2d_parallel_into`, node for node, on periodic P2 meshes (parallelograms and jittered quadrilaterals) and walled drying beaches, and timed.
 - `src/phase1.rs`: `Simulation` with SSP-RK(4,3) on the GPU against the same run on the CPU (`SWEPhysics2D`), the final states node for node, and the time per step.
@@ -85,7 +85,7 @@ SIZES="800x80 1600x160 3200x320" REPEATS=5 gpu/time.sh
 ```
 
 1. Refuses a GPU that is more than 10 % busy (the cards are shared; `FORCE=1` overrides).
-2. Builds with `--no-fmad` and runs the gates against the SIMD batch: `all` (the RHS and `Simulation` runs), `beach`, and `case` on `cases/tidal_channel` (25 h, every station record). On any card each must be bit for bit (`SKIP_GATES=1` skips them).
+2. Builds with `--no-fmad` and runs the gates against the SIMD batch: `all` (the RHS and `Simulation` runs), `beach`, and `case` on `cases/tidal_channel` (25 h, every station record), global steps and local time stepping at 3 levels. On any card each must be bit for bit (`SKIP_GATES=1` skips them).
 3. Builds with FMA and runs `dgcom-gpu case` on the tidal channel refined to each of `SIZES` (`<nx>x<ny>` elements: 64,000 and 256,000 by default, about 1,150 steps each), on the CPU (the SIMD batch on all threads) and on the GPU, `REPEATS` times (3).
 4. Profiles the first size with Nsight Systems, if `nsys` is found (`SKIP_PROFILE=1` skips it): each kernel's time per step.
 

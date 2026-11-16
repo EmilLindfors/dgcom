@@ -37,8 +37,8 @@ use dgcom::solver::{
 };
 use dgcom::source::{HorizontalViscosity2D, ManningFriction2D, SourceContext2D, SourceTerm2D};
 use dgcom::time::{
-    ElementStage, IntegratorInfo, Multirate, MultirateSSPRK3, MultirateStepper, SSPRK3, SspScheme,
-    StandardIntegrator,
+    ElementStage, IntegratorInfo, Multirate, MultirateSSPRK3, MultirateStepper, SSPRK3,
+    ShuOsherStage, SspScheme, StagePlan, StandardIntegrator,
 };
 use dgcom::types::{Depth, ElementIndex};
 
@@ -1007,13 +1007,33 @@ fn a_stage_value_reads_what_line_local_says() {
     // A stage with every term: ¾ base + ¼ (input + Δt F), then the damping
     // and the wet/dry correction
     let elements: Vec<u32> = (0..n_elements as u32).collect();
-    let plan = |_: usize| ElementStage {
-        time: 40.0,
-        a: 0.75,
-        b: 0.25,
-        c: 0.25 * 0.2,
-        accumulate: None,
+    let one_level = vec![0u8; n_elements];
+    let plan = StagePlan {
+        step: (40.0, 0.2),
+        finest: 0,
+        substep: 0,
+        depth: 0,
+        stage: 1,
+        weights: ShuOsherStage {
+            start: 0.75,
+            input: 0.25,
+            beta: 0.25,
+            c: 0.0,
+        },
+        last: false,
+        level: &one_level,
+        rate: &one_level,
     };
+    assert_eq!(
+        plan.at(0),
+        ElementStage {
+            time: 40.0,
+            a: 0.75,
+            b: 0.25,
+            c: 0.25 * 0.2,
+            accumulate: None,
+        }
+    );
     let stage = |input: &SWESolution2D| {
         let mut out = SWESolution2D::new(n_elements, nn);
         local.stage_where(&q, input, &elements, &plan, &mut out, None);

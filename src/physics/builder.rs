@@ -33,7 +33,7 @@ use crate::solver::{
 use crate::source::{
     BottomFriction2D, CageDrag2D, HorizontalViscosity2D, SourceTerm2D, SourceTerms2D,
 };
-use crate::time::multirate::{ElementStage, NodeLines, RhsStencil};
+use crate::time::multirate::{NodeLines, RhsStencil, StagePlan};
 use crate::time::{LocalTimeStepping, SspScheme};
 use crate::types::ElementIndex;
 
@@ -185,7 +185,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     /// capped at the subcells' stability limit in elements with a node at or
     /// below the RHS's subcell threshold (`WetDryConfig::h_dry`, else its
     /// default).
-    fn positivity_bound(&self, scheme: Option<SspScheme>) -> Option<PositivityBound> {
+    pub(super) fn positivity_bound(&self, scheme: Option<SspScheme>) -> Option<PositivityBound> {
         let h_dry = self
             .wet_dry
             .as_ref()
@@ -293,7 +293,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     /// formulation that is not a split form on GLL lines, horizontal
     /// viscosity, a limiter of more than the element, or a source term that
     /// reads beyond its node.
-    fn line_local_depth(&self) -> Option<f64> {
+    pub(super) fn line_local_depth(&self) -> Option<f64> {
         let split_form = matches!(
             self.formulation,
             SWEFormulation2D::WetDry
@@ -654,7 +654,7 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
         base: &SWESolution2D,
         input: &SWESolution2D,
         elements: &[u32],
-        plan: &(dyn Fn(usize) -> ElementStage + Sync),
+        plan: &StagePlan<'_>,
         out: &mut SWESolution2D,
         acc: Option<&mut SWESolution2D>,
     ) {
@@ -666,7 +666,7 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
         let (line_local, shallow) = (&line_local.0[..], line_local.1);
         let breaks = AtomicUsize::new(0);
         let then = |k: usize, [h, hu, hv]: [&mut [f64]; 3], sum: Option<[&mut [f64]; 3]>| {
-            let stage = plan(k);
+            let stage = plan.at(k);
             let nodes = k * n..(k + 1) * n;
             // out = a·base + b·input + c·F, F in the rows (as scale + axpy
             // round it)
@@ -724,7 +724,7 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
             &self.geom,
             &config,
             elements,
-            &|k| plan(k).time,
+            &|k| plan.at(k).time,
             out,
             acc,
             &then,
@@ -736,7 +736,13 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
         }
     }
 
-    fn finish_where(&self, state: &mut SWESolution2D, acc: &SWESolution2D, elements: &[u32]) {
+    fn finish_where(
+        &self,
+        state: &mut SWESolution2D,
+        acc: &SWESolution2D,
+        elements: &[u32],
+        _depth: usize,
+    ) {
         let n = self.ops.n_nodes;
         let [h, hu, hv] = &mut state.data;
         let rows = [

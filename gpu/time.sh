@@ -10,8 +10,9 @@
 #
 # 1. The gates, built with --no-fmad, against the SIMD batch: the RHS and
 #    Simulation runs (`all`), the drying beach (`beach`) and
-#    cases/tidal_channel through the case runner (`case`). On any card each
-#    must be the CPU's bit for bit.
+#    cases/tidal_channel through the case runner (`case`), also with local
+#    time stepping (`case_lts`). On any card each must be the CPU's bit for
+#    bit.
 # 2. The timing, built with FMA: the refined tidal channel at each size, on
 #    the CPU and on the GPU, REPEATS times.
 # 3. Nsight Systems' kernel times on the first size, if nsys is found.
@@ -107,9 +108,11 @@ if ((SKIP_GATES == 0)); then
     say ""
     say "| gate | result |"
     say "|---|---|"
-    for gate in all beach case; do
+    for gate in all beach case case_lts; do
         if [[ $gate == case ]]; then
             run_logged "gate_$gate" "$exe" case "$case_file"
+        elif [[ $gate == case_lts ]]; then
+            run_logged "gate_$gate" "$exe" case "$case_file" --set numerics.local_time_stepping_levels=3
         else
             run_logged "gate_$gate" "$exe" "$gate"
         fi
@@ -118,9 +121,11 @@ if ((SKIP_GATES == 0)); then
         partial=$({ grep -oE '[0-9]+ of [0-9]+ nodes bit-identical' "$log" || true; } | awk '$1 != $3' | wc -l)
         result="bit for bit"
         if ((code != 0 || partial > 0)); then result="**differs** (gate_$gate.log)"; fi
-        if [[ $gate == case ]] && ! grep -q 'bit for bit' "$log"; then result="**differs** (gate_$gate.log)"; fi
+        if [[ $gate == case* ]] && ! grep -q 'bit for bit' "$log"; then result="**differs** (gate_$gate.log)"; fi
         if [[ $gate == case ]]; then
             what="steps, volume, clips and station records"
+        elif [[ $gate == case_lts ]]; then
+            what="the same with local time stepping (3 levels)"
         else
             what="every node of $compared state$( ((compared == 1)) || echo s)"
         fi
