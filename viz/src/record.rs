@@ -29,13 +29,18 @@
 //! photo view's waves too) advance by 1/fps. Nothing depends on how fast the machine
 //! renders. `--ui off|legend|on` [legend] hides the menus, status and trace (`legend`
 //! keeps the colour scale of the water); `--size WxH` [1920x1080] sets the frames'
-//! pixels.
+//! pixels. `--window off` renders them into an image ([`Offscreen`]) where there is no
+//! display to open a window on.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bevy::asset::RenderAssetUsages;
+use bevy::camera::{ImageRenderTarget, RenderTarget};
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+use bevy::render::gpu_readback::{ReadbackComplete, ReadbackOnce};
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::time::TimeUpdateStrategy;
 
 use crate::camera::OrbitCamera;
@@ -89,6 +94,102 @@ pub struct Key {
     /// Model time (s)
     pub model: f64,
     pub view: KeyView,
+}
+
+/// `--window off`: the image the run's camera renders into instead of a window, of the
+/// frames' pixels and laid out as a recording's window is (the usual 1600 × 900, scale
+/// factor `W/1600`), so the HUD and the legend come out the same size.
+#[derive(Resource, Clone)]
+pub struct Offscreen {
+    target: ImageRenderTarget,
+    size: (u32, u32),
+}
+
+impl Offscreen {
+    pub fn new(images: &mut Assets<Image>, width: u32, height: u32) -> Self {
+        let mut image =
+            Image::new_target_texture(width, height, TextureFormat::Rgba8UnormSrgb, None);
+        // Read back by `save_frame`
+        image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
+        Self {
+            target: ImageRenderTarget {
+                handle: images.add(image),
+                scale_factor: width as f32 / 1600.0,
+            },
+            size: (width, height),
+        }
+    }
+
+    /// The camera's target
+    pub fn target(&self) -> RenderTarget {
+        RenderTarget::Image(self.target.clone())
+    }
+}
+
+/// Triggered on [`save_frame`]'s entity once the file is written.
+#[derive(EntityEvent)]
+pub struct FrameSaved {
+    pub entity: Entity,
+}
+
+/// Saves the frame being rendered to `path`: a screenshot of the window, or under
+/// `--window off` the offscreen image read back from the GPU. (Bevy 0.20's screenshot
+/// of an image target came back all black here, NVIDIA's Vulkan without a display,
+/// while the image read back held the whole frame.) [`FrameSaved`] follows on the
+/// returned entity.
+pub fn save_frame(commands: &mut Commands, offscreen: Option<&Offscreen>, path: PathBuf) -> Entity {
+    let saved = |entity: Entity, commands: &mut Commands| commands.trigger(FrameSaved { entity });
+    match offscreen {
+        None => commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path))
+            .observe(
+                move |captured: On<ScreenshotCaptured>, mut commands: Commands| {
+                    saved(captured.entity, &mut commands)
+                },
+            )
+            .id(),
+        Some(offscreen) => {
+            let (width, height) = offscreen.size;
+            commands
+                .spawn(ReadbackOnce::texture(offscreen.target.handle.clone()))
+                .observe(move |read: On<ReadbackComplete>, mut commands: Commands| {
+                    let frame = Image::new(
+                        Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        TextureDimension::D2,
+                        unpadded(&read.data, width, height),
+                        TextureFormat::Rgba8UnormSrgb,
+                        RenderAssetUsages::MAIN_WORLD,
+                    );
+                    let written = frame
+                        .try_into_dynamic()
+                        .map_err(|e| e.to_string())
+                        .and_then(|frame| frame.to_rgb8().save(&path).map_err(|e| e.to_string()));
+                    match written {
+                        Ok(()) => saved(read.entity, &mut commands),
+                        Err(e) => error!("{}: {e}", path.display()),
+                    }
+                })
+                .id()
+        }
+    }
+}
+
+/// The rows of an RGBA8 texture read back with each row padded to wgpu's copy
+/// alignment (256 bytes), without the padding.
+fn unpadded(data: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let row = 4 * width as usize;
+    let stride = row.next_multiple_of(256);
+    let mut rgba = vec![0; row * height as usize];
+    for (line, read) in rgba.chunks_exact_mut(row).zip(data.chunks(stride)) {
+        let n = row.min(read.len());
+        line[..n].copy_from_slice(&read[..n]);
+    }
+    rgba
 }
 
 /// Read a path file's keys, in video-time order.
@@ -371,6 +472,7 @@ fn show(
 /// Saves the frame once the field is the frame's time, then advances the clock.
 fn save(
     mut commands: Commands,
+    offscreen: Option<Res<Offscreen>>,
     mut recording: ResMut<Recording>,
     playback: Res<Playback>,
     field: Res<Field>,
@@ -396,9 +498,7 @@ fn save(
         }
         State::Settle => {
             let path = recording.dir.join(format!("frame_{:05}.png", recording.frame));
-            commands
-                .spawn(Screenshot::primary_window())
-                .observe(save_to_disk(path));
+            save_frame(&mut commands, offscreen.as_deref(), path);
             recording.frame += 1;
             if recording.frame.is_multiple_of(30) || recording.frame == recording.frames {
                 println!(
@@ -558,6 +658,21 @@ mod tests {
         assert_eq!(world.get::<Visibility>(root), Some(&Visibility::Hidden));
         assert_eq!(world.get::<Visibility>(legend), Some(&Visibility::Inherited));
         assert_eq!(world.get::<Visibility>(bed), Some(&Visibility::Hidden));
+    }
+
+    #[test]
+    fn a_frame_read_back_loses_its_row_padding() {
+        // 3 pixels a row: 12 bytes, padded to 256
+        let mut data = vec![0u8; 2 * 256];
+        data[..12].copy_from_slice(&[1; 12]);
+        data[256..268].copy_from_slice(&[2; 12]);
+        let rows = unpadded(&data, 3, 2);
+        assert_eq!(rows.len(), 24);
+        assert_eq!(&rows[..12], &[1; 12]);
+        assert_eq!(&rows[12..], &[2; 12]);
+        // 64 pixels a row fill 256 bytes: nothing to drop
+        let full: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
+        assert_eq!(unpadded(&full, 64, 2), full);
     }
 
     #[test]

@@ -148,6 +148,9 @@
 //!   `--at` at `--rate`), `--fps N` [30], `--ui off|legend|on` [legend], `--size WxH`
 //!   the frames' pixels [1920x1080]. `ffmpeg -framerate 30 -i DIR/frame_%05d.png …`
 //!   makes the video.
+//! - `--window on|off` [on]: `off` opens no window and renders the frames into an
+//!   image of `--size` instead, for `--record`, `--screenshot` or `--frame-times` on a
+//!   machine without a display (a GPU server reached by ssh); no minimap there.
 //!
 //! The menu bar along the top ([`menubar`]) does by mouse what the keys do, F1 (or H,
 //! or ?) lists the keys with what each shows now; both read one table of actions
@@ -194,7 +197,6 @@ use std::sync::Mutex;
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use dgcom::mesh::PointLocator2D;
 use dgcom::time::ModelClock;
 
@@ -273,6 +275,8 @@ struct Args {
     ui: record::Ui,
     /// `--size WxH`: the recorded frames' pixels
     size: (u32, u32),
+    /// `--window off`: render offscreen, into an image of `size` ([`record::Offscreen`])
+    window: bool,
 }
 
 impl Args {
@@ -321,6 +325,7 @@ impl Args {
             fps: 30.0,
             ui: record::Ui::Legend,
             size: (1920, 1080),
+            window: true,
             sigma: None,
             start: "2025-06-15T00:00:00Z".into(),
             sheet: SheetShows::Density,
@@ -434,6 +439,13 @@ impl Args {
                         _ => return Err(format!("--minimap takes on or off, not {value}")),
                     }
                 }
+                "--window" => {
+                    args.window = match value.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("--window takes on or off, not {value}")),
+                    }
+                }
                 "--photo" => {
                     args.photo.on = match value.as_str() {
                         "on" => true,
@@ -484,6 +496,13 @@ impl Args {
                     ));
                 }
             }
+        }
+        // Without a window nothing is seen and nothing ends the run but these
+        let ends = args.record.is_some() || args.screenshot.is_some() || args.frame_times.is_some();
+        if !args.window && !ends {
+            return Err(
+                "--window off renders only for --record, --screenshot or --frame-times".into(),
+            );
         }
         Ok(args)
     }
@@ -1293,9 +1312,13 @@ impl Run {
 struct StartView(OrbitCamera);
 
 /// The run's camera and sun, once the screen before it (and its camera) is gone.
-fn spawn_view(mut commands: Commands, start: Res<StartView>) {
+fn spawn_view(
+    mut commands: Commands,
+    start: Res<StartView>,
+    offscreen: Option<Res<record::Offscreen>>,
+) {
     let start = start.0;
-    commands.spawn((
+    let mut camera = commands.spawn((
         RUN,
         Camera3d::default(),
         // The HUD's, not the minimap's
@@ -1309,6 +1332,9 @@ fn spawn_view(mut commands: Commands, start: Res<StartView>) {
         start.transform(),
         start,
     ));
+    if let Some(offscreen) = offscreen {
+        camera.insert(offscreen.target());
+    }
     // Sun from the south-west, 35° up.
     commands.spawn((
         RUN,
@@ -1367,22 +1393,39 @@ fn main() -> AppExit {
         }
         None => (1600, 900).into(),
     };
+    // `--window off`: no window (winit would fail without a display), frames as fast
+    // as they render, into an image of the frames' pixels laid out the same way
+    let offscreen = run.as_ref().filter(|r| !r.args.window).map(|r| r.args.size);
 
-    let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "dg-viz".into(),
-            resolution,
-            // Timed and recorded frames are not held to the display's rate
-            present_mode: if timed || recorded.is_some() {
-                bevy::window::PresentMode::AutoNoVsync
-            } else {
-                bevy::window::PresentMode::default()
-            },
+    let window = match offscreen {
+        None => WindowPlugin {
+            primary_window: Some(Window {
+                title: "dg-viz".into(),
+                resolution,
+                // Timed and recorded frames are not held to the display's rate
+                present_mode: if timed || recorded.is_some() {
+                    bevy::window::PresentMode::AutoNoVsync
+                } else {
+                    bevy::window::PresentMode::default()
+                },
+                ..default()
+            }),
             ..default()
-        }),
-        ..default()
-    }))
+        },
+        Some(_) => WindowPlugin {
+            primary_window: None,
+            exit_condition: bevy::window::ExitCondition::DontExit,
+            close_when_requested: false,
+            ..default()
+        },
+    };
+    let mut app = App::new();
+    app.add_plugins(match offscreen {
+        None => DefaultPlugins.set(window),
+        Some(_) => DefaultPlugins
+            .set(window)
+            .disable::<bevy::winit::WinitPlugin>(),
+    })
     .insert_resource(ClearColor(Color::srgb(0.05, 0.065, 0.08)))
     .insert_resource(loading::Repo(repo.clone()))
     .insert_resource(menu::Menu::new(repo))
@@ -1436,6 +1479,14 @@ fn main() -> AppExit {
             .in_set(Viewing),
     )
     .add_systems(Last, (frame_times, playback::settle).in_set(Viewing));
+    if let Some((w, h)) = offscreen {
+        app.add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(
+            std::time::Duration::ZERO,
+        ));
+        let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+        let offscreen = record::Offscreen::new(&mut images, w, h);
+        app.insert_resource(offscreen);
+    }
     match run {
         Some(run) => {
             app.insert_state(Screen::Viewer);
@@ -1561,6 +1612,7 @@ fn frame_times(
 
 fn capture(
     mut commands: Commands,
+    offscreen: Option<Res<record::Offscreen>>,
     mut capture: ResMut<Capture>,
     mut playback: ResMut<Playback>,
     field: Res<Field>,
@@ -1595,12 +1647,12 @@ fn capture(
             // a closed channel")
             if n >= 10 && settled && !capture.requested {
                 capture.requested = true;
-                commands
-                    .spawn(Screenshot::primary_window())
-                    .observe(save_to_disk(path))
-                    .observe(|_: On<ScreenshotCaptured>, mut capture: ResMut<Capture>| {
+                let shot = record::save_frame(&mut commands, offscreen.as_deref(), path.into());
+                commands.entity(shot).observe(
+                    |_: On<record::FrameSaved>, mut capture: ResMut<Capture>| {
                         capture.saved = true;
-                    });
+                    },
+                );
             } else if saved {
                 exit.write(AppExit::Success);
             } else if n == 3000 {

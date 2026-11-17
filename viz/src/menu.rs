@@ -65,9 +65,14 @@ impl Plugin for MenuPlugin {
             // The list and a run being built wake four times a second without
             // input; a run is drawn every frame
             .add_systems(OnEnter(Screen::Loading), react)
+            // (No winit, so no settings, under `--window off`)
             .add_systems(
                 OnEnter(Screen::Viewer),
-                |mut winit: ResMut<WinitSettings>| *winit = WinitSettings::default(),
+                |winit: Option<ResMut<WinitSettings>>| {
+                    if let Some(mut winit) = winit {
+                        *winit = WinitSettings::default();
+                    }
+                },
             );
     }
 }
