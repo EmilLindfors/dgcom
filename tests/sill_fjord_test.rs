@@ -35,10 +35,14 @@ fn a_rivers_brackish_layer_is_critical_at_the_fjord_mouth() {
     let outcome = sill_fjord::run(&config, |_| {});
     assert!(outcome.finite, "the run blew up");
     // The horizontal Kuzmin limiter's relaxed bounds let S overshoot the
-    // sea's by ≈ 1e-4
+    // sea's, by an amount the run's last-bit rounding sets: 5.3e-4 and
+    // 3.0e-4 on one machine before and after the shared physics divided less
+    // (#252), 1.4e-3 after it on CI's runner (another glibc), each the same
+    // in every run (`notes/3d-validation.md`, 2026-11-17). Leaving the range
+    // is a matter of whole units (S −3.9 over a 400 m sill before #167).
     let (s_low, s_high) = outcome.salt_range;
     assert!(
-        s_low >= 0.0 && s_high <= S_SEA + 1e-3,
+        s_low >= 0.0 && s_high <= S_SEA + 5e-3,
         "salinity left [0, {S_SEA}]: [{s_low}, {s_high}]"
     );
 
