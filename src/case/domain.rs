@@ -28,8 +28,8 @@ use crate::boundary::{
 };
 use crate::io::{
     AtmosphereReader, BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox,
-    GeoTiffBathymetry, LocalProjection, OceanModelReader, read_farm_site_file,
-    read_tide_gauge_file,
+    GeoTiffBathymetry, LocalProjection, OceanModelReader, SoundingCorrection, read_farm_site_file,
+    read_soundings_file, read_tide_gauge_file,
 };
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, PointLocator2D, read_gmsh_mesh};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
@@ -1389,6 +1389,15 @@ impl CaseFile {
                 )
             }
         };
+        let mut raster = raster;
+        if let Some(soundings) = &spec.soundings {
+            let file = self.resolve(&soundings.file);
+            let stations = read_soundings_file(&file)
+                .map_err(|e| CaseError::Io(format!("{}: {e}", file.display())))?;
+            let report =
+                raster.correct_to_soundings(&stations, soundings.range_m, soundings.noise_m);
+            notes.push(sounding_note(&file, soundings, &report));
+        }
         let (width, height) = raster.dimensions();
         notes.push(format!(
             "bed raster {}: {width} × {height} pixels, {:.0} m, {:.1} % water",
@@ -1398,6 +1407,41 @@ impl CaseFile {
         ));
         Ok(raster)
     }
+}
+
+/// The log's line for a raster corrected to soundings.
+fn sounding_note(
+    file: &std::path::Path,
+    spec: &super::schema::Soundings,
+    r: &SoundingCorrection,
+) -> String {
+    let mut line = format!(
+        "soundings {}: {} of {} stations on the raster's sea ({} off it, {} on its land)",
+        file.display(),
+        r.used,
+        r.stations,
+        r.off_raster,
+        r.on_land
+    );
+    if r.used == 0 {
+        return line + ", nothing corrected";
+    }
+    let [q1, m, q3] = SoundingCorrection::quartiles(&r.deeper_than_raster);
+    let [a1, am, a3] = SoundingCorrection::quartiles(&r.deeper_than_corrected);
+    line += &format!(
+        ", measured less the raster's depth {m:+.1} m (quartiles {q1:+.1}, {q3:+.1}), \
+         {am:+.1} m ({a1:+.1}, {a3:+.1}) after; field σ {:.1} m, noise {} m, range {} m: \
+         {} pixels moved, deepened by up to {:.1} m, made shallower by up to {:.1} m",
+        r.signal, spec.noise_m, spec.range_m, r.pixels, r.deepened_by, r.shoaled_by
+    );
+    if r.held > 0 {
+        line += &format!(
+            " ({} held {} m below mean sea level)",
+            r.held,
+            BedRaster::SHALLOWEST_SOUNDED
+        );
+    }
+    line
 }
 
 /// What [`read_wave_spectra`] reads: the spectra, the wind, the parent's own

@@ -15,6 +15,8 @@
 //! - **River forcing**: ROMS river files (NorKyst-800's NVE rivers) as
 //!   `RiverForcing`, for `source::RiverSources`
 //! - **GeoTIFF bathymetry**: Load depth data from GeoTIFF raster files
+//! - **Soundings**: measured depths at points (a survey's stations), and the
+//!   simple-kriging field that corrects a bed raster to them
 //! - **Coastline data**: Load coastline polygons from GSHHS shapefiles
 //! - **Coordinate projections**: Transform between geographic and Cartesian coordinates
 //!
@@ -104,6 +106,7 @@ mod projection;
 mod restart;
 mod river_forcing;
 mod snapshot;
+mod soundings;
 mod tide_gauge_reader;
 mod timeseries_reader;
 mod vtk;
@@ -156,6 +159,10 @@ pub use river_forcing::{RiverForcing, RiverMouth, RomsRhoPoints, RomsSource, rom
 pub use snapshot::{
     SOLUTION_3D_FIELDS, SnapshotError, SnapshotFrame, SnapshotHeader, SnapshotLayout,
     SnapshotLevels, SnapshotReader, SnapshotWriter,
+};
+pub use soundings::{
+    SimpleKriging, Sounding, SoundingCorrection, SoundingsError, parse_soundings_str,
+    read_soundings_file, spherical_correlation,
 };
 pub use tide_gauge_reader::{
     TideGaugeFile, TideGaugeFileError, files_to_observation_map, read_tide_gauge_directory,

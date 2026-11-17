@@ -26,6 +26,7 @@
 use super::coastline::CoastlineData;
 use super::geotiff::{GeoTiffBathymetry, GeoTiffError};
 use super::projection::{CoordinateProjection, GeoBoundingBox, LocalProjection};
+use super::soundings::{SimpleKriging, Sounding, SoundingCorrection, spherical_correlation};
 
 /// Bed elevation (m above mean sea level, negative under water) on a
 /// north-up longitude/latitude grid, defined everywhere.
@@ -97,6 +98,15 @@ impl Crop {
             .map(|(row, col)| value(row, col))
             .collect()
     }
+}
+
+/// The pixels along one axis whose centres may lie within `reach` of a
+/// point `offset` from the raster's first edge (pixels of size `pixel`,
+/// `count` of them; all in the same unit).
+fn pixel_span(offset: f64, reach: f64, pixel: f64, count: usize) -> std::ops::Range<usize> {
+    let first = ((offset - reach) / pixel).floor().max(0.0) as usize;
+    let end = (((offset + reach) / pixel).ceil().max(0.0) as usize).min(count);
+    first.min(end)..end
 }
 
 /// Land cells on a grid `refinement` times finer than the pixels, with the
@@ -336,6 +346,100 @@ impl BedRaster {
         moved
     }
 
+    /// Correct the sea towards measured depths: add the simple-kriging
+    /// estimate of the stations' residuals (their measured bed less this
+    /// raster's, bilinear) to every sea pixel within `range` m of a station
+    /// (`super::soundings`, the method and its reasoning), and report it.
+    ///
+    /// Stations off the raster or on its land are left out: the raster's
+    /// coast is not theirs to move. For the same reason a sea pixel stays in
+    /// the sea: a correction lifts it at most to [`Self::SHALLOWEST_SOUNDED`]
+    /// below mean sea level, or leaves it where it is if it is shallower
+    /// already; the report counts the pixels so held. Distances are on the
+    /// raster's central local projection.
+    ///
+    /// # Panics
+    /// If `range` or `noise` (m) is not positive.
+    pub fn correct_to_soundings(
+        &mut self,
+        soundings: &[Sounding],
+        range: f64,
+        noise: f64,
+    ) -> SoundingCorrection {
+        let (lat0, lon0) = self.bbox.center();
+        let (m_lat, m_lon) = LocalProjection::new(lat0, lon0).scale_factors();
+        let xy = |lat: f64, lon: f64| [(lon - lon0) * m_lon, (lat - lat0) * m_lat];
+        let bbox = self.bbox;
+        let mut report = SoundingCorrection {
+            stations: soundings.len(),
+            ..Default::default()
+        };
+        let mut used = Vec::new();
+        for s in soundings {
+            let inside = (bbox.min_lon..=bbox.max_lon).contains(&s.lon)
+                && (bbox.min_lat..=bbox.max_lat).contains(&s.lat);
+            if !inside {
+                report.off_raster += 1;
+            } else if self.is_land(s.lat, s.lon) {
+                report.on_land += 1;
+            } else {
+                used.push(*s);
+            }
+        }
+        let points: Vec<[f64; 2]> = used.iter().map(|s| xy(s.lat, s.lon)).collect();
+        let residuals: Vec<f64> = used
+            .iter()
+            .map(|s| -s.depth - self.bilinear(s.lat, s.lon))
+            .collect();
+        report.used = used.len();
+        report.deeper_than_raster = residuals.iter().map(|e| -e).collect();
+        let field = SimpleKriging::new(&points, &residuals, range, noise);
+        report.signal = field.signal_variance().sqrt();
+
+        let (w, h) = (self.width, self.height);
+        let dlon = (bbox.max_lon - bbox.min_lon) / w as f64;
+        let dlat = (bbox.max_lat - bbox.min_lat) / h as f64;
+        let mut correction = vec![0.0; w * h];
+        for (p, weight) in field.terms().filter(|(_, weight)| *weight != 0.0) {
+            let (lon, lat) = (lon0 + p[0] / m_lon, lat0 + p[1] / m_lat);
+            let cols = pixel_span(lon - bbox.min_lon, range / m_lon, dlon, w);
+            let rows = pixel_span(bbox.max_lat - lat, range / m_lat, dlat, h);
+            for row in rows {
+                let y = (bbox.max_lat - (row as f64 + 0.5) * dlat - lat0) * m_lat;
+                for col in cols.clone() {
+                    let x = (bbox.min_lon + (col as f64 + 0.5) * dlon - lon0) * m_lon;
+                    let d = (x - p[0]).hypot(y - p[1]);
+                    correction[row * w + col] += weight * spherical_correlation(d, range);
+                }
+            }
+        }
+        for (b, c) in self.elevation.iter_mut().zip(&correction) {
+            if *b >= 0.0 || *c == 0.0 {
+                continue;
+            }
+            let ceiling = b.max(-Self::SHALLOWEST_SOUNDED);
+            let moved = (*b + c).min(ceiling);
+            if moved < *b + c {
+                report.held += 1;
+            }
+            report.deepened_by = report.deepened_by.max(*b - moved);
+            report.shoaled_by = report.shoaled_by.max(moved - *b);
+            if moved != *b {
+                report.pixels += 1;
+            }
+            *b = moved;
+        }
+        report.deeper_than_corrected = used
+            .iter()
+            .map(|s| s.depth + self.bilinear(s.lat, s.lon))
+            .collect();
+        report
+    }
+
+    /// The shallowest depth (m) [`Self::correct_to_soundings`] lifts a sea
+    /// pixel to, so that a correction never moves the coast.
+    pub const SHALLOWEST_SOUNDED: f64 = 1.0;
+
     /// Extent (outer pixel edges).
     pub fn bbox(&self) -> &GeoBoundingBox {
         &self.bbox
@@ -510,6 +614,83 @@ mod tests {
         let mut same = raster();
         same.lower_sea_to_mean_sea_level(0.0);
         assert_eq!(same.elevation, before.elevation);
+    }
+
+    /// 21 × 21 pixels of 0.001° × 0.0005° (≈ 49 × 56 m) at 63.7° N, all at
+    /// `depth` below mean sea level.
+    fn flat_sea(depth: f64) -> BedRaster {
+        let bbox = GeoBoundingBox::new(8.0, 63.7, 8.021, 63.7105);
+        BedRaster::new(bbox, 21, 21, vec![-depth; 21 * 21])
+    }
+
+    /// The position of pixel `(row, col)`'s centre in [`flat_sea`].
+    fn station(row: usize, col: usize, depth: f64) -> Sounding {
+        Sounding {
+            lon: 8.0 + (col as f64 + 0.5) * 0.001,
+            lat: 63.7105 - (row as f64 + 0.5) * 0.0005,
+            depth,
+        }
+    }
+
+    /// A station 20 m deeper than the raster deepens its pixel to it, the
+    /// sea around it less with distance, and nothing beyond the range or on
+    /// land.
+    #[test]
+    fn soundings_correct_the_sea_within_their_range_only() {
+        let mut r = flat_sea(10.0);
+        r.elevation[10 * 21 + 12] = 2.0; // land, 99 m east of the station
+        let report = r.correct_to_soundings(&[station(10, 10, 30.0)], 300.0, 0.01);
+        assert_eq!((report.stations, report.used), (1, 1));
+        assert!((report.deeper_than_raster[0] - 20.0).abs() < 1e-12);
+        assert!(report.deeper_than_corrected[0].abs() < 1e-3);
+        assert!((r.pixel(10, 10) + 30.0).abs() < 1e-3, "{}", r.pixel(10, 10));
+        // 99 m west: deeper, by less; 198 m: less again; 346 m: untouched
+        let (near, far) = (r.pixel(10, 8), r.pixel(10, 6));
+        assert!(near < far && far < -10.0, "{near} {far}");
+        assert_eq!(r.pixel(10, 3), -10.0);
+        assert_eq!(r.pixel(4, 10), -10.0); // 334 m north
+        assert_eq!(r.pixel(10, 12), 2.0);
+        assert!((report.deepened_by - 20.0).abs() < 1e-3);
+        assert_eq!((report.shoaled_by, report.held), (0.0, 0));
+        // The pixels within 300 m: π · 300² / (49.4 × 55.7 m²) ≈ 103
+        assert!(
+            report.pixels > 90 && report.pixels < 115,
+            "{}",
+            report.pixels
+        );
+    }
+
+    /// A station shallower than the raster lifts the sea no higher than the
+    /// shallowest sounded depth, and a pixel shallower than that stays; the
+    /// stations off the raster and on its land are left out.
+    #[test]
+    fn a_correction_keeps_the_sea_in_the_sea() {
+        let mut r = flat_sea(3.0);
+        r.elevation[10 * 21 + 11] = -0.5;
+        r.elevation[0] = 2.0;
+        let off = Sounding {
+            lon: 7.9,
+            ..station(10, 10, 50.0)
+        };
+        let soundings = [station(10, 10, 0.2), off, station(0, 0, 40.0)];
+        let report = r.correct_to_soundings(&soundings, 300.0, 0.01);
+        assert_eq!(
+            (
+                report.stations,
+                report.off_raster,
+                report.on_land,
+                report.used
+            ),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(r.pixel(10, 10), -BedRaster::SHALLOWEST_SOUNDED);
+        assert_eq!(r.pixel(10, 11), -0.5);
+        assert_eq!(r.pixel(0, 0), 2.0);
+        assert!(report.held >= 2);
+        assert!((report.shoaled_by - 2.0).abs() < 1e-12);
+        // Farther out the lift is less than 2 m and not held
+        let lifted = r.pixel(10, 7);
+        assert!(lifted > -3.0 && lifted < -1.0, "{lifted}");
     }
 
     #[test]
