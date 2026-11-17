@@ -1,0 +1,57 @@
+name: viz
+
+# `viz/` is a workspace of its own, so building and testing dgcom never
+# compiles Bevy, and ci.yml never sees the viewer: it stayed broken for a
+# week after 4d3a160 changed an API it calls (notes/viz.md, 2026-11-05;
+# TODO F.3). This compiles it, with its tests, whenever dgcom's source or the
+# viewer changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "viz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/viz.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "viz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/viz.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # As in ci.yml: the repository's `.cargo/config.toml` builds for the native
+  # CPU, and a restored cache must run on any hosted runner.
+  RUSTFLAGS: "-C target-cpu=x86-64"
+
+concurrency:
+  group: viz-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: check viz/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Bevy's Linux dependencies (audio, input devices, X11 and Wayland),
+      # which its build scripts find through pkg-config
+      - name: Bevy's system libraries
+        run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          pkg-config libx11-dev libasound2-dev libudev-dev libxkbcommon-x11-0
+          libwayland-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: viz
+      # Compiled, not run: the viewer opens a window. `--all-targets` takes
+      # its unit tests and binaries along.
+      - name: cargo check --all-targets
+        working-directory: viz
+        run: cargo check --all-targets --locked
