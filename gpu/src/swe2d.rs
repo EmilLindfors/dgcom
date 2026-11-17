@@ -36,7 +36,8 @@
 use std::sync::{Arc, Mutex};
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig, Stream};
-use cuda_device::{DisjointSlice, device, kernel, thread};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+use cuda_device::{DisjointSlice, device, kernel, thread, warp};
 use cuda_host::cuda_module;
 use dgcom::SWEState2D;
 use dgcom::boundary::{
@@ -306,6 +307,24 @@ fn item(i: usize, list: &[u32], n: u32) -> Option<usize> {
     }
 }
 
+/// Thread `i`'s element of a split list (`split_elements`): `list[i]` for
+/// the first `counts[kind]` threads, `None` past them. The count is the
+/// device's, so a launch covers the pass and the threads past the kind's
+/// elements return at once.
+#[inline]
+fn split_item(i: usize, list: &[u32], counts: &[u32], kind: usize) -> Option<usize> {
+    if i >= counts[kind] as usize {
+        None
+    } else {
+        Some(list[i] as usize)
+    }
+}
+
+/// The wet elements' slot of `split_elements`' counts (the flux-differencing
+/// kernel's) and the subcell elements' (the subcell kernels').
+const WET: usize = 0;
+const SHALLOW: usize = 1;
+
 /// The level of element `k` (`level` empty: global steps, level 0).
 #[inline]
 fn level_of(level: &[u32], k: usize) -> usize {
@@ -318,6 +337,10 @@ fn level_of(level: &[u32], k: usize) -> usize {
 
 /// Threads per block of the element kernels (their registers bound the block).
 const ELEMENT_BLOCK: u32 = 128;
+
+/// Threads per block of `subcell_terms`: at its 186 registers an SM holds
+/// 10 warps, which 256-thread blocks leave at 8.
+const SUBCELL_BLOCK: u32 = 64;
 
 /// Volume node of face node `fi` of `face` (`DGOperators2D::face_nodes`:
 /// faces 2 and 3 list theirs in reverse). A formula, not a table, so that
@@ -553,13 +576,9 @@ fn outer_node(
     face: usize,
     fi: usize,
     state: (&[f64], &[f64], &[f64], &[f64]),
-    affine: &[u32],
-    egeom: &[[f64; EG]],
-    jac: &[f64],
-    fgeom: &[[f64; 3]],
+    outer_distance: &[f64],
     element_edges: &[[u32; 4]],
     edges: &[[u32; 4]],
-    xi: &[f64],
     h_min: f64,
 ) -> (SWENodeState2D, f64, bool) {
     let edge = edges[element_edges[k][face] as usize];
@@ -571,15 +590,6 @@ fn outer_node(
     } else {
         (edge[0] as usize, edge[1] as usize)
     };
-    // Element height normal to a face at a face node, in physical units / 2:
-    // J / sJ there (constant on a parallelogram)
-    let height = |e: usize, f: usize, fi: usize, node: usize| {
-        if affine[e] != 0 {
-            egeom[e][17] / egeom[e][7 + 3 * f]
-        } else {
-            jac[e * NN + node] / fgeom[(e * 4 + f) * N1 + fi][2]
-        }
-    };
     let nb_node = face_node(nb_face, N1 - 1 - fi);
     // One node into the neighbour, normal to its face
     let inner = match nb_face {
@@ -588,9 +598,8 @@ fn outer_node(
         2 => nb_node - N1,
         _ => nb_node + 1,
     };
-    let own_node = face_node(face, fi);
-    let distance =
-        (xi[1] - xi[0]) * height(nb, nb_face, N1 - 1 - fi, nb_node) / height(k, face, fi, own_node);
+    // Static: `Statics::upload` computes it as the CPU does
+    let distance = outer_distance[(k * 4 + face) * N1 + fi];
     let (h, hu, hv, bed) = state;
     (
         node_state(h, hu, hv, bed, nb * NN + inner, h_min),
@@ -1164,9 +1173,73 @@ pub mod kernels {
         }
     }
 
-    /// `SplitFormSWE2D::element_rhs` of the listed elements (every element
-    /// if `list` is empty) without a node shallower than `subcell_depth`
-    /// (one thread per element; the others are `element_rhs_subcells`'):
+    /// The listed elements (every element if `list` is empty) split by
+    /// kind: those without a node shallower than `subcell_depth` appended to
+    /// `wet`, the others to `shallow`, `counts[WET]` and `counts[SHALLOW]`
+    /// counting them (zero before the launch). Each element kernel then runs
+    /// over its own kind only: in a pass's own order the kinds share warps,
+    /// and a warp with one subcell element pays the whole subcell chain on
+    /// the FP64 units (Chiloé: 20 % of the elements on the subcells kept 48 %
+    /// of the line warps and 84 % of the element warps busy). One atomic per
+    /// warp and kind; the order within a list is the atomics', which no
+    /// result depends on (each element writes only its own rows).
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_elements(
+        subcell_depth: f64,
+        list: &[u32],
+        n: u32,
+        h: &[f64],
+        counts: *mut u32,
+        mut wet: DisjointSlice<u32>,
+        mut shallow: DisjointSlice<u32>,
+    ) {
+        // Every lane reaches the votes: no early return
+        let k = item(thread::index_1d().get(), list, n);
+        let (is_wet, is_shallow) = match k {
+            Some(k) => {
+                let sub = is_subcell_element(k, h, subcell_depth);
+                (!sub, sub)
+            }
+            None => (false, false),
+        };
+        let k = k.unwrap_or(0) as u32;
+        let (below, lane) = (warp::lanemask_lt(), warp::lane_id());
+        let wet_mask = warp::ballot(is_wet);
+        let shallow_mask = warp::ballot(is_shallow);
+        // The warp's first lane of each kind reserves the warp's slots
+        let mut base = [0u32; 2];
+        if wet_mask != 0 && lane == wet_mask.trailing_zeros() {
+            // SAFETY: `counts` holds two u32 that only atomics touch here.
+            let count = unsafe { DeviceAtomicU32::from_ptr(counts.add(WET)) };
+            base[WET] = count.fetch_add(wet_mask.count_ones(), AtomicOrdering::Relaxed);
+        }
+        if shallow_mask != 0 && lane == shallow_mask.trailing_zeros() {
+            // SAFETY: as above.
+            let count = unsafe { DeviceAtomicU32::from_ptr(counts.add(SHALLOW)) };
+            base[SHALLOW] = count.fetch_add(shallow_mask.count_ones(), AtomicOrdering::Relaxed);
+        }
+        let wet_base = warp::shuffle(base[WET], wet_mask.trailing_zeros() & 31);
+        let shallow_base = warp::shuffle(base[SHALLOW], shallow_mask.trailing_zeros() & 31);
+        // SAFETY: each lane of a kind writes the slot its warp reserved plus
+        // its rank among the warp's lanes of that kind: distinct slots, within
+        // the pass's n ≤ the lists' length.
+        unsafe {
+            if is_wet {
+                *wet.get_unchecked_mut((wet_base + (wet_mask & below).count_ones()) as usize) = k;
+            }
+            if is_shallow {
+                *shallow.get_unchecked_mut(
+                    (shallow_base + (shallow_mask & below).count_ones()) as usize,
+                ) = k;
+            }
+        }
+    }
+
+    /// `SplitFormSWE2D::element_rhs` of the wet elements of a pass (`list`,
+    /// `split_elements`' first `counts[WET]`: no node shallower than the
+    /// subcell depth; one thread per element; the others are
+    /// `element_rhs_subcells`'):
     /// the flux-differencing volume term and the lifted face terms, divided
     /// by J. One thread per element, not per line as the subcells: split
     /// in two kernels through a buffer of each line's terms (2026-11-16), a
@@ -1177,9 +1250,8 @@ pub mod kernels {
     pub fn element_rhs_volume(
         g: f64,
         h_min: f64,
-        subcell_depth: f64,
         list: &[u32],
-        n: u32,
+        counts: &[u32],
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -1201,12 +1273,9 @@ pub mod kernels {
         mut out_hu: DisjointSlice<f64>,
         mut out_hv: DisjointSlice<f64>,
     ) {
-        let Some(k) = item(thread::index_1d().get(), list, n) else {
+        let Some(k) = split_item(thread::index_1d().get(), list, counts, WET) else {
             return;
         };
-        if is_subcell_element(k, h, subcell_depth) {
-            return;
-        }
         let mut nodes = [SWENodeState2D::default(); NN];
         #[unroll]
         for i in 0..NN {
@@ -1272,8 +1341,9 @@ pub mod kernels {
         );
     }
 
-    /// The subcell terms of the listed elements (every element if `list`
-    /// is empty) with a node shallower than `subcell_depth`: one thread per
+    /// The subcell terms of the subcell elements of a pass (`list`,
+    /// `split_elements`' first `counts[SHALLOW]`: a node shallower than the
+    /// subcell depth): one thread per
     /// element and GLL line (`2·N1` per element, line `l` of direction `d`
     /// the element's `2l + d`), `line_terms` of the line into `terms`
     /// (`LINE_TERMS` per node, at `((k·2N1 + 2l + d)·N1 + a)·LINE_TERMS`),
@@ -1285,10 +1355,9 @@ pub mod kernels {
     pub fn subcell_terms(
         g: f64,
         h_min: f64,
-        subcell_depth: f64,
         h_dry: f64,
         list: &[u32],
-        n: u32,
+        counts: &[u32],
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -1296,8 +1365,7 @@ pub mod kernels {
         affine: &[u32],
         egeom: &[[f64; EG]],
         contra: &[[f64; 4]],
-        jac: &[f64],
-        fgeom: &[[f64; 3]],
+        outer_distance: &[f64],
         d1: &[f64],
         w: &[f64],
         xi: &[f64],
@@ -1307,12 +1375,9 @@ pub mod kernels {
     ) {
         let t = thread::index_1d().get();
         let (i, j) = (t / (2 * N1), t % (2 * N1));
-        let Some(k) = item(i, list, n) else {
+        let Some(k) = split_item(i, list, counts, SHALLOW) else {
             return;
         };
-        if !is_subcell_element(k, h, subcell_depth) {
-            return;
-        }
         let (line, direction) = (j / 2, j % 2);
         let node = |a: usize| {
             if direction == 0 {
@@ -1361,13 +1426,9 @@ pub mod kernels {
                 face,
                 fi,
                 (h, hu, hv, bed),
-                affine,
-                egeom,
-                jac,
-                fgeom,
+                outer_distance,
                 element_edges,
                 edges,
-                &xi_a,
                 h_min,
             )
         };
@@ -1396,9 +1457,9 @@ pub mod kernels {
         }
     }
 
-    /// `SplitFormSWE2D::element_rhs` of the listed elements (every element
-    /// if `list` is empty) with a node shallower than `subcell_depth` (one
-    /// thread per element; the others are `element_rhs_volume`'s): the
+    /// `SplitFormSWE2D::element_rhs` of the subcell elements of a pass
+    /// (`list`, `split_elements`' first `counts[SHALLOW]`; one thread per
+    /// element; the others are `element_rhs_volume`'s): the
     /// subcell terms of its lines (`subcell_terms`) summed into each node in
     /// the CPU's order (line by line, its r-line then its s-line, a node's
     /// terms in turn), then the lifted face terms, divided by J, and the
@@ -1408,9 +1469,8 @@ pub mod kernels {
     pub fn element_rhs_subcells(
         g: f64,
         h_min: f64,
-        subcell_depth: f64,
         list: &[u32],
-        n: u32,
+        counts: &[u32],
         h: &[f64],
         hu: &[f64],
         hv: &[f64],
@@ -1431,12 +1491,9 @@ pub mod kernels {
         mut out_hu: DisjointSlice<f64>,
         mut out_hv: DisjointSlice<f64>,
     ) {
-        let Some(k) = item(thread::index_1d().get(), list, n) else {
+        let Some(k) = split_item(thread::index_1d().get(), list, counts, SHALLOW) else {
             return;
         };
-        if !is_subcell_element(k, h, subcell_depth) {
-            return;
-        }
         let mut nodes = [SWENodeState2D::default(); NN];
         #[unroll]
         for i in 0..NN {
@@ -2049,6 +2106,8 @@ pub struct Gpu {
     module: kernels::LoadedModule,
     /// The device's name and compute capability
     pub name: String,
+    /// Its streaming multiprocessors
+    sms: u32,
 }
 
 impl Gpu {
@@ -2059,11 +2118,32 @@ impl Gpu {
         let name = format!("{} (sm_{major}{minor})", ctx.device_name()?);
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
+        let sms = ctx.multiprocessor_count()?;
         Ok(Arc::new(Self {
             stream,
             module,
             name,
+            sms,
         }))
+    }
+
+    /// A launch over `n` threads in blocks of `max_block`, halved (down to
+    /// a warp) while the grid would give fewer than two blocks per SM. A
+    /// short pass of local time stepping (a few hundred elements) is bound by
+    /// the FP64 rate of the SMs it occupies, and a block runs on one: 128
+    /// elements in one block took Chiloé's volume kernel 70 µs, as long as
+    /// 4,352 in 34 blocks (2026-11-16, RTX 3090: 2 FP64 units per SM).
+    fn spread(&self, n: usize, max_block: u32) -> LaunchConfig {
+        let n = n as u32;
+        let mut block = max_block;
+        while block > 32 && n.div_ceil(block) < 2 * self.sms {
+            block /= 2;
+        }
+        LaunchConfig {
+            grid_dim: (n.div_ceil(block).max(1), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        }
     }
 }
 
@@ -2267,9 +2347,12 @@ struct Statics {
     egeom: DeviceBuffer<[f64; EG]>,
     contra: DeviceBuffer<[f64; 4]>,
     jinv: DeviceBuffer<f64>,
-    /// `J` at every node
-    jac: DeviceBuffer<f64>,
     fgeom: DeviceBuffer<[f64; 3]>,
+    /// Per face node (`(k·4 + face)·N1 + fi`): the distance of the
+    /// neighbour's first interior node on the GLL line through it from the
+    /// face, in `k`'s reference coordinate (zero at a boundary): static, so
+    /// `outer_node` reads it rather than divide three times per line end
+    outer_distance: DeviceBuffer<f64>,
     d1: DeviceBuffer<f64>,
     /// The GLL weights and nodes on [−1, 1]
     w: DeviceBuffer<f64>,
@@ -2375,6 +2458,39 @@ impl Statics {
                 [e.left.element as u32, e.left.face as u32, right, right_face]
             })
             .collect();
+        // `SplitFormSWE2D::outer_node`'s distance, in its arithmetic: the
+        // element height normal to a face at a face node, J / sJ there (in
+        // physical units / 2, constant on a parallelogram), of the neighbour
+        // over this element's, times the GLL spacing next to the face
+        let height = |e: usize, f: usize, fi: usize, node: usize| {
+            if affine[e] != 0 {
+                egeom[e][17] / egeom[e][7 + 3 * f]
+            } else {
+                jac[e * NN + node] / fgeom[(e * 4 + f) * N1 + fi][2]
+            }
+        };
+        let xi = &ops.nodes_1d;
+        let mut outer_distance = vec![0.0; n_el * 4 * N1];
+        for k in 0..n_el {
+            for face in 0..4 {
+                let edge = edges[element_edges[k][face] as usize];
+                if edge[2] == NO_NEIGHBOUR {
+                    continue;
+                }
+                let (nb, nb_face) = if edge[0] as usize == k && edge[1] as usize == face {
+                    (edge[2] as usize, edge[3] as usize)
+                } else {
+                    (edge[0] as usize, edge[1] as usize)
+                };
+                for fi in 0..N1 {
+                    let nb_node = face_node(nb_face, N1 - 1 - fi);
+                    let own_node = face_node(face, fi);
+                    outer_distance[(k * 4 + face) * N1 + fi] = (xi[1] - xi[0])
+                        * height(nb, nb_face, N1 - 1 - fi, nb_node)
+                        / height(k, face, fi, own_node);
+                }
+            }
+        }
         // `CoriolisSource2D::add_element` on a β-plane: f at each node's y
         let f_node: Vec<f64> = match coriolis {
             Some(c) if c.beta != 0.0 => (0..n_el)
@@ -2394,8 +2510,8 @@ impl Statics {
             egeom: DeviceBuffer::from_host(stream, &egeom)?,
             contra: DeviceBuffer::from_host(stream, &contra)?,
             jinv: DeviceBuffer::from_host(stream, &jinv)?,
-            jac: DeviceBuffer::from_host(stream, &jac)?,
             fgeom: DeviceBuffer::from_host(stream, &fgeom)?,
+            outer_distance: DeviceBuffer::from_host(stream, &outer_distance)?,
             d1: DeviceBuffer::from_host(stream, &ops.dr_1d_row_major)?,
             w: DeviceBuffer::from_host(stream, &ops.weights_1d)?,
             xi: DeviceBuffer::from_host(stream, &ops.nodes_1d)?,
@@ -2411,6 +2527,16 @@ impl Statics {
             f_node: DeviceBuffer::from_host(stream, &f_node)?,
         })
     }
+}
+
+/// A pass's elements split by kind (`split_elements`): the wet ones (the
+/// flux-differencing kernel's) and those with a node shallower than the
+/// subcell depth (the subcell kernels'), `counts[WET]` and `counts[SHALLOW]`
+/// of them, on the device.
+struct Split {
+    wet: DeviceBuffer<u32>,
+    shallow: DeviceBuffer<u32>,
+    counts: DeviceBuffer<u32>,
 }
 
 /// The split form the GPU runs (`SWEFormulation2D`).
@@ -2467,6 +2593,8 @@ pub struct GpuSWE2D<'a> {
     /// The subcell terms of every element's lines (`subcell_terms`), for
     /// `element_rhs_subcells`; empty for the entropy-stable form
     terms: Mutex<DeviceBuffer<[f64; 3]>>,
+    /// A pass's elements split by kind for the element kernels
+    split: Mutex<Split>,
     /// Every element's largest reference rate (the time step)
     rates: Mutex<DeviceBuffer<f64>>,
     /// Local time stepping: the line-local depth and the positivity bound's
@@ -3003,6 +3131,12 @@ impl<'a> GpuSWE2D<'a> {
                 .map_err(|e| e.to_string())?,
             ),
             rates: Mutex::new(zeroed(mesh.n_elements)?),
+            split: Mutex::new(Split {
+                wet: DeviceBuffer::zeroed(stream, mesh.n_elements).map_err(|e| e.to_string())?,
+                shallow: DeviceBuffer::zeroed(stream, mesh.n_elements)
+                    .map_err(|e| e.to_string())?,
+                counts: DeviceBuffer::zeroed(stream, 2).map_err(|e| e.to_string())?,
+            }),
             line_local_depth: form.line_local_depth,
             positivity_h_dry: form.positivity_h_dry,
             schedule: Mutex::new(Schedule::empty(gpu)?),
@@ -3127,14 +3261,38 @@ impl<'a> GpuSWE2D<'a> {
             }
         });
         let (coriolis, f0) = self.coriolis_args();
-        let elements_cfg = per_element(n_elements);
+        let elements_cfg = gpu.spread(n_elements, ELEMENT_BLOCK);
+        let mut split = self.split.lock().expect("split lists");
+        let Split {
+            wet,
+            shallow,
+            counts,
+        } = &mut *split;
+        let n_pass = n_elements;
         let n_elements = n_elements as u32;
         // SAFETY: every buffer is sized for this mesh (`Statics::upload`, the
         // state's), the lists hold distinct edges and elements of it, and the
         // kernels index within its elements, edges and nodes.
         unsafe {
+            // The pass's elements by kind, for the element kernels
+            counts
+                .zero_async(&gpu.stream)
+                .expect("clear the split counts");
+            gpu.module
+                .split_elements(
+                    &gpu.stream,
+                    gpu.spread(n_pass, 256),
+                    subcell_depth,
+                    element_list,
+                    n_elements,
+                    &state.h,
+                    counts.cu_deviceptr() as *mut u32,
+                    &mut *wet,
+                    &mut *shallow,
+                )
+                .expect("split elements");
             if n_interior > 0 {
-                let cfg = one_dimensional(n_interior);
+                let cfg = gpu.spread(n_interior, 256);
                 let n = n_interior as u32;
                 if hll {
                     gpu.module.edge_fluxes_hll(
@@ -3179,7 +3337,7 @@ impl<'a> GpuSWE2D<'a> {
                 gpu.module
                     .boundary_fluxes(
                         &gpu.stream,
-                        one_dimensional(n_boundary * N1),
+                        gpu.spread(n_boundary * N1, 256),
                         u32::from(hll),
                         self.g,
                         self.h_min,
@@ -3218,9 +3376,8 @@ impl<'a> GpuSWE2D<'a> {
                     elements_cfg,
                     self.g,
                     self.h_min,
-                    subcell_depth,
-                    element_list,
-                    n_elements,
+                    &*wet,
+                    &*counts,
                     &state.h,
                     &state.hu,
                     &state.hv,
@@ -3250,13 +3407,12 @@ impl<'a> GpuSWE2D<'a> {
                 gpu.module
                     .subcell_terms(
                         &gpu.stream,
-                        one_dimensional(n_elements as usize * 2 * N1),
+                        gpu.spread(n_pass * 2 * N1, SUBCELL_BLOCK),
                         self.g,
                         self.h_min,
-                        subcell_depth,
                         h_dry,
-                        element_list,
-                        n_elements,
+                        &*shallow,
+                        &*counts,
                         &state.h,
                         &state.hu,
                         &state.hv,
@@ -3264,8 +3420,7 @@ impl<'a> GpuSWE2D<'a> {
                         &s.affine,
                         &s.egeom,
                         &s.contra,
-                        &s.jac,
-                        &s.fgeom,
+                        &s.outer_distance,
                         &s.d1,
                         &s.w,
                         &s.xi,
@@ -3281,9 +3436,8 @@ impl<'a> GpuSWE2D<'a> {
                         elements_cfg,
                         self.g,
                         self.h_min,
-                        subcell_depth,
-                        element_list,
-                        n_elements,
+                        &*shallow,
+                        &*counts,
                         &state.h,
                         &state.hu,
                         &state.hv,
@@ -3314,7 +3468,7 @@ impl<'a> GpuSWE2D<'a> {
                 gpu.module
                     .nesting_relaxation(
                         &gpu.stream,
-                        one_dimensional(n_elements as usize),
+                        gpu.spread(n_pass, 256),
                         p as u32,
                         relaxation.rate(),
                         relaxation.wet_depth(),
@@ -3767,7 +3921,7 @@ impl LocalTimeStepping<DeviceState> for GpuSWE2D<'_> {
         unsafe {
             gpu.module.stage_elements(
                 &gpu.stream,
-                per_element(n_elements),
+                gpu.spread(n_elements, ELEMENT_BLOCK),
                 plan.step.0,
                 plan.step.1,
                 plan.finest as u32,
@@ -3841,7 +3995,7 @@ impl LocalTimeStepping<DeviceState> for GpuSWE2D<'_> {
         unsafe {
             gpu.module.finish_elements(
                 &gpu.stream,
-                per_element(n),
+                gpu.spread(n, ELEMENT_BLOCK),
                 list,
                 n as u32,
                 &acc.h,

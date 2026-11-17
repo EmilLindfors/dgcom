@@ -848,6 +848,33 @@ impl MultirateStats {
     }
 }
 
+/// The inputs of [`MultirateStepper::assign`]'s level limit, rates and
+/// lists, which are a function of them alone: the levels as the time steps
+/// gave them, the line-local flags (spreading node by node) or none, the
+/// stencils and the finest level; and the levels the limit made of them.
+struct RateInputs {
+    level: Vec<u8>,
+    line_local: Option<Vec<bool>>,
+    stencils: Vec<RhsStencil>,
+    finest: usize,
+    limited: Vec<u8>,
+}
+
+impl RateInputs {
+    fn matches(
+        &self,
+        level: &[u8],
+        line_local: Option<&[bool]>,
+        stencils: &[RhsStencil],
+        finest: usize,
+    ) -> bool {
+        self.finest == finest
+            && self.stencils == stencils
+            && self.line_local.as_deref() == line_local
+            && self.level == level
+    }
+}
+
 /// Levels, stage storage and work counts of a multirate run; one per
 /// simulation (`Simulation` keeps it).
 pub struct MultirateStepper<S> {
@@ -888,6 +915,9 @@ pub struct MultirateStepper<S> {
     /// node rates for their spreading
     line_local: Vec<bool>,
     node_rate: [Vec<u8>; 2],
+    /// What the last rates and lists were made from: they stand while it
+    /// does (on a tide the levels of most coarse steps are the last ones)
+    memo: Option<RateInputs>,
     /// Stage values 1 to s − 1 (the RHS arguments of stages 2 to s)
     values: Vec<S>,
     /// The last stage's value in the current finest substep
@@ -920,6 +950,7 @@ impl<S: Integrable> MultirateStepper<S> {
             longest_step: false,
             line_local: Vec::new(),
             node_rate: [Vec::new(), Vec::new()],
+            memo: None,
             values: Vec::new(),
             last: None,
             acc: None,
@@ -1062,6 +1093,17 @@ impl<S: Integrable> MultirateStepper<S> {
             .map(|dt| 1.0 / dt)
             .sum();
 
+        // The limit, the rates and the lists are those of the last coarse
+        // step when their inputs are (16 of 20 ms of the host's work per
+        // coarse step on Chiloé's 94,685 elements, the GPU idle meanwhile)
+        let line_flags = lines.as_ref().map(|&(_, flags)| flags);
+        if let Some(memo) = &self.memo
+            && memo.matches(&self.level, line_flags, stencils, finest)
+        {
+            self.level.copy_from_slice(&memo.limited);
+            return dt;
+        }
+        let given = self.level.clone();
         for rate in &mut self.rate {
             rate.resize(n, 0);
         }
@@ -1099,6 +1141,13 @@ impl<S: Integrable> MultirateStepper<S> {
         }
         self.scratch = scratch;
         self.sort_by_rates();
+        self.memo = Some(RateInputs {
+            level: given,
+            line_local: line_flags.map(<[bool]>::to_vec),
+            stencils: stencils.to_vec(),
+            finest,
+            limited: self.level.clone(),
+        });
         dt
     }
 
@@ -1128,6 +1177,7 @@ impl<S: Integrable> MultirateStepper<S> {
     /// needed: the caller takes the global step). Call it once; the levels
     /// stay until the next [`Self::assign_levels`].
     pub fn assign_one_level(&mut self, n_elements: usize) {
+        self.memo = None;
         self.finest = 0;
         self.level.clear();
         self.level.resize(n_elements, 0);
@@ -1587,6 +1637,58 @@ mod tests {
         let dt = stepper.assign_levels(&steps, &mesh, &state, 1.0, None, Some(8.0));
         assert_eq!(dt, 8.0);
         assert_eq!(stepper.levels(), [0, 0, 0, 0, 1, 2, 3, 3]);
+    }
+
+    /// The levels, rates and lists a stepper keeps from its last coarse step
+    /// (its inputs unchanged: the levels the steps give, the stencils) are
+    /// those it would make afresh, and a changed input, or one level between,
+    /// makes them afresh.
+    #[test]
+    fn kept_rates_and_lists_are_those_made_afresh() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 16.0, 0.0, 1.0, 16, 1);
+        let faces = [RhsStencil::Faces];
+        let twice = [RhsStencil::Faces, RhsStencil::Faces];
+        // A 19 s element among slow ones: the jump limit raises its
+        // neighbours' levels, so the kept levels are not those the steps give
+        let mut a = vec![300.0; 15];
+        a.push(19.0);
+        let mut b = a.clone();
+        b[7] = 40.0;
+        let sequence: [Inputs<'_>; 9] = [
+            (&a, &faces, None),
+            (&a, &faces, None),
+            (&a, &faces, Some(1e3)),
+            (&b, &faces, None),
+            (&b, &faces, None),
+            (&a, &twice, None),
+            (&a, &twice, None),
+            (&a, &faces, None),
+            (&a, &faces, Some(60.0)),
+        ];
+        let mut kept = MultirateStepper::<Field>::new(3, SspScheme::Rk3);
+        type Inputs<'a> = (&'a [f64], &'a [RhsStencil], Option<f64>);
+        let check = |kept: &mut MultirateStepper<Field>, (steps, stencils, cap): Inputs<'_>| {
+            let dt = kept.assign_levels_from(steps, &mesh, stencils, cap, None);
+            let mut fresh = MultirateStepper::<Field>::new(3, SspScheme::Rk3);
+            assert_eq!(
+                dt,
+                fresh.assign_levels_from(steps, &mesh, stencils, cap, None)
+            );
+            assert_eq!(kept.finest, fresh.finest);
+            assert_eq!(kept.level, fresh.level);
+            assert_eq!(kept.rate, fresh.rate);
+            assert_eq!(kept.active, fresh.active);
+            assert_eq!(kept.ending, fresh.ending);
+            assert_eq!(kept.planned_work(dt), fresh.planned_work(dt));
+        };
+        for (i, inputs) in sequence.into_iter().enumerate() {
+            check(&mut kept, inputs);
+            if i == 0 {
+                assert_eq!(kept.level[13..], [1, 2, 3], "the limit raised the levels");
+            }
+        }
+        kept.assign_one_level(16);
+        check(&mut kept, (&a, &faces, None));
     }
 
     /// A cap below most elements' steps is the coarse step itself with

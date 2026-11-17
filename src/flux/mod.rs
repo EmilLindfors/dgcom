@@ -34,8 +34,8 @@ pub use swe_2d::{
     SWEFluxType2D, compute_flux_swe_2d, hll_flux_swe_2d, roe_flux_swe_2d, rusanov_flux_swe_2d,
 };
 pub use swe_2d_entropy::{
-    SWENodeState2D, entropy_stable_dissipation_2d, swe_entropy_2d, swe_entropy_variables_2d,
-    wintermeyer_bed_interface_term_2d, wintermeyer_flux_2d,
+    SWENodeState2D, entropy_stable_dissipation_2d, node_velocity, swe_entropy_2d,
+    swe_entropy_variables_2d, wintermeyer_bed_interface_term_2d, wintermeyer_flux_2d,
 };
 pub use upwind::{lax_friedrichs_flux, upwind_flux};
 

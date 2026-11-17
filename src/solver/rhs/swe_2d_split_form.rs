@@ -147,7 +147,7 @@ pub(super) const ELEMENT_CHUNK: usize = 64;
 fn wall_ram_pressure<T: Lane>(h: T, un: T, sill: T, g: f64) -> T {
     let zero = h.constant(0.0);
     let un = un.max(zero);
-    let head = un * un / h.constant(2.0 * g);
+    let head = un * un * h.constant(0.5 / g);
     let ram = (h.constant(1.0) - head / sill)
         * h
         * un
@@ -160,26 +160,46 @@ fn wall_ram_pressure<T: Lane>(h: T, un: T, sill: T, g: f64) -> T {
 /// the central slope, capped so that the face values `q + σ(x − ξ)` stay
 /// between the neighbouring node values (a monotonized-central limiter on the
 /// non-uniform GLL subcells); zero at an extremum.
+///
+/// `inv` holds the reciprocals of the stencil's distances
+/// ([`SlopeDistances`]), which every variable of a subcell shares: three
+/// divisions per subcell rather than three per variable.
 #[inline(always)]
-fn limited_slope<T: Lane>(q: [T; 3], xi: [T; 3], (x_l, x_r): (T, T)) -> T {
+fn limited_slope<T: Lane>(q: [T; 3], inv: &SlopeDistances<T>) -> T {
     let zero = q[0].constant(0.0);
     let (dm, dp) = (q[1] - q[0], q[2] - q[1]);
     let extremum = (dm * dp).at_most(zero);
-    let central = (q[2] - q[0]) / (xi[2] - xi[0]);
-    // An end subcell has its face on the node, where the value is the node
-    // value; bound its slope on that side as the standard MC limiter does
-    // (face halfway to the neighbour), so that a round-off difference cannot
-    // let the central slope through
-    let half = q[0].constant(0.5);
-    let bound = |dq: T, face: T, node: T| {
-        let dx = T::select(face.greater_than(zero), face, half * node);
-        (dq / dx).abs()
-    };
-    let bound = bound(dm, xi[1] - x_l, xi[1] - xi[0]).min(bound(dp, x_r - xi[1], xi[2] - xi[1]));
+    let central = (q[2] - q[0]) * inv.central;
+    let bound = (dm * inv.minus).abs().min((dp * inv.plus).abs());
     // The sign of the central slope, nonzero away from an extremum
     let one = q[0].constant(1.0);
     let sign = T::select(central.less_than(zero), -one, one);
     T::select(extremum, zero, sign * central.abs().min(bound))
+}
+
+/// The reciprocals of the distances a subcell's [`limited_slope`] divides by:
+/// the central difference's `1/(ξ_p − ξ_m)`, and on each side the face's
+/// distance from the node, or, for an end subcell whose face is on the node,
+/// half the distance to the neighbour (the standard MC limiter's bound), so
+/// that a round-off difference cannot let the central slope through.
+struct SlopeDistances<T> {
+    central: T,
+    minus: T,
+    plus: T,
+}
+
+impl<T: Lane> SlopeDistances<T> {
+    #[inline(always)]
+    fn new(xi: [T; 3], (x_l, x_r): (T, T)) -> Self {
+        let zero = xi[0].constant(0.0);
+        let (one, half) = (xi[0].constant(1.0), xi[0].constant(0.5));
+        let side = |face: T, node: T| one / T::select(face.greater_than(zero), face, half * node);
+        Self {
+            central: one / (xi[2] - xi[0]),
+            minus: side(xi[1] - x_l, xi[1] - xi[0]),
+            plus: side(x_r - xi[1], xi[2] - xi[1]),
+        }
+    }
 }
 
 /// One side of a face as the hydrostatic HLL flux and the subcells'
@@ -278,10 +298,11 @@ pub fn reconstruct_subcell<T: Lane>(
     for (&h, &eta) in h.iter().zip(&eta) {
         flooding = flooding | (h.less_than(h_dry) & eta.less_than(wet_surface));
     }
-    let s_h = limited_slope(h, xi, subcell);
-    let s_eta = T::select(flooding, zero, limited_slope(eta, xi, subcell));
-    let s_u = limited_slope([m.u, c.u, p.u], xi, subcell);
-    let s_v = limited_slope([m.v, c.v, p.v], xi, subcell);
+    let inv = SlopeDistances::new(xi, subcell);
+    let s_h = limited_slope(h, &inv);
+    let s_eta = T::select(flooding, zero, limited_slope(eta, &inv));
+    let s_u = limited_slope([m.u, c.u, p.u], &inv);
+    let s_v = limited_slope([m.v, c.v, p.v], &inv);
     let at = |x: T| {
         let d = x - xi[1];
         let h = (c.h + s_h * d).max(zero);
@@ -322,7 +343,8 @@ pub fn hydrostatic_hll<T: Lane>(
     let zero = m.0.constant(0.0);
     let h_min_v = m.0.constant(h_min);
     let norm = (m.0 * m.0 + m.1 * m.1).sqrt();
-    let (nx, ny) = (m.0 / norm, m.1 / norm);
+    let inv_norm = m.0.constant(1.0) / norm;
+    let (nx, ny) = (m.0 * inv_norm, m.1 * inv_norm);
     let b_face = q_a.b.max(q_b.b);
     let side = |q: &SWESide2D<T>| {
         let h_star = (q.h + q.b - b_face).max(zero);

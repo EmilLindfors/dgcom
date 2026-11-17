@@ -65,7 +65,7 @@ use super::{
     hydrostatic_hll, reconstruct_subcell,
 };
 use crate::boundary::SWEBoundaryCondition2D;
-use crate::flux::{SWENodeState2D, wintermeyer_flux_2d};
+use crate::flux::{SWENodeState2D, node_velocity, wintermeyer_flux_2d};
 use crate::mesh::FaceLink;
 use crate::solver::SWEState2D;
 use crate::solver::rhs::subcells::line_node;
@@ -295,7 +295,6 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         let nodes = data.nodes(g);
         let n_lanes = at.slots.len();
         let zero = f64x8::<S>::splat(simd, 0.0);
-        let h_min_v = f64x8::<S>::splat(simd, h_min);
         let [rh, rhu, rhv] = rhs;
         // The left side's normal of a face node, from the stored geometry
         let stored_normal = |k: usize, face: usize, fi: usize| {
@@ -386,11 +385,11 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                         f64x8::<S>::from_slice(simd, &other[1]),
                         f64x8::<S>::from_slice(simd, &other[2]),
                     );
-                    let wet = h.simd_gt(h_min_v);
+                    let (u, v) = node_velocity(h, hu, hv, h_min);
                     let neighbour = SWESide2D {
                         h,
-                        u: wet.select(hu / h, zero),
-                        v: wet.select(hv / h, zero),
+                        u,
+                        v,
                         b: f64x8::<S>::from_slice(simd, &other[3]),
                     };
                     let this = data.side(node);
@@ -452,13 +451,10 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
             None => [zero; NN],
         };
         // SWENodeState2D::new: zero velocity at h ≤ h_min
-        let h_min_v = f64x8::<S>::splat(simd, h_min);
         let mut u = [zero; NN];
         let mut v = [zero; NN];
         for i in 0..NN {
-            let wet = h[i].simd_gt(h_min_v);
-            u[i] = wet.select(hu[i] / h[i], zero);
-            v[i] = wet.select(hv[i] / h[i], zero);
+            (u[i], v[i]) = node_velocity(h[i], hu[i], hv[i], h_min);
         }
 
         let mut xy = [[0.0; L]; 8];
@@ -613,7 +609,7 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
         let [q_h, q_hu, q_hv] = &self.q.data;
         let bed = self.config.bathymetry.map(|b| &b.data[..]);
         let zero = f64x8::<S>::splat(simd, 0.0);
-        let h_min = f64x8::<S>::splat(simd, self.config.equation.h_min.meters());
+        let h_min = self.config.equation.h_min.meters();
         let spacing = f64x8::<S>::splat(simd, ops.nodes_1d[1] - ops.nodes_1d[0]);
         let r0 = f64x8::<S>::splat(simd, ops.nodes_r[0]);
         let s0 = f64x8::<S>::splat(simd, ops.nodes_s[0]);
@@ -690,11 +686,11 @@ impl<BC: SWEBoundaryCondition2D> SplitFormSWE2D<'_, '_, BC> {
                     f64x8::<S>::from_slice(simd, &t[1]),
                     f64x8::<S>::from_slice(simd, &t[2]),
                 );
-                let wet = h.simd_gt(h_min);
+                let (u, v) = node_velocity(h, hu, hv, h_min);
                 let node = SWESide2D {
                     h,
-                    u: wet.select(hu / h, zero),
-                    v: wet.select(hv / h, zero),
+                    u,
+                    v,
                     b: f64x8::<S>::from_slice(simd, &t[3]),
                 };
                 // Heights J / sJ normal to the face (a parallelogram's J at
