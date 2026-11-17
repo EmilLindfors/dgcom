@@ -285,7 +285,8 @@ impl CaseFile {
         let stations = self.stations(&mesh, &ops, &bathymetry, projection.as_ref(), &mut notes)?;
         if stations.iter().any(|s| s.gauge.is_some()) {
             notes.push(format!(
-                "gauged stations: the model's record is fitted with the constituents the                  boundaries carry and the overtides: {}",
+                "gauged stations: the model's record is fitted with the constituents the \
+                 boundaries carry and the overtides: {}",
                 HarmonicAnalysis::station_candidates(&tide_constituents).join(" ")
             ));
         }
@@ -1358,6 +1359,13 @@ impl CaseFile {
                     let filled = raster.fill_holes(|z| z == 0.0);
                     notes.push(format!(
                         "{filled} zero pixels filled from their surroundings"
+                    ));
+                }
+                if spec.sea_datum_m > 0.0 {
+                    let moved = raster.lower_sea_to_mean_sea_level(spec.sea_datum_m);
+                    notes.push(format!(
+                        "sea part lowered to mean sea level, {} m below its datum: {moved} pixels",
+                        spec.sea_datum_m
                     ));
                 }
                 raster.clamp_land(spec.land_elevation_m)

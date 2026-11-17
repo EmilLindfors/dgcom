@@ -454,6 +454,19 @@ fn a_station_is_scored_against_its_gauge() {
     );
     let constants = std::fs::read_to_string(dir.path().join("gauge_constituents.csv")).unwrap();
     assert_eq!(constants.lines().count(), 1 + names.len(), "{constants}");
+    // One day, scored on its hours 3 to 15 (the run's end)
+    assert_eq!(g.daily.len(), 1);
+    assert_eq!(g.daily[0].n, 13);
+    assert!((g.daily[0].bias + 0.1).abs() < 1e-9 && g.daily[0].centred_rmse < 1e-9);
+    let daily = std::fs::read_to_string(dir.path().join("gauge_daily.csv")).unwrap();
+    assert!(
+        daily
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("mouth,2025-06-15,13,"),
+        "{daily}"
+    );
 }
 
 /// The example's case for `hours`, its mouth station scored against a gauge
@@ -541,7 +554,11 @@ fn a_finished_run_is_scored_again_from_its_station_records() {
     let (gauged, _) = gauged_example(15.0);
     let (file, dir) = (&gauged.file, gauged.output.path());
     let report = file.run(&mut |_| {}).unwrap();
-    let files = ["gauge_skill.csv", "gauge_constituents.csv"];
+    let files = [
+        "gauge_skill.csv",
+        "gauge_constituents.csv",
+        "gauge_daily.csv",
+    ];
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
     let ran: Vec<String> = files.iter().map(|f| read(f)).collect();
     for f in files {
@@ -1369,6 +1386,57 @@ fn a_placed_raster_bay_at_rest_stays_at_rest() {
     let (speed, eta, _) = rest_departure(&file);
     println!("bay at rest, local time stepping: |u| ≤ {speed:.2e} m/s, |η| ≤ {eta:.2e} m");
     assert!(speed < 1e-9 && eta < 1e-9, "|u| {speed}, |η| {eta}");
+}
+
+/// `sea_datum_m` lowers a topobathy raster's sea to mean sea level: the deep
+/// bed by exactly the offset, and the bay still holds still water. The
+/// raster's coast stays, but a shore element's projected bed mixes its sea
+/// and land pixels, so more of them have a node below mean sea level and
+/// are kept. A `"bathymetry"` raster's depths are below mean sea level
+/// already and refuse the key.
+#[test]
+fn a_topobathy_sea_in_chart_datum_is_lowered_to_mean_sea_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = bay_case(dir.path(), "").unwrap().build_domain().unwrap();
+    let path = dir.path().join("case.toml");
+    let file = CaseFile::read(&path, &["bathymetry.raster.sea_datum_m=1.5".into()]).unwrap();
+    let lowered = file.build_domain().unwrap();
+    println!(
+        "elements kept: {} plain, {} lowered",
+        plain.mesh.n_elements, lowered.mesh.n_elements
+    );
+    assert!(lowered.mesh.n_elements >= plain.mesh.n_elements);
+    assert!(
+        (lowered.bathymetry.min() - (plain.bathymetry.min() - 1.5)).abs() < 1e-9,
+        "{} against {}",
+        lowered.bathymetry.min(),
+        plain.bathymetry.min()
+    );
+    assert!(
+        lowered
+            .notes
+            .iter()
+            .any(|n| n.starts_with("sea part lowered")),
+        "{:?}",
+        lowered.notes
+    );
+    let (speed, eta, _) = rest_departure(&file);
+    assert!(speed < 1e-9 && eta < 1e-9, "|u| {speed}, |η| {eta}");
+
+    let err = CaseFile::read(
+        &path,
+        &[
+            "bathymetry.raster.kind=bathymetry".into(),
+            "bathymetry.raster.sea_datum_m=1.5".into(),
+        ],
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        err.contains("sea_datum_m is for a \"topobathy\" raster"),
+        "{err}"
+    );
 }
 
 #[test]

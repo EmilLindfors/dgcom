@@ -1,0 +1,61 @@
+# Frøya–Smøla–Hitra, 2026-06-01 to 06-16: the nested 2D tide over a
+# spring–neap cycle (`notes/validation.md`, "Fifteen days, raw against
+# theory", pre-registered 2026-11-15, scored 2026-11-17).
+#
+# `scored_2026-06-12.toml` with the window and a 2D parent file of 15 days
+# swapped in, and nothing else changed: the coastline mesh, the 3D model's
+# bed, NorKyst-800's tide corrected from theory with no gauge. The scores
+# cover hours 3–363 at Kartverket's Mausund gauge. The raw run, NorKyst's
+# tide as it is, is the same case with
+# `--set boundary.0.nesting.correction=none --set run.name=froya_15d_2026-06_raw`.
+# The inputs, besides `scored_2026-06-12.toml`'s mesh, raster and atlas:
+#
+#   cargo run --release --example norkyst_nesting_subset -- \
+#       bbox=8.0,63.6,9.2,64.0 start=2026-06-01 hours=364 \
+#       out=data/froya_norkyst_2026-06_15d.nc
+#   dgcom run cases/froya/scored_15d_2026-06.toml
+#   dgcom score cases/froya/scored_15d_2026-06.toml   # after a change of the fit
+
+[run]
+name = "froya_15d_2026-06"
+start = "2026-06-01T00:00:00Z"
+duration_hours = 363.0
+
+[mesh]
+order = 2
+gmsh = "../../data/froya_coast.msh"
+origin = { lat = 63.8, lon = 8.6 }
+
+[bathymetry.raster]
+file = "../../data/froya_topobathy.tif"
+kind = "topobathy"
+fill_zero_holes = true
+land_elevation_m = 5.0
+
+[bathymetry.slopes_3d]
+thin_depth_m = 1.0              # the scored runs' `debug_3d=thin=1`
+
+[physics]
+coriolis = { f_plane = 1.31e-4 }
+friction = { manning = 0.025 }
+
+[[boundary]]
+tag = "open"
+[boundary.nesting]
+file = "../../data/froya_norkyst_2026-06_15d.nc"
+atlas = "../../data/froya_boundary_tides_2026-06_nkratios.txt"
+correction = "theory"
+ramp_hours = 3.0
+
+[numerics]
+local_time_stepping_levels = 8
+
+[output]
+interval_minutes = 60.0
+station_interval_minutes = 10.0
+
+[[output.station]]
+name = "Mausund"
+lat = 63.869331
+lon = 8.665231
+gauge = "../../data/tide_gauges/mausund_obs_202606.txt"   # scored after the ramp: gauge_skill.csv

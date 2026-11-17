@@ -271,7 +271,7 @@ fn score(file: &CaseFile) -> Result<(), String> {
 }
 
 /// Each gauged station's scores after `spinup` hours, as written to
-/// `gauge_skill.csv` and `gauge_constituents.csv`.
+/// `gauge_skill.csv`, `gauge_constituents.csv` and `gauge_daily.csv`.
 fn print_gauge_scores(stations: &[StationSeries], spinup: f64) {
     for s in stations {
         let Some(g) = &s.gauge else { continue };
@@ -305,6 +305,18 @@ fn print_gauge_scores(stations: &[StationSeries], spinup: f64) {
                     .join(", ")
             ),
             Err(e) => println!("  reference constants: not fitted ({e})"),
+        }
+        if let (Some(lo), Some(hi)) = (
+            g.daily.iter().map(|d| d.centred_rmse).reduce(f64::min),
+            g.daily.iter().map(|d| d.centred_rmse).reduce(f64::max),
+        ) {
+            println!(
+                "  day by day, hours 3–24 (gauge_daily.csv): RMS of {} days {:.1} cm, {:.1} to {:.1}",
+                g.daily.len(),
+                100.0 * crate::analysis::DailySkill::rms(&g.daily),
+                100.0 * lo,
+                100.0 * hi
+            );
         }
     }
 }

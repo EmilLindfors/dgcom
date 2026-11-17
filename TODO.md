@@ -8,16 +8,16 @@ The context of each line (measurements, decisions, what was tried) is in [`notes
 
 Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon-farm application (currents, waves and particles around cages inside a NorKyst-driven coastal domain) on a 2D model that is correct, cheap and validated, and a 3D model rebuilt on the ROMS recipe. "Faster than ROMS" is to be proven by P3.2 (parked), not assumed.
 
-**Up next** (2026-11-15): at a nested gauge the η score measures the parent (the model follows NorKyst within 0.5–0.7 cm), and where dgcom differs from NorKyst, in currents under 50 m, nothing measured checks it. (1) **P3.4** the nested 2D model over 15 days, then (2) **P1.5** the default `nest_tides` from it; (3) **P3.1** measured currents beside them. The sections below are in order of priority.
+**Up next** (2026-11-17): at a nested gauge the η score measures the parent (over 15 days the model follows NorKyst within 0.6 cm a day, 1.2 at worst; P3.4, done 2026-11-17), and where dgcom differs from NorKyst, in currents under 50 m, nothing measured checks it. (1) **P1.6** the bed where the farms are: the topobathy's sea part is in chart datum (1.4–1.7 m too shallow everywhere) and 10–35 m too shallow under Kattholmen against the measured depths of its environmental survey, so the bed comes before (2) **P3.1** measured currents. The sections below are in order of priority.
+
+## Inputs and forcing (P1.6) — [notes/inputs-forcing.md](notes/inputs-forcing.md)
+
+- [ ] **P1.6** Measured depths at the farms: Fiskeridirektoratet's report register (`api.fiskeridir.no/envreportreg-public`, by `siteNumber`) holds each farm's MOM-B surveys, 10–20+ stations with positions and measured depths. At Kattholmen (2026-04, 14 stations) they read 24–65 m where the 50 m topobathy gives 8.5–45 m, 10–35 m shallower at every station: the sound is interpolated, with no survey. Over the Frøya box's 41 surveyed farms (659 stations, `scripts/farm_survey_depths.py`) the raster is 5.1 m too shallow at the median, quartiles −3.5 to +15.9 m; over Bodø's 15 (199 stations) −1.2 m, quartiles −6.3 to +2.3 (Bodø's chart has 15 times the soundings). Take them into the bed near the farms (the raster corrected by the stations' residuals within a radius, or a farm-scale bed of its own); then rerun Kattholmen, whose wake and currents are on a bed a third to half as deep (`notes/farm.md`, `notes/inputs-forcing.md`).
+- [ ] **P1.6** The topobathy's sea part is in chart datum (LAT), checked 2026-11-15 against 91,000 chart depth points: every Frøya and Bodø bed's sea is 1.43 m (Mausund) to 1.69 m (Bodø) too shallow, 7–14 % of the depth at 10–20 m, with the wet/dry line moved as much. `[bathymetry.raster] sea_datum_m` lowers it by a constant (2026-11-15, default 0): rerun a scored day with 1.434 (Frøya) and 1.688 (Bodø) against the gauge and the M2 current map, then set it in the Norwegian cases; a field along the coast from the case's atlas (`TidalAtlas::largest_amplitude_sum`, 1.40 m at Mausund) or Kartverket's "NN2000 over sjøkartnull" grid after that (`notes/inputs-forcing.md`).
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
-- [ ] **P3.4** Score the nested 2D model at Bodø and Mausund over 15 days or more (a spring–neap cycle) as case runs, `nest_tides` raw and theory, so that `dgcom score` keeps them current: NorKyst's own daily centred RMSE cycles 2.3–12.1 cm at Bodø and 2.1–9.6 cm at Mausund over June 2026, and the one pre-registered day (2026-06-12) fell on its worst (`notes/validation.md` P3.4). 2D parent files of 15 days load whole (≈ 22 MB per 3 days); the 3D runs wait for parents read lazily (P1.5, parked).
 - [ ] **P3.1** Measured currents at farm sites inside the Frøya and Bodø boxes, a run of their window nested in NorKyst v3's hindcast (2012-01 to 2025-08), and `dgcom score` scoring a station's current against the record (`ADCPValidationResult`, the ellipses of `fit_ellipses`). The only check of the model where it differs from NorKyst: the island lee's M2 current 0.12–0.19 against 0.255 m/s, 0.56–0.61 of NorKyst where NorKyst is under 50 m deep, 3D 0.78 of 2D in 3–20 m; about ten parked lines wait on it (the 3D bed roughness, Kattholmen's rerun and wake, the particles' K, Frohavet). Leads in `notes/validation.md` (Olausskjæret, Sulfjorden, 2019; SINTEF's Frøya cage-current study; the site reports in hearings); the raw records need requests to operators and consultancies.
-
-## Boundaries and nesting (P1.4, P1.5) — [notes/boundaries-nesting.md](notes/boundaries-nesting.md)
-
-- [ ] **P1.5** Choose the default `nest_tides` (gauge-`corrected` or `theory`) on the 15-day score (P3.4): theory needs no gauge, so it is the one an out-of-sample domain can use.
 
 ## Generic cases and case files (P8) — [notes/case-files.md](notes/case-files.md)
 
@@ -31,7 +31,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Salmon farm and cage drag (F.1) — [notes/farm.md](notes/farm.md)
 
 - [ ] **F.1** The farm's analysis for case files: the wake against the open run, the residual current, the drag on the farm and the runs' divergence (`examples/common/farm_site.rs`, 1,800 lines) as a library report over two (or three, with a control) case runs that differ only in `farm.drag_share`, sampling the snapshots on the farm's grid.
-- [ ] **F.1** Check a site's guessed cage count and size (`FarmSite::cage_layout`, Kattholmen 2 × 4) against an aerial photo or the operator; Kattholmen's two southern cages stand on a 9–10 m bed under 20 m nets (the 50 m topobathy), so check the bed at the frame too.
 
 ## Particles (F.2) — [notes/particles.md](notes/particles.md)
 
@@ -54,10 +53,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 - [ ] **P1.7** Nonlinear SWE convergence with bathymetry on curved and jittered meshes, `EntropyStable` and `WetDry` included, asserting N+1 in `tests/convergence_test.rs` (thresholds 1.5/2.5 today; the averaged metric loses an order pointwise on jittered meshes, `notes/geometry-mesh.md`).
 - [ ] **P1.2** Films on land that do not drain: on Chiloé 500–1100 nodes carry 1–50 mm of water 1–2 m above the high water through the ebb (one 22 cm on a +2.8 m bed); on the Frøya coastline bed a 0.2 m film on +0.27 m land runs at 0.8 m/s for hours; under viscosity a film node reaches the 20 m/s cap; in 3D a 1 m shore element sets the step (0.24 s). One cause or several: log the face and subcell mass fluxes at one such node first (`notes/2d-numerics.md`, `notes/case-files.md` P8.13; the original lines are folded there and in `notes/geometry-mesh.md`).
-
-## Inputs and forcing (P1.6) — [notes/inputs-forcing.md](notes/inputs-forcing.md)
-
-- [ ] **P1.6** Settle the topobathy sea part's vertical datum (NN2000 or chart datum, 1.43 m too shallow at Mausund): check against WFS `wfs.dybdedata` points; add the 8 cm NN2000 → MSL offset if it matters.
 
 ## Tech debt (P6) — [notes/tech-debt.md](notes/tech-debt.md)
 
