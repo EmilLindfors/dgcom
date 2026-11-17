@@ -150,7 +150,7 @@ pub use source::{
     AtmosphericPressure2D, CombinedSource2D, CoriolisSource2D, DragCoefficient,
     GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress, HorizontalViscosity2D,
     HydrostaticReconstruction2D, P_STANDARD, RectangularBoundary, SourceContext2D, SourceTerm2D,
-    SpongeLayer2D, SpongeProfile, TidalPotential, TidalPotentialConstituent, WindStress2D,
+    SpongeLayer2D, SpongeProfile, WindStress2D,
 };
 pub use time::{
     // Coupled SWE + tracer integration
@@ -245,7 +245,6 @@ pub use io::{
 };
 
 // Mesh types (additional exports)
-pub use mesh::{LandMask2D, LandMaskStatistics};
 
 // Physics module types
 pub use physics::{

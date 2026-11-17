@@ -6,7 +6,6 @@
 //! - Coriolis effect
 //! - Wind stress
 //! - Atmospheric pressure
-//! - Tidal potential
 //! - Sponge layers (boundary damping)
 //! - Rivers (volume sources)
 //!
@@ -15,7 +14,7 @@
 //! - [`traits`]: Abstract source term traits (SourceTerm, SourceTerm2D)
 //! - [`swe_1d`]: 1D shallow water source terms
 //! - [`swe_2d`]: 2D shallow water source terms
-//! - [`boundary`]: Boundary treatment sources (sponge, strait friction)
+//! - [`boundary`]: Boundary treatment sources (sponge layers)
 //! - [`river`]: Rivers as volume sources (2D and 3D)
 //! - [`wellbalanced`]: Well-balanced scheme components
 
@@ -41,15 +40,13 @@ pub use swe_2d::{
     CageNode, ChezyFriction2D, CoriolisSource2D, DeviceFriction2D, DragCoefficient,
     GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress, HorizontalViscosity2D,
     ManningFriction2D, NetCage, P_STANDARD, RHO_AIR, RHO_WATER, RHO_WATER_PRESSURE,
-    SpatiallyVaryingManning2D, TidalPotential, TidalPotentialConstituent, WaveCurrentFriction2D,
-    WaveForce2D, WindStress2D, coriolis_beta, coriolis_parameter, loland_drag_coefficient,
+    SpatiallyVaryingManning2D, WaveCurrentFriction2D, WaveForce2D, WindStress2D, coriolis_beta,
+    coriolis_parameter, loland_drag_coefficient,
 };
 
 // Re-export boundary sources
 pub use boundary::{
-    RectangularBoundary, SillDetector, SillOverflow2D, SillWithFriction, SpongeDistanceFn,
-    SpongeLayer2D, SpongeProfile, StraitFriction2D, bathymetry_based_width, rectangular_sponge_fn,
-    rectangular_strait, tapered_strait,
+    RectangularBoundary, SpongeDistanceFn, SpongeLayer2D, SpongeProfile, rectangular_sponge_fn,
 };
 
 // Rivers as volume sources

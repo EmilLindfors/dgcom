@@ -34,8 +34,7 @@ pub use core::{
 // Re-export data types
 pub use data::{
     Bathymetry1D, Bathymetry2D, BoundaryTag, CliffShores, ElementSlopeBound, ElementSlopeSmoothing,
-    LandMask2D, LandMaskStatistics, Rx0, Rx0Smoothing, TidalPonds, WallLandLowering,
-    bathymetry_profiles, bathymetry_profiles_2d,
+    Rx0, Rx0Smoothing, TidalPonds, WallLandLowering, bathymetry_profiles, bathymetry_profiles_2d,
 };
 
 // Re-export I/O types

@@ -117,6 +117,8 @@ All notable changes to this project should be documented in this file.
 
 ### Removed
 
+- **The code without callers (P6, `notes/tech-debt.md`, 2026-11-16), 2,201 lines.** `LandMask2D`, `LandMaskStatistics`; `SillOverflow2D`, `SillWithFriction`, `SillDetector`; `StraitFriction2D`, `rectangular_strait`, `tapered_strait`, `bathymetry_based_width`; `TidalPotential`, `TidalPotentialConstituent`; `ManningFriction2D::fjord`; `TidalConstituent::with_nodal_correction` and `tides::correct_amplitude_phase` (a correction held constant; the forcing paths take `f` and `u` from `NodalDrift` as they drift).
+
 - **The Burn GPU prototype (P0.11, P2.7; `notes/gpu.md`, 2026-11-15).** It computed the HLL flux and discarded it (no surface term), and ran f64 with Burn's fusion off. The GPU port starts again: CUDA first, kernels in Rust with NVIDIA's cuda-oxide, calling the same pointwise physics as the CPU kernels (a spike ran `wintermeyer_flux_2d` and `entropy_stable_dissipation_2d` unchanged on the GPU, bit for bit against the CPU over 2²⁰ face nodes without FMA contraction).
   - **Deleted:** the `burn`, `burn-cuda`, `burn-wgpu`, `burn-ndarray` and `gpu` features and their dependencies, `src/solver/burn/`, `src/time/burn_ssp_rk3.rs` (`ssp_rk3_step_burn`, `compute_dt_burn`, `run_swe_2d_burn`, `BurnTimeConfig`), `examples/profile_gpu.rs`, the GPU path of `examples/quick_profile.rs`, and the unimplemented `MeshGPUData` trait.
 

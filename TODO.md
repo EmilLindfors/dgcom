@@ -57,7 +57,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Tech debt (P6) — [notes/tech-debt.md](notes/tech-debt.md)
 
 - [ ] **P6** Delete the legacy 2D paths in one go: move `profile_cpu`, `quick_profile` and `high_res_benchmark` onto `Simulation` + `SWEPhysics2D`, then delete the `ssp_rk3*` steppers and `SWE2DTimeConfig`, the `Standard` wet/dry path with the cell-average/`linearize` workarounds and its kernels, `solver/simd/`, and `Discharge2D`/`ConstantDischarge2D`. Merge the three legacy conservation tests into one on `Simulation`, and fold `Simulation3D::run_with_callback` into one time loop that lands callbacks exactly (`notes/tech-debt.md`).
-- [ ] **P6** Delete the code without callers: `LandMask2D`; `SillOverflow2D`, `SillWithFriction`, `SillDetector`, `StraitFriction2D` and `TidalPotential` with their presets (≈ 1,800 lines); `TidalConstituent::with_nodal_correction` and `tides::correct_amplitude_phase` (`notes/tech-debt.md`).
 
 ## Viewer (F.3) — [notes/viz.md](notes/viz.md)
 
