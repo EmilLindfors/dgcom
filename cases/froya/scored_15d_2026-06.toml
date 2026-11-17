@@ -1,6 +1,6 @@
 # Frøya–Smøla–Hitra, 2026-06-01 to 06-16: the nested 2D tide over a
 # spring–neap cycle (`notes/validation.md`, "Fifteen days, raw against
-# theory", pre-registered 2026-11-15; TODO P3.4).
+# theory", pre-registered 2026-11-15, scored 2026-11-17).
 #
 # `scored_2026-06-12.toml` with the window and a 2D parent file of 15 days
 # swapped in, and nothing else changed: the coastline mesh, the 3D model's
