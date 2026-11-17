@@ -2,7 +2,7 @@
 # a second (an M2 cycle every 2 s). Mesh km from the case's origin (67.275°N
 # 14.125°E): the Bodø gauge at 11.5, 1.5, Landegode about 8, 15. The views look
 # south-east, over the sea to the Saltfjord's mountains and away from the sun's glint
-# (from the south-west). See viz/src/record.rs for the format.
+# (from the south-west). See viz/src/record.rs for the format; scripts/video/bodo.toml.
 # video_s  model_h  kind   X_km  Y_km  DIST_km  BEARING  PITCH
 0          3        orbit  1     -1    50       150      60
 14         87       orbit  4     2     34       140      48

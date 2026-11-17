@@ -1,0 +1,15 @@
+# Fifteen days of tide in Chiloé's inner sea in a minute: hours 12 to 372 of the run
+# from 2025-10-31 (after the first M2 period's spin-up), 6 model hours a second. Mesh
+# km from the box's centre (43.95°S 74.1°W): Puerto Montt at 91, 274; Ancud, Chacao's
+# western mouth, at 21, 232; Melinka at 28, 6. The views look east from over the
+# Pacific, north on the left, the Andes behind and the sun's glint behind the camera.
+# The closest, over the Gulf of Ancud to Puerto Montt, comes at the spring tide of
+# 2025-11-05..07 (hours 120-168); the neap of 2025-11-12 (hour 288) from farther out.
+# See viz/src/record.rs for the format; scripts/video/chiloe.toml.
+# video_s  model_h  kind   X_km  Y_km  DIST_km  BEARING  PITCH
+0          12       orbit  10    40    460      90       60
+10         72       orbit  30    150   300      80       50
+18         120      orbit  55    225   150      60       40
+26         168      orbit  75    250   95       50       35
+40         252      orbit  40    120   260      95       48
+60         372      orbit  10    40    460      90       60

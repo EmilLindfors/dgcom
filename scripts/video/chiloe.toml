@@ -1,0 +1,31 @@
+# Fifteen days of tide in Chiloé's inner sea: cases/chiloe/case.toml run for 372.42 h
+# from 2025-10-31 (frames every 30 min, stations every 10; output/chiloe_15d/run.sh on
+# the GPU server), in water level: the inner sea's resonance against the ocean's tide,
+# from neap tide (3.0 m at Puerto Montt) to the perigean spring of 2025-11-06 (6.45 m,
+# the largest in the gauges' 60 days) and back to neap.
+#
+#   uv run --with pillow --with numpy --with imageio-ffmpeg python \
+#       scripts/video/make.py scripts/video/chiloe.toml output/chiloe_15d/run
+name = "chiloe_15_days"
+camera = "chiloe.cam"
+terrain = "data/chiloe_gebco.tif"
+viewer = ["--colour", "elevation", "--scale-max", "3", "--water-alpha", "0.85"]
+start = "2025-10-31T00:00:00Z"
+place = "Chiloé and the inner sea, southern Chile"
+title = [
+    "Fifteen days of tide in Chiloé's inner sea",
+    "31 October – 15 November 2025: neap tide, a big spring tide and neap tide again",
+    "dgcom, a discontinuous Galerkin coastal ocean model in Rust, on GEBCO's bed,",
+    "driven by TPXO10's tide at the open boundary · colour: water level",
+]
+
+[strip]
+station = "Puerto Montt"
+title = "Water level at Puerto Montt"
+gauge = "data/tide_gauges/chiloe_pmon_obs.txt"
+gauge_label = "tide gauge (SHOA, via IOC)"
+
+[end]
+heading = "Checked against SHOA's tide gauges"
+stations = ["Puerto Montt", "Ancud", "Melinka"]
+footer = "dgcom · discontinuous Galerkin coastal ocean model, written in Rust"

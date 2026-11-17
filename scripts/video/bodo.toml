@@ -1,0 +1,30 @@
+# Fifteen days of tide at Bodø: the pre-registered 15-day nested run
+# (cases/bodo/scored_15d_2026-06.toml, NorKyst-800's tide corrected from theory;
+# notes/validation.md, P3.4) in current speed.
+#
+#   uv run --with pillow --with numpy --with imageio-ffmpeg python \
+#       scripts/video/make.py scripts/video/bodo.toml output/p34_15d_gpu/bodo_theory_rerun
+name = "bodo_15_days"
+camera = "bodo.cam"                       # beside this file
+terrain = "data/bodo_topobathy.tif"       # from the checkout's root
+viewer = ["--scale-max", "0.35", "--water-alpha", "0.85"]
+start = "2026-06-01T00:00:00Z"            # the run's model time 0
+place = "Bodø, northern Norway"
+title = [
+    "Fifteen days of tide at Bodø",
+    "1–16 June 2026: from spring tide to neap tide and back",
+    "dgcom, a discontinuous Galerkin coastal ocean model in Rust,",
+    "nested in MET Norway's NorKyst-800 · colour: current speed",
+]
+
+[strip]
+station = "Bodø"                          # in the run's stations.csv
+title = "Water level at Bodø"
+gauge = "data/tide_gauges/bodo_obs_202606.txt"
+gauge_label = "tide gauge (Kartverket)"
+
+[end]
+heading = "Checked against Kartverket's tide gauge at Bodø"
+stations = ["Bodø"]
+predicted_cm = { "Bodø" = 5.0 }           # notes/validation.md, P3.4
+footer = "dgcom · discontinuous Galerkin coastal ocean model, written in Rust"
