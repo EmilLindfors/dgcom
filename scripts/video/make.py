@@ -4,6 +4,7 @@ card with the run's own scores, crossfaded, H.264 at 1080p30.
 
     uv run --with pillow --with numpy --with imageio-ffmpeg python \
         scripts/video/make.py scripts/video/bodo.toml RUN_DIR [OUT_DIR] [--no-build] [--window on]
+        [--no-record]
 
 The video's file (`bodo.toml`, `chiloe.toml`) holds its text, the camera path, the
 viewer's options and the gauge. RUN_DIR is a `dgcom run` output folder: its `.dgsnap`
@@ -11,7 +12,8 @@ is replayed, its `stations.csv` gives the model's water level at the gauge, and 
 `gauge_skill.csv` and `gauge_daily.csv` the end card's numbers. The viewer records
 `OUT_DIR/frames/<name>/frame_NNNNN.png` [OUT_DIR: output/video] with `--window off`
 (no display needed; `--window on` to watch), then the frames go to ffmpeg as raw RGB
-through a pipe with the overlays drawn on, into `OUT_DIR/<name>.mp4`. ffmpeg is
+through a pipe with the overlays drawn on, into `OUT_DIR/<name>.mp4` (`--no-record`
+assembles the frames already there again). ffmpeg is
 `$FFMPEG`, else imageio-ffmpeg's, else `ffmpeg` on the PATH; the fonts DejaVu Sans
 (`$FONT_DIR`).
 
@@ -119,15 +121,32 @@ def scores(run, station):
     return math.sqrt(sum(d * d for d in days) / len(days)), len(days), float(obs["correlation"])
 
 
+def m2_ratio(run, station):
+    """The model's M2 amplitude over the gauge's (`gauge_constituents.csv`), or None."""
+    with open(os.path.join(run, "gauge_constituents.csv"), encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r["station"] == station and r["constituent"] == "M2":
+                return float(r["amplitude_ratio"])
+    return None
+
+
 def spring_and_neap(ranges):
     """Days whose observed range is the largest (spring tide) or smallest (neap tide)
-    within three days either side, at least five days from the last one labelled."""
+    within three days either side, at least five days from the last one labelled. A
+    first or last day is the extreme of a week the record cuts short, so it is labelled
+    only if it is also in the top (bottom) third of the record's ranges: Bodø's 15 June
+    (2.48 m, new moon that day) is a spring tide, Chiloé's 14 November (3.68 m, two days
+    after neap and growing) is not."""
     days = sorted(ranges)
+    low, high = min(ranges.values()), max(ranges.values())
     picked = []
-    for kind, better in (("spring tide", max), ("neap tide", min)):
+    for kind, better, far in (("spring tide", max, lambda r: r >= high - (high - low) / 3),
+                              ("neap tide", min, lambda r: r <= low + (high - low) / 3)):
         for k in days:
             near = [ranges[j] for j in days if abs(j - k) <= 3]
-            if ranges[k] == better(near) and all(abs(k - j) >= 5 for j, _ in picked if _ == kind):
+            inside = days[0] < k < days[-1]
+            if (ranges[k] == better(near) and (inside or far(ranges[k]))
+                    and all(abs(k - j) >= 5 for j, kd in picked if kd == kind)):
                 picked.append((k, kind))
     return picked
 
@@ -229,12 +248,14 @@ def clock(img, place, start, h):
 
 
 def card(lines, alpha):
-    """A text card: (text, size, bold, colour, y) per line, faded by `alpha` (0..1)."""
+    """A text card: (text, size, bold, colour, y) per line, centred, or (…, y, x, anchor)
+    for a table's cell; faded in by `alpha` (0..1)."""
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
-    for text, size, bold, colour, y in lines:
+    for text, size, bold, colour, y, *at in lines:
+        x, anchor = at if at else (W / 2, "mm")
         c = tuple(int(BG[i] + (colour[i] - BG[i]) * alpha) for i in range(3))
-        d.text((W / 2, y), text, font=font(size, bold), fill=c, anchor="mm")
+        d.text((x, y), text, font=font(size, bold), fill=c, anchor=anchor)
     return img
 
 
@@ -266,14 +287,20 @@ def end_card(cfg, run, strip_range):
             (f"Correlation over the run: {r:.3f}", 26, False, SOFT, 610),
         ]
     else:
-        y = 500
+        # A table: the gauge, its typical day's error (and days), M2's amplitude, r
+        cols = [(560, "lm"), (1010, "mm"), (1260, "mm"), (1440, "mm")]
+        head = ["", "a typical day's error", "M2 amplitude", "correlation"]
+        lines += [(t, 20, False, DIM, 490, *c) for t, c in zip(head, cols) if t]
+        y = 536
         for s in stations:
             score, n, r = scores(run, s)
-            lines.append((f"{s}: {100 * score:.1f} cm a typical day, correlation {r:.3f}", 30,
-                          False, SOFT, y))
-            y += 50
-        lines.append((f"(each the RMS of {n} daily centred RMS errors against its gauge)", 22,
-                      False, DIM, y + 4))
+            ratio = m2_ratio(run, s)
+            row = [s, f"{100 * score:.1f} cm ({n} days)",
+                   f"{100 * (ratio - 1):+.0f} %" if ratio else "", f"{r:.3f}"]
+            lines += [(t, 28, i == 0, SOFT, y, *c) for i, (t, c) in enumerate(zip(row, cols))]
+            y += 46
+        lines.append(("the RMS of each day's centred RMS error against the gauge; M2: the "
+                      "model's harmonic amplitude against the gauge's", 20, False, DIM, y + 14))
     lines.append((end["footer"], 22, False, DIM, 760))
     return lines
 
@@ -353,12 +380,12 @@ def assemble(cfg, here, run, frames, out):
 
 
 def main(argv):
-    flags = {"--no-build": False}
+    flags = {"--no-build": False, "--no-record": False}
     window = "off"
     args = []
     it = iter(argv)
     for a in it:
-        if a == "--no-build":
+        if a in flags:
             flags[a] = True
         elif a == "--window":
             window = next(it)
@@ -376,7 +403,8 @@ def main(argv):
         sys.exit(f"no .dgsnap in {run}")
     frames = os.path.join(out_dir, "frames", cfg["name"])
     os.makedirs(frames, exist_ok=True)
-    record(cfg, here, os.path.join(run, snaps[0]), frames, window, not flags["--no-build"])
+    if not flags["--no-record"]:
+        record(cfg, here, os.path.join(run, snaps[0]), frames, window, not flags["--no-build"])
     assemble(cfg, here, run, frames, os.path.join(out_dir, cfg["name"] + ".mp4"))
 
 
