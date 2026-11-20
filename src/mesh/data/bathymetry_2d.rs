@@ -2341,7 +2341,7 @@ mod tests {
         let at = |x: f64, y: f64, p: [f64; 2]| (x - p[0]).abs() < 1e-9 && (y - p[1]).abs() < 1e-9;
         let water = |x: f64, y: f64| -10.0 + y - x;
         let bed = |x: f64, y: f64| {
-            if y > 2.0 - 1e-9 || y < 1e-9 || at(x, y, [2.5, 1.5]) {
+            if !(1e-9..=2.0 - 1e-9).contains(&y) || at(x, y, [2.5, 1.5]) {
                 3.0
             } else {
                 water(x, y)

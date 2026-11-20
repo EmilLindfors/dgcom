@@ -188,6 +188,7 @@ pub fn compute_transport_rhs_3d(
         config.elements,
     );
     if let Some(reference) = config.reference {
+        let start = crate::profiling::start();
         add_reference_advection(
             [&mut rhs.temp, &mut rhs.salt],
             [&state.temp, &state.salt],
@@ -201,5 +202,6 @@ pub fn compute_transport_rhs_3d(
             config.min_column_depth,
             config.elements,
         );
+        crate::profiling::stop("3d: reference advection", start);
     }
 }

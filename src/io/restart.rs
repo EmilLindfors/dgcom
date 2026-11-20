@@ -271,11 +271,11 @@ impl Restart3D {
             }
         }
         if let Some(profile) = &self.reference_profile {
-            let (heights, temp, salt, slopes) = profile.samples_and_slopes();
+            let [heights, temp, salt] = profile.samples();
             sections.push(("reference_profile.z".into(), heights));
             sections.push(("reference_profile.temp".into(), temp));
             sections.push(("reference_profile.salt".into(), salt));
-            if let Some([temp_slope, salt_slope]) = slopes {
+            if let Some([temp_slope, salt_slope]) = profile.slopes() {
                 sections.push(("reference_profile.temp_slope".into(), temp_slope));
                 sections.push(("reference_profile.salt_slope".into(), salt_slope));
             }
@@ -893,13 +893,11 @@ mod tests {
         assert_eq!(a.slow_forcing.g.len(), b.slow_forcing.g.len());
         match (&a.reference_profile, &b.reference_profile) {
             (Some(pa), Some(pb)) => {
-                let (za, ta, sa, slopes_a) = pa.samples_and_slopes();
-                let (zb, tb, sb, slopes_b) = pb.samples_and_slopes();
-                for (x, y) in [(za, zb), (ta, tb), (sa, sb)] {
+                for (x, y) in pa.samples().into_iter().zip(pb.samples()) {
                     assert_eq!(bits(x), bits(y));
                 }
-                let [ta, sa] = slopes_a.expect("the sample is cubic");
-                let [tb, sb] = slopes_b.expect("the slopes are lost");
+                let [ta, sa] = pa.slopes().expect("the sample is cubic");
+                let [tb, sb] = pb.slopes().expect("the slopes are lost");
                 assert_eq!(bits(ta), bits(tb));
                 assert_eq!(bits(sa), bits(sb));
                 // The profile itself, at heights between the samples

@@ -410,6 +410,10 @@ impl BalancedReference {
 /// density slope is taken as zero.
 const MIN_LEVEL_SPACING: f64 = 1e-9;
 
+/// The most σ-levels a reference stratification's kernels take (their
+/// per-level buffers are on the stack).
+const MAX_LEVELS: usize = 128;
+
 /// One water column's density anomaly as a piecewise Hermite cubic in `z`,
 /// and its hydrostatic pressure (per `g`) at the level centres.
 #[derive(Clone, Copy)]
@@ -985,7 +989,7 @@ pub struct ReferenceFields {
     pub tracers: [Vec<f64>; 2],
     /// Their gradients over each layer,
     /// `γ = (C̄(z_{l+½}) − C̄(z_{l−½})) / H_z` between the σ-surfaces that
-    /// bound it (zero in a layer without thickness).
+    /// bound it (zero in a column without water).
     pub gradients: [Vec<f64>; 2],
     /// `ρ̄`, the density of `(T̄, S̄)`, at the layer centres.
     pub density: Vec<f64>,
@@ -996,6 +1000,10 @@ pub struct ReferenceFields {
     /// The mean displacement `κ` (m) of every element's stratification
     /// about the reference, `[element]` ([`Self::set_displacements`]).
     pub displacement: Vec<f64>,
+    /// The free surface the fields of each column were last filled at
+    /// (`[element][node]`, NaN before the first): [`Self::fill`] leaves an
+    /// element whose columns have not moved as it is.
+    filled_at: Vec<f64>,
 }
 
 impl ReferenceFields {
@@ -1005,6 +1013,13 @@ impl ReferenceFields {
     /// A layer's gradient is the reference's mean over the layer, so that
     /// the gradients of a column add up to the reference's change over it
     /// whatever the levels resolve.
+    ///
+    /// The fields are functions of the columns' `η` alone, so an element
+    /// whose `η` is that of its last fill is left as it is (a stage's
+    /// pressure gradient and its transport take the same levels, and a fluid
+    /// at rest never moves them): the same profile, equation of state, bed
+    /// and levels must be given every time (a new [`Self::default`] for
+    /// others).
     #[allow(clippy::too_many_arguments)]
     pub fn fill(
         &mut self,
@@ -1024,6 +1039,7 @@ impl ReferenceFields {
             density: rho,
             stratification,
             displacement,
+            filled_at,
         } = self;
         for field in [
             &mut *temp,
@@ -1036,7 +1052,14 @@ impl ReferenceFields {
             field.resize(n, 0.0);
         }
         displacement.resize(state.n_elements, 0.0);
+        filled_at.resize(state.n_elements * nn, f64::NAN);
         let (sigma_rho, sigma_w) = (sigma.sigma_rho(), sigma.sigma_w());
+        // 1/Δσ of every layer: a layer's thickness is Δσ times the depth
+        assert!(nl <= MAX_LEVELS, "at most {MAX_LEVELS} levels, not {nl}");
+        let mut inverse_d_sigma = [0.0; MAX_LEVELS];
+        for (inverse, w) in inverse_d_sigma.iter_mut().zip(sigma_w.windows(2)) {
+            *inverse = 1.0 / (w[1] - w[0]);
+        }
         for_each_block(
             elements,
             [
@@ -1046,6 +1069,7 @@ impl ReferenceFields {
                 &mut salt_gradient[..],
                 &mut rho[..],
                 &mut stratification[..],
+                &mut filled_at[..],
             ],
             || (),
             |_,
@@ -1057,10 +1081,21 @@ impl ReferenceFields {
                 salt_gradient,
                 rho,
                 stratification,
+                filled_at,
             ]| {
-                for i in 0..nn {
-                    let eta = state.eta.data[k * nn + i];
+                let eta_k = &state.eta.data[k * nn..(k + 1) * nn];
+                if filled_at.iter().zip(eta_k).all(|(a, b)| a == b) {
+                    return;
+                }
+                filled_at.copy_from_slice(eta_k);
+                for (i, &eta) in eta_k.iter().enumerate() {
                     let depth = eta - bathymetry.data[k * nn + i];
+                    // No gradient in a column without water
+                    let inverse_depth = if depth > MIN_LEVEL_SPACING {
+                        1.0 / depth
+                    } else {
+                        0.0
+                    };
                     let mut below = profile.at(eta + sigma_w[0] * depth);
                     for l in 0..nl {
                         let c = i * nl + l;
@@ -1068,15 +1103,9 @@ impl ReferenceFields {
                         (temp[c], salt[c]) = (t, s);
                         rho[c] = density(t, s);
                         let above = profile.at(eta + sigma_w[l + 1] * depth);
-                        let thickness = (sigma_w[l + 1] - sigma_w[l]) * depth;
-                        let (gt, gs) = if thickness > MIN_LEVEL_SPACING {
-                            (
-                                (above.0 - below.0) / thickness,
-                                (above.1 - below.1) / thickness,
-                            )
-                        } else {
-                            (0.0, 0.0)
-                        };
+                        let inverse = inverse_d_sigma[l] * inverse_depth;
+                        let (gt, gs) =
+                            ((above.0 - below.0) * inverse, (above.1 - below.1) * inverse);
                         (temp_gradient[c], salt_gradient[c]) = (gt, gs);
                         let (rho_t, rho_s) = partials(t, s);
                         stratification[c] = -(rho_t * gt + rho_s * gs);
@@ -1138,19 +1167,6 @@ impl ReferenceFields {
     }
 }
 
-/// The share of a reference's jump `reference` along an edge that the
-/// field's own jump `actual` along it holds, in `[0, 1]`: 1 in a fluid
-/// stratified like the reference, `b` at a fraction `b` of its strength, 0
-/// where the field is uniform or stratified the other way.
-#[inline]
-fn share(actual: f64, reference: f64) -> f64 {
-    if reference == 0.0 {
-        0.0
-    } else {
-        (actual / reference).clamp(0.0, 1.0)
-    }
-}
-
 /// Add to the tracers' inventory tendencies `rhs` (`[T, S]`, `∂(H_z C)/∂t`,
 /// layout of [`Solution3D`]) what turns the conservative advection of the
 /// reference stratification into its advection by the vertical velocity
@@ -1205,6 +1221,7 @@ pub fn add_reference_advection(
     elements: Blocks,
 ) {
     let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+    assert!(nl <= MAX_LEVELS, "at most {MAX_LEVELS} levels, not {nl}");
     let n = state.n_elements * nn * nl;
     let (sigma_rho, d_sigma) = (sigma.sigma_rho(), sigma.d_sigma());
     let metric = transport.metric;
@@ -1215,111 +1232,200 @@ pub fn add_reference_advection(
         || (),
         |_, k, [rhs_t, rhs_s]| {
             let mut out = [rhs_t, rhs_s];
-            let base = k * nn * nl;
+            let block = k * nn * nl..(k + 1) * nn * nl;
+            let fields = [0, 1].map(|t| EdgeFields {
+                reference: &reference.tracers[t][block.clone()],
+                gradient: &reference.gradients[t][block.clone()],
+                tracer: &tracers[t][block.clone()],
+            });
+            let (hu, hv) = (&transport.hu[block.clone()], &transport.hv[block.clone()]);
             let eta = |i: usize| state.eta.data[k * nn + i];
             let depth = |i: usize| state.eta.data[k * nn + i] - bathymetry.data[k * nn + i];
-            // What the edges' terms make of each tracer in the element
-            // (m² · m C/s)
-            let mut made = [0.0; 2];
-            // One edge's term at both its ends: the flux `half` (½ f m, out
-            // of `a`), the ends' columns `a`, `b` (offsets in the element)
-            // at levels `la`, `lb`, their height difference `dz` and the
-            // ends' inverse masses
-            let mut edge = |half: f64,
-                            (a, la): (usize, usize),
-                            (b, lb): (usize, usize),
-                            dz: f64,
-                            (inv_a, inv_b): (f64, f64)| {
-                let (pa, pb) = (a * nl + la, b * nl + lb);
-                for t in 0..2 {
-                    let (values, gradients) = (&reference.tracers[t], &reference.gradients[t]);
-                    let chord = values[base + pb] - values[base + pa];
-                    let actual = tracers[t][base + pb] - tracers[t][base + pa];
-                    let weight = half * share(actual, chord);
-                    let at_a = weight * (chord - gradients[base + pa] * dz);
-                    let at_b = weight * (chord - gradients[base + pb] * dz);
-                    out[t][pa] += at_a * inv_a;
-                    out[t][pb] += at_b * inv_b;
-                    made[t] += at_a + at_b;
-                }
-            };
+            let wet = |i: usize| depth(i) >= min_column_depth;
+            // What the edges' terms make of each tracer in the element, per
+            // level (m² · m C/s)
+            let mut made = [[0.0; MAX_LEVELS]; 2];
+            // An edge's half flux (½ F, out of its first end) and height
+            // difference on every level
+            let (mut half, mut dz) = ([0.0; MAX_LEVELS], [0.0; MAX_LEVELS]);
+
             // The pairs of the split form, with the pressure gradient's own
             // coefficients, where it has its volume term: in an element
             // without a thin column that moves its layers by the pairs
-            let wet = |i: usize| depth(i) >= min_column_depth;
             if !transport.subcell_elements[k] && (0..nn).all(wet) {
                 let averaged = metric.averaged_on(geom, k);
+                // Only nodes on one GLL line are a pair
+                let apart = |a: usize, b: usize| ops.dr[(a, b)] == 0.0 && ops.ds[(a, b)] == 0.0;
                 for i in 0..nn {
                     let m_i = geom.node_mass(k, i);
-                    for j in i + 1..nn {
+                    for j in (i + 1..nn).filter(|&j| !(apart(i, j) && apart(j, i))) {
                         let [(dx_ij, dy_ij), (dx_ji, dy_ji)] =
                             pair_derivatives(ops, geom, k, i, j, averaged);
-                        if dx_ij == 0.0 && dy_ij == 0.0 && dx_ji == 0.0 && dy_ji == 0.0 {
-                            continue;
-                        }
                         let m_j = geom.node_mass(k, j);
-                        let (hu_i, hv_i) = (
-                            &transport.hu[base + i * nl..][..nl],
-                            &transport.hv[base + i * nl..][..nl],
-                        );
-                        let (hu_j, hv_j) = (
-                            &transport.hu[base + j * nl..][..nl],
-                            &transport.hv[base + j * nl..][..nl],
-                        );
-                        // z_j − z_i on level l: (η_j − η_i) + σ_l (D_j − D_i)
+                        let (ci, cj) = (i * nl..(i + 1) * nl, j * nl..(j + 1) * nl);
+                        // The pair's volume flux from i to j on every level,
+                        // m_i Dx_ij·Q_i − m_j Dx_ji·Q_j, and z_j − z_i,
+                        // (η_j − η_i) + σ_l (D_j − D_i)
+                        let (ax, ay) = (m_i * dx_ij, m_i * dy_ij);
+                        let (bx, by) = (m_j * dx_ji, m_j * dy_ji);
                         let (d_eta, d_depth) = (eta(j) - eta(i), depth(j) - depth(i));
-                        let inverse = (1.0 / m_i, 1.0 / m_j);
+                        let (hu_i, hv_i) = (&hu[ci.clone()], &hv[ci.clone()]);
+                        let (hu_j, hv_j) = (&hu[cj.clone()], &hv[cj.clone()]);
                         for l in 0..nl {
-                            // The pair's volume flux from i to j,
-                            // m_i Dx_ij·Q_i − m_j Dx_ji·Q_j
-                            let flux = m_i * (dx_ij * hu_i[l] + dy_ij * hv_i[l])
-                                - m_j * (dx_ji * hu_j[l] + dy_ji * hv_j[l]);
-                            let dz = d_eta + sigma_rho[l] * d_depth;
-                            edge(0.5 * flux, (i, l), (j, l), dz, inverse);
+                            half[l] = 0.5
+                                * ((ax * hu_i[l] + ay * hv_i[l]) - (bx * hu_j[l] + by * hv_j[l]));
+                            dz[l] = d_eta + sigma_rho[l] * d_depth;
+                        }
+                        for (t, field) in fields.iter().enumerate() {
+                            // i < j: the two ends' rows are disjoint
+                            let (low, high) = out[t].split_at_mut(cj.start);
+                            edges_over_levels(
+                                &half[..nl],
+                                &dz[..nl],
+                                field.rows(ci.clone()),
+                                field.rows(cj.clone()),
+                                (1.0 / m_i, 1.0 / m_j),
+                                &mut low[ci.clone()],
+                                &mut high[..nl],
+                                &mut made[t][..nl],
+                            );
                         }
                     }
                 }
             }
             // The σ-surfaces of every column that is not thin: Ω up through
-            // surface l (per unit area: times the node's mass in `made`)
+            // surface l, between the layers l − 1 and l (per unit area: the
+            // node's mass in `made`)
+            let (mut lower, mut upper) = ([0.0; MAX_LEVELS], [0.0; MAX_LEVELS]);
+            let mut made_column = [0.0; MAX_LEVELS];
+            let surfaces = nl - 1;
             for i in (0..nn).filter(|&i| wet(i)) {
                 let (depth, mass) = (depth(i), geom.node_mass(k, i));
                 let omega = &transport.omega[(k * nn + i) * (nl + 1)..][..nl + 1];
                 for l in 1..nl {
-                    if omega[l] != 0.0 {
-                        let dz = (sigma_rho[l] - sigma_rho[l - 1]) * depth;
-                        let half = 0.5 * omega[l] * mass;
-                        edge(half, (i, l - 1), (i, l), dz, (1.0 / mass, 1.0 / mass));
+                    half[l - 1] = 0.5 * omega[l];
+                    dz[l - 1] = (sigma_rho[l] - sigma_rho[l - 1]) * depth;
+                }
+                let column = i * nl..(i + 1) * nl;
+                for (t, field) in fields.iter().enumerate() {
+                    lower[..surfaces].fill(0.0);
+                    upper[..surfaces].fill(0.0);
+                    made_column[..surfaces].fill(0.0);
+                    edges_over_levels(
+                        &half[..surfaces],
+                        &dz[..surfaces],
+                        field.rows(column.start..column.end - 1),
+                        field.rows(column.start + 1..column.end),
+                        (1.0, 1.0),
+                        &mut lower[..surfaces],
+                        &mut upper[..surfaces],
+                        &mut made_column[..surfaces],
+                    );
+                    let out = &mut out[t][column.clone()];
+                    for l in 0..surfaces {
+                        out[l] += lower[l];
+                        out[l + 1] += upper[l];
+                        made[t][l] += mass * made_column[l];
                     }
                 }
             }
             // Taken back as a uniform displacement of the element's stable
             // stratification: the element keeps its inventories
+            let made = made.map(|levels| levels[..nl].iter().sum::<f64>());
             if made == [0.0; 2] {
                 return;
             }
-            let gamma = |i: usize, l: usize| reference.stratification[base + i * nl + l].max(0.0);
+            let stratification = &reference.stratification[block];
             let mut weight = 0.0;
             for i in (0..nn).filter(|&i| wet(i)) {
                 let mass = geom.node_mass(k, i) * depth(i);
-                for (l, &ds) in d_sigma.iter().enumerate() {
-                    weight += mass * ds * gamma(i, l);
+                for (&gamma, &ds) in stratification[i * nl..(i + 1) * nl].iter().zip(d_sigma) {
+                    weight += mass * ds * gamma.max(0.0);
                 }
             }
             if weight <= 0.0 {
                 return;
             }
             for i in (0..nn).filter(|&i| wet(i)) {
-                let depth = depth(i);
-                for (l, &ds) in d_sigma.iter().enumerate() {
-                    let share = depth * ds * gamma(i, l) / weight;
-                    for t in 0..2 {
-                        out[t][i * nl + l] -= share * made[t];
+                let scale = depth(i) / weight;
+                let column = i * nl..(i + 1) * nl;
+                for (t, out) in out.iter_mut().enumerate() {
+                    let taken = scale * made[t];
+                    for ((o, &gamma), &ds) in out[column.clone()]
+                        .iter_mut()
+                        .zip(&stratification[column.clone()])
+                        .zip(d_sigma)
+                    {
+                        *o -= taken * ds * gamma.max(0.0);
                     }
                 }
             }
         },
     );
+}
+
+/// One tracer's rows of an element for [`add_reference_advection`]
+/// (`[node][level]`): the reference, its gradient over each layer, and the
+/// tracer itself.
+#[derive(Clone, Copy)]
+struct EdgeFields<'a> {
+    reference: &'a [f64],
+    gradient: &'a [f64],
+    tracer: &'a [f64],
+}
+
+impl<'a> EdgeFields<'a> {
+    /// The fields over `range` of the element's rows: one end of an edge
+    /// per level.
+    fn rows(&self, range: std::ops::Range<usize>) -> EdgeFields<'a> {
+        EdgeFields {
+            reference: &self.reference[range.clone()],
+            gradient: &self.gradient[range.clone()],
+            tracer: &self.tracer[range],
+        }
+    }
+}
+
+/// The terms of [`add_reference_advection`] of one edge per level, between
+/// the ends `a` and `b`: with the half flux `half` (½ F, out of `a`) and the
+/// height difference `dz = z_b − z_a` of every level's edge,
+/// `½ F θ [(C̄_b − C̄_a) − γ dz]` at each end with its own `γ`, added to
+/// `out_a`, `out_b` over the ends' masses (`inverse_mass`), and their sum to
+/// `made`. `θ` is the share of the reference's jump along the edge that the
+/// tracer's own jump holds, in `[0, 1]`: 1 in a fluid stratified like the
+/// reference, `b` at a fraction `b` of its strength, 0 where the tracer is
+/// uniform or stratified the other way. Every slice has one value per level.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn edges_over_levels(
+    half: &[f64],
+    dz: &[f64],
+    a: EdgeFields,
+    b: EdgeFields,
+    inverse_mass: (f64, f64),
+    out_a: &mut [f64],
+    out_b: &mut [f64],
+    made: &mut [f64],
+) {
+    let n = half.len();
+    let (dz, out_a, out_b, made) = (&dz[..n], &mut out_a[..n], &mut out_b[..n], &mut made[..n]);
+    let (ref_a, ref_b) = (&a.reference[..n], &b.reference[..n]);
+    let (grad_a, grad_b) = (&a.gradient[..n], &b.gradient[..n]);
+    let (c_a, c_b) = (&a.tracer[..n], &b.tracer[..n]);
+    // Not inlined: the slices are then known not to overlap, and the loop
+    // (a division per level) is taken several levels at once
+    for l in 0..n {
+        let chord = ref_b[l] - ref_a[l];
+        // No reference jump, no share (0/0 is NaN, which `clamp` keeps)
+        let ratio = ((c_b[l] - c_a[l]) / chord).clamp(0.0, 1.0);
+        let share = if chord == 0.0 { 0.0 } else { ratio };
+        let weight = half[l] * share;
+        let at_a = weight * (chord - grad_a[l] * dz[l]);
+        let at_b = weight * (chord - grad_b[l] * dz[l]);
+        out_a[l] += at_a * inverse_mass.0;
+        out_b[l] += at_b * inverse_mass.1;
+        made[l] += at_a + at_b;
+    }
 }
 
 #[cfg(test)]
@@ -1722,22 +1828,25 @@ mod tests {
     }
 
     /// A thermocline over a stratification that is stable everywhere, as a
-    /// reference profile (S uniform), with the linear equation of state
-    /// `ρ = ρ₀ (1 − α (T − 10))`: the profile, the density and its partials.
-    fn thermocline() -> (
-        TracerReferenceProfile,
-        impl Fn(f64, f64) -> f64 + Sync + Copy,
-        impl Fn(f64, f64) -> (f64, f64) + Sync + Copy,
-    ) {
-        const ALPHA: f64 = 2e-4;
-        let profile = TracerReferenceProfile::from_smooth_fn(-130.0, 5.0, 2701, |z| {
+    /// reference profile (S uniform), for the linear equation of state
+    /// [`thermocline_density`].
+    fn thermocline() -> TracerReferenceProfile {
+        TracerReferenceProfile::from_smooth_fn(-130.0, 5.0, 2701, |z| {
             (10.0 + 4.0 * ((z + 15.0) / 4.0).tanh() + 0.01 * z, 34.0)
-        });
-        (
-            profile,
-            |t: f64, _s: f64| RHO0 * (1.0 - ALPHA * (t - 10.0)),
-            |_t: f64, _s: f64| (-RHO0 * ALPHA, 0.0),
-        )
+        })
+    }
+
+    /// Thermal expansion of [`thermocline_density`] (1/°C).
+    const ALPHA: f64 = 2e-4;
+
+    /// `ρ = ρ₀ (1 − α (T − 10))`.
+    fn thermocline_density(t: f64, _s: f64) -> f64 {
+        RHO0 * (1.0 - ALPHA * (t - 10.0))
+    }
+
+    /// `(∂ρ/∂T, ∂ρ/∂S)` of [`thermocline_density`].
+    fn thermocline_partials(_t: f64, _s: f64) -> (f64, f64) {
+        (-RHO0 * ALPHA, 0.0)
     }
 
     /// TODO P1.3 gate, the identity the stability at rest stands on: about
@@ -1774,7 +1883,8 @@ mod tests {
             let (nn, nl) = (ops.n_nodes, sigma.n_levels());
             let n = mesh.n_elements * nn * nl;
             let all = Blocks::All(mesh.n_elements);
-            let (profile, density, partials) = thermocline();
+            let (profile, density, partials) =
+                (thermocline(), thermocline_density, thermocline_partials);
             let mut fields = ReferenceFields::default();
             fields.fill(
                 &profile,
@@ -1940,7 +2050,7 @@ mod tests {
             MetricForm::Averaged,
         );
         let all = Blocks::All(mesh.n_elements);
-        let (_, density, partials) = thermocline();
+        let (density, partials) = (thermocline_density, thermocline_partials);
         let apply = |profile: &TracerReferenceProfile, tracers: [&[f64]; 2]| {
             let mut fields = ReferenceFields::default();
             fields.fill(profile, density, partials, &state, &bathymetry, &sigma, all);

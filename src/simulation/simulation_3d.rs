@@ -3579,9 +3579,11 @@ mod tests {
         (physics, state)
     }
 
-    /// A smooth `profile(z) = (T, S)` as a reference stratification over
-    /// the heights of the bed `bathymetry`: cubic between samples every
-    /// 5 cm (its error against the profile ≈ 1e-9 of its range).
+    /// `profile(z) = (T, S)` as a reference stratification over the heights
+    /// of the bed `bathymetry`: linear between samples every 5 cm (as a
+    /// run's mean profile is between its metres; the fixtures start in the
+    /// reference itself, so its distance from `profile`, ≈ 1e-4 of the
+    /// profile's range, is no departure from rest).
     fn sampled_reference(
         bathymetry: &Bathymetry2D,
         profile: impl Fn(f64) -> (f64, f64),
@@ -3590,7 +3592,7 @@ mod tests {
         let highest = bathymetry.data.iter().copied().fold(0.0, f64::max);
         let (bottom, top) = (deepest - 1.0, highest + 1.0);
         let n = ((top - bottom) / 0.05).ceil() as usize + 1;
-        TracerReferenceProfile::from_smooth_fn(bottom, top, n, profile)
+        TracerReferenceProfile::from_fn(bottom, top, n, profile)
     }
 
     /// [`channel_at_rest`] with a cliff: the bed falls from 15 to 300 m inside
@@ -3830,7 +3832,7 @@ mod tests {
                 (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
             })
             .collect();
-        let departure = coords.from_energy(&coords.to_energy(&coords.from_energy(&random)));
+        let departure = coords.departure_of(&coords.energy_of(&coords.departure_of(&random)));
         let largest = departure.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
         let start: Vec<f64> = x0
             .iter()
@@ -3844,7 +3846,7 @@ mod tests {
             pack(state, &mut x);
             let departure: Vec<f64> = x.iter().zip(&x0).map(|(a, b)| a - b).collect();
             0.5 * coords
-                .to_energy(&departure)
+                .energy_of(&departure)
                 .iter()
                 .map(|y| y * y)
                 .sum::<f64>()
@@ -4301,7 +4303,7 @@ mod tests {
         }
 
         /// The departure `dx` (state units) in energy coordinates.
-        fn to_energy(&self, dx: &[f64]) -> Vec<f64> {
+        fn energy_of(&self, dx: &[f64]) -> Vec<f64> {
             let nl = self.nl;
             let field = self.velocity.len();
             let n2 = self.barotropic.len();
@@ -4333,7 +4335,7 @@ mod tests {
         }
 
         /// The departure (state units) of the energy coordinates `y`.
-        fn from_energy(&self, y: &[f64]) -> Vec<f64> {
+        fn departure_of(&self, y: &[f64]) -> Vec<f64> {
             let nl = self.nl;
             let field = self.velocity.len();
             let n2 = self.barotropic.len();
@@ -4414,7 +4416,7 @@ mod tests {
             // largest component is `epsilon` in the state's units
             let (dx, scale) = match &coords {
                 Some(coords) => {
-                    let dx = coords.from_energy(v);
+                    let dx = coords.departure_of(v);
                     let largest = dx.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
                     (dx, epsilon / largest)
                 }
@@ -4427,7 +4429,7 @@ mod tests {
                 .map(|(a, b)| (a - b) / scale)
                 .collect();
             match &coords {
-                Some(coords) => coords.to_energy(&out),
+                Some(coords) => coords.energy_of(&out),
                 None => out,
             }
         };
@@ -4442,7 +4444,7 @@ mod tests {
             })
             .collect();
         if let Some(coords) = &coords {
-            start = coords.to_energy(&coords.from_energy(&start));
+            start = coords.energy_of(&coords.departure_of(&start));
         }
         let s = norm(&start);
         start.iter_mut().for_each(|x| *x /= s);

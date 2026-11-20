@@ -477,6 +477,11 @@ where
     pub fn set_reference_profile(&mut self, profile: Option<Arc<TracerReferenceProfile>>) {
         self.reference_profile = profile;
         self.automatic_reference_profile = false;
+        // The fields of the profile before, if any
+        self.reference_fields
+            .get_mut()
+            .expect("Failed to lock reference_fields")
+            .0 = ReferenceFields::default();
     }
 
     /// No reference stratification, and no automatic one from
@@ -521,8 +526,9 @@ where
             |_| true,
             |t, s| self.eos.compute_density(t, s, 0.0),
         );
-        self.reference_profile =
-            mean.map(|mean| Arc::new(TracerReferenceProfile::from_mean(&mean)));
+        if let Some(mean) = mean {
+            self.set_reference_profile(Some(Arc::new(TracerReferenceProfile::from_mean(&mean))));
+        }
     }
 
     /// The reference stratification, if any (see
