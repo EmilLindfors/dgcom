@@ -231,11 +231,9 @@ where
     /// state's mean profile as the reference (the default; see
     /// [`Self::without_reference_profile`]).
     automatic_reference_profile: bool,
-    /// The reference's density at the layer centres of the last momentum
-    /// stage (allocated on first use), and the elements it was set on.
-    reference_density: Mutex<(Vec<f64>, Neighbourhood)>,
-    /// The reference at the levels of the last transport stage.
-    reference_fields: Mutex<ReferenceFields>,
+    /// The reference at the levels of the last stage's kernel (allocated on
+    /// first use), and the elements the pressure gradient needs it on.
+    reference_fields: Mutex<(ReferenceFields, Neighbourhood)>,
 }
 
 /// The implicit part of `Ω` of [`Hydrostatic3D`]'s last 3D stage (see
@@ -409,8 +407,7 @@ where
             surface_flux_scratch: Mutex::new(Default::default()),
             reference_profile: None,
             automatic_reference_profile: true,
-            reference_density: Mutex::new((Vec::new(), Neighbourhood::default())),
-            reference_fields: Mutex::new(ReferenceFields::default()),
+            reference_fields: Mutex::new((ReferenceFields::default(), Neighbourhood::default())),
         }
     }
 
@@ -446,11 +443,12 @@ where
     /// e-folding of 47 min over a 15 → 300 m cliff, and of 2 h at a terrace
     /// of the smoothed Frøya bed).
     ///
-    /// What it costs: the reference's share of the tracers is advected in
-    /// advective form, so a curved reference's inventory is conserved to the
-    /// scheme's truncation error (the trapezoid rule of the reference's
-    /// gradient along each edge), not to round-off; the water's volume, a
-    /// uniform tracer and the anomalies are as before. A reference linear in
+    /// The tracers' inventories are kept, element by element: the
+    /// reference's advection is not a flux between cells, and what it makes
+    /// in an element is taken back as a uniform displacement of the
+    /// element's stratification, with its adjoint in the force (the
+    /// element's mean displacement exerts no force within it). The water's
+    /// volume and a uniform tracer are as before, and a reference linear in
     /// `z` changes nothing but the pressure integral.
     ///
     /// The profile is fixed in `z`: where the stratification drifts from it
@@ -658,20 +656,10 @@ where
     /// ([`Self::with_reference_profile`]) both forces are those of the
     /// state's anomaly about it.
     pub fn set_balanced_reference(&mut self, state: &Solution3D) {
-        let reference_density = self.active_reference().map(|profile| {
-            let mut density = vec![0.0; state.rho.len()];
-            crate::solver::rhs::reference_density_into(
-                profile,
-                |t, s| self.eos.compute_density(t, s, 0.0),
-                state,
-                &self.mesh,
-                &self.bathymetry,
-                &self.sigma,
-                &mut Neighbourhood::default(),
-                &mut density,
-                Blocks::All(state.n_elements),
-            );
-            density
+        let reference = self.active_reference().map(|profile| {
+            let mut fields = ReferenceFields::default();
+            self.fill_reference(&mut fields, profile, state, Blocks::All(state.n_elements));
+            fields
         });
         self.balanced_reference = Some(Arc::new(BalancedReference::new(
             state,
@@ -685,8 +673,37 @@ where
             self.rho0,
             self.min_column_depth,
             self.metric_form(),
-            reference_density.as_deref(),
+            reference.as_ref(),
         )));
+    }
+
+    /// `fields` of the reference `profile` at `state`'s levels on
+    /// `elements`, with their mean displacements (the pressure gradient's;
+    /// `state.rho` must be current).
+    fn fill_reference(
+        &self,
+        fields: &mut ReferenceFields,
+        profile: &TracerReferenceProfile,
+        state: &Solution3D,
+        elements: Blocks,
+    ) {
+        fields.fill(
+            profile,
+            |t, s| self.eos.compute_density(t, s, 0.0),
+            |t, s| self.eos.density_partials(t, s),
+            state,
+            &self.bathymetry,
+            &self.sigma,
+            elements,
+        );
+        fields.set_displacements(
+            state,
+            &self.geom,
+            &self.bathymetry,
+            &self.sigma,
+            self.min_column_depth,
+            elements,
+        );
     }
 
     /// The volume form of the 3D horizontal divergences: the 2D module's
@@ -1270,7 +1287,6 @@ where
                 PressureGradientForm::ConstantDepth => None,
             },
             // The reference is evaluated (and locked) where a kernel needs it
-            reference_density: None,
             reference: None,
             metric: self.metric_form(),
             tracer_range: self.tracer_limiter.advection_ranges(),
@@ -1300,37 +1316,29 @@ where
         stage: bool,
     ) {
         let elements = on.elements;
-        let mut reference = self
-            .reference_density
+        // The reference at this state's levels, on the elements and the
+        // neighbours whose columns their faces read
+        let mut guard = self
+            .reference_fields
             .lock()
-            .expect("Failed to lock reference_density");
-        let reference_density = self.active_reference().map(|profile| {
-            let (density, neighbourhood) = &mut *reference;
-            density.resize(state.rho.len(), 0.0);
-            crate::profiling::scope("3d: reference density", || {
-                crate::solver::rhs::reference_density_into(
-                    profile,
-                    |t, s| self.eos.compute_density(t, s, 0.0),
-                    state,
-                    &self.mesh,
-                    &self.bathymetry,
-                    &self.sigma,
-                    neighbourhood,
-                    density,
-                    elements,
-                )
+            .expect("Failed to lock reference_fields");
+        let reference = self.active_reference().map(|profile| {
+            let (fields, neighbourhood) = &mut *guard;
+            crate::profiling::scope("3d: reference", || {
+                let around = neighbourhood.faces(&self.mesh, elements);
+                self.fill_reference(fields, profile, state, around)
             });
-            &density[..]
+            &*fields
         });
         let config = Rhs3DConfig {
             elements,
-            reference_density,
+            reference,
             ..self.rhs_config()
         };
         crate::profiling::scope("3d: pgf, coriolis", || {
             compute_momentum_rhs_3d(rhs, state, &config)
         });
-        drop(reference);
+        drop(guard);
         let viscosity = crate::profiling::start();
         if !self.horizontal_viscosity.is_zero() && self.viscosity_once_per_step {
             assert!(
@@ -1482,8 +1490,17 @@ where
                 .lock()
                 .expect("Failed to lock reference_fields");
             let reference = self.active_reference().map(|profile| {
-                crate::profiling::scope("3d: reference fields", || {
-                    fields.fill(profile, state, &self.bathymetry, &self.sigma, elements)
+                let (fields, _) = &mut *fields;
+                crate::profiling::scope("3d: reference", || {
+                    fields.fill(
+                        profile,
+                        |t, s| self.eos.compute_density(t, s, 0.0),
+                        |t, s| self.eos.density_partials(t, s),
+                        state,
+                        &self.bathymetry,
+                        &self.sigma,
+                        elements,
+                    )
                 });
                 &*fields
             });

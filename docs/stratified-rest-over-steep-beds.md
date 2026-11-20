@@ -220,3 +220,328 @@ On the 11048 patch from rest, 8.8 h:
 - **Default**: 2.2e-2 m/s, in elements 90–92 (the mode).
 - **`vref`**: 1.4e-3 m/s, still rising slowly and close to linearly, in shallow shore elements 13 and 63 (5–28 m). That is the GLS creep at the slopes.
 - **Centred**: 1.5e-3 m/s, in the same elements as `vref`.
+
+## The cure: a reference stratification, advected by the pressure gradient's adjoint (2026-11-20)
+
+The rest state is now stable by construction, on beds that are not smoothed.
+`Hydrostatic3D::with_reference_profile` takes a horizontally uniform `T̄(z)`,
+`S̄(z)`; the baroclinic pressure gradient is that of the density anomaly about
+it, and the tracers' advection moves the reference by the vertical velocity
+that is that force's exact adjoint. The scheme linearised about rest in the
+reference then conserves a positive pseudo-energy (kinetic energy plus the
+available potential energy `½ g ρ′²/Γ`), with the stratification's own weights
+at every node, so nothing is stiff, and every element keeps its tracer
+inventories. Code: `solver::rhs::baroclinic` ("About a reference"),
+`ReferenceFields`, `add_reference_advection`. This section is the derivation,
+the routes that were ruled out on the way, and the measurements.
+
+### The layers as a graph
+
+Write `a = (i, l)` for node `i` of an element on level `l`, `m_a = w_i J_i`
+for its horizontal mass, `H_a = D_i Δσ_l` for its layer thickness and
+`z_a = η_i + σ_l D_i` for its height. The layers move their volume along the
+edges of a graph, each with a volume flux `F_ab = −F_ba` (m³/s) from `a` to
+`b`:
+
+- **pairs**: two nodes `i ≠ j` of an element on one level, with
+  `Φ_ij = m_i Dx_ij·Q_i − m_j Dx_ji·Q_j`, where `Q = H u` (corrected to the
+  barotropic transport) and `Dx_ij` are the element's derivative coefficients
+  with the pair's metric (on a parallelogram `Φ_ij = 2 m_i Dx_ij·{{Q}}_ij`,
+  the split form's two-point flux; nonzero only for nodes on one GLL line);
+- **σ-surfaces**: between the layers `l − 1` and `l` of a column, `m Ω`;
+- **faces**: between the two sides of an element face, the layer's face flux;
+- **subcell interfaces**: in a shore element (one with a thin column), the
+  layer's share of the barotropic flux.
+
+The layer continuity is `m_a ∂H_a/∂t = −Σ_b F_ab`, and the conservative tracer
+advection, in advective form,
+
+```text
+    m_a H_a ∂C_a/∂t = −Σ_b F_ab (Ĉ_ab − C_a),
+```
+
+with the edge value `Ĉ_ab = ½(C_a + C_b)` on pairs and subcell interfaces
+(the split form), the vertical scheme's surface value on σ-surfaces (the mean
+of the two layers for the reference's share, since 2026-10-04), and the
+upwind value on faces.
+
+### Why the σ-pairs scheme is not stable: the chord
+
+At rest in a profile `C̄(z)` the two sides of a face are at one height (the
+bed is continuous), so a perturbation's flux `δF` advects the background only
+along pairs and σ-surfaces:
+
+```text
+    m_a H_a ∂δC_a/∂t = −½ Σ_b δF_ab [C̄(z_b) − C̄(z_a)].          (chord)
+```
+
+The σ-pairs pressure gradient, summed against the transports and by parts
+with the continuity (the pressure differences of the pairs and faces become
+those across the σ-surfaces, and with the trapezoid rule
+`p_l − p_{l+1} = ½(ρ′_l + ρ′_{l+1})(z_{l+1} − z_l)`), does the work
+
+```text
+    −(ρ₀/g) Σ_a m_a Q_a·F_a = Σ_edges F_ab ½(ρ′_a + ρ′_b)(z_b − z_a) =: b(F, ρ′)   (work)
+```
+
+over the pairs and the σ-surfaces. So the force responds to `ρ′_a` through
+the *height* differences `z_b − z_a` of the node's edges, and the advection
+makes `ρ′_a` from the *density* differences `ρ̄_b − ρ̄_a` along the same edges.
+The operator `(δu, δρ) ↦ (−(g/ρ₀) B δρ, −A δu)` is skew-adjoint in a norm
+`½ρ₀ Σ m H |δu|² + ½ Σ s_a δρ_a²` only if `s_a (ρ̄_b − ρ̄_a) = −g m_a H_a (z_b − z_a)`
+for *every* edge of `a` at once: the chords of all the node's edges must have
+one slope. That holds for a profile linear in `z` (the variance argument of
+2026-10-03) and fails wherever an edge straddles the pycnocline. Without it
+the spectrum of `A B` is not real and non-negative, and pairs of complex
+eigenvalues appear: the modes of the cliff and of the terrace.
+
+### The scheme
+
+Three changes, all on exactly the edges the force acts along: the pairs of an
+element without a thin column that moves its layers by the pairs, and the
+σ-surfaces of the columns that are not thin.
+
+1. **The force is the anomaly's, and linear.** `ρ′_a = ρ_a − ρ̄(z_a)` with
+   `ρ̄(z) = ρ(T̄(z), S̄(z))` at the node's own height at the stage's `η`, and
+   the trapezoid rule for its pressure (the monotone cubic's harmonic-mean
+   slopes are not linear in the density, so that force has no adjoint). At
+   rest in the reference the force is zero, over any bed.
+2. **The reference is advected by the tangent.** To the conservative
+   advection the kernel adds, per edge and at both its ends,
+
+   ```text
+       ½ F_ab θ_ab [(C̄_b − C̄_a) − γ_a (z_b − z_a)] / m_a,
+       γ_a = [C̄(z_{a+½}) − C̄(z_{a−½})] / H_a,
+   ```
+
+   `γ_a` the reference's mean gradient over the layer of `a` (between the
+   σ-surfaces that bound it, so a column's gradients add up to the
+   reference's change over it whatever its levels resolve),
+   `θ_ab = clamp(ΔC_ab/ΔC̄_ab, 0, 1)` the share of the reference's jump that
+   the tracer's own jump along the edge holds.
+3. **The element's mean displacement.** The two ends' terms of an edge do not
+   cancel: they add up to `F_ab τ_ab`,
+   `τ_ab = (C̄_b − C̄_a) − ½(γ_a + γ_b)(z_b − z_a)`, the trapezoid rule's error
+   of the reference's gradient along the edge. With `R = Σ F_ab τ_ab` over the
+   element's edges and `N = Σ m H Γ` over its stably stratified layers
+   (`Γ = −(ρ_T γ^T + ρ_S γ^S)`), every layer of the element gets `−H Γ R/N`:
+   the element's stratification displaced as a whole at the rate `R/N`. And
+   the force leaves out, along every edge of the element, the trapezoid
+   rule's error of the anomaly of the element's mean displacement
+   `κ = Σ m H ρ′/N`:
+
+   ```text
+       ½(ρ′_a + ρ′_b)(z_b − z_a) − κ [(ρ̄_b − ρ̄_a) + ½(Γ_a + Γ_b)(z_b − z_a)].
+   ```
+
+In a fluid at rest in the reference `θ = 1`, the chord of (chord) cancels, and
+what is left of the advection is
+
+```text
+    H_a ∂δC_a/∂t = −γ^C_a (H w)_a − H_a Γ_a R^C/N,
+    (H w)_a = (1/m_a) Σ_b ½ δF_ab (z_b − z_a).
+```
+
+`w` is the rate at which the layer's water rises relative to its node,
+`u·∇_σ z + Ω`: the horizontal part is the split-form derivative of the level's
+height along the flow, the vertical part `Ω` averaged to the layer centre with
+the trapezoid rule's weights, `½(Ω_{l−½} Δz_{l−½} + Ω_{l+½} Δz_{l+½})/H`. It
+is defined by the force: `Σ_a m_a ρ′_a (H w)_a` is the sum (work), term by
+term. Step 3 reads the same way: `κ` is the projection of the anomaly on a
+uniform displacement of the reference (whose anomaly is `κΓ`) in the
+available potential energy's norm, and the force integrates that part of the
+anomaly along each edge exactly, as `−κ(ρ̄_b − ρ̄_a)`, instead of by the
+trapezoid rule. A stratification displaced as a whole within an element then
+exerts no force within it (but for the surface half-layer), where the
+trapezoid rule alone leaves the σ form's error of the displaced profile at
+every straddle: the well-known limit of subtracting a reference profile, that
+the error comes back once the isopycnals move, is gone for the element's mean
+displacement.
+
+### The statement and its proof
+
+**Assumptions.** The reference is statically stable: with `ρ_T`, `ρ_S` the
+equation of state's partials at the reference at node `a` (the code's density
+depends on `T` and `S` alone), `Γ_a = −(ρ_T γ^T_a + ρ_S γ^S_a) ≥ 0`. The
+equation of state is linear in `T` and `S`. The bed is continuous across
+element faces. The state is at rest in the reference (`u = 0`, `η` flat,
+`T = T̄(z_a)`, `S = S̄(z_a)` at every node). The force is the σ-pairs form.
+
+**Claim.** For the semi-discrete scheme linearised about that state, and
+perturbations whose transports have no depth mean (the 3D operator at a fixed
+barotropic state, between walls),
+
+```text
+    d/dt [ ½ρ₀ Σ_a m_a H_a |δu_a|² + ½ g Σ_{Γ_a > 0} m_a H_a δρ_a²/Γ_a ] = −D ≤ 0,
+```
+
+with `δρ = ρ_T δT + ρ_S δS` and `D` the dissipation of the vertical and
+horizontal viscosities. Where `Γ_a = 0` the anomaly `δρ_a` does not change.
+And every element's inventories of `T` and `S` change only through its faces.
+
+**Proof.** (i) From the scheme,
+`m_a H_a ∂δρ_a/∂t = Γ_a [m_a (H w)_a − m_a H_a R/N]`, with
+`R = Σ_edges δF_ab τ_ab` and `τ_ab = (ρ̄_b − ρ̄_a) + ½(Γ_a + Γ_b)(z_b − z_a)`
+the density's: `δρ` is the same combination of `δT` and `δS` that `Γ` is of
+their gradients, and `ρ̄`'s chords of theirs. (ii) The momentum advection is
+quadratic in the perturbation, Coriolis does no work node by node, the bottom
+drag is quadratic and Smagorinsky's viscosity vanishes with the strain; the
+force's work, by (work) with step 3's term, is
+`ρ₀ Σ m_a H_a δu_a·∂δu_a/∂t = −g [b(δF, δρ) − κ R] − D`. (iii) The potential
+energy's rate is `g Σ_a (δρ_a/Γ_a) m_a H_a ∂δρ_a/∂t = g Σ_a m_a δρ_a (H w)_a − g (Σ_a m_a H_a δρ_a/N) R = g [b(δF, δρ) − κ R]`:
+each edge gives `½ F_ab (z_b − z_a)` to `m_a (H w)_a` and
+`½ F_ba (z_a − z_b)`, the same number, to `m_b (H w)_b`, and the second sum is
+`κ` by its definition. The two rates cancel. (iv) The inventory: the edges'
+terms add up to `R` in the element, and step 3 takes `Σ m H Γ R/N = R` back. ∎
+
+The quantity is positive definite on the dynamic variables, with the weights
+of the available potential energy of Holliday & McIntyre (1981); the operator
+is skew-adjoint in that norm, the route of Bell, Peixoto & Thuburn (2017).
+It holds for any mesh, bed, level distribution and reference, in particular
+at straddles: `Γ_a` is the node's own stratification, whatever its
+neighbours'. Nothing is stiff: the fastest mode is an internal wave's,
+`ω² ≤ (g/ρ₀) max Γ · ‖w‖²`; the displacement's rate `R/N` is of the size of
+`w` itself (at a straddle `τ` is the reference's range and `N` the columns'
+area times that range).
+
+The whole exchange is checked to round-off, with the actual kernels, by the
+gate `the_reference_advection_and_the_pressure_gradient_exchange_pseudo_energy_exactly`:
+random transports without a depth mean and random anomalies, the tracers at
+rest in a thermocline, on parallelograms and distorted elements in both
+metric forms, over a 5 → 125 m cliff, across faces, with a shore element. The
+rate of the potential energy (from the conservative tracer kernel about the
+reference plus `add_reference_advection`) and the force's work agree to 1e-11
+of their terms, and the inventory's rate is round-off. In time it is checked
+by `the_pseudo_energy_of_a_departure_from_rest_does_not_grow_over_a_cliff`
+and by the spectrum probes in pseudo-energy coordinates (below).
+
+### Conservation: what an edge cannot do, and the element can
+
+*With single-valued fluxes between cells paired by level index, exact
+conservation of a curved reference, the skew structure and bounded weights
+exclude each other.* Let an edge treat its two ends with tangent increments
+`t_ab` at `a` and `t_ba` at `b`. The tracer the edge creates is
+`F_ab [ (C̄_b − C̄_a) − ½(t_ab − t_ba) ]`, zero only if the two tangents average
+to the chord. The skew structure needs `t_ab = γ_a κ_ab` with `κ_ab` the
+weight of `ρ′_a` in the force's term of that edge (`κ_ab + κ_ba = z_b − z_a`
+for a consistent force). Both hold only for
+`κ_ab = (z_b − z_a)(Ḡ_ab − γ_b)/(γ_a − γ_b)`, with `Ḡ_ab` the chord's slope:
+between 0 and `z_b − z_a` where the chord's slope lies between the two ends'
+gradients (a resolved profile), and unbounded where it does not (both ends in
+weakly stratified water, the pycnocline between). That is the linearisation
+of Tadmor's entropy-conservative pair density with the Casimir's weights, and
+its stiffness (`chord/Γ` up to 100) is the result of 2026-10-04 again, from
+the other side.
+
+The way out is that conservation is needed per element, not per edge, and
+every edge the force acts along lies within one element. The edges' errors
+`F_ab τ_ab` are collected over the element and taken back as one more
+vertical velocity, uniform over the element (step 3), which has a bounded
+adjoint in the force. Without step 3 the scheme of steps 1 and 2 is stable
+too (it was the first prototype), but its tracer inventories drift at the
+trapezoid rule's error: under a 0.5 m seiche over a 12 → 4 m slope with a
+6 °C thermocline (`SlopingTide`), the basin's mean temperature changed by
+4.5e-3, 9.3e-4 and 2.6e-4 °C over one period on 3, 6 and 12 levels (second
+order in the layers' thickness), most of it secular. With step 3 the
+inventories of `T` and `S` hold to 2e-14 on the same runs
+(`a_curved_reference_keeps_constancy_and_the_tracers_inventories`).
+
+### Where the proof stops
+
+- **A state that is not the reference.** Only the share `θ` of the
+  reference's stratification that the tracers hold along an edge is advected
+  by the tangent; the rest of their jump is advected conservatively, as
+  before. A column at a fraction `b` of the reference's strength is exact
+  (`θ = b`); a mixed column gets nothing (constancy, gate
+  `the_reference_advection_keeps_constancy_a_linear_reference_and_the_elements_inventories`);
+  another shape of profile is in between, and has no proof. The reference is
+  fixed in `z`: under a tide the levels move through it, and the anomaly is
+  the physical one (differential stretching over a slope makes real
+  gradients, which a reference that followed the σ-levels would hide). The
+  force's displacement term is linear in the anomaly whatever its size: for
+  an anomaly that is not a displacement (a river plume over a cliff) it is a
+  term of the size of the σ form's own error there, and vanishes with it
+  under refinement.
+- **The barotropic mode.** The claim is for the 3D operator at a fixed
+  barotropic state. The depth mean of the force reaches the 2D module as the
+  slow forcing, and the layers carry their shares of the 2D mass flux, so the
+  pairing extends to the depth-mean flow along the pairs and the central part
+  of the face fluxes. Two parts of the 2D mass flux have no partner: the
+  dissipative part of its Riemann flux, and its subcell interfaces inside
+  shore elements, where the force has no volume term (as before 2026-11-20:
+  the layers there move the reference along the σ-levels with the barotropic
+  flow, conservatively). Both couple the two modes with a feedback of relative
+  size `Δρ/ρ₀`, and the 2D scheme's own dissipation is larger. The step maps
+  below include the barotropic variables.
+- **A discontinuous bed.** Across a face whose two sides are at different
+  heights the upwind face value advects the background at a rate set by
+  `|F|`, and the force's face term has a `ρ′ Δz` part: neither is covered.
+  Every bed pipeline of the crate gives a continuous bed.
+- **An equation of state that is not linear in T and S.** `Γ` is taken with
+  the partials at the reference, and the reference density's chords differ
+  from the tracers' at the equation's curvature: the exchange is exact up to
+  that.
+- **Time.** The 3D stages are SSP-RK3 (dissipative on the imaginary axis
+  below `|ω|Δt = √3`), the barotropic pass is filtered and its slow forcing
+  extrapolated by AB3. No proof; the step maps below contract.
+- **The implicit part of the vertical advection** (above an outflow Courant
+  number of 0.4) is upwind in the full tracer, as before. It is zero at rest.
+- **Limiters, mixing.** A limiter or a diffusion changes the tracers at rest
+  only if it acts on the reference itself; give the limiter the same profile.
+  GLS mixing changes the stratification, and the state then drifts from the
+  reference (see the first item).
+- **An element switching between the pairs and the subcells** within a step
+  (a column crossing the thin depth): the force decides by the stage's
+  depths, the layers by the barotropic pass of the step. At rest they agree.
+
+### Routes ruled out on the way
+
+- **The pair density with its stiff part implicit** (piece 3 of 2026-10-04).
+  The stiff couplings are not local to an element and level: the vertical
+  pairs are stiff too where 20 levels in 300 m do not resolve an 8 m
+  pycnocline (`chord/Γ` ≈ 100 between adjacent levels), and they couple every
+  level of a column through `Ω`. The solve would be 9 nodes × levels ×
+  (u, v, T, S) per element and stage, with the reference's inverse map in it.
+  The tangent scheme is that scheme with the stiff remainder (the chord minus
+  the tangent, and its partner in the force) left out of the edges and its
+  total kept by the element.
+- **A weaker force at straddles** (the conservative chords kept, the force
+  made their adjoint with node weights `g/γ̂_a`, `γ̂_a` the steepest chord at
+  the node). Skew and conservative, but the internal waves of every column
+  beside a cliff slow by `√(Γ/γ̂)`, up to 7×: the physics pays, not a
+  truncation error.
+- **Pairs by depth** (z-pairs, shaved cells, LSC²). A pair at one height
+  advects no background at all, so nothing needs repair. It replaces the
+  layer graph (a pair's flux lands in another level of the neighbouring
+  column, and a deep layer beside a shallow column has no partner), the mode
+  splitter's shares and the 2D/3D identity with it. Not needed for rest; it
+  would also remove the σ form's error of the anomalies that are not a
+  displacement (Parked, P1.3).
+- **The redistribution with other weights.** Taking the element's error back
+  in proportion to each tracer's own gradient makes the force's partner
+  divide by `Γ` (stiff where `T` and `S` compensate in density); in
+  proportion to `H Γ` for both tracers it is the uniform displacement above,
+  and its partner is bounded.
+- **Cancelling the reference's advection where the force has no term** (the
+  first prototype did, on shore elements' subcell interfaces). Not needed for
+  the claim (those edges carry no flux in it), and it gives up conservation
+  to first order under a tide. The spectra are the same with and without
+  (terrace 0.9977 against 0.9979, shore slice 0.9974 against 0.9973).
+
+### Measurements
+
+The probes now run in pseudo-energy coordinates (`EnergyCoordinates`: the
+shear times `√(ρ₀ m H)`, the depth mean times `√(ρ₀ m D)`, `η` times
+`√(ρ₀ g m)`, the density anomaly times `√(g m H/Γ)`; the squared norm is
+twice the pseudo-energy). Arnoldi's Ritz values then lie in the step map's
+numerical range in that norm, whatever their residuals, and the largest
+singular value of the Arnoldi matrix is the largest growth of the norm over
+the horizon among the Krylov vectors: for a stable scheme the Ritz values
+crowd the unit circle and do not converge one by one (residuals 0.1–0.4), but
+they and the growth are bounded by the map's norm.
+
+"Before" is the code of 2026-11-17 (σ-pairs of the full density with the
+profile's force subtracted, LimitedAkima about the per-node vertical
+reference); "after" this scheme. Constant mixing (ν 1e-3 m²/s), no limiter.
+
+MEASUREMENTS

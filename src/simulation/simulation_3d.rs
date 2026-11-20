@@ -1527,6 +1527,94 @@ mod tests {
         );
     }
 
+    /// TODO P1.3 gate: what a curved reference profile keeps
+    /// (`Hydrostatic3D::with_reference_profile`), under the 0.5 m seiche
+    /// over the bed rising from 12 to 4 m with sheared columns, a
+    /// thermocline at 5 m (6 °C across ≈ 3 m) and a linear salinity, on 3, 6
+    /// and 12 levels:
+    ///
+    /// - uniform tracers stay uniform, whatever the reference (they hold no
+    ///   share of its stratification);
+    /// - the water's volume is conserved to round-off;
+    /// - the tracers at rest in the reference keep their inventories to
+    ///   round-off: the reference's advection by the pressure gradient's
+    ///   adjoint is not in flux form, but what it makes in an element is
+    ///   taken back within the element. (Without that the basin's mean
+    ///   temperature changed by 4.5e-3, 9.3e-4 and 2.6e-4 °C over the period,
+    ///   the trapezoid rule's error of the thermocline's gradient.)
+    #[test]
+    fn a_curved_reference_keeps_constancy_and_the_tracers_inventories() {
+        let eos = LinearEOS::default();
+        let profile = |z: f64| (eos.t0 + 3.0 * ((z + 5.0) / 1.5).tanh(), eos.s0 + 0.05 * z);
+        let reference = Arc::new(TracerReferenceProfile::from_smooth_fn(
+            -14.0, 2.0, 1601, profile,
+        ));
+        for levels in [3, 6, 12] {
+            let mut case = SlopingTide::new();
+            case.sigma = SigmaGrid::new(levels, UniformStretching);
+            let physics = case.physics().with_reference_profile(reference.clone());
+
+            // Uniform tracers under the curved reference
+            let mut state = case.state(&physics, |_, _| (eos.t0 + 2.3, eos.s0 - 0.9));
+            let mut drift = 0.0_f64;
+            case.run(&physics, &mut state, |s, _| {
+                for (t, salt) in s.temp.iter().zip(&s.salt) {
+                    drift = drift
+                        .max((t - (eos.t0 + 2.3)).abs())
+                        .max((salt - (eos.s0 - 0.9)).abs());
+                }
+            });
+            assert!(
+                drift < 1e-11 * eos.s0,
+                "{levels} levels: uniform tracers drifted by {drift:.3e}"
+            );
+
+            // At rest in the reference, but for the seiche and the shear
+            let mut state = case.state(&physics, |_, _| (0.0, 0.0));
+            let (nn, nl) = (case.ops.n_nodes, levels);
+            for idx in 0..case.mesh.n_elements * nn {
+                let eta = state.eta.data[idx];
+                let depth = eta - case.bathymetry.data[idx];
+                for (l, &sigma) in case.sigma.sigma_rho().iter().enumerate() {
+                    (state.temp[idx * nl + l], state.salt[idx * nl + l]) =
+                        reference.at(eta + sigma * depth);
+                }
+            }
+            physics.update_density(&mut state);
+            let volume = case.volume(&state);
+            let (t0, s0) = (
+                case.inventory(&state, &state.temp),
+                case.inventory(&state, &state.salt),
+            );
+            let (mut volume_error, mut salt_error, mut temp_error) = (0.0_f64, 0.0_f64, 0.0_f64);
+            let mut moved = 0.0_f64;
+            let rest = state.temp.clone();
+            case.run(&physics, &mut state, |s, _| {
+                volume_error = volume_error.max((case.volume(s) - volume).abs() / volume);
+                salt_error = salt_error.max((case.inventory(s, &s.salt) - s0).abs() / s0);
+                temp_error = temp_error.max((case.inventory(s, &s.temp) - t0).abs() / t0);
+                for (t, r) in s.temp.iter().zip(&rest) {
+                    moved = moved.max((t - r).abs());
+                }
+            });
+            println!(
+                "{levels} levels: volume {volume_error:.1e}, S inventory {salt_error:.1e}, \
+                 T inventory {temp_error:.1e} (T moved by up to {moved:.2} °C at a node)"
+            );
+            assert!(moved > 0.3, "test regime: T moved by {moved:.2e} °C");
+            assert!(
+                volume_error < 1e-13,
+                "{levels} levels: volume {volume_error:.2e}"
+            );
+            // Measured ≤ 2.1e-14
+            assert!(
+                salt_error < 1e-12 && temp_error < 1e-12,
+                "{levels} levels: the inventories drifted by {temp_error:.2e} (T) and \
+                 {salt_error:.2e} (S)"
+            );
+        }
+    }
+
     /// TODO P4.5 gate: the 3D stages on SSP-RK(4,3)
     /// (`ModeSplitIntegrator::with_baroclinic_scheme`), at half SSP-RK3's
     /// steps per period (twice the step, as `cfl_3d` doubles with it): uniform
@@ -2522,10 +2610,9 @@ mod tests {
     /// TODO P5.3 gate: a 3D run restarted halfway, from a file, in a new
     /// simulation, ends bit for bit where the uninterrupted run does
     /// (`restart_case`: wetting and drying, GLS, implicit vertical advection, a
-    /// relaxing vertical reference). The same state without
-    /// `Simulation3D::resume` (a fresh AB3 history of the slow forcing, the
-    /// initial reference) ends elsewhere, so the gate sees what the file adds
-    /// to the state.
+    /// reference profile). The same state without `Simulation3D::resume` (a
+    /// fresh AB3 history of the slow forcing) ends elsewhere, so the gate
+    /// sees what the file adds to the state.
     #[test]
     fn a_restarted_run_ends_bit_for_bit_where_the_uninterrupted_run_does() {
         let t_end = 900.0;
@@ -3667,18 +3754,128 @@ mod tests {
         assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s");
     }
 
-    /// TODO P1.3 gate (fails today): the cliff under a pycnocline (2 kg/m³
-    /// across ≈ 8 m at 15 m depth, 4e-4 kg/m⁴ above and below). Where a
-    /// σ-level crosses the pycnocline between two nodes of one element, the
-    /// pair's chord is far steeper than the stratification at either node,
-    /// no conserved functional has its minimum at rest, and round-off grows
-    /// with an e-folding of ≈ 45 min (2.3e-8 m/s after 6 h; on the Frøya bed
-    /// ≈ 15 min).
+    /// TODO P1.3 gate: the cliff under a pycnocline (2 kg/m³ across ≈ 8 m at
+    /// 15 m depth, 4e-4 kg/m⁴ above and below), the bed not smoothed. Where
+    /// a σ-level crosses the pycnocline between two nodes of one element,
+    /// the pair's chord is far steeper than the stratification at either
+    /// node. The σ-pairs scheme of the full density has no conserved
+    /// functional with its minimum at rest there, and round-off grew with an
+    /// e-folding of 47 min (2.3e-8 m/s after 6 h when the gate was written;
+    /// on the Frøya bed ≈ 15 min). About the reference profile the scheme
+    /// conserves a pseudo-energy to first order
+    /// (`Hydrostatic3D::with_reference_profile`): measured 7.3e-13 m/s.
     #[test]
-    #[ignore = "known failure, TODO P1.3: the pycnocline over a cliff is unstable at rest"]
     fn a_pycnocline_over_a_cliff_stays_at_rest() {
         let speed = cliff_at_rest(|z| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z, 6.0);
         assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s");
+    }
+
+    /// TODO P1.3 gate: the pycnocline over beds that are not smoothed, each
+    /// step inside one 1 km element, for two days: the 15 → 300 m cliff,
+    /// 0.5 m of water beside 150 m, land beside 300 m of water (a shore
+    /// element with dry nodes), and 15 → 60 m (a third of the cliff, which
+    /// the σ-pairs scheme of the full density grew with an e-folding of
+    /// 1.8 h; the cliff and the shallows it blew up within 48 h). Round-off
+    /// stays round-off: measured ≤ 3.2e-12 m/s at 48 h.
+    #[test]
+    fn a_pycnocline_over_unsmoothed_steps_stays_at_rest_for_two_days() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        for (name, left, right) in [
+            ("cliff", -300.0, -15.0),
+            ("shallows", -150.0, -0.5),
+            ("shore", -300.0, 5.0),
+            ("step", -60.0, -15.0),
+        ] {
+            let speed =
+                channel_at_rest(|x| step_bed(x, 3, left, right), None, pycnocline, &[48.0])[0];
+            println!("unsmoothed {name}: {speed:.2e} m/s after 48 h");
+            assert!(
+                speed < 1e-9,
+                "the unsmoothed {name} spun up {speed:.3e} m/s"
+            );
+        }
+    }
+
+    /// TODO P1.3 gate, the property the gates above stand on: the
+    /// pseudo-energy of a departure from rest in the reference stratification
+    /// (kinetic energy, the free surface's, and `½ g ρ′²/Γ`;
+    /// [`EnergyCoordinates`]) does not grow, over the unsmoothed 15 → 300 m
+    /// cliff. A random departure of every field (1e-6 in the state's units
+    /// at most), an hour of 36 s steps: the pseudo-energy after every step
+    /// is at most the one before (but for the splitting's round-off-sized
+    /// exchanges), and it only falls, by the vertical viscosity and the
+    /// barotropic fluxes' dissipation. The σ-pairs scheme of the full density
+    /// multiplied this norm by up to 4.6 over the hour (a pair of modes with
+    /// an e-folding of 47 min).
+    #[test]
+    fn the_pseudo_energy_of_a_departure_from_rest_does_not_grow_over_a_cliff() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+        let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
+        let (physics, rest) = basin_physics(mesh, bed, None, pycnocline);
+        let reference = physics
+            .reference_profile()
+            .expect("the fixture's reference");
+        let coords = EnergyCoordinates::new(&physics, &rest, reference);
+        let mut x0 = Vec::new();
+        pack(&rest, &mut x0);
+        // A random departure in energy coordinates (so every part of the
+        // pseudo-energy starts with its share)
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let random: Vec<f64> = (0..x0.len())
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+            })
+            .collect();
+        let departure = coords.from_energy(&coords.to_energy(&coords.from_energy(&random)));
+        let largest = departure.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+        let start: Vec<f64> = x0
+            .iter()
+            .zip(&departure)
+            .map(|(a, b)| a + 1e-6 / largest * b)
+            .collect();
+        let mut state = rest.clone();
+        unpack(&start, &mut state);
+        let mut x = Vec::new();
+        let mut energy = |state: &Solution3D| {
+            pack(state, &mut x);
+            let departure: Vec<f64> = x.iter().zip(&x0).map(|(a, b)| a - b).collect();
+            0.5 * coords
+                .to_energy(&departure)
+                .iter()
+                .map(|y| y * y)
+                .sum::<f64>()
+        };
+        let initial = energy(&state);
+        let (dt, mut integrator) = (36.0, ModeSplitIntegrator::new());
+        let (mut last, mut largest_rise) = (initial, 0.0_f64);
+        for n in 0..100 {
+            physics.update_density(&mut state);
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+            let now = energy(&state);
+            largest_rise = largest_rise.max(now / last - 1.0);
+            last = now;
+            if n % 10 == 9 {
+                println!(
+                    "pseudo-energy after {} s: {:.6} of the start",
+                    (n + 1) as f64 * dt,
+                    now / initial
+                );
+            }
+        }
+        println!("largest rise over a step: {largest_rise:.2e}");
+        assert!(
+            last < initial,
+            "the pseudo-energy rose from {initial:.6e} to {last:.6e} J over the hour"
+        );
+        assert!(
+            largest_rise < 1e-6,
+            "the pseudo-energy rose by {largest_rise:.2e} of itself over a step"
+        );
     }
 
     /// The pycnocline over the 15 → 300 m cliff, over 0.5 m of water beside
@@ -4569,7 +4766,8 @@ mod tests {
         };
         assert!(reference_after(physics(), &uniform).is_none(), "unmixed");
         // Every column is the same: their mean is each one's profile, linear
-        // between the layer centres (20 m in three layers)
+        // between the layer centres (20 m in three layers; on the mean's
+        // 1 m grid, which has the kink at the middle centre)
         let taken = reference_after(physics(), &stratified).expect("stratified");
         for (z, t) in [(-50.0 / 3.0, 8.0), (-10.0, 9.0), (-10.0 / 3.0, 12.0)] {
             assert!(

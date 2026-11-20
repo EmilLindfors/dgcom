@@ -64,16 +64,13 @@ pub struct Rhs3DConfig<'a> {
     /// A reference state balanced by the constant-depth form, if any (with
     /// [`PressureGradientForm::SigmaPairs`]).
     pub balanced_reference: Option<&'a BalancedReference>,
-    /// The reference stratification's density at the layer centres of
-    /// `state` (`[element][node][level]`,
-    /// `crate::solver::rhs::baroclinic::reference_density_into`), if any:
-    /// the pressure gradient is the density anomaly's about it
-    /// ([`compute_momentum_rhs_3d`]).
-    pub reference_density: Option<&'a [f64]>,
     /// The reference stratification at the levels of `state`
-    /// ([`ReferenceFields::fill`]), if any: the tracers' vertical
-    /// reconstruction is taken about it, and the reference itself is
-    /// advected by the pressure gradient's adjoint
+    /// ([`ReferenceFields::fill`]), if any. The pressure gradient is the
+    /// density anomaly's about it ([`compute_momentum_rhs_3d`], which needs
+    /// it on the elements' face neighbours too, with the elements'
+    /// displacements, [`ReferenceFields::set_displacements`]); the tracers'
+    /// vertical reconstruction is taken about it, and the reference itself
+    /// is advected by the pressure gradient's adjoint
     /// ([`compute_transport_rhs_3d`]).
     pub reference: Option<&'a ReferenceFields>,
     /// The volume form of the horizontal divergences, the 2D module's (the
@@ -115,7 +112,7 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         config.min_column_depth,
         config.pressure_gradient,
         config.metric,
-        config.reference_density,
+        config.reference,
         &mut rhs.u,
         &mut rhs.v,
         config.elements,

@@ -409,8 +409,13 @@ impl ElementSlopeBound {
     /// 12 h. With a free depth of 1.5 × `bottom` (28.5 m), shallow–deep pairs
     /// below it grew (e-folding 43 min). At `bottom` the full coastline mesh
     /// at rest holds 8.4e-9 m/s for 11.7 h with constant mixing, with the
-    /// 3D model's vertical reference (`Hydrostatic3D::with_vertical_reference`),
-    /// and levels off at 2.8e-3 m/s with GLS (TODO P1.3). The 2D tide at
+    /// vertical tracer advection about the stratification at rest, and
+    /// levels off at 2.8e-3 m/s with GLS. Those are measurements of the
+    /// σ-pairs scheme of 2026-10: about a reference profile
+    /// (`Hydrostatic3D::with_reference_profile`, 2026-11-20) the x–z slices
+    /// hold round-off on beds that are not smoothed at all, and the bound is
+    /// to be recalibrated, or dropped, on the full coastline mesh (TODO
+    /// P1.3, `notes/geometry-mesh.md`). The 2D tide at
     /// Mausund on that bed: centred RMSE 2.8 cm against the gauge's
     /// prediction, 4.0 cm against the observations.
     pub fn for_pycnocline(bottom: f64) -> Self {

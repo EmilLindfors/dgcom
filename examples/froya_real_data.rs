@@ -316,7 +316,7 @@
 //! `<output>/<domain>.restart` (`Restart3D`, replaced in one rename, so a
 //! crash while writing keeps the previous one) at the first progress line at
 //! or after every H model hours. It holds the state, the mode splitter's slow
-//! forcing, the vertical reference, the station records and the sampling
+//! forcing, the reference profile, the station records and the sampling
 //! counters. `resume=<file>`, with the same other options (the domain's
 //! fingerprint is checked), builds the run as before from its initial state,
 //! then continues from the file's time to `hours=`: the snapshot file drops
