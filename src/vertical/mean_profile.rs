@@ -128,6 +128,12 @@ impl MeanProfile {
         Some(Self { z0, temp, salt })
     }
 
+    /// The heights of the grid points (m, increasing) and T and S there.
+    pub fn samples(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let heights = (0..self.temp.len()).map(|i| self.z0 + i as f64).collect();
+        (heights, self.temp.clone(), self.salt.clone())
+    }
+
     /// T and S at height `z` (m), linear between grid points and held beyond
     /// them.
     pub fn at(&self, z: f64) -> (f64, f64) {

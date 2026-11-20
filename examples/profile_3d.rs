@@ -33,6 +33,7 @@ use dgcom::solver::rhs::{BarotropicFlux, MomentumAdvectionForm, VerticalAdvectio
 use dgcom::solver::state::Solution3D;
 use dgcom::solver::{
     Blocks, SWEFormulation2D, SWESolution2D, TracerLimiter3DConfig, TracerLimiterType3D,
+    TracerReferenceProfile,
 };
 use dgcom::source::CoriolisSource2D;
 use dgcom::time::{ModeSplitIntegrator, ModeSplitPhysics, StageElements, StepDrag};
@@ -267,9 +268,15 @@ fn main() {
         }
     }
     physics.update_density(&mut state);
-    // The vertical tracer advection about the initial stratification, as
-    // `Simulation3D` does
-    let physics = physics.with_vertical_reference(&state);
+    // The initial stratification as the reference profile, as `Simulation3D`
+    // takes one
+    let deepest = bathymetry.data.iter().copied().fold(0.0, f64::min);
+    let physics = physics.with_reference_profile(TracerReferenceProfile::from_smooth_fn(
+        deepest - 1.0,
+        1.0,
+        (20.0 * (2.0 - deepest)) as usize + 1,
+        |z| (eos.t0 + 4.0 * ((z + 15.0) / 5.0).tanh(), eos.s0),
+    ));
 
     println!(
         "profile_3d: {} elements × {nn} nodes × {nl} levels = {} 3D points, P{order}, dt {dt} s, \

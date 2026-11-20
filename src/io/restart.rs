@@ -56,8 +56,9 @@
 //! restart: `state.<field>` for the fields of [`Solution3D`] (`eta`, `ubar`,
 //! `vbar`, `u`, `v`, `w`, `temp`, `salt`, `rho`, `eddy_viscosity`,
 //! `eddy_diffusivity`, `tke`, `gls`), `slow_forcing.t`, `slow_forcing.next_t`
-//! and `slow_forcing.<j>.h|hu|hv` (newest first), `vertical_reference.temp`
-//! and `.salt` if any. Of both: `extra.<name>`, `text.<name>` (text, e.g. a
+//! and `slow_forcing.<j>.h|hu|hv` (newest first), and the reference
+//! stratification if any: `reference_profile.z`, `.temp`, `.salt`, and
+//! `.temp_slope`, `.salt_slope` if it is cubic between its samples. Of both: `extra.<name>`, `text.<name>` (text, e.g. a
 //! case run's resolved case file), and `metadata` last (text, `key=value`
 //! lines). `write` writes a temporary file beside the target and
 //! renames it over the target, so an interrupted write leaves the previous
@@ -67,12 +68,13 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 
 use crate::mesh::Mesh2D;
 use crate::solver::state::Solution3D;
-use crate::solver::{DGSolution2D, SWESolution2D};
+use crate::solver::{DGSolution2D, SWESolution2D, TracerReferenceProfile};
 use crate::time::SlowForcingRecord;
 use crate::vertical::SigmaGrid;
 
@@ -243,9 +245,9 @@ pub struct Restart3D {
     pub state: Solution3D,
     /// The mode splitter's slow forcing history.
     pub slow_forcing: SlowForcingRecord,
-    /// The vertical tracer advection's reference `[temperature, salinity]`,
-    /// `[element][node][level]`, if the run has one.
-    pub vertical_reference: Option<[Vec<f64>; 2]>,
+    /// The run's reference stratification
+    /// (`Hydrostatic3D::with_reference_profile`), if it has one.
+    pub reference_profile: Option<Arc<TracerReferenceProfile>>,
     /// The driver's data.
     pub driver: DriverData,
 }
@@ -268,9 +270,15 @@ impl Restart3D {
                 sections.push((format!("slow_forcing.{j}.{component}"), values));
             }
         }
-        if let Some([temp, salt]) = &self.vertical_reference {
-            sections.push(("vertical_reference.temp".into(), temp));
-            sections.push(("vertical_reference.salt".into(), salt));
+        if let Some(profile) = &self.reference_profile {
+            let (heights, temp, salt, slopes) = profile.samples_and_slopes();
+            sections.push(("reference_profile.z".into(), heights));
+            sections.push(("reference_profile.temp".into(), temp));
+            sections.push(("reference_profile.salt".into(), salt));
+            if let Some([temp_slope, salt_slope]) = slopes {
+                sections.push(("reference_profile.temp_slope".into(), temp_slope));
+                sections.push(("reference_profile.salt_slope".into(), salt_slope));
+            }
         }
         let header = Header {
             magic: MAGIC_3D,
@@ -346,15 +354,28 @@ impl Restart3D {
             }
             g.push(gj);
         }
-        let has_reference = file
-            .order
-            .iter()
-            .any(|n| n.starts_with("vertical_reference."));
-        let vertical_reference = if has_reference {
-            Some([
-                file.take("vertical_reference.temp", Some(n_3d))?,
-                file.take("vertical_reference.salt", Some(n_3d))?,
-            ])
+        let has = |file: &RawRestart, name: &str| file.order.iter().any(|n| n == name);
+        let reference_profile = if has(&file, "reference_profile.z") {
+            let heights = file.take("reference_profile.z", None)?;
+            let n = heights.len();
+            if n == 0 || heights.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(format(
+                    "the reference profile's heights do not increase".into(),
+                ));
+            }
+            let temp = file.take("reference_profile.temp", Some(n))?;
+            let salt = file.take("reference_profile.salt", Some(n))?;
+            let slopes = if has(&file, "reference_profile.temp_slope") {
+                Some([
+                    file.take("reference_profile.temp_slope", Some(n))?,
+                    file.take("reference_profile.salt_slope", Some(n))?,
+                ])
+            } else {
+                None
+            };
+            Some(Arc::new(TracerReferenceProfile::from_samples(
+                heights, temp, salt, slopes,
+            )))
         } else {
             None
         };
@@ -364,7 +385,7 @@ impl Restart3D {
             domain: file.header.domain,
             state,
             slow_forcing: SlowForcingRecord { g, t, next_t },
-            vertical_reference,
+            reference_profile,
             driver: file.driver()?,
         })
     }
@@ -811,7 +832,12 @@ mod tests {
                 t: vec![1200.0, 1165.25],
                 next_t: 1234.5,
             },
-            vertical_reference: Some([vec![1.5; ne * nn * nl], vec![-0.25; ne * nn * nl]]),
+            reference_profile: Some(Arc::new(TracerReferenceProfile::from_smooth_fn(
+                -40.0,
+                0.0,
+                9,
+                |z| (8.0 + 0.1 * z + (0.3 * z).sin(), 34.0 - 0.02 * z * z),
+            ))),
             driver: driver(),
         }
     }
@@ -865,13 +891,24 @@ mod tests {
             }
         }
         assert_eq!(a.slow_forcing.g.len(), b.slow_forcing.g.len());
-        match (&a.vertical_reference, &b.vertical_reference) {
-            (Some([ta, sa]), Some([tb, sb])) => {
+        match (&a.reference_profile, &b.reference_profile) {
+            (Some(pa), Some(pb)) => {
+                let (za, ta, sa, slopes_a) = pa.samples_and_slopes();
+                let (zb, tb, sb, slopes_b) = pb.samples_and_slopes();
+                for (x, y) in [(za, zb), (ta, tb), (sa, sb)] {
+                    assert_eq!(bits(x), bits(y));
+                }
+                let [ta, sa] = slopes_a.expect("the sample is cubic");
+                let [tb, sb] = slopes_b.expect("the slopes are lost");
                 assert_eq!(bits(ta), bits(tb));
                 assert_eq!(bits(sa), bits(sb));
+                // The profile itself, at heights between the samples
+                for z in [-39.3, -17.25, -0.4] {
+                    assert_eq!(pa.at(z), pb.at(z), "the profile at {z} m");
+                }
             }
             (None, None) => {}
-            _ => panic!("vertical reference lost"),
+            _ => panic!("reference profile lost"),
         }
         assert_same_driver(&a.driver, &b.driver);
     }
@@ -890,7 +927,7 @@ mod tests {
 
         // Without the optional parts
         let mut bare = sample();
-        bare.vertical_reference = None;
+        bare.reference_profile = None;
         bare.slow_forcing = SlowForcingRecord::empty();
         bare.state.tke.clear();
         bare.state.gls.clear();

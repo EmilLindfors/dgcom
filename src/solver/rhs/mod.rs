@@ -51,8 +51,9 @@ pub use swe_2d::{
 pub use swe_2d_viscosity::largest_viscosity_swe_2d;
 
 // 3D Baroclinic
+pub(crate) use baroclinic::reference_density_into;
 pub use baroclinic::{
-    BalancedReference, PressureGradientForm, ReferenceStratification, add_reference_advection,
+    BalancedReference, PressureGradientForm, ReferenceFields, add_reference_advection,
     compute_pressure_gradient,
 };
 

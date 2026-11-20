@@ -345,8 +345,9 @@
 //! `debug_3d=` takes comma-separated switches for diagnosing the 3D model on
 //! the real bed: `trace` (the largest speed and where, every step, and the
 //! momentum tendency at rest), `uniform` (no stratification), `linear`
-//! (linear in z instead of the pycnocline), `balanced` (the initial state as
-//! the PGF's balanced reference), `nolimiter`, `constant` (constant mixing
+//! (linear in z instead of the pycnocline), `balanced` (no reference
+//! profile, the initial state as the PGF's balanced reference), `nolimiter`,
+//! `constant` (constant mixing
 //! instead of GLS), `thin=D` (the 3D thin-column depth, 0.1 m by default),
 //! `vcentred` (centred vertical tracer advection), `nu=V` (a constant
 //! horizontal viscosity of the shear, m²/s, added to Smagorinsky's),
@@ -359,8 +360,9 @@
 //! so that modes with e-foldings of hours show within a run rather than
 //! after round-off has grown for a day), `deep=G` (°C/m below
 //! the pycnocline, 0.002), `vadv=centred|akima|tvd|upwind|hermite` (the
-//! vertical tracer scheme), `noref` (that scheme without the reference of
-//! the state at rest, which 3D runs take by default; TODO P1.3),
+//! vertical tracer scheme), `noref` (without the stratification at rest as
+//! the reference profile, `Hydrostatic3D::with_reference_profile`, which 3D
+//! runs take by default: the σ-pairs scheme of the full density),
 //! `tadv=none|centred` (the turbulence's advection) and
 //! `export=PATH` (with `around=`: the patch as a test fixture).
 //!
@@ -3976,14 +3978,24 @@ fn tidal_run_3d<'a>(
     if dbg("uniform") || dbg("flat") {
         covered.fill(false);
     }
-    let profile = |z: f64| {
-        if dbg("flat") {
-            (eos.t0, eos.s0)
-        } else {
-            mean.as_ref().map_or_else(|| summer(z), |m| m.at(z))
+    // The reference stratification: the parent's mean profile (else the
+    // summer pycnocline, cubic between samples every 5 cm). The nodes no
+    // parent covers start exactly in it
+    let deepest = bed.iter().copied().fold(0.0, f64::min);
+    let reference = Arc::new(if dbg("flat") {
+        TracerReferenceProfile::new(vec![0.0], vec![eos.t0], vec![eos.s0])
+    } else {
+        match &mean {
+            Some(mean) => TracerReferenceProfile::from_mean(mean),
+            None => TracerReferenceProfile::from_smooth_fn(
+                deepest - 1.0,
+                1.0,
+                (20.0 * (2.0 - deepest)).ceil() as usize + 1,
+                summer,
+            ),
         }
-    };
-    state.fill_tracers(&sigma, bed, |idx| !covered[idx], profile);
+    });
+    state.fill_tracers(&sigma, bed, |idx| !covered[idx], |z| reference.at(z));
     // The velocity: the parent's shear about the 2D module's depth mean,
     // zero at the start (the tide ramps up from rest), where the parent
     // covers a column at least the thin depth deep; else at rest
@@ -4028,9 +4040,9 @@ fn tidal_run_3d<'a>(
             "  Initial T, S: the summer pycnocline (no NorKyst profiles): T {t_lo:.2}–{t_hi:.2} °C"
         ),
     }
-    let (t_top, s_top) = profile(-0.5);
-    let (t_30, s_30) = profile(-30.0);
-    let (t_100, s_100) = profile(-100.0);
+    let (t_top, s_top) = reference.at(-0.5);
+    let (t_30, s_30) = reference.at(-30.0);
+    let (t_100, s_100) = reference.at(-100.0);
     println!(
         "  Mean profile: {t_top:.2} °C, {s_top:.2} at 0.5 m; {t_30:.2} °C, {s_30:.2} at 30 m; \
          {t_100:.2} °C, {s_100:.2} at 100 m"
@@ -4067,17 +4079,11 @@ fn tidal_run_3d<'a>(
         opts.band_minutes
     );
 
-    let deepest = bed.iter().copied().fold(0.0, f64::min);
     let limiter = TracerLimiter3DConfig {
         limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
         ..TracerLimiter3DConfig::default()
     }
-    .with_reference_profile(TracerReferenceProfile::from_fn(
-        deepest - 1.0,
-        1.0,
-        4001,
-        profile,
-    ));
+    .with_reference_profile(reference.clone());
     let mut physics = Hydrostatic3D::new(
         domain.mesh.clone(),
         domain.ops.clone(),
@@ -4158,11 +4164,9 @@ fn tidal_run_3d<'a>(
         physics = physics.with_implicit_vertical_advection(ImplicitVerticalAdvection::default());
     }
     physics.update_density(&mut state);
-    // The PGF about the mean profile (Mellor et al. 1998)
-    let physics = physics.with_reference_profile(&state, |z| {
-        let (t, s) = profile(z);
-        eos.compute_density(t, s, z)
-    });
+    // The anomalies about the mean profile: its pressure gradient (Mellor
+    // et al. 1998) and the advection that is its adjoint
+    let physics = physics.with_reference_profile(reference);
 
     let output_dir = output_dir(domain, opts);
     fs::create_dir_all(&output_dir)?;
@@ -5287,6 +5291,18 @@ fn cost_3d(domain: &Domain, opts: &Options) {
             )
         }
     };
+    // As the reference stratification: cubic between samples every 5 cm
+    let (deepest, highest) = domain
+        .bathymetry
+        .data
+        .iter()
+        .fold((0.0_f64, 0.0_f64), |(lo, hi), &b| (lo.min(b), hi.max(b)));
+    let reference = Arc::new(TracerReferenceProfile::from_smooth_fn(
+        deepest - 1.0,
+        highest + 1.0,
+        (20.0 * (highest - deepest + 2.0)).ceil() as usize + 1,
+        profile,
+    ));
     let physics: Physics3D = Hydrostatic3D::new(
         domain.mesh.clone(),
         domain.ops.clone(),
@@ -5347,13 +5363,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
             limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
             ..TracerLimiter3DConfig::default()
         };
-        let deepest = domain.bathymetry.data.iter().copied().fold(0.0, f64::min);
-        config.with_reference_profile(TracerReferenceProfile::from_fn(
-            deepest - 1.0,
-            1.0,
-            4001,
-            profile,
-        ))
+        config.with_reference_profile(reference.clone())
     });
 
     let (ne, nn) = (domain.mesh.n_elements, domain.ops.n_nodes);
@@ -5364,7 +5374,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         state.eta.data[idx] = eta;
         for (l, &s) in sigma.sigma_rho().iter().enumerate() {
             let z = eta + s * (eta - bed);
-            (state.temp[idx * nl + l], state.salt[idx * nl + l]) = profile(z);
+            (state.temp[idx * nl + l], state.salt[idx * nl + l]) = reference.at(z);
         }
     }
     physics.update_density(&mut state);
@@ -5448,27 +5458,19 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         times[2]
     };
 
-    // The stratification's profile as the PGF's reference, exact at rest
-    // (`balanced`: the state as the balanced reference, which leaves the
-    // constant-depth form's error at rest, 1.7e-4 m/s² at cliff shores;
-    // `unbalanced`: none, the σ-pairs' error, 2.2e-2 m/s²)
-    let physics = if dbg("unbalanced") {
+    // The stratification at rest as the reference profile: no force at rest,
+    // and the advection that is its pressure gradient's adjoint (`noref`:
+    // none, the σ-pairs' error of the full density, 2.2e-2 m/s²; `balanced`:
+    // none, with the state as the balanced reference, which leaves the
+    // constant-depth form's error at rest, 1.7e-4 m/s² at cliff shores)
+    let physics = if dbg("balanced") {
         physics
-    } else if dbg("balanced") {
-        physics.with_balanced_reference(&state)
+            .without_reference_profile()
+            .with_balanced_reference(&state)
+    } else if dbg("noref") {
+        physics.without_reference_profile()
     } else {
-        use dgcom::physics::EquationOfState;
-        physics.with_reference_profile(&state, |z| {
-            let (t, s) = profile(z);
-            eos.compute_density(t, s, z)
-        })
-    };
-    // The vertical tracer advection about the state at rest, as
-    // `Simulation3D` does (`noref`: the plain scheme)
-    let physics = if dbg("noref") {
-        physics
-    } else {
-        physics.with_vertical_reference(&state)
+        physics.with_reference_profile(reference)
     };
     let mut integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(opts.rk_3d);
     let ssp = opts.rk_3d.ssp_coefficient();

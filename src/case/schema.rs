@@ -955,6 +955,27 @@ impl ThreeDSection {
         Some((a[1] + w * (b[1] - a[1]), a[2] + w * (b[2] - a[2])))
     }
 
+    /// `profile` as a reference stratification (its points, linear between
+    /// them and held beyond, as [`Self::profile_at`]); `None` without one.
+    pub fn reference_profile(&self) -> Option<crate::solver::TracerReferenceProfile> {
+        if self.profile.is_empty() {
+            return None;
+        }
+        // From the bottom up
+        let column = |j: usize| {
+            self.profile
+                .iter()
+                .rev()
+                .map(|p| p[j])
+                .collect::<Vec<f64>>()
+        };
+        Some(crate::solver::TracerReferenceProfile::new(
+            column(0),
+            column(1),
+            column(2),
+        ))
+    }
+
     fn validate(&self) -> Result<(), CaseError> {
         let invalid = |m: String| Err(CaseError::Invalid(format!("three_d.{m}")));
         if self.levels < 2 {

@@ -179,8 +179,11 @@ impl TracerLimiter3DConfig {
     /// out, a fluid at rest in it has nothing to limit; with a
     /// stratification that varies horizontally, the limiter sees only the
     /// variation. Use the domain's typical (or initial) profile.
-    pub fn with_reference_profile(mut self, reference: TracerReferenceProfile) -> Self {
-        self.reference = Some(Arc::new(reference));
+    pub fn with_reference_profile(
+        mut self,
+        reference: impl Into<Arc<TracerReferenceProfile>>,
+    ) -> Self {
+        self.reference = Some(reference.into());
         self
     }
 }
@@ -377,6 +380,55 @@ impl TracerReferenceProfile {
             .unzip();
         reference.slopes = Some([temp_slope, salt_slope]);
         reference
+    }
+
+    /// The profile of a domain's mean stratification `mean` (its 1 m grid,
+    /// linear between the grid points).
+    pub fn from_mean(mean: &crate::vertical::MeanProfile) -> Self {
+        let (heights, temp, salt) = mean.samples();
+        Self::new(heights, temp, salt)
+    }
+
+    /// The heights of the samples, their temperatures and salinities, and
+    /// the slopes `[dT/dz, dS/dz]` there if the profile is cubic between
+    /// them: what [`Self::from_samples`] rebuilds it from.
+    pub fn samples_and_slopes(&self) -> (&[f64], &[f64], &[f64], Option<[&[f64]; 2]>) {
+        let slopes = self.slopes.as_ref().map(|[t, s]| [&t[..], &s[..]]);
+        (&self.heights, &self.temp, &self.salt, slopes)
+    }
+
+    /// [`Self::new`], cubic between the samples if `slopes`
+    /// (`[dT/dz, dS/dz]` at the heights) are given.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::new`], or if the slopes' lengths differ from the heights'.
+    pub fn from_samples(
+        heights: Vec<f64>,
+        temp: Vec<f64>,
+        salt: Vec<f64>,
+        slopes: Option<[Vec<f64>; 2]>,
+    ) -> Self {
+        let mut profile = Self::new(heights, temp, salt);
+        if let Some(slopes) = slopes {
+            assert!(
+                slopes.iter().all(|s| s.len() == profile.heights.len()),
+                "a reference profile needs as many slopes as heights"
+            );
+            profile.slopes = Some(slopes);
+        }
+        profile
+    }
+
+    /// Temperature and salinity at height `z` (one search for both).
+    #[inline]
+    pub fn at(&self, z: f64) -> (f64, f64) {
+        let temp = self.samples(TracerComponent::Temperature);
+        let bracket = temp.bracket(z);
+        (
+            temp.at_bracket(bracket),
+            self.samples(TracerComponent::Salinity).at_bracket(bracket),
+        )
     }
 
     /// The temperature at height `z`.

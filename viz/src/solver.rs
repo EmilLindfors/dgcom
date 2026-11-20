@@ -483,16 +483,17 @@ fn spawn_3d(
                 // 3 m halocline at 4 cm (TODO F.3)
                 let deepest = bathymetry.data.iter().copied().fold(0.0, f64::min);
                 let (bottom, top) = (deepest - 1.0, 1.0);
-                let limiter = TracerLimiter3DConfig {
-                    limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
-                    ..TracerLimiter3DConfig::default()
-                }
-                .with_reference_profile(TracerReferenceProfile::from_smooth_fn(
+                let reference = Arc::new(TracerReferenceProfile::from_smooth_fn(
                     bottom,
                     top,
                     ((top - bottom) / REFERENCE_SPACING).ceil() as usize + 1,
                     profile,
                 ));
+                let limiter = TracerLimiter3DConfig {
+                    limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+                    ..TracerLimiter3DConfig::default()
+                }
+                .with_reference_profile(reference.clone());
                 let physics = Hydrostatic3D::new(
                     mesh.clone(),
                     ops.clone(),
@@ -530,7 +531,8 @@ fn spawn_3d(
                     physics
                 };
 
-                // At rest at mean sea level, stratified as the scenario's profile
+                // At rest at mean sea level, in the reference stratification (the
+                // scenario's profile)
                 let n_levels = three_d.sigma.n_levels();
                 let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, n_levels);
                 for (k, (temp, salt)) in state
@@ -542,7 +544,7 @@ fn spawn_3d(
                     let depth = -bathymetry.data[k];
                     for ((t, s), &sigma) in temp.iter_mut().zip(salt).zip(three_d.sigma.sigma_rho())
                     {
-                        (*t, *s) = profile(sigma * depth);
+                        (*t, *s) = reference.at(sigma * depth);
                     }
                 }
                 physics.update_density(&mut state);
@@ -569,12 +571,9 @@ fn spawn_3d(
                         Err(e) => eprintln!("no relaxation band at the open faces: {e}"),
                     }
                 }
-                // The baroclinic pressure gradient about the profile, exact at rest
-                // (Mellor et al. 1998)
-                let physics = physics.with_reference_profile(&state, |z| {
-                    let (t, s) = profile(z);
-                    eos.compute_density(t, s, z)
-                });
+                // The anomalies about the profile: its pressure gradient, exact at
+                // rest (Mellor et al. 1998), and the advection that is its adjoint
+                let physics = physics.with_reference_profile(reference);
 
                 let started = Instant::now();
                 let mut save = Save::new(save);

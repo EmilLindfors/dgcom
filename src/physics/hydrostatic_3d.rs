@@ -83,28 +83,30 @@ use crate::physics::vertical_diffusion::{
 };
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
-use crate::solver::core::blocks::{Blocks, Pooled, for_each_block, reduce_blocks, update_with};
+use crate::solver::core::blocks::{
+    Blocks, Neighbourhood, Pooled, for_each_block, reduce_blocks, update_with,
+};
 use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::rhs::{
     AdvectedTracer, BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D,
     ExtrapolationTracerBC3D, HorizontalViscosity3D, LayerTransport, MetricForm,
-    MomentumAdvectionForm, PressureGradientForm, ReferenceStratification, Rhs3DConfig,
-    TracerBoundaryCondition3D,
-    VerticalAdvection, ViscosityScratch3D, apply_coriolis_3d, apply_horizontal_viscosity_3d,
-    apply_momentum_transport_3d, apply_w_point_transport_3d, compute_momentum_rhs_3d,
-    compute_transport_rhs_3d, element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
-    w_cell_thicknesses,
+    MomentumAdvectionForm, PressureGradientForm, ReferenceFields, Rhs3DConfig,
+    TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D, apply_coriolis_3d,
+    apply_horizontal_viscosity_3d, apply_momentum_transport_3d, apply_w_point_transport_3d,
+    compute_momentum_rhs_3d, compute_transport_rhs_3d, element_dt_viscous_swe_2d,
+    largest_horizontal_viscosity_3d, w_cell_thicknesses,
 };
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
 use crate::solver::{
-    TracerLimiter3DConfig, TracerLimiter3DStats, TracerLimiterType3D, apply_tracer_limiters_3d,
+    TracerLimiter3DConfig, TracerLimiter3DStats, TracerLimiterType3D, TracerReferenceProfile,
+    apply_tracer_limiters_3d,
 };
 use crate::source::{CageDrag2D, CageNode, CoriolisSource2D, RiverSources};
 use crate::time::multirate::RhsStencil;
 use crate::time::{ModeSplitPhysics, StageElements, StageStash, StepDrag};
 use crate::types::ElementIndex;
-use crate::vertical::SigmaGrid;
+use crate::vertical::{MeanProfile, SigmaGrid};
 
 /// Hydrostatic 3D Physics Module.
 ///
@@ -168,9 +170,6 @@ where
     /// A reference state whose pressure gradient is the constant-depth
     /// form's, if any (see [`Self::with_balanced_reference`]).
     pub balanced_reference: Option<Arc<BalancedReference>>,
-    /// Prototype (TODO P1.3): the reference stratification of the anomaly
-    /// pressure gradient and its adjoint advection.
-    pub reference_stratification: Option<Arc<ReferenceStratification>>,
     /// Advection of a prognostic closure's turbulence, with this vertical
     /// reconstruction; `None` keeps it in its column (see
     /// [`Self::with_turbulence_advection`]).
@@ -225,13 +224,18 @@ where
     /// non-solar, shortwave and freshwater fluxes on every column
     /// (allocated on first use).
     surface_flux_scratch: Mutex<[Vec<f64>; 5]>,
-    /// The stratification about which the vertical tracer advection
-    /// reconstructs, if any (see [`Self::with_vertical_reference`]).
-    vertical_reference: Option<VerticalReference>,
-    /// Whether [`Self::ensure_vertical_reference`] takes a stratified initial
-    /// state as the reference (the default; see
-    /// [`Self::without_vertical_reference`]).
-    automatic_vertical_reference: bool,
+    /// The reference stratification, if any (see
+    /// [`Self::with_reference_profile`]).
+    reference_profile: Option<Arc<TracerReferenceProfile>>,
+    /// Whether [`Self::ensure_reference_profile`] takes a stratified initial
+    /// state's mean profile as the reference (the default; see
+    /// [`Self::without_reference_profile`]).
+    automatic_reference_profile: bool,
+    /// The reference's density at the layer centres of the last momentum
+    /// stage (allocated on first use), and the elements it was set on.
+    reference_density: Mutex<(Vec<f64>, Neighbourhood)>,
+    /// The reference at the levels of the last transport stage.
+    reference_fields: Mutex<ReferenceFields>,
 }
 
 /// The implicit part of `Ω` of [`Hydrostatic3D`]'s last 3D stage (see
@@ -328,16 +332,6 @@ struct ElementRates {
     depth: f64,
 }
 
-/// The temperature and salinity about which [`Hydrostatic3D`]'s vertical
-/// tracer advection reconstructs (see [`Hydrostatic3D::with_vertical_reference`]),
-/// per node and level, and how it follows the state.
-struct VerticalReference {
-    /// `[temperature, salinity]`, `[element][node][level]`.
-    fields: Mutex<[Vec<f64>; 2]>,
-    /// The time scale (s) of the relaxation towards the state, if any.
-    timescale: Option<f64>,
-}
-
 impl<EOS, MIX, BC> Hydrostatic3D<EOS, MIX, BC>
 where
     EOS: EquationOfState,
@@ -394,7 +388,6 @@ where
             momentum_vertical_advection: VerticalAdvection::Centred,
             pressure_gradient: PressureGradientForm::default(),
             balanced_reference: None,
-            reference_stratification: None,
             turbulence_advection: Some(VerticalAdvection::LimitedAkima),
             bottom_drag: None,
             cage_drag: None,
@@ -414,113 +407,101 @@ where
             step_viscosity: Mutex::new([Vec::new(), Vec::new()]),
             surface_stress_scratch: Mutex::new([Vec::new(), Vec::new()]),
             surface_flux_scratch: Mutex::new(Default::default()),
-            vertical_reference: None,
-            automatic_vertical_reference: true,
+            reference_profile: None,
+            automatic_reference_profile: true,
+            reference_density: Mutex::new((Vec::new(), Neighbourhood::default())),
+            reference_fields: Mutex::new(ReferenceFields::default()),
         }
     }
 
-    /// Reconstruct the tracers at the σ-surfaces about `state`'s temperature
-    /// and salinity, its stratification (at rest, or a parent model's): the
-    /// vertical scheme ([`Self::with_vertical_advection`]) keeps its limiting
-    /// for departures from it, while the stratification itself is advected
-    /// with the centred value (see
-    /// [`crate::solver::rhs::apply_tracer_transport_3d`]).
+    /// The reference stratification `profile`: a horizontally uniform
+    /// `T̄(z)`, `S̄(z)` (the stratification at rest, a parent model's mean
+    /// profile, [`TracerReferenceProfile::from_mean`]) about which the model
+    /// takes its anomalies. A fluid at rest in it is at rest in the model,
+    /// over any bed, and stays there: the scheme linearised about that state
+    /// conserves a positive pseudo-energy (kinetic energy, the free
+    /// surface's, and `½ g ρ′²/Γ` with `Γ = −∂ρ̄/∂z` over each layer), so
+    /// nothing can grow out of round-off
+    /// (`docs/stratified-rest-over-steep-beds.md`, TODO P1.3). With it:
     ///
-    /// Use it for stratified runs: about a stratified rest state, a
-    /// dissipative or higher-order vertical scheme mixes the background at a
-    /// rate set by a perturbation's own vertical flow, which feeds the
-    /// perturbation. On the Frøya coastline mesh at rest that grew with an
-    /// e-folding of 35 min for the default `LimitedAkima` (26 min upwind,
-    /// 50 min Akima) at terrace edges beside shore elements; centred, or any
-    /// scheme about the reference, holds round-off (TODO P1.3,
-    /// `docs/stratified-rest-over-steep-beds.md`).
+    /// - the baroclinic pressure gradient is that of the density anomaly
+    ///   `ρ − ρ̄(z)` at every node's own height, integrated by the trapezoid
+    ///   rule (linear in the anomaly, so the force has an adjoint;
+    ///   [`crate::solver::rhs::baroclinic`]);
+    /// - the tracers' advection moves the reference's share of their
+    ///   stratification by the vertical velocity that is that force's
+    ///   adjoint, times the reference's gradient over the layer
+    ///   ([`crate::solver::rhs::add_reference_advection`]), and
+    ///   reconstructs them at the σ-surfaces about the reference, so the
+    ///   vertical scheme ([`Self::with_vertical_advection`]) limits only the
+    ///   departures from it
+    ///   ([`crate::solver::rhs::apply_tracer_transport_3d`]).
     ///
-    /// The reference is per node and level, so it follows the σ-levels as a
-    /// tide stretches the columns. A uniform tracer stays uniform whatever
-    /// the reference, and a column stratified like it at a fraction of its
-    /// strength is still advected centred. Refresh it with
-    /// [`Self::set_vertical_reference`], or let it follow the state with
-    /// [`Self::with_vertical_reference_timescale`].
+    /// Give the same profile to the tracer limiter, which then bounds the
+    /// departures from it ([`TracerLimiter3DConfig::with_reference_profile`]).
+    ///
+    /// Without a reference the scheme is the σ-pairs one, which exchanges
+    /// energy exactly but holds a curved profile at rest only where no
+    /// σ-level crosses it steeply within an element (round-off grew with an
+    /// e-folding of 47 min over a 15 → 300 m cliff, and of 2 h at a terrace
+    /// of the smoothed Frøya bed).
+    ///
+    /// What it costs: the reference's share of the tracers is advected in
+    /// advective form, so a curved reference's inventory is conserved to the
+    /// scheme's truncation error (the trapezoid rule of the reference's
+    /// gradient along each edge), not to round-off; the water's volume, a
+    /// uniform tracer and the anomalies are as before. A reference linear in
+    /// `z` changes nothing but the pressure integral.
+    ///
+    /// The profile is fixed in `z`: where the stratification drifts from it
+    /// (mixing, rivers, a parent model's water), only the share of the
+    /// reference that the tracers still hold is treated this way, and the
+    /// rest as without one. [`Self::set_reference_profile`] replaces it.
+    /// It applies to [`PressureGradientForm::SigmaPairs`] (the default).
     ///
     /// It is the default: [`crate::simulation::Simulation3D`] takes a
-    /// stratified initial state as the reference when none was given
-    /// ([`Self::ensure_vertical_reference`]; opt out with
-    /// [`Self::without_vertical_reference`]). Loops that step the model
-    /// themselves call this, or [`Self::ensure_vertical_reference`].
-    pub fn with_vertical_reference(mut self, state: &Solution3D) -> Self {
-        self.vertical_reference = Some(VerticalReference {
-            fields: Mutex::new([state.temp.clone(), state.salt.clone()]),
-            timescale: None,
-        });
-        self
-    }
-
-    /// [`Self::with_vertical_reference`] of a horizontally uniform profile
-    /// `profile(z) = (T, S)`, sampled at the levels of `state` (its `η`).
-    pub fn with_vertical_reference_profile(
-        self,
-        state: &Solution3D,
-        profile: impl Fn(f64) -> (f64, f64),
+    /// stratified initial state's mean profile when none was given
+    /// ([`Self::ensure_reference_profile`]; opt out with
+    /// [`Self::without_reference_profile`]). Loops that step the model
+    /// themselves call this, or [`Self::ensure_reference_profile`].
+    pub fn with_reference_profile(
+        mut self,
+        profile: impl Into<Arc<TracerReferenceProfile>>,
     ) -> Self {
-        let mut reference = state.clone();
-        let nl = state.n_levels;
-        for (idx, (temp, salt)) in reference
-            .temp
-            .chunks_exact_mut(nl)
-            .zip(reference.salt.chunks_exact_mut(nl))
-            .enumerate()
-        {
-            let eta = state.eta.data[idx];
-            let depth = eta - self.bathymetry.data[idx];
-            for (l, &s) in self.sigma.sigma_rho().iter().enumerate() {
-                (temp[l], salt[l]) = profile(eta + s * depth);
-            }
-        }
-        self.with_vertical_reference(&reference)
-    }
-
-    /// Relax the reference of [`Self::with_vertical_reference`] towards the
-    /// state with the time scale `timescale` (s) at every
-    /// [`Self::relax_vertical_reference`] (each step of [`crate::simulation::Simulation3D`]),
-    /// so that it follows a stratification that changes slowly (mixing,
-    /// rivers, a parent model) while departures faster than `timescale`
-    /// are still limited. A day or more keeps the tide's departures.
-    ///
-    /// # Panics
-    /// Without a reference, or if `timescale` is not positive.
-    pub fn with_vertical_reference_timescale(mut self, timescale: f64) -> Self {
-        assert!(
-            timescale > 0.0,
-            "the reference's time scale must be positive, got {timescale}"
-        );
-        self.vertical_reference
-            .as_mut()
-            .expect("with_vertical_reference_timescale needs with_vertical_reference first")
-            .timescale = Some(timescale);
+        self.set_reference_profile(Some(profile.into()));
         self
     }
 
-    /// The plain vertical scheme, without a reference, and no automatic one
-    /// from [`Self::ensure_vertical_reference`].
-    pub fn without_vertical_reference(mut self) -> Self {
-        self.vertical_reference = None;
-        self.automatic_vertical_reference = false;
+    /// Replace the reference of [`Self::with_reference_profile`] (`None`:
+    /// no reference, and no automatic one). A balanced reference
+    /// ([`Self::with_balanced_reference`]) is that of the reference it was
+    /// set with: set it again after this.
+    pub fn set_reference_profile(&mut self, profile: Option<Arc<TracerReferenceProfile>>) {
+        self.reference_profile = profile;
+        self.automatic_reference_profile = false;
+    }
+
+    /// No reference stratification, and no automatic one from
+    /// [`Self::ensure_reference_profile`].
+    pub fn without_reference_profile(mut self) -> Self {
+        self.set_reference_profile(None);
         self
     }
 
-    /// Take `state`'s temperature and salinity as the reference of
-    /// [`Self::with_vertical_reference`] if none is set, the state is
+    /// Take the mean profile of `state` ([`MeanProfile`]: its columns' mean
+    /// at every height, made statically stable) as the reference of
+    /// [`Self::with_reference_profile`] if none is set, the state is
     /// stratified (a column's T or S varies by more than 1e-9) and
-    /// [`Self::without_vertical_reference`] did not opt out.
+    /// [`Self::without_reference_profile`] did not opt out.
     /// [`crate::simulation::Simulation3D`] calls it with its initial state.
     /// The first call decides: a later one (a run continued by another
     /// `run` call, whose state may have stratified since) takes no reference
     /// mid-run.
-    pub fn ensure_vertical_reference(&mut self, state: &Solution3D) {
-        if self.vertical_reference.is_some() || !self.automatic_vertical_reference {
+    pub fn ensure_reference_profile(&mut self, state: &Solution3D) {
+        if self.reference_profile.is_some() || !self.automatic_reference_profile {
             return;
         }
-        self.automatic_vertical_reference = false;
+        self.automatic_reference_profile = false;
         let nl = state.n_levels;
         let stratified = [&state.temp, &state.salt].iter().any(|field| {
             field.chunks_exact(nl).any(|column| {
@@ -532,102 +513,33 @@ where
                 hi - lo > 1e-9
             })
         });
-        if stratified {
-            self.set_vertical_reference(state);
-        }
-    }
-
-    /// Replace the reference of [`Self::with_vertical_reference`] by
-    /// `state`'s temperature and salinity (none set: sets one).
-    pub fn set_vertical_reference(&mut self, state: &Solution3D) {
-        match &self.vertical_reference {
-            Some(reference) => {
-                let mut fields = reference
-                    .fields
-                    .lock()
-                    .expect("Failed to lock the vertical reference");
-                fields[0].copy_from_slice(&state.temp);
-                fields[1].copy_from_slice(&state.salt);
-            }
-            None => {
-                self.vertical_reference = Some(VerticalReference {
-                    fields: Mutex::new([state.temp.clone(), state.salt.clone()]),
-                    timescale: None,
-                });
-            }
-        }
-    }
-
-    /// Continue a run's reference (from [`Self::vertical_reference`] of the
-    /// run being resumed, `[temperature, salinity]` per node and level):
-    /// its fields replace this physics' (keeping the relaxation time scale
-    /// it was built with), and `None`, a run without one, removes any
-    /// reference and the automatic one of [`Self::ensure_vertical_reference`].
-    ///
-    /// # Panics
-    /// If the fields do not have the size of the reference's.
-    pub fn restore_vertical_reference(&mut self, reference: Option<[Vec<f64>; 2]>) {
-        let Some(fields) = reference else {
-            self.vertical_reference = None;
-            self.automatic_vertical_reference = false;
+        if !stratified {
             return;
-        };
-        let n = self.mesh.n_elements * self.ops.n_nodes * self.sigma.n_levels();
-        assert!(
-            fields.iter().all(|field| field.len() == n),
-            "the vertical reference has {} and {} values, expected {n}",
-            fields[0].len(),
-            fields[1].len()
+        }
+        let mean = MeanProfile::of(
+            state,
+            &self.bathymetry.data,
+            &self.sigma,
+            |_| true,
+            |t, s| self.eos.compute_density(t, s, 0.0),
         );
-        match &mut self.vertical_reference {
-            Some(reference) => {
-                *reference
-                    .fields
-                    .get_mut()
-                    .expect("Failed to lock the vertical reference") = fields;
-            }
-            None => {
-                self.vertical_reference = Some(VerticalReference {
-                    fields: Mutex::new(fields),
-                    timescale: None,
-                });
-            }
-        }
-        self.automatic_vertical_reference = false;
+        self.reference_profile =
+            mean.map(|mean| Arc::new(TracerReferenceProfile::from_mean(&mean)));
     }
 
-    /// Relax the reference towards `state` over a step `dt` (s):
-    /// `C_ref += (1 − e^{−dt/τ})(C − C_ref)` with the time scale of
-    /// [`Self::with_vertical_reference_timescale`]; nothing without one.
-    pub fn relax_vertical_reference(&self, state: &Solution3D, dt: f64) {
-        let Some(VerticalReference {
-            fields,
-            timescale: Some(timescale),
-        }) = &self.vertical_reference
-        else {
-            return;
-        };
-        let weight = 1.0 - (-dt / timescale).exp();
-        let mut fields = fields
-            .lock()
-            .expect("Failed to lock the vertical reference");
-        for (reference, field) in fields.iter_mut().zip([&state.temp, &state.salt]) {
-            for (r, &c) in reference.iter_mut().zip(field.iter()) {
-                *r += weight * (c - *r);
-            }
-        }
+    /// The reference stratification, if any (see
+    /// [`Self::with_reference_profile`]).
+    pub fn reference_profile(&self) -> Option<&Arc<TracerReferenceProfile>> {
+        self.reference_profile.as_ref()
     }
 
-    /// The reference's temperature and salinity, if any (see
-    /// [`Self::with_vertical_reference`]).
-    pub fn vertical_reference(&self) -> Option<[Vec<f64>; 2]> {
-        self.vertical_reference.as_ref().map(|reference| {
-            reference
-                .fields
-                .lock()
-                .expect("Failed to lock the vertical reference")
-                .clone()
-        })
+    /// The reference the kernels take: the profile, with the σ-pairs force
+    /// whose adjoint its advection is.
+    fn active_reference(&self) -> Option<&TracerReferenceProfile> {
+        match self.pressure_gradient {
+            PressureGradientForm::SigmaPairs => self.reference_profile.as_deref(),
+            PressureGradientForm::ConstantDepth => None,
+        }
     }
 
     /// Rivers as volume sources (see [`crate::source::river`]). The mode
@@ -741,46 +653,26 @@ where
         self
     }
 
-    /// Balance a horizontally uniform reference density `profile(z)`
-    /// (kg/m³) exactly: a fluid resting in it feels no pressure gradient
-    /// force at all (Mellor et al. 1998's subtraction of a reference
-    /// profile; [`BalancedReference::from_profile`]), at the levels of
-    /// `state`'s `η`. Prefer it to [`Self::with_balanced_reference`] where
-    /// the stratification starts horizontally uniform, or has a typical
-    /// profile: over cliff coasts the constant-depth form's own error at rest
-    /// is not small. No effect with [`PressureGradientForm::ConstantDepth`].
-    pub fn with_reference_profile(
-        mut self,
-        state: &Solution3D,
-        profile: impl Fn(f64) -> f64,
-    ) -> Self {
-        self.balanced_reference = Some(Arc::new(BalancedReference::from_profile(
-            state,
-            &self.mesh,
-            &self.bathymetry,
-            &self.sigma,
-            &self.ops,
-            &self.geom,
-            self.g,
-            self.rho0,
-            self.rho0,
-            self.min_column_depth,
-            self.metric_form(),
-            profile,
-        )));
-        self
-    }
-
-    /// Prototype (TODO P1.3): the anomaly pressure gradient and its adjoint
-    /// advection about `reference`.
-    pub fn with_reference_stratification(mut self, reference: ReferenceStratification) -> Self {
-        self.reference_stratification = Some(Arc::new(reference));
-        self
-    }
-
     /// Replace the balanced reference state (see
-    /// [`Self::with_balanced_reference`]).
+    /// [`Self::with_balanced_reference`]). With a reference stratification
+    /// ([`Self::with_reference_profile`]) both forces are those of the
+    /// state's anomaly about it.
     pub fn set_balanced_reference(&mut self, state: &Solution3D) {
+        let reference_density = self.active_reference().map(|profile| {
+            let mut density = vec![0.0; state.rho.len()];
+            crate::solver::rhs::reference_density_into(
+                profile,
+                |t, s| self.eos.compute_density(t, s, 0.0),
+                state,
+                &self.mesh,
+                &self.bathymetry,
+                &self.sigma,
+                &mut Neighbourhood::default(),
+                &mut density,
+                Blocks::All(state.n_elements),
+            );
+            density
+        });
         self.balanced_reference = Some(Arc::new(BalancedReference::new(
             state,
             &self.mesh,
@@ -793,6 +685,7 @@ where
             self.rho0,
             self.min_column_depth,
             self.metric_form(),
+            reference_density.as_deref(),
         )));
     }
 
@@ -1376,10 +1269,10 @@ where
                 PressureGradientForm::SigmaPairs => self.balanced_reference.as_deref(),
                 PressureGradientForm::ConstantDepth => None,
             },
-            reference: self.reference_stratification.as_deref(),
+            // The reference is evaluated (and locked) where a kernel needs it
+            reference_density: None,
+            reference: None,
             metric: self.metric_form(),
-            // The vertical reference is locked where the transport needs it
-            tracer_reference: [None, None],
             tracer_range: self.tracer_limiter.advection_ranges(),
             elements: Blocks::All(self.mesh.n_elements),
         }
@@ -1407,13 +1300,37 @@ where
         stage: bool,
     ) {
         let elements = on.elements;
+        let mut reference = self
+            .reference_density
+            .lock()
+            .expect("Failed to lock reference_density");
+        let reference_density = self.active_reference().map(|profile| {
+            let (density, neighbourhood) = &mut *reference;
+            density.resize(state.rho.len(), 0.0);
+            crate::profiling::scope("3d: reference density", || {
+                crate::solver::rhs::reference_density_into(
+                    profile,
+                    |t, s| self.eos.compute_density(t, s, 0.0),
+                    state,
+                    &self.mesh,
+                    &self.bathymetry,
+                    &self.sigma,
+                    neighbourhood,
+                    density,
+                    elements,
+                )
+            });
+            &density[..]
+        });
         let config = Rhs3DConfig {
             elements,
+            reference_density,
             ..self.rhs_config()
         };
         crate::profiling::scope("3d: pgf, coriolis", || {
             compute_momentum_rhs_3d(rhs, state, &config)
         });
+        drop(reference);
         let viscosity = crate::profiling::start();
         if !self.horizontal_viscosity.is_zero() && self.viscosity_once_per_step {
             assert!(
@@ -1559,40 +1476,27 @@ where
                 );
             }
             crate::profiling::stop("3d: layer transports", layer);
-            let reference = self.vertical_reference.as_ref().map(|reference| {
-                reference
-                    .fields
-                    .lock()
-                    .expect("Failed to lock the vertical reference")
+            // The reference at this stage's levels
+            let mut fields = self
+                .reference_fields
+                .lock()
+                .expect("Failed to lock reference_fields");
+            let reference = self.active_reference().map(|profile| {
+                crate::profiling::scope("3d: reference fields", || {
+                    fields.fill(profile, state, &self.bathymetry, &self.sigma, elements)
+                });
+                &*fields
             });
             let config = Rhs3DConfig {
                 exterior,
-                tracer_reference: match &reference {
-                    Some(fields) => [Some(fields[0].as_slice()), Some(fields[1].as_slice())],
-                    None => [None, None],
-                },
+                reference,
                 elements,
                 ..self.rhs_config()
             };
             crate::profiling::scope("3d: advection kernels", || {
                 compute_transport_rhs_3d(rhs, state, transport, &config)
             });
-            if let Some(reference) = &self.reference_stratification {
-                crate::solver::rhs::add_reference_advection(
-                    [&mut rhs.temp, &mut rhs.salt],
-                    [&state.temp, &state.salt],
-                    state,
-                    transport,
-                    reference,
-                    &self.ops,
-                    &self.geom,
-                    &self.sigma,
-                    &self.bathymetry,
-                    self.min_column_depth,
-                    self.metric_form(),
-                    elements,
-                );
-            }
+            drop(fields);
             // The water no transport carries (the 2D module's own mass
             // sources) at the concentrations and velocities it joins
             let means = barotropic.element_means;
