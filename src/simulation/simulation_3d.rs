@@ -3362,7 +3362,7 @@ mod tests {
     fn channel_at_rest(
         bed: impl Fn(f64) -> f64,
         bound: Option<ElementSlopeBound>,
-        rho: impl Fn(f64) -> f64 + Copy,
+        rho: impl Fn(f64) -> f64 + Copy + Send + Sync + 'static,
         hours: &[f64],
     ) -> Vec<f64> {
         let (nx, dx) = (8, 1000.0);
@@ -3377,7 +3377,7 @@ mod tests {
         mesh: Mesh2D,
         bed: impl Fn(f64, f64) -> f64,
         bound: Option<ElementSlopeBound>,
-        rho: impl Fn(f64) -> f64 + Copy,
+        rho: impl Fn(f64) -> f64 + Copy + Send + Sync + 'static,
         hours: &[f64],
         dt: f64,
     ) -> (Vec<f64>, usize) {
@@ -3417,7 +3417,7 @@ mod tests {
         mesh: Mesh2D,
         bed: impl Fn(f64, f64) -> f64,
         bound: Option<ElementSlopeBound>,
-        rho: impl Fn(f64) -> f64 + Copy,
+        rho: impl Fn(f64) -> f64 + Copy + Send + Sync + 'static,
     ) -> (Physics, Solution3D) {
         use crate::physics::EquationOfState;
         use crate::vertical::SongHaidvogelStretching;
@@ -3474,8 +3474,16 @@ mod tests {
             }
         }
         physics.update_density(&mut state);
-        let physics =
-            physics.with_reference_profile(&state, |z| eos.compute_density(temp(z), eos.s0, z));
+        let physics = if std::env::var("DGRS_TANGENT").is_ok_and(|v| v == "1") {
+            physics.with_reference_stratification(
+                crate::solver::rhs::ReferenceStratification::new(
+                    move |z| (eos.t0 - (rho(z) / eos.rho0 - 1.0) / eos.alpha, eos.s0),
+                    move |t, s| eos.compute_density(t, s, 0.0),
+                ),
+            )
+        } else {
+            physics.with_reference_profile(&state, |z| eos.compute_density(temp(z), eos.s0, z))
+        };
         // Experiment (TODO P1.3): DGRS_VADV picks the vertical tracer scheme,
         // DGRS_VREF=1 reconstructs it about the state at rest
         let physics = match std::env::var("DGRS_VADV").as_deref() {
@@ -3498,7 +3506,7 @@ mod tests {
     /// element 3 (a `tanh` step), so every σ-level of that element spans most
     /// of the water column, and its pairs of nodes straddle whatever the
     /// density does in between. The largest layer speed after `hours`.
-    fn cliff_at_rest(rho: impl Fn(f64) -> f64 + Copy, hours: f64) -> f64 {
+    fn cliff_at_rest(rho: impl Fn(f64) -> f64 + Copy + Send + Sync + 'static, hours: f64) -> f64 {
         channel_at_rest(|x| step_bed(x, 3, -300.0, -15.0), None, rho, &[hours])[0]
     }
 
@@ -3827,10 +3835,19 @@ mod tests {
             }
         }
         physics.update_density(&mut state);
-        let physics = physics.with_reference_profile(&state, |z| {
-            let (t, s) = summer_pycnocline(&eos, z);
-            eos.compute_density(t, s, z)
-        });
+        let physics = if std::env::var("DGRS_TANGENT").is_ok_and(|v| v == "1") {
+            physics.with_reference_stratification(
+                crate::solver::rhs::ReferenceStratification::new(
+                    move |z| summer_pycnocline(&eos, z),
+                    move |t, s| eos.compute_density(t, s, 0.0),
+                ),
+            )
+        } else {
+            physics.with_reference_profile(&state, |z| {
+                let (t, s) = summer_pycnocline(&eos, z);
+                eos.compute_density(t, s, z)
+            })
+        };
         let physics = match scheme {
             Some(scheme) => physics.with_vertical_advection(scheme),
             None => physics,
@@ -4032,10 +4049,16 @@ mod tests {
         let about_rest = std::env::var("DGRS_VREF").is_ok_and(|v| v == "1");
         set_curvature_weight();
         let (physics, rest) = terrace_patch_physics(scheme, about_rest);
+        let eos = physics.eos;
+        let reference = crate::solver::rhs::ReferenceStratification::new(
+            move |z| summer_pycnocline(&eos, z),
+            move |t, s| eos.compute_density(t, s, 0.0),
+        );
         print_spectrum(
             &physics,
             &rest,
             &format!("terrace {scheme:?} about rest {about_rest}"),
+            Some(&reference),
         );
     }
 
@@ -4064,7 +4087,7 @@ mod tests {
         let nx = env_or("DGRS_SLICE_NX", 8.0) as usize;
         let mesh = Mesh2D::uniform_rectangle(0.0, nx as f64 * dx, 0.0, dx, nx, 1);
         let eos = LinearEOS::default();
-        let pycnocline = |z: f64| {
+        let pycnocline = move |z: f64| {
             let (t, s) = summer_pycnocline(&eos, z);
             eos.rho0 * (1.0 - eos.alpha * (t - eos.t0) + eos.beta * (s - eos.s0))
         };
@@ -4073,12 +4096,175 @@ mod tests {
             right + (left - right) * 0.5 * (1.0 - (8.0 * (t - 0.5)).tanh())
         };
         let (physics, rest) = basin_physics(mesh, |x, _| step(x), None, pycnocline);
-        print_spectrum(&physics, &rest, &format!("slice {left}:{right} dx {dx}"));
+        let reference = crate::solver::rhs::ReferenceStratification::new(
+            move |z| (eos.t0 - (pycnocline(z) / eos.rho0 - 1.0) / eos.alpha, eos.s0),
+            move |t, s| eos.compute_density(t, s, 0.0),
+        );
+        print_spectrum(
+            &physics,
+            &rest,
+            &format!("slice {left}:{right} dx {dx}"),
+            Some(&reference),
+        );
+    }
+
+    /// Pseudo-energy coordinates of a departure from the state at rest in a
+    /// reference stratification (the layout of [`pack`]): the shear times
+    /// `√(ρ₀ m H)`, the depth-mean velocity times `√(ρ₀ m D)`, the free
+    /// surface times `√(ρ₀ g m)`, and in the temperature's place the density
+    /// anomaly `a = ρ_T δT + ρ_S δS` times `√(g m H/Γ)`, with `m` the node's
+    /// mass, `H` the layer's thickness and `Γ = −∂ρ̄/∂z` the reference's
+    /// gradient over the layer. The squared norm is twice the pseudo-energy
+    /// (kinetic, free-surface and available potential energy, J). The part of
+    /// `(δT, δS)` that is not a displacement of the reference (it changes no
+    /// density to first order and is not changed by the flow) is left out, as
+    /// are thin columns.
+    struct EnergyCoordinates {
+        nl: usize,
+        velocity: Vec<f64>,
+        barotropic: Vec<f64>,
+        surface: Vec<f64>,
+        density: Vec<f64>,
+        gradient: [Vec<f64>; 2],
+        gamma: Vec<f64>,
+        partials: [f64; 2],
+        root_d_sigma: Vec<f64>,
+    }
+
+    impl EnergyCoordinates {
+        fn new(
+            physics: &Physics,
+            rest: &Solution3D,
+            reference: &crate::solver::rhs::ReferenceStratification,
+        ) -> Self {
+            let (nn, nl) = (rest.n_nodes, rest.n_levels);
+            let n2 = rest.n_elements * nn;
+            let sigma = &physics.sigma;
+            let eos = physics.eos;
+            let partials = [-eos.rho0 * eos.alpha, eos.rho0 * eos.beta];
+            let mut coords = Self {
+                nl,
+                velocity: vec![0.0; n2 * nl],
+                barotropic: vec![0.0; n2],
+                surface: vec![0.0; n2],
+                density: vec![0.0; n2 * nl],
+                gradient: [vec![0.0; n2 * nl], vec![0.0; n2 * nl]],
+                gamma: vec![0.0; n2 * nl],
+                partials,
+                root_d_sigma: sigma.d_sigma().iter().map(|d| d.sqrt()).collect(),
+            };
+            for idx in 0..n2 {
+                let eta = rest.eta.data[idx];
+                let depth = eta - physics.bathymetry.data[idx];
+                if depth < physics.min_column_depth {
+                    continue;
+                }
+                let mass = physics.geom.node_mass(idx / nn, idx % nn);
+                coords.barotropic[idx] = (RHO0 * mass * depth).sqrt();
+                coords.surface[idx] = (RHO0 * G * mass).sqrt();
+                for l in 0..nl {
+                    let h = depth * sigma.d_sigma()[l];
+                    coords.velocity[idx * nl + l] = (RHO0 * mass * h).sqrt();
+                    let (below, above) = (
+                        eta + sigma.sigma_w()[l] * depth,
+                        eta + sigma.sigma_w()[l + 1] * depth,
+                    );
+                    let (lo, hi) = (reference.tracers(below), reference.tracers(above));
+                    let (gt, gs) = ((hi.0 - lo.0) / h, (hi.1 - lo.1) / h);
+                    let gamma = -(partials[0] * gt + partials[1] * gs);
+                    coords.gradient[0][idx * nl + l] = gt;
+                    coords.gradient[1][idx * nl + l] = gs;
+                    coords.gamma[idx * nl + l] = gamma;
+                    if gamma > 1e-12 {
+                        coords.density[idx * nl + l] = (G * mass * h / gamma).sqrt();
+                    }
+                }
+            }
+            coords
+        }
+
+        /// The departure `dx` (state units) in energy coordinates.
+        fn to_energy(&self, dx: &[f64]) -> Vec<f64> {
+            let nl = self.nl;
+            let field = self.velocity.len();
+            let n2 = self.barotropic.len();
+            let mut y = vec![0.0; dx.len()];
+            for idx in 0..n2 {
+                for f in 0..2 {
+                    let column = &dx[f * field + idx * nl..f * field + (idx + 1) * nl];
+                    let mean: f64 = column
+                        .iter()
+                        .zip(&self.root_d_sigma)
+                        .map(|(u, r)| u * r * r)
+                        .sum();
+                    for l in 0..nl {
+                        y[f * field + idx * nl + l] =
+                            self.velocity[idx * nl + l] * (column[l] - mean);
+                    }
+                }
+                for l in 0..nl {
+                    let i = idx * nl + l;
+                    let anomaly =
+                        self.partials[0] * dx[2 * field + i] + self.partials[1] * dx[3 * field + i];
+                    y[2 * field + i] = self.density[i] * anomaly;
+                }
+                y[4 * field + idx] = self.surface[idx] * dx[4 * field + idx];
+                y[4 * field + n2 + idx] = self.barotropic[idx] * dx[4 * field + n2 + idx];
+                y[4 * field + 2 * n2 + idx] = self.barotropic[idx] * dx[4 * field + 2 * n2 + idx];
+            }
+            y
+        }
+
+        /// The departure (state units) of the energy coordinates `y`.
+        fn from_energy(&self, y: &[f64]) -> Vec<f64> {
+            let nl = self.nl;
+            let field = self.velocity.len();
+            let n2 = self.barotropic.len();
+            let mut dx = vec![0.0; y.len()];
+            let over = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
+            for idx in 0..n2 {
+                for f in 0..2 {
+                    let bar = over(y[4 * field + (f + 1) * n2 + idx], self.barotropic[idx]);
+                    dx[4 * field + (f + 1) * n2 + idx] = bar;
+                    let mut mean = 0.0;
+                    for l in 0..nl {
+                        let i = idx * nl + l;
+                        let shear = over(y[f * field + i], self.velocity[i]);
+                        dx[f * field + i] = shear;
+                        mean += self.root_d_sigma[l] * self.root_d_sigma[l] * shear;
+                    }
+                    if self.barotropic[idx] > 0.0 {
+                        for l in 0..nl {
+                            dx[f * field + idx * nl + l] += bar - mean;
+                        }
+                    }
+                }
+                for l in 0..nl {
+                    let i = idx * nl + l;
+                    // The displacement of the reference with this anomaly
+                    let displacement = over(over(y[2 * field + i], self.density[i]), self.gamma[i]);
+                    dx[2 * field + i] = -self.gradient[0][i] * displacement;
+                    dx[3 * field + i] = -self.gradient[1][i] * displacement;
+                }
+                dx[4 * field + idx] = over(y[4 * field + idx], self.surface[idx]);
+            }
+            dx
+        }
     }
 
     /// The leading eigenvalues of the step map about `rest` (see
-    /// [`probe_terrace_spectrum`]) and where the leading modes live.
-    fn print_spectrum(physics: &Physics, rest: &Solution3D, label: &str) {
+    /// [`probe_terrace_spectrum`]) and where the leading modes live. With
+    /// `DGRS_ENERGY=1` and a `reference`, in pseudo-energy coordinates
+    /// ([`EnergyCoordinates`]): the Ritz values then lie in the map's
+    /// numerical range in that norm, and the largest singular value of the
+    /// Arnoldi matrix is the largest growth of the pseudo-energy's root over
+    /// the horizon among the Krylov vectors.
+    fn print_spectrum(
+        physics: &Physics,
+        rest: &Solution3D,
+        label: &str,
+        reference: Option<&crate::solver::rhs::ReferenceStratification>,
+    ) {
         let weight = env_or("DGRS_WEIGHT", 0.5);
         let horizon = env_or("DGRS_SPECTRUM_SECONDS", 1800.0);
         let m = env_or("DGRS_KRYLOV", 30.0) as usize;
@@ -4107,13 +4293,30 @@ mod tests {
         // nonlinearity
         let epsilon = 1e-6;
         let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let coords = reference
+            .filter(|_| std::env::var("DGRS_ENERGY").is_ok_and(|v| v == "1"))
+            .map(|reference| EnergyCoordinates::new(physics, rest, reference));
         let apply = |v: &[f64]| -> Vec<f64> {
-            let x: Vec<f64> = x0.iter().zip(v).map(|(a, b)| a + epsilon * b).collect();
-            advance(&x)
+            // In energy coordinates the departure is scaled so that its
+            // largest component is `epsilon` in the state's units
+            let (dx, scale) = match &coords {
+                Some(coords) => {
+                    let dx = coords.from_energy(v);
+                    let largest = dx.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                    (dx, epsilon / largest)
+                }
+                None => (v.to_vec(), epsilon),
+            };
+            let x: Vec<f64> = x0.iter().zip(&dx).map(|(a, b)| a + scale * b).collect();
+            let out: Vec<f64> = advance(&x)
                 .iter()
                 .zip(&base)
-                .map(|(a, b)| (a - b) / epsilon)
-                .collect()
+                .map(|(a, b)| (a - b) / scale)
+                .collect();
+            match &coords {
+                Some(coords) => coords.to_energy(&out),
+                None => out,
+            }
         };
         // Arnoldi with full re-orthogonalisation, from a deterministic start
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
@@ -4125,6 +4328,9 @@ mod tests {
                 (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
             })
             .collect();
+        if let Some(coords) = &coords {
+            start = coords.to_energy(&coords.from_energy(&start));
+        }
         let s = norm(&start);
         start.iter_mut().for_each(|x| *x /= s);
         let mut basis = vec![start];
@@ -4149,6 +4355,21 @@ mod tests {
             basis.push(w);
         }
         let hessenberg = faer::Mat::<f64>::from_fn(size, size, |i, j| h[i][j]);
+        // The largest growth of the norm over the horizon among the Krylov
+        // vectors: the largest singular value of the (size + 1) × size
+        // Arnoldi matrix
+        let rows = (size + 1).min(m + 1);
+        let gram = faer::Mat::<f64>::from_fn(size, size, |i, j| {
+            (0..rows).map(|r| h[r][i] * h[r][j]).sum::<f64>()
+        });
+        let largest_growth = gram
+            .eigen()
+            .expect("Gram eigendecomposition")
+            .S()
+            .column_vector()
+            .iter()
+            .fold(0.0_f64, |m, e| m.max(e.re))
+            .sqrt();
         let eigen = hessenberg.eigen().expect("Hessenberg eigendecomposition");
         let values = eigen.S().column_vector();
         let vectors = eigen.U();
@@ -4162,6 +4383,11 @@ mod tests {
             env_or("DGRS_KV", 1e-3),
             env_or("DGRS_KT", 0.0),
             env_or("DGRS_SMAG", 0.1)
+        );
+        println!(
+            "  {} coordinates: the largest growth of the norm over the horizon among the \
+             Krylov vectors is {largest_growth:.6}",
+            if coords.is_some() { "pseudo-energy" } else { "state" }
         );
         let (ne, nn, nl) = (rest.n_elements, rest.n_nodes, rest.n_levels);
         let field = ne * nn * nl;

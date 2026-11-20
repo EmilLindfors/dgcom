@@ -88,7 +88,8 @@ use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::rhs::{
     AdvectedTracer, BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D,
     ExtrapolationTracerBC3D, HorizontalViscosity3D, LayerTransport, MetricForm,
-    MomentumAdvectionForm, PressureGradientForm, Rhs3DConfig, TracerBoundaryCondition3D,
+    MomentumAdvectionForm, PressureGradientForm, ReferenceStratification, Rhs3DConfig,
+    TracerBoundaryCondition3D,
     VerticalAdvection, ViscosityScratch3D, apply_coriolis_3d, apply_horizontal_viscosity_3d,
     apply_momentum_transport_3d, apply_w_point_transport_3d, compute_momentum_rhs_3d,
     compute_transport_rhs_3d, element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
@@ -167,6 +168,9 @@ where
     /// A reference state whose pressure gradient is the constant-depth
     /// form's, if any (see [`Self::with_balanced_reference`]).
     pub balanced_reference: Option<Arc<BalancedReference>>,
+    /// Prototype (TODO P1.3): the reference stratification of the anomaly
+    /// pressure gradient and its adjoint advection.
+    pub reference_stratification: Option<Arc<ReferenceStratification>>,
     /// Advection of a prognostic closure's turbulence, with this vertical
     /// reconstruction; `None` keeps it in its column (see
     /// [`Self::with_turbulence_advection`]).
@@ -390,6 +394,7 @@ where
             momentum_vertical_advection: VerticalAdvection::Centred,
             pressure_gradient: PressureGradientForm::default(),
             balanced_reference: None,
+            reference_stratification: None,
             turbulence_advection: Some(VerticalAdvection::LimitedAkima),
             bottom_drag: None,
             cage_drag: None,
@@ -763,6 +768,13 @@ where
             self.metric_form(),
             profile,
         )));
+        self
+    }
+
+    /// Prototype (TODO P1.3): the anomaly pressure gradient and its adjoint
+    /// advection about `reference`.
+    pub fn with_reference_stratification(mut self, reference: ReferenceStratification) -> Self {
+        self.reference_stratification = Some(Arc::new(reference));
         self
     }
 
@@ -1364,6 +1376,7 @@ where
                 PressureGradientForm::SigmaPairs => self.balanced_reference.as_deref(),
                 PressureGradientForm::ConstantDepth => None,
             },
+            reference: self.reference_stratification.as_deref(),
             metric: self.metric_form(),
             // The vertical reference is locked where the transport needs it
             tracer_reference: [None, None],
@@ -1564,6 +1577,22 @@ where
             crate::profiling::scope("3d: advection kernels", || {
                 compute_transport_rhs_3d(rhs, state, transport, &config)
             });
+            if let Some(reference) = &self.reference_stratification {
+                crate::solver::rhs::add_reference_advection(
+                    [&mut rhs.temp, &mut rhs.salt],
+                    [&state.temp, &state.salt],
+                    state,
+                    transport,
+                    reference,
+                    &self.ops,
+                    &self.geom,
+                    &self.sigma,
+                    &self.bathymetry,
+                    self.min_column_depth,
+                    self.metric_form(),
+                    elements,
+                );
+            }
             // The water no transport carries (the 2D module's own mass
             // sources) at the concentrations and velocities it joins
             let means = barotropic.element_means;

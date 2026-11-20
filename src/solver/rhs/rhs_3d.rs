@@ -21,7 +21,7 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::Blocks;
 use crate::solver::rhs::advection_3d::TracerBoundaryCondition3D;
 use crate::solver::rhs::baroclinic::{
-    BalancedReference, PressureGradientForm, compute_pressure_gradient,
+    BalancedReference, PressureGradientForm, ReferenceStratification, compute_pressure_gradient,
 };
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D};
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
@@ -63,6 +63,9 @@ pub struct Rhs3DConfig<'a> {
     /// A reference state balanced by the constant-depth form, if any (with
     /// [`PressureGradientForm::SigmaPairs`]).
     pub balanced_reference: Option<&'a BalancedReference>,
+    /// The reference stratification the pressure gradient takes the density
+    /// anomaly about, if any (prototype, TODO P1.3).
+    pub reference: Option<&'a ReferenceStratification>,
     /// The volume form of the horizontal divergences, the 2D module's (the
     /// pressure gradient takes its adjoint).
     pub metric: MetricForm,
@@ -105,11 +108,12 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         config.min_column_depth,
         config.pressure_gradient,
         config.metric,
+        config.reference,
         &mut rhs.u,
         &mut rhs.v,
         config.elements,
     );
-    if let Some(reference) = config.balanced_reference {
+    if let (Some(reference), None) = (config.balanced_reference, config.reference) {
         reference.add_to(&mut rhs.u, &mut rhs.v, config.elements);
     }
     apply_coriolis_3d(

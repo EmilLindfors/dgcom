@@ -51,7 +51,10 @@ pub use swe_2d::{
 pub use swe_2d_viscosity::largest_viscosity_swe_2d;
 
 // 3D Baroclinic
-pub use baroclinic::{BalancedReference, PressureGradientForm, compute_pressure_gradient};
+pub use baroclinic::{
+    BalancedReference, PressureGradientForm, ReferenceStratification, add_reference_advection,
+    compute_pressure_gradient,
+};
 
 pub mod coriolis_3d;
 pub use coriolis_3d::apply_coriolis_3d;

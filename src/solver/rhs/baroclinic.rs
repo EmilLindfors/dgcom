@@ -185,7 +185,7 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::blocks::{Blocks, Pooled, for_each_block};
-use crate::solver::rhs::transport_3d::MetricForm;
+use crate::solver::rhs::transport_3d::{LayerTransport, MetricForm};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -257,6 +257,7 @@ impl BalancedReference {
                 min_column_depth,
                 form,
                 metric,
+                None,
                 &mut fx,
                 &mut fy,
                 Blocks::All(state.n_elements),
@@ -321,6 +322,7 @@ impl BalancedReference {
             min_column_depth,
             PressureGradientForm::SigmaPairs,
             metric,
+            None,
             &mut fx,
             &mut fy,
             Blocks::All(reference.n_elements),
@@ -346,6 +348,40 @@ impl BalancedReference {
                 *f += c;
             }
         }
+    }
+}
+
+/// A horizontally uniform reference stratification `(T̄, S̄)(z)` with the
+/// density of its water (prototype, TODO P1.3).
+#[derive(Clone)]
+pub struct ReferenceStratification {
+    profile: std::sync::Arc<dyn Fn(f64) -> (f64, f64) + Send + Sync>,
+    density: std::sync::Arc<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+}
+
+impl ReferenceStratification {
+    /// The reference `profile(z) = (T, S)` and the density of `(T, S)`.
+    pub fn new(
+        profile: impl Fn(f64) -> (f64, f64) + Send + Sync + 'static,
+        density: impl Fn(f64, f64) -> f64 + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            profile: std::sync::Arc::new(profile),
+            density: std::sync::Arc::new(density),
+        }
+    }
+
+    /// `(T̄, S̄)` at height `z`.
+    #[inline]
+    pub fn tracers(&self, z: f64) -> (f64, f64) {
+        (self.profile)(z)
+    }
+
+    /// `ρ̄` at height `z`.
+    #[inline]
+    pub fn density(&self, z: f64) -> f64 {
+        let (t, s) = (self.profile)(z);
+        (self.density)(t, s)
     }
 }
 
@@ -524,6 +560,7 @@ impl Columns {
         el: ElementIndex,
         node: usize,
         rho_ref: f64,
+        reference: Option<&ReferenceStratification>,
     ) {
         let nl = self.n_levels;
         let range = c * nl..(c + 1) * nl;
@@ -539,7 +576,10 @@ impl Columns {
         let at_level = &mut self.at_level[range];
         for (l, (zl, &s)) in z.iter_mut().zip(sigma.sigma_rho()).enumerate() {
             *zl = eta + s * depth;
-            rho[l] = state.rho_column(el, node)[l] - rho_ref;
+            rho[l] = match reference {
+                Some(reference) => state.rho_column(el, node)[l] - reference.density(*zl),
+                None => state.rho_column(el, node)[l] - rho_ref,
+            };
         }
 
         // Monotone slopes: harmonic mean of the neighbouring secants, zero at
@@ -552,8 +592,10 @@ impl Columns {
                 0.0
             }
         };
-        if nl == 1 {
-            slope[0] = 0.0;
+        if nl == 1 || reference.is_some() {
+            // About a reference the anomaly is integrated by the trapezoid
+            // rule: linear in the anomaly, so the force has an adjoint
+            slope.fill(0.0);
         } else {
             slope[0] = secant(0);
             slope[nl - 1] = secant(nl - 2);
@@ -639,6 +681,7 @@ pub fn compute_pressure_gradient(
     min_column_depth: f64,
     form: PressureGradientForm,
     metric: MetricForm,
+    reference: Option<&ReferenceStratification>,
     grad_px: &mut [f64],
     grad_py: &mut [f64],
     elements: Blocks,
@@ -669,8 +712,8 @@ pub fn compute_pressure_gradient(
                 dp,
             } = &mut **scratch;
             pressure_gradient_element(
-                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, form, metric, own, across,
-                px, py, dp,
+                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, reference, form, metric,
+                own, across, px, py, dp,
             );
             for ((fx, fy), (&dx, &dy)) in out_x.iter_mut().zip(out_y).zip(px.iter().zip(&*py)) {
                 *fx = scale * dx;
@@ -720,6 +763,7 @@ fn pressure_gradient_element(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     rho_ref: f64,
+    reference: Option<&ReferenceStratification>,
     form: PressureGradientForm,
     metric: MetricForm,
     own: &mut Columns,
@@ -731,7 +775,7 @@ fn pressure_gradient_element(
     let nn = ops.n_nodes;
     let el = ElementIndex::new(k);
     for i in 0..nn {
-        own.fill(i, state, bathymetry, sigma, el, i, rho_ref);
+        own.fill(i, state, bathymetry, sigma, el, i, rho_ref, reference);
     }
     px.fill(0.0);
     py.fill(0.0);
@@ -752,7 +796,7 @@ fn pressure_gradient_element(
         let nb_el = ElementIndex::new(nb.element);
         for fi in 0..nfn {
             let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
-            across.fill(fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref);
+            across.fill(fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref, reference);
         }
         for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
             pressure_differences(&own.view(node), &across.view(fi), form, dp);
@@ -826,6 +870,194 @@ fn dg_volume_term(
             }
         }
     }
+}
+
+/// The share of a reference's jump `reference` that the field's own jump
+/// `actual` along the same edge holds, in `[0, 1]`.
+#[inline]
+fn share(actual: f64, reference: f64) -> f64 {
+    if reference == 0.0 {
+        0.0
+    } else {
+        (actual / reference).clamp(0.0, 1.0)
+    }
+}
+
+/// Prototype (TODO P1.3): add to the tracers' inventory tendencies `rhs`
+/// (`[T, S]`) what turns the conservative advection of the reference
+/// stratification (along the pairs of each level and through the σ-surfaces,
+/// with the values at the two ends of each edge) into its advection by the
+/// vertical velocity that is the adjoint of the pressure gradient, times the
+/// reference's own gradient at the node.
+#[allow(clippy::too_many_arguments)]
+pub fn add_reference_advection(
+    rhs: [&mut [f64]; 2],
+    tracers: [&[f64]; 2],
+    state: &Solution3D,
+    transport: &LayerTransport,
+    reference: &ReferenceStratification,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    sigma: &SigmaGrid,
+    bathymetry: &Bathymetry2D,
+    min_column_depth: f64,
+    metric: MetricForm,
+    elements: Blocks,
+) {
+    let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+    let n1 = ops.n_1d;
+    let n_sub = crate::solver::rhs::subcells::subcell_interfaces(n1);
+    let n = state.n_elements * nn * nl;
+    let [rhs_t, rhs_s] = rhs;
+    let no_theta = std::env::var("DGRS_NOTHETA").is_ok();
+    let no_tangent = std::env::var("DGRS_NOTANGENT").is_ok();
+    for_each_block(
+        elements,
+        [&mut rhs_t[..n], &mut rhs_s[..n]],
+        || {
+            (
+                vec![0.0; nn * nl],          // z at the centres
+                [vec![0.0; nn * nl], vec![0.0; nn * nl]], // reference T, S
+                [vec![0.0; nn * nl], vec![0.0; nn * nl]], // reference gradients
+                vec![false; nn],
+            )
+        },
+        |(zc, cbar, gamma, wet), k, [rt, rs]| {
+            for i in 0..nn {
+                let idx = k * nn + i;
+                let eta = state.eta.data[idx];
+                let depth = eta - bathymetry.data[idx];
+                wet[i] = depth >= min_column_depth;
+                let (mut below_z, mut below) = {
+                    let z = eta + sigma.sigma_w()[0] * depth;
+                    (z, reference.tracers(z))
+                };
+                for l in 0..nl {
+                    let z = eta + sigma.sigma_rho()[l] * depth;
+                    zc[i * nl + l] = z;
+                    let (t, s) = reference.tracers(z);
+                    cbar[0][i * nl + l] = t;
+                    cbar[1][i * nl + l] = s;
+                    let above_z = eta + sigma.sigma_w()[l + 1] * depth;
+                    let above = reference.tracers(above_z);
+                    let h = above_z - below_z;
+                    let (gt, gs) = if h > MIN_LEVEL_SPACING {
+                        ((above.0 - below.0) / h, (above.1 - below.1) / h)
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    gamma[0][i * nl + l] = gt;
+                    gamma[1][i * nl + l] = gs;
+                    (below_z, below) = (above_z, above);
+                }
+            }
+            let all_wet = wet.iter().all(|&w| w) && !no_tangent;
+            let out = [rt, rs];
+            let field = |t: usize, i: usize, l: usize| tracers[t][(k * nn + i) * nl + l];
+            let theta = |actual: f64, chord: f64| {
+                if no_theta { 1.0 } else { share(actual, chord) }
+            };
+            if !transport.subcell_elements[k] {
+                let averaged = metric.averaged_on(geom, k);
+                for i in 0..nn {
+                    let (ar_i, as_i) = geom.contravariant(k, i);
+                    let j_inv_i = geom.jacobian_inv(k, i);
+                    let m_i = geom.node_mass(k, i);
+                    for j in i + 1..nn {
+                        let (dr_ij, ds_ij) = (ops.dr[(i, j)], ops.ds[(i, j)]);
+                        let (dr_ji, ds_ji) = (ops.dr[(j, i)], ops.ds[(j, i)]);
+                        if dr_ij == 0.0 && ds_ij == 0.0 && dr_ji == 0.0 && ds_ji == 0.0 {
+                            continue;
+                        }
+                        let (ar_j, as_j) = geom.contravariant(k, j);
+                        let j_inv_j = geom.jacobian_inv(k, j);
+                        let m_j = geom.node_mass(k, j);
+                        let ((ar_ij, as_ij), (ar_ji, as_ji)) = if averaged {
+                            let mean = |a: (f64, f64), b: (f64, f64)| {
+                                (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1))
+                            };
+                            let m = (mean(ar_i, ar_j), mean(as_i, as_j));
+                            (m, m)
+                        } else {
+                            ((ar_i, as_i), (ar_j, as_j))
+                        };
+                        let (dx_ij, dy_ij) = (
+                            j_inv_i * (ar_ij.0 * dr_ij + as_ij.0 * ds_ij),
+                            j_inv_i * (ar_ij.1 * dr_ij + as_ij.1 * ds_ij),
+                        );
+                        let (dx_ji, dy_ji) = (
+                            j_inv_j * (ar_ji.0 * dr_ji + as_ji.0 * ds_ji),
+                            j_inv_j * (ar_ji.1 * dr_ji + as_ji.1 * ds_ji),
+                        );
+                        for l in 0..nl {
+                            let (a, b) = ((k * nn + i) * nl + l, (k * nn + j) * nl + l);
+                            // Volume flux of the pair, from i to j
+                            let phi = m_i * (dx_ij * transport.hu[a] + dy_ij * transport.hv[a])
+                                - m_j * (dx_ji * transport.hu[b] + dy_ji * transport.hv[b]);
+                            let dz = zc[j * nl + l] - zc[i * nl + l];
+                            for t in 0..2 {
+                                let chord = cbar[t][j * nl + l] - cbar[t][i * nl + l];
+                                let th = theta(field(t, j, l) - field(t, i, l), chord);
+                                let (tan_i, tan_j) = if all_wet {
+                                    (gamma[t][i * nl + l] * dz, -gamma[t][j * nl + l] * dz)
+                                } else {
+                                    (0.0, 0.0)
+                                };
+                                out[t][i * nl + l] += 0.5 * th * phi * (chord - tan_i) / m_i;
+                                out[t][j * nl + l] += 0.5 * th * -phi * (-chord - tan_j) / m_j;
+                            }
+                        }
+                    }
+                }
+            } else {
+                let w = &ops.weights_1d;
+                for dir in 0..2 {
+                    for line in 0..n1 {
+                        for a in 0..n1 - 1 {
+                            let slot = crate::solver::rhs::subcells::subcell_slot(n1, dir, line, a);
+                            let (ia, ib) = (
+                                crate::solver::rhs::subcells::line_node(n1, dir, line, a),
+                                crate::solver::rhs::subcells::line_node(n1, dir, line, a + 1),
+                            );
+                            let mass_a = w[a] / geom.jacobian_inv(k, ia);
+                            let mass_b = w[a + 1] / geom.jacobian_inv(k, ib);
+                            for l in 0..nl {
+                                let f = transport.subcell[(k * n_sub + slot) * nl + l];
+                                for t in 0..2 {
+                                    let chord = cbar[t][ib * nl + l] - cbar[t][ia * nl + l];
+                                    let th = theta(field(t, ib, l) - field(t, ia, l), chord);
+                                    out[t][ia * nl + l] += 0.5 * th * f * chord / mass_a;
+                                    out[t][ib * nl + l] += 0.5 * th * f * chord / mass_b;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Through the σ-surfaces
+            for i in 0..nn {
+                let omega = &transport.omega[(k * nn + i) * (nl + 1)..(k * nn + i + 1) * (nl + 1)];
+                let tangent = wet[i] && !no_tangent;
+                for l in 0..nl {
+                    for t in 0..2 {
+                        let g = if tangent { gamma[t][i * nl + l] } else { 0.0 };
+                        if l + 1 < nl {
+                            let chord = cbar[t][i * nl + l + 1] - cbar[t][i * nl + l];
+                            let th = theta(field(t, i, l + 1) - field(t, i, l), chord);
+                            let eps = chord - g * (zc[i * nl + l + 1] - zc[i * nl + l]);
+                            out[t][i * nl + l] += 0.5 * th * omega[l + 1] * eps;
+                        }
+                        if l > 0 {
+                            let chord = cbar[t][i * nl + l - 1] - cbar[t][i * nl + l];
+                            let th = theta(field(t, i, l - 1) - field(t, i, l), chord);
+                            let eps = chord - g * (zc[i * nl + l - 1] - zc[i * nl + l]);
+                            out[t][i * nl + l] += 0.5 * th * -omega[l] * eps;
+                        }
+                    }
+                }
+            }
+        },
+    );
 }
 
 #[cfg(test)]
@@ -903,6 +1135,7 @@ mod tests {
                 0.0,
                 form,
                 MetricForm::Conservative,
+                None,
                 &mut fx,
                 &mut fy,
                 Blocks::All(self.state.n_elements),
