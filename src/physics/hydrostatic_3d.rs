@@ -298,6 +298,11 @@ pub struct TimeStepLimits {
     pub vertical: TimeStepLimit,
     /// Coriolis, `|f|Δt ≤ 1`.
     pub coriolis: TimeStepLimit,
+    /// The reference stratification's internal waves along sloping
+    /// σ-levels, `ω Δt ≤ 1` with `ω` the bound of
+    /// [`ReferenceFields::sloping_level_rate`] on `N |∇_σ z|` (none without
+    /// a reference profile, [`Hydrostatic3D::with_reference_profile`]).
+    pub sloping_levels: TimeStepLimit,
     /// Horizontal viscosity.
     pub viscosity: TimeStepLimit,
 }
@@ -324,6 +329,8 @@ pub struct ElementStep {
 struct ElementRates {
     wave: f64,
     vertical: f64,
+    /// The reference's internal waves along the σ-levels (1/s)
+    sloping_levels: f64,
     speed: f64,
     c1: f64,
     length: f64,
@@ -710,6 +717,36 @@ where
             self.min_column_depth,
             elements,
         );
+    }
+
+    /// `f` with the reference's fields at `state`'s levels on every
+    /// element, for the bounds on the step (`None` without a reference). A
+    /// stage at the same state finds them filled.
+    fn with_reference_fields<R>(
+        &self,
+        state: &Solution3D,
+        f: impl FnOnce(Option<&ReferenceFields>) -> R,
+    ) -> R {
+        let mut guard = self
+            .reference_fields
+            .lock()
+            .expect("Failed to lock reference_fields");
+        let reference = self.active_reference().map(|profile| {
+            let (fields, _) = &mut *guard;
+            crate::profiling::scope("3d: reference", || {
+                fields.fill(
+                    profile,
+                    |t, s| self.eos.compute_density(t, s, 0.0),
+                    |t, s| self.eos.density_partials(t, s),
+                    state,
+                    &self.bathymetry,
+                    &self.sigma,
+                    Blocks::All(self.mesh.n_elements),
+                )
+            });
+            &*fields
+        });
+        f(reference)
     }
 
     /// The volume form of the 3D horizontal divergences: the 2D module's
@@ -1722,6 +1759,14 @@ where
     ///   ([`Self::with_implicit_vertical_advection`]);
     /// - Coriolis, `|f| Δt ≤ 1` (SSP-RK3 is stable on the imaginary axis up
     ///   to √3, SSP-RK(4,3) up to 2.16);
+    /// - with a reference profile ([`Self::with_reference_profile`]), its
+    ///   internal waves along sloping σ-levels, `ω Δt ≤ 1` with
+    ///   `ω ≈ N |∇_σ z|` bounded by [`ReferenceFields::sloping_level_rate`]
+    ///   (imaginary too): the flow along a level that crosses the
+    ///   stratification displaces it by the level's rise, and the anomaly's
+    ///   pressure gradient pushes back. The advection that is the pressure
+    ///   gradient's adjoint carries this frequency in full; a 285 m cliff
+    ///   over 500 m under `N = 0.05 s⁻¹` allows 60 s, not 90 s;
     /// - the horizontal viscosity, by the BR1 spectral radius.
     ///
     /// Thin columns are left to the 2D module (a domain of thin columns
@@ -1744,6 +1789,7 @@ where
             .advection
             .dt
             .min(limits.coriolis.dt)
+            .min(limits.sloping_levels.dt)
             .min(limits.viscosity.dt);
         if self.implicit_vertical_advection.is_none() {
             dt = dt.min(ssp * limits.vertical.dt);
@@ -1767,10 +1813,32 @@ where
     /// Element `k`'s rates of [`Self::compute_dt`]: the largest
     /// `(|u| + c₁)/h` and `|Ω|/H_z` over its nodes that are not thin, and
     /// what makes up the first at the node that sets it.
-    fn element_rates(&self, state: &Solution3D, k: usize) -> ElementRates {
+    fn element_rates(
+        &self,
+        state: &Solution3D,
+        k: usize,
+        reference: Option<&ReferenceFields>,
+        scratch: &mut [f64],
+    ) -> ElementRates {
         let (nn, nl) = (state.n_nodes, state.n_levels);
         let (sigma_rho, d_sigma) = (self.sigma.sigma_rho(), self.sigma.d_sigma());
-        let mut rates = ElementRates::default();
+        let mut rates = ElementRates {
+            sloping_levels: reference.map_or(0.0, |fields| {
+                fields.sloping_level_rate(
+                    state,
+                    &self.ops,
+                    &self.geom,
+                    &self.bathymetry,
+                    &self.sigma,
+                    self.g / self.rho0,
+                    self.min_column_depth,
+                    self.metric_form(),
+                    k,
+                    scratch,
+                )
+            }),
+            ..ElementRates::default()
+        };
         for i in 0..nn {
             let idx = k * nn + i;
             // Thin films are the 2D module's (and its own CFL's) business
@@ -1843,17 +1911,21 @@ where
         let explicit_vertical = self.implicit_vertical_advection.is_none();
         // Each element's rates once: its advective bound, and its vertical
         // rate for the pass below
-        let mut vertical = vec![0.0; ne];
-        for_each_block(
-            ne,
-            [&mut out[..], &mut vertical[..]],
-            || (),
-            |_, k, [dt, vertical]| {
-                let rates = self.element_rates(state, k);
-                dt[0] = cfl / rates.wave / order_factor;
-                vertical[0] = rates.vertical;
-            },
-        );
+        let (mut vertical, mut sloping_levels) = (vec![0.0; ne], vec![0.0; ne]);
+        let nn = state.n_nodes;
+        self.with_reference_fields(state, |reference| {
+            for_each_block(
+                ne,
+                [&mut out[..], &mut vertical[..], &mut sloping_levels[..]],
+                || vec![0.0; 2 * nn],
+                |scratch, k, [dt, vertical, sloping_levels]| {
+                    let rates = self.element_rates(state, k, reference, scratch);
+                    dt[0] = cfl / rates.wave / order_factor;
+                    vertical[0] = rates.vertical;
+                    sloping_levels[0] = rates.sloping_levels;
+                },
+            )
+        });
         // The advective bound over the face neighbours too, then the
         // element's own others
         let own = out.to_vec();
@@ -1873,7 +1945,7 @@ where
                     .iter()
                     .map(|&[_, y]| self.coriolis.f_at(y).abs())
                     .fold(0.0, f64::max);
-                bound = bound.min(1.0 / f);
+                bound = bound.min(1.0 / f).min(1.0 / sloping_levels[k]);
                 // The vertical advection's Courant number: one where it is
                 // explicit, a few where its excess is implicit
                 let courant = if explicit_vertical {
@@ -1941,7 +2013,7 @@ where
         let order_factor = (self.ops.order as f64 + 1.0).powi(2);
         (0..self.mesh.n_elements)
             .map(|k| {
-                let r = self.element_rates(state, k);
+                let r = self.element_rates(state, k, None, &mut []);
                 ElementStep {
                     dt: cfl / r.wave / order_factor,
                     speed: r.speed,
@@ -1959,32 +2031,38 @@ where
     /// [`Self::compute_dt`] does not apply it), Coriolis, and the horizontal
     /// viscosity. A bound nothing sets is infinite.
     pub fn time_step_limits(&self, state: &Solution3D, cfl: f64) -> TimeStepLimits {
-        let [advection, vertical, coriolis] = reduce_blocks::<f64, _, _, 0>(
-            self.mesh.n_elements,
-            [],
-            || (),
-            |_, k, []| {
-                let ElementRates {
-                    wave: wave_rate,
-                    vertical: vertical_rate,
-                    ..
-                } = self.element_rates(state, k);
-                let f = self
-                    .mesh
-                    .element_vertices(ElementIndex::new(k))
-                    .iter()
-                    .map(|&[_, y]| self.coriolis.f_at(y).abs())
-                    .fold(0.0, f64::max);
-                let bound = |dt: f64| TimeStepLimit { dt, element: k };
-                [
-                    bound(cfl / wave_rate / (self.ops.order as f64 + 1.0).powi(2)),
-                    bound(1.0 / vertical_rate),
-                    bound(1.0 / f),
-                ]
-            },
-            || [TimeStepLimit::NONE; 3],
-            |a, b| [0, 1, 2].map(|j| a[j].min(b[j])),
-        );
+        let nn = state.n_nodes;
+        let [advection, vertical, coriolis, sloping_levels] =
+            self.with_reference_fields(state, |reference| {
+                reduce_blocks::<f64, _, _, 0>(
+                    self.mesh.n_elements,
+                    [],
+                    || vec![0.0; 2 * nn],
+                    |scratch, k, []| {
+                        let ElementRates {
+                            wave: wave_rate,
+                            vertical: vertical_rate,
+                            sloping_levels: sloping_rate,
+                            ..
+                        } = self.element_rates(state, k, reference, scratch);
+                        let f = self
+                            .mesh
+                            .element_vertices(ElementIndex::new(k))
+                            .iter()
+                            .map(|&[_, y]| self.coriolis.f_at(y).abs())
+                            .fold(0.0, f64::max);
+                        let bound = |dt: f64| TimeStepLimit { dt, element: k };
+                        [
+                            bound(cfl / wave_rate / (self.ops.order as f64 + 1.0).powi(2)),
+                            bound(1.0 / vertical_rate),
+                            bound(1.0 / f),
+                            bound(1.0 / sloping_rate),
+                        ]
+                    },
+                    || [TimeStepLimit::NONE; 4],
+                    |a, b| [0, 1, 2, 3].map(|j| a[j].min(b[j])),
+                )
+            });
 
         // The horizontal viscosity, explicit in the SSP stages: BR1
         // couples an element to its face neighbours' gradients, so each
@@ -2032,6 +2110,7 @@ where
             advection,
             vertical,
             coriolis,
+            sloping_levels,
             viscosity,
         }
     }

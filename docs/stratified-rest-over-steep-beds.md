@@ -230,10 +230,14 @@ it, and the tracers' advection moves the reference by the vertical velocity
 that is that force's exact adjoint. The scheme linearised about rest in the
 reference then conserves a positive pseudo-energy (kinetic energy plus the
 available potential energy `½ g ρ′²/Γ`), with the stratification's own weights
-at every node, so nothing is stiff, and every element keeps its tracer
-inventories. Code: `solver::rhs::baroclinic` ("About a reference"),
-`ReferenceFields`, `add_reference_advection`. This section is the derivation,
-the routes that were ruled out on the way, and the measurements.
+at every node, and every element keeps its tracer inventories. The price is
+in the time step: the scheme carries in full the frequency `N |∇_σ z|` of a
+stratification displaced along a sloping level, and the step must resolve it
+(a bound of `compute_dt` now; it binds on the exaggerated cliff slice, not on
+the fixture cut from the Frøya bed). Code: `solver::rhs::baroclinic` ("About
+a reference"), `ReferenceFields`, `add_reference_advection`. This section is
+the derivation, the routes that were ruled out on the way, and the
+measurements.
 
 ### The layers as a graph
 
@@ -399,10 +403,12 @@ of the available potential energy of Holliday & McIntyre (1981); the operator
 is skew-adjoint in that norm, the route of Bell, Peixoto & Thuburn (2017).
 It holds for any mesh, bed, level distribution and reference, in particular
 at straddles: `Γ_a` is the node's own stratification, whatever its
-neighbours'. Nothing is stiff: the fastest mode is an internal wave's,
-`ω² ≤ (g/ρ₀) max Γ · ‖w‖²`; the displacement's rate `R/N` is of the size of
-`w` itself (at a straddle `τ` is the reference's range and `N` the columns'
-area times that range).
+neighbours'. No weight is singular: the fastest mode is an internal wave's,
+`ω² ≤ (g/ρ₀) max Γ · ‖w‖²`, and the displacement's rate `R/N` is of the size
+of `w` itself (at a straddle `τ` is the reference's range and `N` the columns'
+area times that range). But `w` has the level's slope in it, and that sets a
+frequency of its own: see "The frequency along sloping levels, and the time
+step".
 
 The whole exchange is checked to round-off, with the actual kernels, by the
 gate `the_reference_advection_and_the_pressure_gradient_exchange_pseudo_energy_exactly`:
@@ -446,6 +452,61 @@ order in the layers' thickness), most of it secular. With step 3 the
 inventories of `T` and `S` hold to 2e-14 on the same runs
 (`a_curved_reference_keeps_constancy_and_the_tracers_inventories`).
 
+### The frequency along sloping levels, and the time step
+
+The exchange between the two energies has a frequency. In the pseudo-energy's
+coordinates, `r = ρ′ √(g m H/Γ)` and `v = u √(ρ₀ m H)`, the pairs' part of the
+operator linearised about rest is `[[0, −Bᵀ], [B, 0]]` on each level of an
+element, with
+
+```text
+    B[i; i]  =  ½ N_i Σ_j (z_j − z_i) D_ij              (½ N ∇_σ z at the node)
+    B[i; j]  = −½ N_i (z_j − z_i) √(m_j D_j / m_i D_i) D_ji
+```
+
+(`N² = (g/ρ₀) Γ`, `D_ij` the pair's derivative coefficients, `D_i` the depth).
+Its eigenvalues are `±i` times the singular values of `B`: frequencies
+`N |∇_σ z|`, the buoyancy frequency times the slope of the level. The
+element's mean displacement (step 3) is an orthogonal projection in these
+coordinates, off the direction `r_a ∝ √(m H Γ)`, and does not raise them.
+
+That frequency is the hydrostatic equations' own: water that moves along a
+surface of slope `s` through a stratification `N` oscillates at `N s` (the
+frequency of the internal waves whose rays run along the slope). Where the
+levels resolve the stratification they cross, the scheme of the full density
+carried it too. Where a level crosses the pycnocline between two nodes it did
+not: the chord gave it `(g/ρ₀) Δρ̄/Δz` in place of `N²` (the reference's change
+over the level's whole rise: across the 15 → 300 m cliff 1.06 kg/m³ over
+142.5 m against 0.25 kg/m⁴ at the node, 34 times less), and no conserved
+quantity. The tangent takes the node's own `N²` for the whole
+rise, which is what the node's water does to first order, and what the
+adjoint needs.
+
+An explicit step must resolve the frequency: SSP-RK3 is stable on the
+imaginary axis for `ω Δt ≤ √3`. `Hydrostatic3D::compute_dt` bounds it, with a
+reference only (`TimeStepLimits::sloping_levels`,
+`ReferenceFields::sloping_level_rate`; the local steps take it per element):
+`ω Δt ≤ 1` with `ω = √(‖B‖₁ ‖B‖∞)`, the row and column sums of `B`, where
+`z_j − z_i = (1 + σ)(η_j − η_i) − σ(B_j − B_i)` is bounded over the levels by
+each column's largest `N` and largest `N |σ|`. That is `O(nodes²)` per
+element and step, and the fields it reads are the first stage's (the step's
+cost does not change). The gate
+`the_sloping_level_rate_bounds_the_pairs_frequency` assembles `B` from the
+kernels, column by column, on parallelograms and distorted elements in both
+metric forms over a 5 → 125 m cliff: the bound is 1.22 to 1.54 times its
+largest singular value, and zero where the pairs do not act (a shore element).
+With the margin of `√3` the model's step is 2.1 to 2.7 times below the
+scheme's limit where this bound sets it.
+
+So the cure does need a shorter step, exactly where `N |∇_σ z| Δt` was above
+the limit and the old scheme did not see it. The numbers are under
+"Measurements": none on the fixture cut from the Frøya bed, a factor of 4 on
+the cliff slice. What would give the step back is a force and an advection
+that do not act along the levels at all (pairs by depth, below), not a
+weight: scaling the pair's term of the force by a factor below one, with its
+adjoint, keeps the skew structure but leaves a uniform anomaly `ρ′` with a
+force `g ρ′ Δz/ρ₀` along every sloping level.
+
 ### Where the proof stops
 
 - **A state that is not the reference.** Only the share `θ` of the
@@ -483,7 +544,9 @@ inventories of `T` and `S` hold to 2e-14 on the same runs
   that.
 - **Time.** The 3D stages are SSP-RK3 (dissipative on the imaginary axis
   below `|ω|Δt = √3`), the barotropic pass is filtered and its slow forcing
-  extrapolated by AB3. No proof; the step maps below contract.
+  extrapolated by AB3. No proof; the step maps below contract, at steps
+  within the bound of the section above. Above it the rest state blows up
+  within the hour (the cliff at 72 s).
 - **The implicit part of the vertical advection** (above an outflow Courant
   number of 0.4) is upwind in the full tracer, as before. It is zero at rest.
 - **Limiters, mixing.** A limiter or a diffusion changes the tracers at rest

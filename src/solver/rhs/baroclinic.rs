@@ -1165,6 +1165,99 @@ impl ReferenceFields {
             },
         );
     }
+
+    /// A bound (1/s) on the frequency of the reference's internal waves
+    /// along the σ-levels of element `k` (after [`Self::fill`] on it): of
+    /// the oscillation in which the flow along a pair of nodes on a sloping
+    /// level displaces the stratification, [`add_reference_advection`], and
+    /// the anomaly's pressure gradient pushes back. `buoyancy` is `g/ρ₀`;
+    /// `scratch` holds two numbers per node. Zero in an element with a
+    /// column thinner than `min_column_depth`, where the pairs do not act.
+    ///
+    /// In the pseudo-energy's coordinates, `r = ρ′ √(g m H_z/Γ)` and
+    /// `v = u √(ρ₀ m H_z)`, the pairs' part of the operator linearised about
+    /// rest is `[[0, −Bᵀ], [B, 0]]` on each level, with
+    ///
+    /// ```text
+    ///     B[i; i]  =  ½ N_i Σ_j (z_j − z_i) D_ij              (½ N ∇_σ z)
+    ///     B[i; j]  = −½ N_i (z_j − z_i) √(m_j D_j / m_i D_i) D_ji
+    /// ```
+    ///
+    /// (`N² = (g/ρ₀) Γ`, `D_ij` the pair's derivative coefficients, `D_i`
+    /// the depth): frequencies `N |∇_σ z|`, the buoyancy frequency times
+    /// the slope of the level. Its eigenvalues are `±i` times `B`'s singular
+    /// values, at most `√(‖B‖₁ ‖B‖∞)`: the row and column sums here, with
+    /// `z_j − z_i = (1 + σ)(η_j − η_i) − σ (B_j − B_i)` bounded over the
+    /// levels by each column's largest `N` and largest `N |σ|`. The
+    /// element's mean displacement is an orthogonal projection in these
+    /// coordinates and does not raise the bound.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sloping_level_rate(
+        &self,
+        state: &Solution3D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        bathymetry: &Bathymetry2D,
+        sigma: &SigmaGrid,
+        buoyancy: f64,
+        min_column_depth: f64,
+        metric: MetricForm,
+        k: usize,
+        scratch: &mut [f64],
+    ) -> f64 {
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let eta = |i: usize| state.eta.data[k * nn + i];
+        let bed = |i: usize| bathymetry.data[k * nn + i];
+        if (0..nn).any(|i| eta(i) - bed(i) < min_column_depth) {
+            return 0.0;
+        }
+        // Each column's largest N and largest N |σ|
+        let (largest, deepest) = scratch[..2 * nn].split_at_mut(nn);
+        for i in 0..nn {
+            let column = &self.stratification[(k * nn + i) * nl..][..nl];
+            let (mut n2, mut n2_sigma2) = (0.0_f64, 0.0_f64);
+            for (&gamma, &s) in column.iter().zip(sigma.sigma_rho()) {
+                let gamma = gamma.max(0.0);
+                n2 = n2.max(gamma);
+                n2_sigma2 = n2_sigma2.max(gamma * s * s);
+            }
+            largest[i] = (buoyancy * n2).sqrt();
+            deepest[i] = (buoyancy * n2_sigma2).sqrt();
+        }
+        if largest.iter().all(|&n| n == 0.0) {
+            return 0.0;
+        }
+        let averaged = metric.averaged_on(geom, k);
+        let weight = |i: usize| geom.node_mass(k, i) * (eta(i) - bed(i));
+        let (mut rows, mut columns) = (0.0_f64, 0.0_f64);
+        for i in 0..nn {
+            // ∇η and ∇B at the node, and the sums over the other nodes of
+            // its row and of its velocity's two columns
+            let (mut grad_eta, mut grad_bed) = ((0.0, 0.0), (0.0, 0.0));
+            let (mut row, mut column) = (0.0, (0.0, 0.0));
+            for j in (0..nn).filter(|&j| j != i) {
+                let [(dx_ij, dy_ij), (dx_ji, dy_ji)] =
+                    pair_derivatives(ops, geom, k, i, j, averaged);
+                let (d_eta, d_bed) = (eta(j) - eta(i), bed(j) - bed(i));
+                grad_eta = (grad_eta.0 + dx_ij * d_eta, grad_eta.1 + dy_ij * d_eta);
+                grad_bed = (grad_bed.0 + dx_ij * d_bed, grad_bed.1 + dy_ij * d_bed);
+                let ratio = (weight(j) / weight(i)).sqrt();
+                row += (largest[i] * d_eta.abs() + deepest[i] * d_bed.abs())
+                    * ratio
+                    * (dx_ji.abs() + dy_ji.abs());
+                let from_j = (largest[j] * d_eta.abs() + deepest[j] * d_bed.abs()) / ratio;
+                column = (
+                    column.0 + from_j * dx_ij.abs(),
+                    column.1 + from_j * dy_ij.abs(),
+                );
+            }
+            let own_x = largest[i] * grad_eta.0.abs() + deepest[i] * grad_bed.0.abs();
+            let own_y = largest[i] * grad_eta.1.abs() + deepest[i] * grad_bed.1.abs();
+            rows = rows.max(0.5 * (own_x + own_y + row));
+            columns = columns.max(0.5 * (own_x + column.0).max(own_y + column.1));
+        }
+        (rows * columns).sqrt()
+    }
 }
 
 /// Add to the tracers' inventory tendencies `rhs` (`[T, S]`, `∂(H_z C)/∂t`,
@@ -2025,6 +2118,183 @@ mod tests {
                 "distortion {distort}, {metric:?}: the inventory changes at {inventory:.3e} \
                  (scale {inventory_scale:.2e})"
             );
+        }
+    }
+
+    /// The step's bound on the reference's waves along sloping levels
+    /// ([`ReferenceFields::sloping_level_rate`]) against the kernels. In the
+    /// pseudo-energy's coordinates, the pairs' advection of the reference
+    /// (the split form's chords with [`add_reference_advection`], no flux
+    /// through the σ-surfaces) is a matrix `B` from the layers' velocities
+    /// to the anomaly's rate, assembled here column by column in every
+    /// element of the cliff basin; its largest singular value (power
+    /// iteration on `BᵀB`) is the largest frequency of the oscillation the
+    /// pairs and the anomaly's pressure gradient make. The bound is at
+    /// least that in every element without a thin column (measured 1.3 to
+    /// 1.9 times it; on distorted elements too, in both metric forms), and
+    /// none where the pairs do not act.
+    #[test]
+    fn the_sloping_level_rate_bounds_the_pairs_frequency() {
+        for (distort, metric) in [
+            (0.0, MetricForm::Conservative),
+            (0.12, MetricForm::Conservative),
+            (0.12, MetricForm::Averaged),
+        ] {
+            let (mesh, ops, geom, bathymetry, sigma, state) = cliff_basin(distort, 0.0);
+            let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+            let (ne, per_element) = (mesh.n_elements, nn * nl);
+            let n = ne * per_element;
+            let mut fields = ReferenceFields::default();
+            fields.fill(
+                &thermocline(),
+                thermocline_density,
+                thermocline_partials,
+                &state,
+                &bathymetry,
+                &sigma,
+                Blocks::All(ne),
+            );
+            let depth =
+                |k: usize, i: usize| state.eta.data[k * nn + i] - bathymetry.data[k * nn + i];
+            let wet = |k: usize| (0..nn).all(|i| depth(k, i) >= 0.1);
+            // m H_z of a layer
+            let volume = |k: usize, i: usize, l: usize| {
+                geom.node_mass(k, i) * depth(k, i) * sigma.d_sigma()[l]
+            };
+            let [reference_t, reference_s] = &fields.tracers;
+            let mut transport = LayerTransport::new(ne, &ops, nl).with_metric(metric);
+            // B of every element, [row = node, level][column = node, level, x|y]
+            let columns = 2 * per_element;
+            let mut b = vec![0.0; ne * per_element * columns];
+            let (mut rate_t, mut rate_s) = (vec![0.0; n], vec![0.0; n]);
+            for column in 0..columns {
+                let (at, y) = (column / 2, column % 2 == 1);
+                // A unit of √(ρ₀ m H_z) u at the column's node and level of
+                // every element, as its layer transport H_z u
+                transport.hu.fill(0.0);
+                transport.hv.fill(0.0);
+                for k in (0..ne).filter(|&k| wet(k)) {
+                    let (i, l) = (at / nl, at % nl);
+                    let h = depth(k, i) * sigma.d_sigma()[l];
+                    let q = h / (RHO0 * volume(k, i, l)).sqrt();
+                    let field = if y {
+                        &mut transport.hv
+                    } else {
+                        &mut transport.hu
+                    };
+                    field[k * per_element + at] = q;
+                }
+                rate_t.fill(0.0);
+                rate_s.fill(0.0);
+                add_reference_advection(
+                    [&mut rate_t, &mut rate_s],
+                    [reference_t, reference_s],
+                    &fields,
+                    &state,
+                    &transport,
+                    &ops,
+                    &geom,
+                    &sigma,
+                    &bathymetry,
+                    0.1,
+                    Blocks::All(ne),
+                );
+                for k in (0..ne).filter(|&k| wet(k)) {
+                    let averaged = metric.averaged_on(&geom, k);
+                    let block = k * per_element;
+                    // The split form's own advection of the reference along
+                    // the pairs, −(1/m_i) Σ_j ½ Φ_ij (T̄_j − T̄_i)
+                    for i in 0..nn {
+                        for j in i + 1..nn {
+                            let [(dx_ij, dy_ij), (dx_ji, dy_ji)] =
+                                pair_derivatives(&ops, &geom, k, i, j, averaged);
+                            let (m_i, m_j) = (geom.node_mass(k, i), geom.node_mass(k, j));
+                            for l in 0..nl {
+                                let (a, c) = (block + i * nl + l, block + j * nl + l);
+                                let half = 0.5
+                                    * (m_i * (dx_ij * transport.hu[a] + dy_ij * transport.hv[a])
+                                        - m_j
+                                            * (dx_ji * transport.hu[c] + dy_ji * transport.hv[c]));
+                                let chord = reference_t[c] - reference_t[a];
+                                rate_t[a] -= half * chord / m_i;
+                                rate_t[c] -= half * chord / m_j;
+                            }
+                        }
+                    }
+                    // … as the rate of ρ′ √(g m H_z / Γ)
+                    for row in 0..per_element {
+                        let (i, l) = (row / nl, row % nl);
+                        let gamma = fields.stratification[block + row];
+                        assert!(gamma > 0.0, "the thermocline is stable");
+                        let h = depth(k, i) * sigma.d_sigma()[l];
+                        let rate = -RHO0 * ALPHA * rate_t[block + row] / h;
+                        b[(block + row) * columns + column] =
+                            rate * (G * volume(k, i, l) / gamma).sqrt();
+                    }
+                }
+            }
+            let mut scratch = vec![0.0; 2 * nn];
+            let mut steep = 0;
+            for k in 0..ne {
+                let bound = fields.sloping_level_rate(
+                    &state,
+                    &ops,
+                    &geom,
+                    &bathymetry,
+                    &sigma,
+                    G / RHO0,
+                    0.1,
+                    metric,
+                    k,
+                    &mut scratch,
+                );
+                let b = &b[k * per_element * columns..(k + 1) * per_element * columns];
+                if !wet(k) {
+                    assert!(b.iter().all(|&x| x == 0.0), "pairs act in element {k}");
+                    assert_eq!(bound, 0.0, "a bound without pairs in element {k}");
+                    continue;
+                }
+                // The largest singular value, from below
+                let mut x: Vec<f64> = (0..columns)
+                    .map(|c| 1.0 + 0.37 * (c as f64).sin())
+                    .collect();
+                let mut y = vec![0.0; per_element];
+                let mut frequency = 0.0_f64;
+                for _ in 0..500 {
+                    for (row, y) in y.iter_mut().enumerate() {
+                        *y = b[row * columns..(row + 1) * columns]
+                            .iter()
+                            .zip(&x)
+                            .map(|(b, x)| b * x)
+                            .sum();
+                    }
+                    let norm_x = x.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    let norm_y = y.iter().map(|y| y * y).sum::<f64>().sqrt();
+                    frequency = norm_y / norm_x;
+                    for (c, x) in x.iter_mut().enumerate() {
+                        *x = (0..per_element)
+                            .map(|row| b[row * columns + c] * y[row])
+                            .sum();
+                    }
+                    let norm = x.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    x.iter_mut().for_each(|x| *x /= norm);
+                }
+                println!(
+                    "distortion {distort}, {metric:?}, element {k}: frequency {frequency:.4e} \
+                     1/s, bound {bound:.4e} ({:.2})",
+                    bound / frequency
+                );
+                assert!(
+                    frequency <= bound,
+                    "element {k}: frequency {frequency:.4e} above the bound {bound:.4e}"
+                );
+                assert!(
+                    bound < 2.5 * frequency,
+                    "element {k}: the bound {bound:.4e} is slack on {frequency:.4e}"
+                );
+                steep += usize::from(frequency > 5e-3);
+            }
+            assert!(steep >= 2, "the cliff's elements carry the frequency");
         }
     }
 

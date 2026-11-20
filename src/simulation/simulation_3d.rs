@@ -3765,7 +3765,7 @@ mod tests {
     /// e-folding of 47 min (2.3e-8 m/s after 6 h when the gate was written;
     /// on the Frøya bed ≈ 15 min). About the reference profile the scheme
     /// conserves a pseudo-energy to first order
-    /// (`Hydrostatic3D::with_reference_profile`): measured 7.3e-13 m/s.
+    /// (`Hydrostatic3D::with_reference_profile`): measured 2.2e-12 m/s.
     #[test]
     fn a_pycnocline_over_a_cliff_stays_at_rest() {
         let speed = cliff_at_rest(|z| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z, 6.0);
@@ -3778,7 +3778,7 @@ mod tests {
     /// element with dry nodes), and 15 → 60 m (a third of the cliff, which
     /// the σ-pairs scheme of the full density grew with an e-folding of
     /// 1.8 h; the cliff and the shallows it blew up within 48 h). Round-off
-    /// stays round-off: measured ≤ 3.2e-12 m/s at 48 h.
+    /// stays round-off: measured ≤ 8.7e-12 m/s at 48 h.
     #[test]
     fn a_pycnocline_over_unsmoothed_steps_stays_at_rest_for_two_days() {
         let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
@@ -3798,6 +3798,66 @@ mod tests {
         }
     }
 
+    /// TODO P1.3 gate: the step the model picks holds the reference over
+    /// the unsmoothed cliff. About a reference the scheme carries in full
+    /// the frequency `N |∇_σ z|` of a stratification displaced along a
+    /// sloping level (the chords of the full-density scheme carried less of
+    /// it): the 15 → 300 m cliff holds at steps of 36 and 60 s and blows up
+    /// at 90 s, where the full-density scheme ran at 180 s (and grew its
+    /// round-off). [`Hydrostatic3D::compute_dt`] bounds it
+    /// ([`TimeStepLimits::sloping_levels`]): 27.4 s in the cliff's element,
+    /// whatever the Courant number, where advection and the internal waves'
+    /// WKB speed allow 161 s at Courant number 1; the local steps take it
+    /// too. No such bound without a reference. At the model's step the rest
+    /// state holds for 6 h (measured 6.0e-12 m/s).
+    #[test]
+    fn the_models_step_holds_the_reference_over_a_cliff() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let mesh = || Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+        let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
+        let (physics, rest) = basin_physics(mesh(), bed, None, pycnocline);
+        let limits = physics.time_step_limits(&rest, 1.0);
+        let bound = limits.sloping_levels;
+        assert_eq!(bound.element, 3, "the cliff's element binds");
+        assert!((25.0..30.0).contains(&bound.dt), "bound {} s", bound.dt);
+        assert!(limits.advection.dt > 150.0, "{:?}", limits.advection);
+        let dt = physics.compute_dt(&rest, 1.0);
+        assert_eq!(dt, bound.dt, "the model's step is the bound");
+        let mut steps = vec![0.0; rest.n_elements];
+        physics.element_steps_into(&rest, 1.0, 1.0, &mut steps);
+        assert_eq!(steps[3], bound.dt, "the cliff's own step");
+        assert!(steps[0] > 150.0, "the flat bed's step {} s", steps[0]);
+
+        let speed = basin_at_rest(mesh(), bed, None, pycnocline, &[6.0], dt).0[0];
+        assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s at {dt} s");
+
+        let plain = physics.without_reference_profile();
+        let limits = plain.time_step_limits(&rest, 1.0);
+        assert_eq!(limits.sloping_levels.dt, f64::INFINITY);
+        assert!(plain.compute_dt(&rest, 1.0) > 150.0);
+    }
+
+    /// Probe (TODO P1.3): the bounds on the step over the unsmoothed steps
+    /// and on the terrace fixture, at Courant number 1.
+    #[test]
+    #[ignore = "probe: the step's bounds on the P1.3 fixtures"]
+    fn probe_step_bounds() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        for (name, left, right) in [
+            ("cliff", -300.0, -15.0),
+            ("shallows", -150.0, -0.5),
+            ("shore", -300.0, 5.0),
+            ("step", -60.0, -15.0),
+        ] {
+            let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+            let bed = |x: f64, _| step_bed(x, 3, left, right);
+            let (physics, rest) = basin_physics(mesh, bed, None, pycnocline);
+            println!("{name}: {:?}", physics.time_step_limits(&rest, 1.0));
+        }
+        let (physics, rest) = terrace_patch_physics(None);
+        println!("terrace: {:?}", physics.time_step_limits(&rest, 1.0));
+    }
+
     /// TODO P1.3 gate, the property the gates above stand on: the
     /// pseudo-energy of a departure from rest in the reference stratification
     /// (kinetic energy, the free surface's, and `½ g ρ′²/Γ`;
@@ -3815,14 +3875,37 @@ mod tests {
         let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
         let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
         let (physics, rest) = basin_physics(mesh, bed, None, pycnocline);
+        let tenths: Vec<f64> = (1..=10).map(|n| 0.1 * n as f64).collect();
+        let (history, largest_rise) = pseudo_energy_history(&physics, &rest, 36.0, &tenths);
+        let last = *history.last().expect("ten samples");
+        assert!(
+            last < 1.0,
+            "the pseudo-energy rose to {last:.6} of its start over the hour"
+        );
+        assert!(
+            largest_rise < 1e-6,
+            "the pseudo-energy rose by {largest_rise:.2e} of itself over a step"
+        );
+    }
+
+    /// The pseudo-energy ([`EnergyCoordinates`]) of a random departure from
+    /// `rest` in `physics`' reference stratification (every field, 1e-6 in
+    /// the state's units at most, each part of the pseudo-energy with its
+    /// share), in steps of `dt`: its fraction of the start after each of
+    /// `hours` (increasing; printed), and its largest relative rise over a
+    /// step.
+    fn pseudo_energy_history(
+        physics: &Physics,
+        rest: &Solution3D,
+        dt: f64,
+        hours: &[f64],
+    ) -> (Vec<f64>, f64) {
         let reference = physics
             .reference_profile()
             .expect("the fixture's reference");
-        let coords = EnergyCoordinates::new(&physics, &rest, reference);
+        let coords = EnergyCoordinates::new(physics, rest, reference);
         let mut x0 = Vec::new();
-        pack(&rest, &mut x0);
-        // A random departure in energy coordinates (so every part of the
-        // pseudo-energy starts with its share)
+        pack(rest, &mut x0);
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
         let random: Vec<f64> = (0..x0.len())
             .map(|_| {
@@ -3832,7 +3915,10 @@ mod tests {
                 (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
             })
             .collect();
-        let departure = coords.departure_of(&coords.energy_of(&coords.departure_of(&random)));
+        let mut departure = coords.departure_of(&coords.energy_of(&coords.departure_of(&random)));
+        // No change of the volume, the heat or the salt: such a departure
+        // ends in another state at rest, not in this one
+        conserve_totals(physics, rest, &mut departure);
         let largest = departure.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
         let start: Vec<f64> = x0
             .iter()
@@ -3852,32 +3938,57 @@ mod tests {
                 .sum::<f64>()
         };
         let initial = energy(&state);
-        let (dt, mut integrator) = (36.0, ModeSplitIntegrator::new());
-        let (mut last, mut largest_rise) = (initial, 0.0_f64);
-        for n in 0..100 {
-            physics.update_density(&mut state);
-            integrator.step(&mut state, &physics, dt, n as f64 * dt);
-            physics.post_process(&mut state);
-            let now = energy(&state);
-            largest_rise = largest_rise.max(now / last - 1.0);
-            last = now;
-            if n % 10 == 9 {
-                println!(
-                    "pseudo-energy after {} s: {:.6} of the start",
-                    (n + 1) as f64 * dt,
-                    now / initial
-                );
+        let mut integrator = ModeSplitIntegrator::new();
+        let (mut last, mut largest_rise, mut n) = (initial, 0.0_f64, 0);
+        let mut history = Vec::with_capacity(hours.len());
+        for &until in hours {
+            while (n as f64) < (until * 3600.0 / dt).round() {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+                n += 1;
+                let now = energy(&state);
+                largest_rise = largest_rise.max(now / last - 1.0);
+                last = now;
             }
+            println!(
+                "pseudo-energy after {until:.1} h: {:.6} of the start",
+                last / initial
+            );
+            history.push(last / initial);
         }
         println!("largest rise over a step: {largest_rise:.2e}");
-        assert!(
-            last < initial,
-            "the pseudo-energy rose from {initial:.6e} to {last:.6e} J over the hour"
-        );
-        assert!(
-            largest_rise < 1e-6,
-            "the pseudo-energy rose by {largest_rise:.2e} of itself over a step"
-        );
+        (history, largest_rise)
+    }
+
+    /// Probe (TODO P1.3): [`pseudo_energy_history`] on the terrace fixture
+    /// (or, with `DGRS_SLICE` = "left:right" bed elevations, on the step
+    /// inside one 1 km element of the channel), in steps of `DGRS_DT` (5 s;
+    /// 36 s on a slice) to the hours `DGRS_HOURS` ("1,2,4,8,12,24").
+    #[test]
+    #[ignore = "probe: the pseudo-energy of a departure from rest over hours"]
+    fn probe_pseudo_energy() {
+        let hours: Vec<f64> = std::env::var("DGRS_HOURS")
+            .unwrap_or_else(|_| "1,2,4,8,12,24".into())
+            .split(',')
+            .filter_map(|h| h.parse().ok())
+            .collect();
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let (physics, rest, dt) = match std::env::var("DGRS_SLICE") {
+            Ok(spec) => {
+                let (left, right) = spec.split_once(':').expect("DGRS_SLICE left:right");
+                let (left, right): (f64, f64) = (left.parse().unwrap(), right.parse().unwrap());
+                let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+                let bed = move |x: f64, _| step_bed(x, 3, left, right);
+                let (physics, rest) = basin_physics(mesh, bed, None, pycnocline);
+                (physics, rest, env_or("DGRS_DT", 36.0))
+            }
+            Err(_) => {
+                let (physics, rest) = terrace_patch_physics(None);
+                (physics, rest, env_or("DGRS_DT", 5.0))
+            }
+        };
+        pseudo_energy_history(&physics, &rest, dt, &hours);
     }
 
     /// The pycnocline over the 15 → 300 m cliff, over 0.5 m of water beside
@@ -4165,6 +4276,50 @@ mod tests {
         }
     }
 
+    /// Take out of the departure `dx` from `rest` (the layout of [`pack`])
+    /// what changes the volume, the heat or the salt: a uniform `η` and
+    /// uniform `T` and `S` over the columns that are not thin. The step map
+    /// keeps the three totals, so the departures that change none of them
+    /// are an invariant subspace of it.
+    fn conserve_totals(physics: &Physics, rest: &Solution3D, dx: &mut [f64]) {
+        let (ne, nn, nl) = (rest.n_elements, rest.n_nodes, rest.n_levels);
+        let field = ne * nn * nl;
+        let d_sigma = physics.sigma.d_sigma();
+        let mass = |idx: usize| physics.geom.node_mass(idx / nn, idx % nn);
+        let depth = |idx: usize| rest.eta.data[idx] - physics.bathymetry.data[idx];
+        let deep: Vec<usize> = (0..ne * nn)
+            .filter(|&idx| depth(idx) >= physics.min_column_depth)
+            .collect();
+        let area: f64 = deep.iter().map(|&idx| mass(idx)).sum();
+        let volume: f64 = deep.iter().map(|&idx| mass(idx) * depth(idx)).sum();
+        // No volume
+        let eta = &mut dx[4 * field..4 * field + ne * nn];
+        let mean = deep.iter().map(|&idx| mass(idx) * eta[idx]).sum::<f64>() / area;
+        deep.iter().for_each(|&idx| eta[idx] -= mean);
+        // No heat, no salt: Σ m Δσ (D δC + C δη)
+        for (t, tracer) in [&rest.temp, &rest.salt].into_iter().enumerate() {
+            let total: f64 = deep
+                .iter()
+                .map(|&idx| {
+                    let eta = dx[4 * field + idx];
+                    (0..nl)
+                        .map(|l| {
+                            let c = idx * nl + l;
+                            let change = depth(idx) * dx[(2 + t) * field + c] + tracer[c] * eta;
+                            mass(idx) * d_sigma[l] * change
+                        })
+                        .sum::<f64>()
+                })
+                .sum();
+            let shift = total / volume;
+            for &idx in &deep {
+                dx[(2 + t) * field + idx * nl..][..nl]
+                    .iter_mut()
+                    .for_each(|c| *c -= shift);
+            }
+        }
+    }
+
     /// Probe (TODO P1.3): the leading eigenvalues of the linearised step map
     /// about rest on the terrace fixture, by Arnoldi on finite differences
     /// of `DGRS_SPECTRUM_SECONDS` (1800 s) of `DGRS_DT` (5 s) steps,
@@ -4411,17 +4566,35 @@ mod tests {
             .reference_profile()
             .filter(|_| env_or("DGRS_ENERGY", 1.0) != 0.0)
             .map(|reference| EnergyCoordinates::new(physics, rest, reference));
+        // The conserved totals (volume, heat, salt) each have a neutral
+        // direction: a departure that changes one ends in another state at
+        // rest, an eigenvalue of exactly 1 that Arnoldi approaches slowly
+        // and from both sides (its tracers settle over days). With
+        // `DGRS_DEFLATE` (on by default) the map is taken on the departures
+        // that change none of them, an invariant subspace: a uniform η and
+        // uniform T and S over the columns that are not thin are taken out
+        // of every departure before it is advanced.
+        let deflate = env_or("DGRS_DEFLATE", 1.0) != 0.0;
+        let conserve_totals = |dx: &mut [f64]| conserve_totals(physics, rest, dx);
+        let (ne, nn, nl) = (rest.n_elements, rest.n_nodes, rest.n_levels);
+        let field = ne * nn * nl;
         let apply = |v: &[f64]| -> Vec<f64> {
             // In energy coordinates the departure is scaled so that its
             // largest component is `epsilon` in the state's units
-            let (dx, scale) = match &coords {
+            let (mut dx, scale) = match &coords {
                 Some(coords) => {
-                    let dx = coords.departure_of(v);
+                    let mut dx = coords.departure_of(v);
+                    if deflate {
+                        conserve_totals(&mut dx);
+                    }
                     let largest = dx.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
                     (dx, epsilon / largest)
                 }
                 None => (v.to_vec(), epsilon),
             };
+            if deflate && coords.is_none() {
+                conserve_totals(&mut dx);
+            }
             let x: Vec<f64> = x0.iter().zip(&dx).map(|(a, b)| a + scale * b).collect();
             let out: Vec<f64> = advance(&x)
                 .iter()
@@ -4500,16 +4673,19 @@ mod tests {
             env_or("DGRS_SMAG", 0.1)
         );
         println!(
-            "  {} coordinates: the largest growth of the norm over the horizon among the \
+            "  {} coordinates{}: the largest growth of the norm over the horizon among the \
              Krylov vectors is {largest_growth:.6}",
             if coords.is_some() {
                 "pseudo-energy"
             } else {
                 "state"
+            },
+            if deflate {
+                ", the departures that keep the volume, the heat and the salt"
+            } else {
+                ""
             }
         );
-        let (ne, nn, nl) = (rest.n_elements, rest.n_nodes, rest.n_levels);
-        let field = ne * nn * nl;
         let bathymetry = physics.bathymetry.clone();
         for (rank, &k) in order.iter().take(10).enumerate() {
             let mu = values[k];
@@ -4573,6 +4749,35 @@ mod tests {
                 sv / total,
                 st / total,
                 barotropic / total
+            );
+            // The barotropic part by field (η, ū, v̄) and element
+            let per = ne * nn;
+            let mut fields = [0.0; 3];
+            let mut by_element = vec![[0.0; 3]; ne];
+            for i in 4 * field..n {
+                let (f, r) = ((i - 4 * field) / per, (i - 4 * field) % per);
+                fields[f] += power(i);
+                by_element[r / nn][f] += power(i);
+            }
+            let rows: Vec<String> = by_element
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.iter().sum::<f64>() > 0.02 * barotropic)
+                .map(|(e, p)| {
+                    format!(
+                        "e{e} {:.2}/{:.2}/{:.2}",
+                        p[0] / barotropic,
+                        p[1] / barotropic,
+                        p[2] / barotropic
+                    )
+                })
+                .collect();
+            println!(
+                "    barotropic: η {:.3}, ū {:.3}, v̄ {:.3}; by element (η/ū/v̄): {}",
+                fields[0] / barotropic,
+                fields[1] / barotropic,
+                fields[2] / barotropic,
+                rows.join(", ")
             );
             for (name, part, sum) in [("velocity", &velocity, sv), ("tracers", &tracer, st)] {
                 let mut top: Vec<(f64, usize)> =

@@ -393,7 +393,9 @@
 //!
 //! `slopes3d=on` (the default for 3D runs, `levels=N`, since 2026-11-10;
 //! `slopes3d=off` keeps the bed as it is, with a warning when it is over the
-//! bound; in a 2D run it shows what the 3D bed does to the tide) smooths the
+//! bound: the rest state then stands on the reference profile, see
+//! `docs/stratified-rest-over-steep-beds.md`; in a 2D run it shows what the
+//! 3D bed does to the tide) smooths the
 //! bed, keeping its volume,
 //! until no element's depth range lets a σ-level cross the summer
 //! pycnocline between two of its nodes (`Bathymetry2D::smooth_element_slopes`,
@@ -1694,8 +1696,9 @@ impl Domain {
             if over > 0 {
                 println!(
                     "  WARNING: slopes3d=off leaves {over} elements over the σ-levels' slope \
-                     bound (the largest {:.1} m too deep); σ-levels across them drive spurious \
-                     currents that can blow the run up",
+                     bound (the largest {:.1} m too deep). σ-levels across them drove spurious \
+                     currents that blew runs up; about the reference profile the rest state \
+                     held on the fixtures (TODO P1.3), and the full-mesh check is open",
                     excess.iter().copied().fold(0.0, f64::max)
                 );
             }
@@ -4320,6 +4323,10 @@ fn tidal_run_3d<'a>(
                         let mut bounds = vec![
                             ("advection and internal waves", limits.advection),
                             ("Coriolis", limits.coriolis),
+                            (
+                                "the reference's waves along sloping levels",
+                                limits.sloping_levels,
+                            ),
                             ("viscosity", limits.viscosity),
                         ];
                         if physics.implicit_vertical_advection.is_none() {
@@ -4489,13 +4496,15 @@ fn tidal_run_3d<'a>(
                     );
                     let limits = physics.time_step_limits(s, opts.cfl_3d);
                     println!(
-                        "           limits now: advection {:.2} (element {}), viscosity {:.2} (element {}), coriolis {:.0}, vertical {:.2}; last compute_dt's advection {:.2}",
+                        "           limits now: advection {:.2} (element {}), viscosity {:.2} (element {}), coriolis {:.0}, vertical {:.2}, sloping levels {:.2} (element {}); last compute_dt's advection {:.2}",
                         limits.advection.dt,
                         limits.advection.element,
                         limits.viscosity.dt,
                         limits.viscosity.element,
                         limits.coriolis.dt,
                         limits.vertical.dt,
+                        limits.sloping_levels.dt,
+                        limits.sloping_levels.element,
                         physics
                             .last_time_step_limits()
                             .map_or(f64::NAN, |l| l.advection.dt),
