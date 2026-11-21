@@ -3809,7 +3809,7 @@ mod tests {
     /// whatever the Courant number, where advection and the internal waves'
     /// WKB speed allow 161 s at Courant number 1; the local steps take it
     /// too. No such bound without a reference. At the model's step the rest
-    /// state holds (2 h here, measured 1.2e-12 m/s; 4.2e-12 m/s after 6 h; at
+    /// state holds (2 h here, measured 1.7e-12 m/s; at
     /// 72 s it blows up within the hour).
     #[test]
     fn the_models_step_holds_the_reference_over_a_cliff() {
@@ -3836,6 +3836,141 @@ mod tests {
         let limits = plain.time_step_limits(&rest, 1.0);
         assert_eq!(limits.sloping_levels.dt, f64::INFINITY);
         assert!(plain.compute_dt(&rest, 1.0) > 150.0);
+    }
+
+    /// TODO P1.3 gate (from the review of 2026-11-21): a state that is the
+    /// reference plus a uniform offset is at rest too. The trapezoid rule's
+    /// force of a uniform anomaly is zero, and it is no displacement of the
+    /// stratification ([`ReferenceFields::set_displacements`] measures the
+    /// displacement with the stratification's residual about each column's
+    /// line in `z`). With the displacement as the plain projection of the
+    /// anomaly on the stratification, 0.5 °C off the reference drove
+    /// 0.21 m/s within 15 min over the unsmoothed 15 → 300 m cliff and
+    /// 3.7e-2 m/s within the hour on the terrace of the smoothed Frøya bed.
+    /// An hour over the cliff (measured 1.2e-12 m/s) and half an hour on the
+    /// terrace (1.5e-12 m/s).
+    ///
+    /// An offset linear in `z` (3 °C over the cliff's 300 m) is no
+    /// displacement either, but its force is not exactly zero: the
+    /// pressure's mean over a column is the anomaly's first moment by the
+    /// midpoint rule (the partner of the layers' rise with the free
+    /// surface), second order for such an anomaly, a depth-mean force that
+    /// is a gradient. Measured 1.2e-4 m/s after the hour, the adjustment of
+    /// the free surface to it.
+    #[test]
+    fn an_offset_from_the_reference_stays_at_rest() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        type Offset = fn(f64) -> f64;
+        let offsets: [(&str, Offset, f64); 2] = [
+            ("uniform", |_| -0.5, 1e-9),
+            ("linear in z", |z| 0.5 + 0.01 * z, 1e-3),
+        ];
+        let run = |physics: &Physics, mut state: Solution3D, offset: Offset, dt: f64, steps| {
+            let (nl, sigma) = (state.n_levels, physics.sigma.clone());
+            for idx in 0..state.n_elements * state.n_nodes {
+                let eta = state.eta.data[idx];
+                let depth = eta - physics.bathymetry.data[idx];
+                for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                    state.temp[idx * nl + l] += offset(eta + s * depth);
+                }
+            }
+            let mut integrator = ModeSplitIntegrator::new();
+            for n in 0..steps {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+            }
+            max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)))
+        };
+        for (name, offset, bound) in offsets {
+            let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+            let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
+            let (physics, state) = basin_physics(mesh, bed, None, pycnocline);
+            let speed = run(&physics, state, offset, 36.0, 100);
+            println!("the cliff, {name} offset: {speed:.2e} m/s after 1 h");
+            assert!(speed < bound, "the cliff, {name} offset: {speed:.3e} m/s");
+        }
+        let (physics, state) = terrace_patch_physics(None);
+        let speed = run(&physics, state, offsets[0].1, 5.0, 360);
+        println!("the terrace, uniform offset: {speed:.2e} m/s after 0.5 h");
+        assert!(speed < 1e-9, "the terrace, uniform offset: {speed:.3e} m/s");
+    }
+
+    /// Probe (TODO P1.3): a seiche over the unsmoothed 15 → 300 m cliff, the
+    /// flow the gates at rest do not have. The free surface starts tilted by
+    /// `DGRS_TILT` (0.2 m end to end, a cosine), the tracers at rest in the
+    /// reference at their levels; steps of `DGRS_DT` (20 s) to the hours
+    /// `DGRS_HOURS` ("1,3,6,12"). Prints the largest layer speed, the largest
+    /// departure of T from the reference at the node's height, and the
+    /// change of the heat content.
+    #[test]
+    #[ignore = "probe: a seiche over the unsmoothed cliff"]
+    fn probe_seiche_over_a_cliff() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+        let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
+        let (physics, mut state) = basin_physics(mesh, bed, None, pycnocline);
+        let reference = physics.reference_profile().expect("a reference").clone();
+        let (nn, nl) = (state.n_nodes, state.n_levels);
+        let tilt = env_or("DGRS_TILT", 0.2);
+        let sigma = physics.sigma.clone();
+        for k in 0..state.n_elements {
+            for i in 0..nn {
+                let (r, s) = (physics.ops.nodes_r[i], physics.ops.nodes_s[i]);
+                let [x, _] = physics
+                    .mesh
+                    .reference_to_physical(ElementIndex::new(k), r, s);
+                let idx = k * nn + i;
+                let eta = 0.5 * tilt * (std::f64::consts::PI * x / 8000.0).cos();
+                state.eta.data[idx] = eta;
+                let depth = eta - physics.bathymetry.data[idx];
+                for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                    (state.temp[idx * nl + l], state.salt[idx * nl + l]) =
+                        reference.at(eta + s * depth);
+                }
+            }
+        }
+        physics.update_density(&mut state);
+        let heat = |state: &Solution3D| -> f64 {
+            (0..state.n_elements * nn)
+                .map(|idx| {
+                    let depth = state.eta.data[idx] - physics.bathymetry.data[idx];
+                    let mass = physics.geom.node_mass(idx / nn, idx % nn);
+                    (0..nl)
+                        .map(|l| mass * depth * sigma.d_sigma()[l] * state.temp[idx * nl + l])
+                        .sum::<f64>()
+                })
+                .sum()
+        };
+        let initial = heat(&state);
+        let dt = env_or("DGRS_DT", 20.0);
+        let hours: Vec<f64> = std::env::var("DGRS_HOURS")
+            .unwrap_or_else(|_| "1,3,6,12".into())
+            .split(',')
+            .filter_map(|h| h.parse().ok())
+            .collect();
+        let mut integrator = ModeSplitIntegrator::new();
+        let mut n = 0;
+        for until in hours {
+            while (n as f64) < (until * 3600.0 / dt).round() {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+                n += 1;
+            }
+            let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
+            let departure = max_or_nan((0..state.n_elements * nn * nl).map(|c| {
+                let idx = c / nl;
+                let eta = state.eta.data[idx];
+                let z = eta + sigma.sigma_rho()[c % nl] * (eta - physics.bathymetry.data[idx]);
+                (state.temp[c] - reference.at(z).0).abs()
+            }));
+            println!(
+                "seiche over the cliff, {until} h: largest speed {speed:.3e} m/s, |T − T̄(z)| \
+                 {departure:.3e} °C, heat {:+.2e} of itself",
+                heat(&state) / initial - 1.0
+            );
+        }
     }
 
     /// Probe (TODO P1.3): the bounds on the step over the unsmoothed steps
@@ -4159,9 +4294,9 @@ mod tests {
 
     /// [`terrace_patch_physics`] with the vertical tracer scheme `scheme`
     /// (the default if none), from a temperature perturbation of 1e-6 °C at
-    /// every wet point, in steps of `DGRS_DT` (5 s): the largest layer speed
-    /// after each of `hours`.
-    fn terrace_patch_run(scheme: Option<VerticalAdvection>, hours: &[f64]) -> Vec<f64> {
+    /// every wet point, in steps of `dt`: the largest layer speed after each
+    /// of `hours`.
+    fn terrace_patch_run(scheme: Option<VerticalAdvection>, hours: &[f64], dt: f64) -> Vec<f64> {
         let (physics, mut state) = terrace_patch_physics(scheme);
         let rest = state.clone();
         let (nl, bathymetry) = (state.n_levels, physics.bathymetry.clone());
@@ -4175,7 +4310,6 @@ mod tests {
                 *t += 1e-6 * ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5);
             }
         }
-        let dt = env_or("DGRS_DT", 5.0);
         let mut integrator = ModeSplitIntegrator::new();
         let mut n = 0;
         let mut speeds = Vec::with_capacity(hours.len());
@@ -4225,7 +4359,22 @@ mod tests {
             .split(',')
             .map(|h| h.parse().expect("DGRS_HOURS"))
             .collect();
-        terrace_patch_run(probed_vertical_advection(), &hours);
+        terrace_patch_run(probed_vertical_advection(), &hours, env_or("DGRS_DT", 5.0));
+    }
+
+    /// TODO P1.3 gate: the first three hours of the terrace fixture, seeded
+    /// (the gate of 2026-10-04, when the vertical scheme about the rest state
+    /// took out the 36-min mode of the smoothed Frøya coastline mesh): the
+    /// largest speed at 3 h is below twice the one at 1 h. About the
+    /// reference profile: measured 4.7e-7 → 3.7e-7 m/s (the seed's own
+    /// internal waves). The twelve hours are the gate below.
+    #[test]
+    fn a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference() {
+        let speeds = terrace_patch_run(None, &[1.0, 3.0], 5.0);
+        assert!(
+            speeds[1] < 2.0 * speeds[0],
+            "about its reference the terrace grew: {speeds:?}"
+        );
     }
 
     /// TODO P1.3 gate: a terrace of the smoothed Frøya coastline bed (22.6 m
@@ -4242,7 +4391,7 @@ mod tests {
     /// scheme taken about no reference a real one of 33 min.
     #[test]
     fn a_terrace_beside_a_shore_element_stays_at_rest_for_twelve_hours() {
-        let speeds = terrace_patch_run(None, &[3.0, 12.0]);
+        let speeds = terrace_patch_run(None, &[3.0, 12.0], 5.0);
         assert!(
             speeds[1] < 2.0 * speeds[0],
             "about its reference the terrace grew: {speeds:?}"

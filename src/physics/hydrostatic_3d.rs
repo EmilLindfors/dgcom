@@ -423,12 +423,15 @@ where
     /// The reference stratification `profile`: a horizontally uniform
     /// `T̄(z)`, `S̄(z)` (the stratification at rest, a parent model's mean
     /// profile, [`TracerReferenceProfile::from_mean`]) about which the model
-    /// takes its anomalies. A fluid at rest in it is at rest in the model,
-    /// over any bed, and stays there: the scheme linearised about that state
-    /// conserves a positive pseudo-energy (kinetic energy, the free
-    /// surface's, and `½ g ρ′²/Γ` with `Γ = −∂ρ̄/∂z` over each layer), so
-    /// nothing can grow out of round-off
-    /// (`docs/stratified-rest-over-steep-beds.md`, TODO P1.3). With it:
+    /// takes its anomalies. A fluid at rest in it feels no force, over any
+    /// bed, and for the scheme linearised about that state the baroclinic
+    /// force's work and the rate of the available potential energy
+    /// `½ g ρ′²/Γ` (`Γ = −∂ρ̄/∂z` over each layer) cancel exactly with the
+    /// layers' central fluxes, so that exchange cannot make round-off grow.
+    /// What the proof does not cover (the 2D module's Riemann fluxes, the
+    /// splitting in time, a state that has left the reference) is listed
+    /// with the measurements in `docs/stratified-rest-over-steep-beds.md`
+    /// (TODO P1.3). With it:
     ///
     /// - the baroclinic pressure gradient is that of the density anomaly
     ///   `ρ − ρ̄(z)` at every node's own height, integrated by the trapezoid
@@ -459,9 +462,10 @@ where
     ///
     /// The tracers' inventories are kept, element by element: the
     /// reference's advection is not a flux between cells, and what it makes
-    /// in an element is taken back as a uniform displacement of the
-    /// element's stratification, with its adjoint in the force (the
-    /// element's mean displacement exerts no force within it). The water's
+    /// in an element is taken back as a displacement of the element's
+    /// stratification, with its adjoint in the force (a stratification
+    /// displaced as a whole within an element exerts no force within it,
+    /// and a state uniformly off the reference none at all). The water's
     /// volume and a uniform tracer are as before, and a reference linear in
     /// `z` changes nothing but the pressure integral.
     ///
@@ -516,6 +520,9 @@ where
     /// stratified (a column's T or S varies by more than 1e-9) and
     /// [`Self::without_reference_profile`] did not opt out.
     /// [`crate::simulation::Simulation3D`] calls it with its initial state.
+    /// None is taken either where a balanced reference state is set
+    /// ([`Self::with_balanced_reference`], computed for the force it was set
+    /// under; set the profile first to have both).
     /// The first call decides: a later one (a run continued by another
     /// `run` call, whose state may have stratified since) takes no reference
     /// mid-run.
@@ -524,6 +531,12 @@ where
             return;
         }
         self.automatic_reference_profile = false;
+        // A balanced reference state was computed for the force of the full
+        // density: a reference profile taken now would change the force
+        // under it
+        if self.balanced_reference.is_some() {
+            return;
+        }
         let nl = state.n_levels;
         let stratified = [&state.temp, &state.salt].iter().any(|field| {
             field.chunks_exact(nl).any(|column| {
@@ -703,7 +716,7 @@ where
     }
 
     /// `fields` of the reference `profile` at `state`'s levels on
-    /// `elements`, with their mean displacements (the pressure gradient's;
+    /// `elements`, with their displacements (the pressure gradient's;
     /// `state.rho` must be current).
     fn fill_reference(
         &self,

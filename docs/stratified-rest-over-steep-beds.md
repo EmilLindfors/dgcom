@@ -223,14 +223,19 @@ On the 11048 patch from rest, 8.8 h:
 
 ## The cure: a reference stratification, advected by the pressure gradient's adjoint (2026-11-20, 2026-11-21)
 
-The rest state is now stable by construction, on beds that are not smoothed.
-`Hydrostatic3D::with_reference_profile` takes a horizontally uniform `T̄(z)`,
-`S̄(z)`; the baroclinic pressure gradient is that of the density anomaly about
-it, and the tracers' advection moves the reference by the vertical velocity
-that is that force's exact adjoint. The scheme linearised about rest in the
-reference then conserves a positive pseudo-energy (kinetic energy plus the
-available potential energy `½ g ρ′²/Γ`), with the stratification's own weights
-at every node, and every element keeps its tracer inventories. The price is
+The mechanism that made a stratified rest state grow over steep beds is
+removed by construction, and the fixtures hold at rest on beds that are not
+smoothed. `Hydrostatic3D::with_reference_profile` takes a horizontally
+uniform `T̄(z)`, `S̄(z)`; the baroclinic pressure gradient is that of the
+density anomaly about it, and the tracers' advection moves the reference by
+the vertical velocity that is that force's exact adjoint. For the scheme
+linearised about rest in the reference, with the layers' central fluxes, the
+force's work and the rate of the available potential energy `½ g ρ′²/Γ` then
+cancel exactly, with the stratification's own weights at every node, and
+every element keeps its tracer inventories. That is a proof for this
+exchange, not for the whole model: what it leaves out is under "Where the
+proof stops", and the evidence for the rest is the step maps and the long
+runs under "Measurements". The price is
 in the time step: the scheme carries in full the frequency `N |∇_σ z|` of a
 stratification displaced along a sloping level, and the step must resolve it
 (a bound of `compute_dt` now; it binds on the exaggerated cliff slice, not on
@@ -324,21 +329,30 @@ one (step 5), and the σ-surfaces of the columns that are not thin.
    reference's change over it whatever its levels resolve),
    `θ_ab = clamp(ΔC_ab/ΔC̄_ab, 0, 1)` the share of the reference's jump that
    the tracer's own jump along the edge holds.
-3. **The element's mean displacement.** The two ends' terms of an edge do not
+3. **The element's displacement.** The two ends' terms of an edge do not
    cancel: they add up to `F_ab τ_ab`,
    `τ_ab = (C̄_b − C̄_a) − ½(γ_a + γ_b)(z_b − z_a)`, the trapezoid rule's error
-   of the reference's gradient along the edge. With `R = Σ F_ab τ_ab` over the
-   element's edges and `N = Σ m H Γ` over its stably stratified layers
-   (`Γ = −(ρ_T γ^T + ρ_S γ^S)`), every layer of the element gets `−H Γ R/N`:
-   the element's stratification displaced as a whole at the rate `R/N`. And
-   the force leaves out, along every edge of the element, the trapezoid
-   rule's error of the anomaly of the element's mean displacement
-   `κ = Σ m H ρ′/N`:
+   of the reference's gradient along the edge. With `R = Σ F_ab τ_ab` over
+   the element's edges, every layer of the element gets `−H Γ g R/N`: the
+   element's stratification displaced at the rate `R/N`, in the shape of
+   `g`, the stratification's residual about its own column's line in `z`
+   (`Γ` less its least-squares line over the column's layers, weighted by
+   their thickness), with `N = Σ m H Γ g` (`= Σ m H g²`;
+   `Γ = −(ρ_T γ^T + ρ_S γ^S)`, its negative parts counted as zero). And the
+   force leaves out, along every edge of the element, the trapezoid rule's
+   error of the anomaly of the element's displacement `κ = Σ m H g ρ′/N`:
 
    ```text
        ½(ρ′_a + ρ′_b)(z_b − z_a) − κ [(ρ̄_b − ρ̄_a) + ½(Γ_a + Γ_b)(z_b − z_a)].
    ```
 
+   `κ` is the regression of the anomaly on the stratification within the
+   columns: a stratification displaced as a whole has its displacement
+   (`ρ′ = κΓ` gives `κ`), and an anomaly that is uniform or linear in `z` in
+   each column has none, so the force of such an anomaly is the trapezoid
+   rule's, as without step 3. Where the stratification has no residual (a
+   reference linear or quadratic in `z` over the element) there is nothing
+   to take back (`τ = 0`), and no `κ`.
 4. **The pressure's mean over a column is the anomaly's first moment about
    the bed.** Transports with a depth mean move the free surface, and a
    layer's centre rises through the reference (which is fixed in `z`) by
@@ -387,16 +401,28 @@ what is left of the advection is
 height along the flow, the vertical part `Ω` averaged to the layer centre with
 the trapezoid rule's weights, `½(Ω_{l−½} Δz_{l−½} + Ω_{l+½} Δz_{l+½})/H`. It
 is defined by the force: `Σ_a m_a ρ′_a (H w)_a` is the sum (work), term by
-term. Step 3 reads the same way: `κ` is the projection of the anomaly on a
-uniform displacement of the reference (whose anomaly is `κΓ`) in the
-available potential energy's norm, and the force integrates that part of the
+term. Step 3 reads the same way: the force integrates the part `κΓ` of the
 anomaly along each edge exactly, as `−κ(ρ̄_b − ρ̄_a)`, instead of by the
 trapezoid rule. A stratification displaced as a whole within an element then
-exerts no force within it (but for the surface half-layer), where the
-trapezoid rule alone leaves the σ form's error of the displaced profile at
-every straddle: the well-known limit of subtracting a reference profile, that
-the error comes back once the isopycnals move, is gone for the element's mean
-displacement.
+exerts no force within it, where the trapezoid rule alone leaves the σ form's
+error of the displaced profile at every straddle: the well-known limit of
+subtracting a reference profile, that the error comes back once the
+isopycnals move, is gone for the element's displacement.
+
+What counts as a displacement decides what step 3 costs. Its first version
+took `κ` as the plain projection of the anomaly on the stratification
+(`Σ m H ρ′/Σ m H Γ`, a uniform displacement, taken back in proportion to
+`H Γ`). Then any anomaly with a mean has a `κ`, and the force gets `κ` times
+the trapezoid error of the reference along every edge, which at a straddle
+is the tangent's overshoot: the independent review of 2026-11-21 found that
+a state 0.5 °C off the reference everywhere, which is at rest, spun up to
+0.21 m/s within 15 minutes over the unsmoothed cliff, and to 3.7e-2 m/s
+within the hour on the terrace of the smoothed bed, where the scheme before
+felt nothing. With the residual `g`, a uniform offset is exactly at rest
+again (gate `an_offset_from_the_reference_stays_at_rest`, 1.2e-12 m/s), and
+a general anomaly's `κ` is bounded by its correlation with the
+stratification within the columns: the term is then of the size of the σ
+form's own error of that anomaly at a straddle, not seventeen times it.
 
 ### The statement and its proof
 
@@ -431,7 +457,7 @@ changes at `−D ≤ 0` less what the 2D module's Riemann fluxes dissipate. And
 every element's inventories of `T` and `S` change only through its faces.
 
 **Proof.** (i) From the scheme,
-`m_a H_a ∂δρ_a/∂t = Γ_a [m_a (H w)_a − m_a H_a R/N]`, with
+`m_a H_a ∂δρ_a/∂t = Γ_a [m_a (H w)_a − m_a H_a g_a R/N]`, with
 `R = Σ_edges δF_ab τ_ab` and `τ_ab = (ρ̄_b − ρ̄_a) + ½(Γ_a + Γ_b)(z_b − z_a)`
 the density's: `δρ` is the same combination of `δT` and `δS` that `Γ` is of
 their gradients, and `ρ̄`'s chords of theirs. (ii) The momentum advection is
@@ -439,11 +465,11 @@ quadratic in the perturbation, Coriolis does no work node by node, the bottom
 drag is quadratic and Smagorinsky's viscosity vanishes with the strain; the
 force's work, by (work) with step 3's term, is
 `ρ₀ Σ m_a H_a δu_a·∂δu_a/∂t = −g [b(δF, δρ) − κ R] − D`. (iii) The potential
-energy's rate is `g Σ_a (δρ_a/Γ_a) m_a H_a ∂δρ_a/∂t = g Σ_a m_a δρ_a (H w)_a − g (Σ_a m_a H_a δρ_a/N) R = g [b(δF, δρ) − κ R]`:
+energy's rate is `g Σ_a (δρ_a/Γ_a) m_a H_a ∂δρ_a/∂t = g Σ_a m_a δρ_a (H w)_a − g (Σ_a m_a H_a g_a δρ_a/N) R = g [b(δF, δρ) − κ R]`:
 each edge gives `½ F_ab (z_b − z_a)` to `m_a (H w)_a` and
 `½ F_ba (z_a − z_b)`, the same number, to `m_b (H w)_b`, and the second sum is
 `κ` by its definition. The two rates cancel. (iv) The inventory: the edges'
-terms add up to `R` in the element, and step 3 takes `Σ m H Γ R/N = R` back.
+terms add up to `R` in the element, and step 3 takes `Σ m H Γ g R/N = R` back.
 (v) A depth mean. The sum (work) is by parts with the layers' continuity,
 `Σ_b F_ab = −m_a (Δσ ∂η/∂t + Ω_{a+½} − Ω_{a−½})`: the pressure differences
 along the horizontal edges become `Σ_a p_a Σ_b F_ab`, whose `Ω` part is the
@@ -478,7 +504,9 @@ energy (from the conservative tracer kernel about the reference plus
 the force's work agree to 1e-11 of their terms, and the inventory's rate is
 round-off. Without step 4 the two differ by 8 % of the work for transports
 with a depth mean on those levels (3 % on uniform levels: step 3's term), and
-without step 5 by another 4 %. In time it is checked
+without step 5 by another 4 %. One term of the gate is the proof's and not
+the model's, the layers' rise in part (v): see "Where the proof stops". In
+time the exchange is checked
 by `the_pseudo_energy_of_a_departure_from_rest_does_not_grow_over_a_cliff`
 and by the spectrum probes in pseudo-energy coordinates (below).
 
@@ -503,8 +531,8 @@ the other side.
 The way out is that conservation is needed per element, not per edge, and
 every edge the force acts along lies within one element. The edges' errors
 `F_ab τ_ab` are collected over the element and taken back as one more
-vertical velocity, uniform over the element (step 3), which has a bounded
-adjoint in the force. Without step 3 the scheme of steps 1 and 2 is stable
+vertical velocity in the shape of the stratification's residual (step 3),
+which has a bounded adjoint in the force. Without step 3 the scheme of steps 1 and 2 is stable
 too (it was the first prototype), but its tracer inventories drift at the
 trapezoid rule's error: under a 0.5 m seiche over a 12 → 4 m slope with a
 6 °C thermocline (`SlopingTide`), the basin's mean temperature changed by
@@ -527,9 +555,10 @@ element, with
 
 (`N² = (g/ρ₀) Γ`, `D_ij` the pair's derivative coefficients, `D_i` the depth).
 Its eigenvalues are `±i` times the singular values of `B`: frequencies
-`N |∇_σ z|`, the buoyancy frequency times the slope of the level. The
-element's mean displacement (step 3) is an orthogonal projection in these
-coordinates, off the direction `r_a ∝ √(m H Γ)`, and does not raise them.
+`N |∇_σ z|`, the buoyancy frequency times the slope of the level. Step 3
+adds a term of rank one per element to `B` (the element's error `R`, taken
+back in the shape of `Γ g`); the bound below is for the pairs' `B`, and its
+gate measures it against the operator with step 3 in it.
 
 That frequency is the hydrostatic equations' own: water that moves along a
 surface of slope `s` through a stratification `N` oscillates at `N s` (the
@@ -584,19 +613,52 @@ force `g ρ′ Δz/ρ₀` along every sloping level.
   fixed in `z`: under a tide the levels move through it, and the anomaly is
   the physical one (differential stretching over a slope makes real
   gradients, which a reference that followed the σ-levels would hide). The
-  force's displacement term is linear in the anomaly whatever its size: for
-  an anomaly that is not a displacement (a river plume over a cliff) it is a
-  term of the size of the σ form's own error there, and vanishes with it
-  under refinement.
+  force's displacement term is linear in the anomaly whatever its size: an
+  anomaly that is uniform or linear in `z` in each column has none, and for
+  another that is not a displacement (a river plume over a cliff) it is `κ`
+  times the trapezoid error of the reference along the edge, with `κ` the
+  anomaly's regression on the stratification within the columns: of the size
+  of the σ form's own error of that anomaly at a straddle. Under flow with
+  `0 < θ < 1` at a straddle the tracer's own jump is advected at the
+  tangent's rate over the chord's (up to 34 on the cliff slice): bounded by
+  the step's bound (`θ ≤ 1`), but no gate runs a tide over an unsmoothed
+  straddle, and none can pass before the full-mesh check.
+- **The layers' rise at the centre.** Step 4 pairs the layers' rise with the
+  reference's gradient over the layer, `Γ (1 + σ) ∂η/∂t`, as the tangent and
+  the potential energy's weight take it. The model's reference is taken at
+  the layer centre, and changes with the free surface at its gradient
+  there. The two agree where a layer resolves the reference. Across a layer
+  that does not, the exchange with a depth-mean flow misses by their
+  difference: with the gate's random transports and anomalies over the
+  5 → 125 m cliff under an 8 m thermocline, 3.0e-2, 1.4e-2, 7.6e-4 and
+  4.5e-7 of the identity's terms on 6, 12, 24 and 48 levels. And the
+  pressure's mean being the midpoint rule's moment makes the force of an
+  anomaly linear in `z` second order instead of zero: a depth-mean force
+  that is a gradient (3 °C over the cliff's 300 m: 1.2e-4 m/s while the free
+  surface adjusts, against 1e-7 without step 4). On the terrace fixture step
+  4 changes nothing measurable (100 vectors: 0.99979 with it, 0.99980
+  without).
+- **The layer centres are the midpoints of their σ-surfaces** in every
+  stretching of the crate, which step 4 uses (a uniform anomaly's pressure
+  then has its moment as its mean). `SigmaGrid::from_levels` accepts others:
+  there a uniform anomaly gets a depth-mean force of the centres' offset.
+- **Layers without stratification.** Where `Γ = 0` the potential energy has
+  no weight for an anomaly that the force still feels: the claim is for
+  `ρ′ = 0` there. An element with no residual in its stratification takes no
+  tracer back; its tangents make none either.
 - **The barotropic mode.** The exchange is exact for the central layer
-  fluxes, whatever their depth mean (steps 4 and 5). The depth mean of the
-  force reaches the 2D module as the slow forcing, and the layers carry their
-  shares of the 2D mass flux. What has no partner is the dissipative part of
-  the 2D Riemann flux (at faces and on the subcell interfaces: it moves the
-  stratification with a flux proportional to the jump of `η`, not to a
-  transport the force acts on), and the interfaces to a thin column. Both
-  couple the two modes with a feedback of relative size `Δρ/ρ₀` times the 2D
-  dissipation. The step maps below include the barotropic variables.
+  fluxes, whatever their depth mean (steps 4 and 5, with the limit above).
+  The depth mean of the force reaches the 2D module as the slow forcing, and
+  the layers carry their shares of the 2D mass flux. That flux is not the
+  central one of step 5: on a shore element's subcell interfaces it is the
+  2D kernel's Riemann flux of hydrostatically reconstructed, limited states
+  (a depth at the interface, not the two columns' mean transport, where the
+  bed changes between two nodes; and a flux into a thin column), and at
+  faces it has the Riemann flux's dissipation. Step 5's force is the partner
+  of the central part only, and its gate runs without a barotropic pass. The
+  rest couples the two modes with no partner; the step maps below, which
+  include the barotropic variables and the pass's fluxes, are the evidence
+  that it does not grow on the fixtures.
 - **A discontinuous bed.** Across a face whose two sides are at different
   heights the upwind face value advects the background at a rate set by
   `|F|`, and the force's face term has a `ρ′ Δz` part: neither is covered.
@@ -645,9 +707,18 @@ force `g ρ′ Δz/ρ₀` along every sloping level.
   displacement (Parked, P1.3).
 - **The redistribution with other weights.** Taking the element's error back
   in proportion to each tracer's own gradient makes the force's partner
-  divide by `Γ` (stiff where `T` and `S` compensate in density); in
-  proportion to `H Γ` for both tracers it is the uniform displacement above,
-  and its partner is bounded.
+  divide by `Γ` (stiff where `T` and `S` compensate in density). In
+  proportion to `H Γ` for both tracers it is a uniform displacement, whose
+  partner in the force is the plain projection of the anomaly on the
+  stratification: bounded, but it gives every anomaly with a mean a force
+  at straddles (the review's finding, under step 3). In proportion to
+  `H Γ g` it is the scheme's.
+- **The redistribution without its partner in the force.** The element's
+  displacement then feels the trapezoid rule's force of its own anomaly,
+  `κ τ` along every edge, which drives the fluxes that the redistribution
+  answers with more of the same displacement: `∂²κ/∂t² = +κ |L τ|²/N` (`L`
+  from the pressure differences along the edges to the fluxes they drive),
+  growth at every straddle. Not run.
 - **Cancelling the reference's advection where the force has no term** (the
   first prototype did, on shore elements' subcell interfaces). It gives up
   conservation to first order under a tide, and the 30-vector spectra were
@@ -676,8 +747,9 @@ and in the barotropic fields, and the pseudo-energy of a random departure,
 that, and the harness and the scheme have each changed for them.
 
 - **The conserved totals have neutral directions.** A departure that changes
-  the volume, the heat or the salt ends in another state at rest, an
-  eigenvalue of exactly 1. Arnoldi approaches it slowly and from both sides,
+  the volume, the heat or the salt ends in another state at rest (a uniform
+  `T` or `S` offset is one, with step 3 as it is now), an eigenvalue of
+  exactly 1. Arnoldi approaches it slowly and from both sides,
   because its tracers settle over days: on the day map of the fully wet
   cliff slice the leading Ritz value was 1.040 (residual 2.8e-2), and its
   vector's barotropic part was 99.9 % a uniform `η` over all eight elements.
@@ -703,7 +775,44 @@ that, and the harness and the scheme have each changed for them.
 
 On the terrace, with the totals taken out, 100 vectors gave 1.00987 for the
 norm and a leading Ritz value of 1.00613 (e-folding 82 h, tracers) before
-steps 4 and 5, and give 1.00028 and 0.99978 with them.
+steps 4 and 5, and give 1.00031 and 0.99979 with them. Step 5 is what did
+it: without step 4 the same map gives 1.00032 and 0.99980.
+
+### The independent review (2026-11-21)
+
+A reviewer that had not seen the reasoning (a separate agent, with the diff
+and this section only) re-derived the work identity with the faces, the
+pairs' fluxes in both metric forms, step 2's two-end sum, step 3's adjoint
+and the inventory, step 4's algebra, step 5's coefficient, sign and weights,
+and `B` with both bounds, and found them right. It ran what the gates did not:
+
+- **A state uniformly off the reference spun up** (0.5 °C: 0.21 m/s within
+  15 min over the cliff, 3.7e-2 m/s within the hour on the terrace; the
+  scheme before felt nothing). Step 3's displacement was the plain
+  projection of the anomaly on the stratification, so a uniform anomaly had
+  one, times the trapezoid error of the reference along the edges. Two
+  things had hidden it: the fjord gate had been ported with a hand-built
+  reference without displacements, and the probes' "conserved totals"
+  removed exactly the uniform `T` and `S` departures as other states at
+  rest, which in that scheme they were not. Cured: the residual `g` of step
+  3; the fjord gate goes through the model's own path; the gate
+  `an_offset_from_the_reference_stays_at_rest`.
+- **The layers' rise at the layer centre** is not the proof's rate where a
+  layer does not resolve the reference, and **step 5's flux** is the central
+  one only in the gate: both are under "Where the proof stops" now, the
+  first with its size by the number of levels in the exchange gate.
+- **An automatic reference under a balanced reference state** changed the
+  force that state was computed for: `ensure_reference_profile` takes none
+  where a balanced reference is set.
+- **No gate has flow over an unsmoothed straddle** with a state that has
+  left the reference (`0 < θ < 1`): one probe since, the seiche under
+  "Measurements"; the rest is the full-mesh check, and after it a tide on
+  the unsmoothed bed before `slopes_3d` stops being the default.
+- It also found the 3 h terrace gate deleted (restored, unchanged), no
+  threshold loosened and no horizon shortened, and the write-up overstating
+  ("stable by construction", "cancel exactly for any layer transports"):
+  the claim is now stated for the exchange that is proved, with the central
+  fluxes.
 
 ### Measurements
 
@@ -734,11 +843,11 @@ horizon / leading Ritz value):
 
 | | before | after, 30 vectors | after, 100 vectors |
 |---|---|---|---|
-| terrace, 1800 s | a pair at 1.2974 (e-folding 115.2 min, ω 5.46e-4 rad/s, residual 8.7e-3), a second at 153 min | 0.99747 / 0.99531 | 1.00028 / 0.99978; then a pair at 0.97971, ω 5.72e-4 rad/s, velocity and anomaly in equal parts: the old mode's oscillation, decaying |
-| 15 → 300 m cliff, 3600 s | pairs with e-folding 46.9, 47.6, 48.5 min (residuals ≤ 2e-7); the norm grows 4.62× | 0.99817 / 0.99485 | 0.99968 / 0.99907 |
-| land beside 300 m, 3600 s | on the day map, tracer modes at 2.24, 1.73, 1.37 (e-folding 30, 44, 76 h; residuals 3e-14, 2e-9, 4e-4) | 0.99948 / 0.98955 | 1.00242 / 0.99808 |
-| 0.5 m beside 150 m, 3600 s | | 1.00056 / 0.99731 | 1.00195 / 0.99965 |
-| 15 → 60 m, 3600 s | | 0.99880 / 0.99793 | 0.99974 / 0.99960 |
+| terrace, 1800 s | a pair at 1.2974 (e-folding 115.2 min, ω 5.46e-4 rad/s, residual 8.7e-3), a second at 153 min | 0.99747 / 0.99531 | 1.00031 / 0.99979; then pairs at 0.9793 with the velocity and the anomaly in equal parts, at ω 1.12e-3 and 5.74e-4 rad/s: the second is the old mode's oscillation, decaying over a day |
+| 15 → 300 m cliff, 3600 s | pairs with e-folding 46.9, 47.6, 48.5 min (residuals ≤ 2e-7); the norm grows 4.62× | 0.99819 / 0.99484 | 0.99972 / 0.99908 |
+| land beside 300 m, 3600 s | on the day map, tracer modes at 2.24, 1.73, 1.37 (e-folding 30, 44, 76 h; residuals 3e-14, 2e-9, 4e-4) | 0.99948 / 0.98958 | 1.00242 / 0.99807 |
+| 0.5 m beside 150 m, 3600 s | | 1.00054 / 0.99731 | 1.00195 / 0.99964 |
+| 15 → 60 m, 3600 s | | 0.99881 / 0.99793 | 0.99974 / 0.99961 |
 
 No Ritz value is above 1. The norm's growth over the horizon is above 1 by
 3e-4 to 2.4e-3 on the terrace and beside shallow or dry columns at 100
@@ -750,10 +859,19 @@ column, the splitting in time).
 
 | | before | after |
 |---|---|---|
-| terrace, seeded with 1e-6 °C | 4.2e-7 m/s at 3 h, 1.3e-5 at 12 h | 3.7e-7 at 3 h, 4.6e-7 at 12 h |
-| the cliff from round-off, 6 h | 6.6e-10 m/s (2.3e-8 when its gate was written) | 1.4e-12 |
-| unsmoothed steps from round-off, 12 → 48 h | 15 → 300 m: 2.4e-6 → NaN; 0.5 → 150 m: 4.1e-8 → NaN; 15 → 60 m: 6.1e-11 → 5.0e-2 (e-folding 1.8 h); land → 300 m: 1.8e-12 → 2.6e-12 | at 48 h: 9.3e-12, 2.4e-12, 2.2e-12, 2.2e-12 |
-| the cliff at the model's own step (27.4 s), 6 h | | 4.2e-12 |
+| terrace, seeded with 1e-6 °C | 4.2e-7 m/s at 3 h, 1.3e-5 at 12 h | 4.7e-7 at 1 h, 3.75e-7 at 3 h, 4.6e-7 at 12 h |
+| the cliff from round-off, 6 h | 6.6e-10 m/s (2.3e-8 when its gate was written) | 1.5e-12 |
+| unsmoothed steps from round-off, 12 → 48 h | 15 → 300 m: 2.4e-6 → NaN; 0.5 → 150 m: 4.1e-8 → NaN; 15 → 60 m: 6.1e-11 → 5.0e-2 (e-folding 1.8 h); land → 300 m: 1.8e-12 → 2.6e-12 | at 48 h: 3.3e-12, 2.8e-12, 1.6e-12, 2.2e-12 |
+| the cliff at the model's own step (27.4 s), 2 h | | 1.7e-12 |
+| 0.5 °C off the reference everywhere, the cliff, 1 h | 0 (the force of a uniform anomaly) | 1.2e-12 (0.41 m/s with the displacement of step 3's first version) |
+| the same on the terrace, 0.5 h | | 1.5e-12 (3.7e-2 m/s at 1 h with the first version) |
+
+**Under flow** there is one run, not a gate: a seiche over the unsmoothed
+cliff (`probe_seiche_over_a_cliff`: the free surface tilted by 0.2 m over the
+8 km, 20 s steps). It stays bounded for the 12 h it ran: the largest layer
+speed 7.4e-2 m/s at 1, 3 and 6 h and 4.1e-2 m/s at 12 h (the barotropic
+seiche in 15 m of water, decaying), `T` off the reference at the node's
+height by 0.28 to 0.63 °C, and the heat content kept to 1e-12.
 
 **The pseudo-energy of a random departure** (every field, 1e-6 at most, the
 totals kept; fraction of its start):
@@ -763,14 +881,13 @@ totals kept; fraction of its start):
 | 15 → 300 m cliff | 0.525 | 0.399 | 0.286 | 0.237 | 0.203 | |
 | land beside 300 m | 0.723 | 0.546 | 0.366 | 0.272 | 0.206 | |
 | 0.5 m beside 150 m | 0.472 | 0.381 | 0.301 | 0.268 | 0.248 | |
-| terrace | | 0.233 | 0.168 | 0.154 | 0.146 | 0.142 |
+| terrace | | 0.233 | 0.168 | 0.154 | 0.146 | 0.143 |
 
-On the slices it falls at every one of the 9600 steps. On the terrace it falls
-from each sampled time to the next through 144 h (0.193 at 12 h), and over a
-single step it rises by 1.3e-7 of itself at most (the splitting's exchanges
-between the two modes). With steps 1 to 3 alone, and the totals not kept, the
-terrace gave 0.229, 0.164, 0.151 and 0.1477 at 6, 24, 48 and 96 h, and 0.1507
-at 144 h, with single steps rising by up to 1.4e-6.
+It falls at every step: 9600 of them on each slice, 103,680 on the terrace
+(0.193 at 12 h). With steps 1 to 3 alone, the totals not kept and step 3's
+first version, the terrace gave 0.229, 0.164, 0.151 and 0.1477 at 6, 24, 48
+and 96 h, and 0.1507 at 144 h, with single steps rising by up to 1.4e-6 of
+it.
 
 **Conservation.** A 0.5 m seiche over a 12 → 4 m slope with a 6 °C
 thermocline in the reference, one period, on 3, 6 and 12 levels
@@ -803,6 +920,10 @@ fastest current: the full-mesh run prints both (`notes/geometry-mesh.md`).
 
 | | before | after |
 |---|---|---|
-| `profile_3d nx=64 ny=16 order=2 levels=20` (1024 elements, release), 1 thread | 353.6 ms | 388.0 ms (+9.7 %): the momentum stages 61.1 → 71.4, the tracer stages 75.1 → 92.0, `compute_dt` 8.9 → 14.4 (the reference's fields, which the first stage then finds filled), the barotropic pass and the rest unchanged |
-| the same, 4 threads | 146.4 ms | 151.3 ms (+3.4 %) |
-| terrace fixture (22 elements, 20 levels, test profile), 1 thread | 20.3 ms | 21.9 ms (+7.8 %) |
+| `profile_3d nx=64 ny=16 order=2 levels=20` (1024 elements, release), 1 thread | 369.2 ms | 394.4 ms (+6.8 %): the momentum stages 63.1 → 73.4, the tracer stages 76.6 → 90.1, `compute_dt` 9.5 → 14.9 (the reference's fields, which the first stage then finds filled), the barotropic pass and the rest within the noise |
+| the same, 4 threads | 135.7 ms | 147.7 ms (+8.8 %) |
+| terrace fixture (22 elements, 20 levels, test profile), 1 thread | 20.3 ms | 22.5 ms (+10.5 %) |
+
+A series an hour earlier on the same machine gave +9.7 % and +3.4 % for the
+benchmark on one and four threads: the cost is 7 to 10 % of a step, and the
+machine's noise is a few per cent.
