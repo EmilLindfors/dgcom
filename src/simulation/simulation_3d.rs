@@ -259,14 +259,18 @@ where
             // Compute time step (3D CFL). With local time stepping, the
             // coarse step of the levels, fitted to the time to land on:
             // equal steps to it, each with the levels of its own length
-            let ssp = self.integrator.baroclinic_scheme().ssp_coefficient();
+            let scheme = self.integrator.baroclinic_scheme();
             let mut dt = crate::profiling::scope("step: compute_dt", || {
                 if self.integrator.baroclinic_levels() == 0 {
-                    return self.physics.compute_dt_ssp(state, self.config.cfl, ssp);
+                    return self.physics.compute_dt_ssp(state, self.config.cfl, scheme);
                 }
                 self.element_dt.resize(state.n_elements, 0.0);
-                self.physics
-                    .element_steps_into(state, self.config.cfl, ssp, &mut self.element_dt);
+                self.physics.element_steps_into(
+                    state,
+                    self.config.cfl,
+                    scheme,
+                    &mut self.element_dt,
+                );
                 let stencils = self.physics.stage_stencils();
                 self.integrator.assign_baroclinic_levels(
                     state,
@@ -2740,7 +2744,7 @@ mod tests {
         let scheme = SspScheme::Rk43;
         let cfl = 0.5;
         let mut element_dt = vec![0.0; physics.mesh.n_elements];
-        physics.element_steps_into(&state, cfl, scheme.ssp_coefficient(), &mut element_dt);
+        physics.element_steps_into(&state, cfl, scheme, &mut element_dt);
         let finite = || element_dt.iter().copied().filter(|dt| dt.is_finite());
         let smallest = finite().fold(f64::INFINITY, f64::min);
         let largest = finite().fold(0.0, f64::max);
@@ -3472,9 +3476,22 @@ mod tests {
         hours: &[f64],
         dt: f64,
     ) -> (Vec<f64>, usize) {
+        basin_at_rest_with(SspScheme::Rk3, mesh, bed, bound, rho, hours, dt)
+    }
+
+    /// [`basin_at_rest`] with the 3D stages of `scheme`.
+    fn basin_at_rest_with(
+        scheme: SspScheme,
+        mesh: Mesh2D,
+        bed: impl Fn(f64, f64) -> f64,
+        bound: Option<ElementSlopeBound>,
+        rho: impl Fn(f64) -> f64 + Copy,
+        hours: &[f64],
+        dt: f64,
+    ) -> (Vec<f64>, usize) {
         let (physics, mut state) = basin_physics(mesh, bed, bound, rho);
         let nn = state.n_nodes;
-        let mut integrator = ModeSplitIntegrator::new();
+        let mut integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(scheme);
         let mut n = 0;
         let mut speeds = Vec::with_capacity(hours.len());
         for &until in hours {
@@ -3802,38 +3819,58 @@ mod tests {
     /// the unsmoothed cliff. About a reference the scheme carries in full
     /// the frequency `N |∇_σ z|` of a stratification displaced along a
     /// sloping level (the chords of the full-density scheme carried less of
-    /// it): the 15 → 300 m cliff holds at steps of 36 and 60 s and blows up
-    /// at 90 s, where the full-density scheme ran at 180 s (and grew its
-    /// round-off). [`Hydrostatic3D::compute_dt`] bounds it
-    /// ([`TimeStepLimits::sloping_levels`]): 27.4 s in the cliff's element,
+    /// it): the 15 → 300 m cliff holds SSP-RK3 at steps of 36 and 60 s and
+    /// blows up at 72 s, where the full-density scheme ran at 180 s (and
+    /// grew its round-off). [`Hydrostatic3D::compute_dt_ssp`] bounds it
+    /// ([`TimeStepLimits::sloping_levels`]) at
+    /// [`Hydrostatic3D::SLOPING_LEVEL_MARGIN`] of the scheme's reach along
+    /// the imaginary axis over the cliff element's measured frequency,
     /// whatever the Courant number, where advection and the internal waves'
     /// WKB speed allow 161 s at Courant number 1; the local steps take it
     /// too. No such bound without a reference. At the model's step the rest
-    /// state holds (2 h here, measured 1.7e-12 m/s; at
-    /// 72 s it blows up within the hour).
+    /// state holds with either scheme (2 h here).
     #[test]
     fn the_models_step_holds_the_reference_over_a_cliff() {
         let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
         let mesh = || Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
         let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
         let (physics, rest) = basin_physics(mesh(), bed, None, pycnocline);
-        let limits = physics.time_step_limits(&rest, 1.0);
-        let bound = limits.sloping_levels;
-        assert_eq!(bound.element, 3, "the cliff's element binds");
-        assert!((25.0..30.0).contains(&bound.dt), "bound {} s", bound.dt);
-        assert!(limits.advection.dt > 150.0, "{:?}", limits.advection);
-        let dt = physics.compute_dt(&rest, 1.0);
-        assert_eq!(dt, bound.dt, "the model's step is the bound");
-        let mut steps = vec![0.0; rest.n_elements];
-        physics.element_steps_into(&rest, 1.0, 1.0, &mut steps);
-        assert_eq!(steps[3], bound.dt, "the cliff's own step");
-        assert!(steps[0] > 150.0, "the flat bed's step {} s", steps[0]);
+        let mut bounds = [0.0; 2];
+        for (scheme, bound_dt) in [SspScheme::Rk3, SspScheme::Rk43]
+            .into_iter()
+            .zip(&mut bounds)
+        {
+            let limits = physics.time_step_limits(&rest, 1.0, scheme);
+            let bound = limits.sloping_levels;
+            assert_eq!(bound.element, 3, "the cliff's element binds");
+            assert!(limits.advection.dt > 150.0, "{:?}", limits.advection);
+            let dt = physics.compute_dt_ssp(&rest, 1.0, scheme);
+            assert_eq!(dt, bound.dt, "the model's step is the bound");
+            let mut steps = vec![0.0; rest.n_elements];
+            physics.element_steps_into(&rest, 1.0, scheme, &mut steps);
+            assert_eq!(steps[3], bound.dt, "the cliff's own step");
+            assert!(steps[0] > 150.0, "the flat bed's step {} s", steps[0]);
 
-        let speed = basin_at_rest(mesh(), bed, None, pycnocline, &[2.0], dt).0[0];
-        assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s at {dt} s");
+            let speed = basin_at_rest_with(scheme, mesh(), bed, None, pycnocline, &[2.0], dt).0[0];
+            println!("{scheme:?}: {speed:.3e} m/s after 2 h at the model's {dt:.2} s");
+            assert!(
+                speed < 1e-9,
+                "{scheme:?}: the cliff spun up {speed:.3e} m/s at {dt} s"
+            );
+            *bound_dt = bound.dt;
+        }
+        // SSP-RK3 below the 60 s that hold and well above the 27.4 s of
+        // `ω Δt ≤ 1` with the pairs' bound; SSP-RK(4,3) by its longer reach
+        let [rk3, rk43] = bounds;
+        assert!((40.0..60.0).contains(&rk3), "SSP-RK3's bound {rk3} s");
+        let reach = SspScheme::Rk43.imaginary_axis_limit() / SspScheme::Rk3.imaginary_axis_limit();
+        assert!(
+            (rk43 / rk3 - reach).abs() < 1e-12,
+            "{rk43} s against {rk3} s"
+        );
 
         let plain = physics.without_reference_profile();
-        let limits = plain.time_step_limits(&rest, 1.0);
+        let limits = plain.time_step_limits(&rest, 1.0, SspScheme::Rk3);
         assert_eq!(limits.sloping_levels.dt, f64::INFINITY);
         assert!(plain.compute_dt(&rest, 1.0) > 150.0);
     }
@@ -3988,10 +4025,81 @@ mod tests {
             let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
             let bed = |x: f64, _| step_bed(x, 3, left, right);
             let (physics, rest) = basin_physics(mesh, bed, None, pycnocline);
-            println!("{name}: {:?}", physics.time_step_limits(&rest, 1.0));
+            for scheme in [SspScheme::Rk3, SspScheme::Rk43] {
+                let limits = physics.time_step_limits(&rest, 1.0, scheme);
+                println!("{name}, {scheme:?}: {limits:?}");
+            }
         }
         let (physics, rest) = terrace_patch_physics(None);
-        println!("terrace: {:?}", physics.time_step_limits(&rest, 1.0));
+        for scheme in [SspScheme::Rk3, SspScheme::Rk43] {
+            let limits = physics.time_step_limits(&rest, 1.0, scheme);
+            println!("terrace, {scheme:?}: {limits:?}");
+        }
+        // What the bounds cost beside a step, where no element's frequency
+        // is measured (Courant number 1) and where every steep one's is
+        // (a Courant number that lets the sloping levels set the step)
+        for cfl in [1.0, 40.0] {
+            let calls = 200;
+            let start = std::time::Instant::now();
+            let mut dt = 0.0;
+            for _ in 0..calls {
+                dt = std::hint::black_box(physics.compute_dt_ssp(&rest, cfl, SspScheme::Rk43));
+            }
+            let bounds = start.elapsed().as_secs_f64() / calls as f64;
+            let mut state = rest.clone();
+            let mut integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(SspScheme::Rk43);
+            let steps = 20;
+            let start = std::time::Instant::now();
+            for n in 0..steps {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, &physics, 5.0, n as f64 * 5.0);
+                physics.post_process(&mut state);
+            }
+            let step = start.elapsed().as_secs_f64() / steps as f64;
+            println!(
+                "terrace, Courant number {cfl}: the bounds take {:.1} µs ({dt:.2} s), a step \
+                 {:.1} µs: {:.2} %",
+                1e6 * bounds,
+                1e6 * step,
+                100.0 * bounds / step
+            );
+        }
+    }
+
+    /// Probe (TODO P1.3): where the rest state over the 15 → 300 m cliff
+    /// stops holding, as a share of the scheme's reach along the imaginary
+    /// axis over the cliff element's measured frequency (the model takes
+    /// [`Hydrostatic3D::SLOPING_LEVEL_MARGIN`] of it).
+    #[test]
+    #[ignore = "probe: the largest step that holds the reference over the cliff"]
+    fn probe_sloping_level_step() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let mesh = || Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+        let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
+        let hours: f64 = env_or("DGRS_HOURS", 6.0);
+        for scheme in [SspScheme::Rk3, SspScheme::Rk43] {
+            let (physics, rest) = basin_physics(mesh(), bed, None, pycnocline);
+            let limits = physics.time_step_limits(&rest, 1.0, scheme);
+            let reach = limits.sloping_levels.dt / Physics::SLOPING_LEVEL_MARGIN;
+            println!(
+                "{scheme:?}: the model's step {:.2} s, the scheme's reach {reach:.2} s \
+                 (frequency {:.4e} 1/s)",
+                limits.sloping_levels.dt,
+                scheme.imaginary_axis_limit() / reach
+            );
+            for share in [0.85, 0.95, 1.0, 1.05, 1.15, 1.3] {
+                let dt = share * reach;
+                let run = std::panic::catch_unwind(|| {
+                    basin_at_rest_with(scheme, mesh(), bed, None, pycnocline, &[hours], dt).0[0]
+                });
+                match run {
+                    Ok(speed) => println!(
+                        "{scheme:?}, {share} of the reach ({dt:.2} s): {speed:.3e} m/s at {hours} h"
+                    ),
+                    Err(_) => println!("{scheme:?}, {share} of the reach ({dt:.2} s): stopped"),
+                }
+            }
+        }
     }
 
     /// TODO P1.3 gate, the property the gates above stand on: the
@@ -4697,18 +4805,30 @@ mod tests {
     /// ([`EnergyCoordinates`]): the Ritz values then lie in the map's
     /// numerical range in that norm, and the largest singular value of the
     /// Arnoldi matrix is the largest growth of the pseudo-energy's root over
-    /// the horizon among the Krylov vectors.
+    /// the horizon among the Krylov vectors. Steps of `DGRS_DT` (5 s; 0 for
+    /// the model's own at Courant number 1) with the 3D stages of `DGRS_RK`
+    /// (3, or 43 for SSP-RK(4,3)).
     fn print_spectrum(physics: &Physics, rest: &Solution3D, label: &str) {
         let weight = env_or("DGRS_WEIGHT", 0.5);
         let horizon = env_or("DGRS_SPECTRUM_SECONDS", 1800.0);
         let m = env_or("DGRS_KRYLOV", 30.0) as usize;
-        let dt = env_or("DGRS_DT", 5.0);
+        let scheme = match env_or("DGRS_RK", 3.0) as usize {
+            3 => SspScheme::Rk3,
+            43 => SspScheme::Rk43,
+            other => panic!("DGRS_RK is 3 or 43, not {other}"),
+        };
+        let mut dt = env_or("DGRS_DT", 5.0);
+        if dt == 0.0 {
+            dt = physics.compute_dt_ssp(rest, 1.0, scheme);
+            let limits = physics.last_time_step_limits().expect("limits");
+            println!("{label}: the model's step {dt:.3} s with {scheme:?} ({limits:?})");
+        }
         let steps = (horizon / dt).round() as usize;
         // The step map over the horizon, from a fresh integrator each time
         let advance = |x: &[f64]| -> Vec<f64> {
             let mut state = rest.clone();
             unpack(x, &mut state);
-            let mut integrator = ModeSplitIntegrator::new();
+            let mut integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(scheme);
             for n in 0..steps {
                 physics.update_density(&mut state);
                 integrator.step(&mut state, physics, dt, n as f64 * dt);

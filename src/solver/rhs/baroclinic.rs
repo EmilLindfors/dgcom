@@ -1419,6 +1419,7 @@ impl ReferenceFields {
     /// element's displacement adds a term of rank one to `B`, which this
     /// bound does not count; the gate measures the bound against the
     /// operator with it (1.2 to 1.5 times its largest singular value).
+    /// [`Self::sloping_level_frequency`] measures that value.
     ///
     /// Along a subcell interface between the columns `a` and `b` every layer
     /// carries its share of one flux, `Δσ_l w ½ m·(Q̄_a + Q̄_b)`, so the
@@ -1559,6 +1560,185 @@ impl ReferenceFields {
             columns = columns.max(0.5 * (own_x + column.0).max(own_y + column.1));
         }
         (rows * columns).sqrt()
+    }
+
+    /// The largest frequency (1/s) of the reference's waves along the
+    /// σ-levels of element `k`, measured: the largest singular value of the
+    /// element's operator `B` of [`Self::sloping_level_rate`] with the
+    /// element's displacement in it, by power iteration on `BᵀB` (from
+    /// below; to 0.03 % between two iterations, 40 at most: within 1 % of
+    /// it on the gate's elements). `None` for an
+    /// element with a column thinner than `min_column_depth`, whose flow
+    /// along the interfaces is the barotropic pass's. `scratch` holds five
+    /// numbers per node and level.
+    ///
+    /// `B` is applied pair by pair as [`add_reference_advection`] applies it
+    /// at rest in the reference, in the pseudo-energy's coordinates with
+    /// `g/ρ₀` (`buoyancy`) taken into `n = √((g/ρ₀) Γ⁺)`: with a velocity
+    /// `v` in them, the pair `(i, j)` on level `l` carries the half flux
+    ///
+    /// ```text
+    ///     h = ½ √Δσ_l [√(m_i D_i) D_ij·v_i − √(m_j D_j) D_ji·v_j]
+    /// ```
+    ///
+    /// and makes `n_a (z_j − z_i) h / √(m_a D_a Δσ_l)` at each end `a`, the
+    /// tangent's advection. The displacement takes back, in the shape `s`
+    /// of [`add_reference_advection`]'s last step (`g` or 1),
+    ///
+    /// ```text
+    ///     −s_a n_a √(m_a D_a Δσ_l) / W  ·  Σ_pairs h e,
+    ///     e = 2 (ρ̄_j − ρ̄_i) + (Γ_i + Γ_j)(z_j − z_i),     W = Σ m D Δσ Γ⁺ s,
+    /// ```
+    ///
+    /// the density the tangents' errors of `T̄` and `S̄` add up to along the
+    /// edge (with the equation of state's partials taken as one along it:
+    /// exact for a linear one; the force's displacement term,
+    /// [`Self::set_displacements`], is this one's transpose as it stands).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sloping_level_frequency(
+        &self,
+        state: &Solution3D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        bathymetry: &Bathymetry2D,
+        sigma: &SigmaGrid,
+        buoyancy: f64,
+        min_column_depth: f64,
+        metric: MetricForm,
+        k: usize,
+        scratch: &mut [f64],
+    ) -> Option<f64> {
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        assert!(nl <= MAX_LEVELS, "at most {MAX_LEVELS} levels, not {nl}");
+        let eta = |i: usize| state.eta.data[k * nn + i];
+        let depth = |i: usize| state.eta.data[k * nn + i] - bathymetry.data[k * nn + i];
+        if !(0..nn).all(|i| depth(i) >= min_column_depth) {
+            return None;
+        }
+        let (sigma_rho, d_sigma) = (sigma.sigma_rho(), sigma.d_sigma());
+        let block = k * nn * nl..(k + 1) * nn * nl;
+        let stratification = &self.stratification[block.clone()];
+        let density = &self.density[block.clone()];
+        let residual = &self.residual[block];
+        let per_element = nn * nl;
+        let (velocity, rest) = scratch[..5 * per_element].split_at_mut(2 * per_element);
+        let (vx, vy) = velocity.split_at_mut(per_element);
+        let (anomaly, rest) = rest.split_at_mut(per_element);
+        // n / √(m D) of every row, and the displacement's s n √(m D Δσ) / W
+        let (tangent, taken) = rest.split_at_mut(per_element);
+        let (mut weight, mut scale, mut mean_weight) = (0.0, 0.0, 0.0);
+        for i in 0..nn {
+            let volume = geom.node_mass(k, i) * depth(i);
+            for l in 0..nl {
+                let gamma = stratification[i * nl + l].max(0.0);
+                tangent[i * nl + l] = (buoyancy * gamma / volume).sqrt();
+                weight += volume * d_sigma[l] * gamma * residual[i * nl + l];
+                scale += volume * d_sigma[l] * gamma * gamma;
+                mean_weight += volume * d_sigma[l] * gamma;
+            }
+        }
+        if mean_weight <= 0.0 {
+            return Some(0.0);
+        }
+        let shaped = has_residual(weight, scale);
+        let weight = if shaped { weight } else { mean_weight };
+        for i in 0..nn {
+            let volume = geom.node_mass(k, i) * depth(i);
+            for l in 0..nl {
+                let c = i * nl + l;
+                let shape = if shaped { residual[c] } else { 1.0 };
+                taken[c] = shape * tangent[c] * volume * d_sigma[l].sqrt() / weight;
+            }
+        }
+        let averaged = metric.averaged_on(geom, k);
+        let apart = |a: usize, b: usize| ops.dr[(a, b)] == 0.0 && ops.ds[(a, b)] == 0.0;
+        // Every pair's (i, j, ½ √(m_i D_i) D_ij, ½ √(m_j D_j) D_ji, η_j − η_i,
+        // D_j − D_i)
+        let pairs = || {
+            (0..nn).flat_map(move |i| {
+                (i + 1..nn)
+                    .filter(move |&j| !(apart(i, j) && apart(j, i)))
+                    .map(move |j| {
+                        let [(dx_ij, dy_ij), (dx_ji, dy_ji)] =
+                            pair_derivatives(ops, geom, k, i, j, averaged);
+                        let at_i = 0.5 * (geom.node_mass(k, i) * depth(i)).sqrt();
+                        let at_j = 0.5 * (geom.node_mass(k, j) * depth(j)).sqrt();
+                        (
+                            (i, j),
+                            (at_i * dx_ij, at_i * dy_ij),
+                            (at_j * dx_ji, at_j * dy_ji),
+                            (eta(j) - eta(i), depth(j) - depth(i)),
+                        )
+                    })
+            })
+        };
+        // e √Δσ of a pair on level l
+        let mut root = [0.0; MAX_LEVELS];
+        for (root, ds) in root.iter_mut().zip(d_sigma) {
+            *root = ds.sqrt();
+        }
+        let error = |i: usize, j: usize, l: usize, dz: f64| {
+            let (a, c) = (i * nl + l, j * nl + l);
+            root[l]
+                * (2.0 * (density[c] - density[a]) + (stratification[a] + stratification[c]) * dz)
+        };
+        // v ← Bᵀ r
+        let transpose = |anomaly: &[f64], vx: &mut [f64], vy: &mut [f64]| {
+            vx.fill(0.0);
+            vy.fill(0.0);
+            let moved: f64 = taken.iter().zip(anomaly).map(|(t, r)| t * r).sum();
+            for ((i, j), (ax, ay), (bx, by), (d_eta, d_depth)) in pairs() {
+                for l in 0..nl {
+                    let (a, c) = (i * nl + l, j * nl + l);
+                    let dz = d_eta + sigma_rho[l] * d_depth;
+                    let w = (tangent[a] * anomaly[a] + tangent[c] * anomaly[c]) * dz
+                        - moved * error(i, j, l, dz);
+                    vx[a] += ax * w;
+                    vy[a] += ay * w;
+                    vx[c] -= bx * w;
+                    vy[c] -= by * w;
+                }
+            }
+        };
+        // Start from the anomaly n: every stratified row, in phase
+        for (r, &gamma) in anomaly.iter_mut().zip(stratification) {
+            *r = (buoyancy * gamma.max(0.0)).sqrt();
+        }
+        transpose(anomaly, vx, vy);
+        let norm = |x: &[f64]| x.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let mut frequency = 0.0_f64;
+        for iteration in 0..40 {
+            let length = (norm(vx).powi(2) + norm(vy).powi(2)).sqrt();
+            if length == 0.0 {
+                return Some(frequency);
+            }
+            vx.iter_mut()
+                .chain(vy.iter_mut())
+                .for_each(|v| *v /= length);
+            // r ← B v
+            anomaly.fill(0.0);
+            let mut made = 0.0;
+            for ((i, j), (ax, ay), (bx, by), (d_eta, d_depth)) in pairs() {
+                for l in 0..nl {
+                    let (a, c) = (i * nl + l, j * nl + l);
+                    let half = (ax * vx[a] + ay * vy[a]) - (bx * vx[c] + by * vy[c]);
+                    let dz = d_eta + sigma_rho[l] * d_depth;
+                    anomaly[a] += tangent[a] * dz * half;
+                    anomaly[c] += tangent[c] * dz * half;
+                    made += half * error(i, j, l, dz);
+                }
+            }
+            for (r, t) in anomaly.iter_mut().zip(&*taken) {
+                *r -= t * made;
+            }
+            let last = frequency;
+            frequency = norm(anomaly);
+            if iteration >= 2 && (frequency - last).abs() <= 3e-4 * frequency {
+                break;
+            }
+            transpose(anomaly, vx, vy);
+        }
+        Some(frequency)
     }
 }
 
@@ -2606,7 +2786,14 @@ mod tests {
     /// over 100 m) it is a larger part: the bound is then 1.07 to 1.54 times
     /// the frequency here, and the review of 2026-11-21 measured 0.97 for
     /// one such reference, so the gate allows the frequency 10 % over the
-    /// bound there. The step takes `ω Δt ≤ 1`, where SSP-RK3 holds to `√3`.
+    /// bound there.
+    ///
+    /// The step does not take the bound where it could bind but the
+    /// frequency itself ([`ReferenceFields::sloping_level_frequency`], the
+    /// same operator applied pair by pair, displacement and all): within
+    /// 1 % of the kernels' here (measured 0.4 % at most), under both
+    /// references. The bound decides which elements are measured, and is
+    /// the step's own in an element with a thin column.
     #[test]
     fn the_sloping_level_rate_bounds_the_pairs_frequency() {
         // A smooth reference too (T̄ exponential over 100 m): the element's
@@ -2811,7 +2998,7 @@ mod tests {
                 }
                 frequency
             };
-            let mut scratch = vec![0.0; 5 * nn];
+            let mut scratch = vec![0.0; 5 * per_element];
             let (mut steep, mut shores) = (0, 0);
             for k in 0..ne {
                 let bound = fields.sloping_level_rate(
@@ -2826,6 +3013,19 @@ mod tests {
                     k,
                     &mut scratch,
                 );
+                let measured = fields.sloping_level_frequency(
+                    &state,
+                    &ops,
+                    &geom,
+                    &bathymetry,
+                    &sigma,
+                    G / RHO0,
+                    0.1,
+                    metric,
+                    k,
+                    &mut scratch,
+                );
+                assert_eq!(measured.is_some(), wet(k), "element {k}");
                 let b = &b[k * per_element * columns..(k + 1) * per_element * columns];
                 if !wet(k) {
                     assert!(b.iter().all(|&x| x == 0.0), "pairs act in element {k}");
@@ -2849,11 +3049,20 @@ mod tests {
                     continue;
                 }
                 let frequency = largest(b, columns);
+                let measured = measured.expect("no thin column");
                 println!(
                     "distortion {distort}, {metric:?}, {} reference, element {k}: frequency \
-                     {frequency:.4e} 1/s, bound {bound:.4e} ({:.2})",
+                     {frequency:.4e} 1/s, measured {measured:.4e} ({:.4}), bound {bound:.4e} \
+                     ({:.2})",
                     if sharp { "thermocline" } else { "smooth" },
+                    measured / frequency,
                     bound / frequency
+                );
+                // The step's own measurement is the kernels' frequency: the
+                // same operator, displacement and all, from below
+                assert!(
+                    (measured - frequency).abs() <= 1e-2 * frequency.max(1e-6),
+                    "element {k}: measured {measured:.6e}, the kernels' {frequency:.6e}"
                 );
                 // The bound is the pairs': the element's displacement, a
                 // term of rank one, is not in it. Under a thermocline the

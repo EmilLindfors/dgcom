@@ -487,7 +487,7 @@ impl CaseFile {
             ));
         }
         let mut steps = vec![0.0; domain.mesh.n_elements];
-        let scheme = ssp(d.scheme).ssp_coefficient();
+        let scheme = ssp(d.scheme);
         sim.physics()
             .element_steps_into(&state, d.cfl(), scheme, &mut steps);
         notes.extend(describe_element_steps(&steps, d.dt_max_s).map(|steps| {

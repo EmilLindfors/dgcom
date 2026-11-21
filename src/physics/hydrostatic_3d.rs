@@ -104,7 +104,7 @@ use crate::solver::{
 };
 use crate::source::{CageDrag2D, CageNode, CoriolisSource2D, RiverSources};
 use crate::time::multirate::RhsStencil;
-use crate::time::{ModeSplitPhysics, StageElements, StageStash, StepDrag};
+use crate::time::{ModeSplitPhysics, SspScheme, StageElements, StageStash, StepDrag};
 use crate::types::ElementIndex;
 use crate::vertical::{MeanProfile, SigmaGrid};
 
@@ -288,22 +288,28 @@ impl TimeStepLimit {
     }
 }
 
-/// The bounds of [`Hydrostatic3D::compute_dt`].
+/// The bounds of [`Hydrostatic3D::compute_dt_ssp`]
+/// ([`Hydrostatic3D::time_step_limits`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TimeStepLimits {
     /// Horizontal advection and internal waves.
     pub advection: TimeStepLimit,
-    /// Vertical advection, `|Ω|Δt/H_z ≤ 1` (not applied with
+    /// Vertical advection, `|Ω|Δt/H_z ≤ 1`: the forward-Euler bound, which
+    /// the step takes times the scheme's SSP coefficient (not applied with
     /// [`Hydrostatic3D::with_implicit_vertical_advection`]).
     pub vertical: TimeStepLimit,
     /// Coriolis, `|f|Δt ≤ 1`.
     pub coriolis: TimeStepLimit,
     /// The reference stratification's internal waves along sloping
-    /// σ-levels, `ω Δt ≤ 1` with `ω` the bound of
-    /// [`ReferenceFields::sloping_level_rate`] on `N |∇_σ z|` (none without
-    /// a reference profile, [`Hydrostatic3D::with_reference_profile`]; in an
-    /// element with a thin column, along the subcell interfaces between its
-    /// other columns).
+    /// σ-levels, `ω ≈ N |∇_σ z|`, as the scheme the limits were asked for
+    /// takes them ([`Hydrostatic3D::SLOPING_LEVEL_MARGIN`] of its
+    /// imaginary-axis limit over the element's frequency; none without a
+    /// reference profile, [`Hydrostatic3D::with_reference_profile`]). The
+    /// frequency is measured ([`ReferenceFields::sloping_level_frequency`])
+    /// in the elements whose bound
+    /// ([`ReferenceFields::sloping_level_rate`]) could set the step, so
+    /// this is the step's bound where it binds and a lower estimate of it
+    /// where it does not.
     pub sloping_levels: TimeStepLimit,
     /// Horizontal viscosity.
     pub viscosity: TimeStepLimit,
@@ -1787,31 +1793,104 @@ where
     /// - Coriolis, `|f| Δt ≤ 1` (SSP-RK3 is stable on the imaginary axis up
     ///   to √3, SSP-RK(4,3) up to 2.16);
     /// - with a reference profile ([`Self::with_reference_profile`]), its
-    ///   internal waves along sloping σ-levels, `ω Δt ≤ 1` with
-    ///   `ω ≈ N |∇_σ z|` bounded by [`ReferenceFields::sloping_level_rate`]
-    ///   (imaginary too): the flow along a level that crosses the
-    ///   stratification displaces it by the level's rise, and the anomaly's
-    ///   pressure gradient pushes back. The advection that is the pressure
-    ///   gradient's adjoint carries this frequency in full; a 285 m cliff
-    ///   over 500 m under `N = 0.05 s⁻¹` allows 60 s, not 90 s;
+    ///   internal waves along sloping σ-levels, `ω ≈ N |∇_σ z|` (imaginary
+    ///   too): the flow along a level that crosses the stratification
+    ///   displaces it by the level's rise, and the anomaly's pressure
+    ///   gradient pushes back. The advection that is the pressure gradient's
+    ///   adjoint carries this frequency in full, and the step keeps `ω Δt`
+    ///   within [`Self::SLOPING_LEVEL_MARGIN`] of the scheme's reach along
+    ///   the imaginary axis ([`SspScheme::imaginary_axis_limit`]) with the
+    ///   element's measured frequency
+    ///   ([`ReferenceFields::sloping_level_frequency`]); a 285 m cliff over
+    ///   500 m under `N = 0.05 s⁻¹` allows SSP-RK3 60 s, not 90 s. In an
+    ///   element with a thin column the flow along the subcell interfaces is
+    ///   the barotropic pass's, not the stages': `ω Δt ≤ 1` there, with the
+    ///   bound of [`ReferenceFields::sloping_level_rate`] (about three times
+    ///   the frequency);
     /// - the horizontal viscosity, by the BR1 spectral radius.
     ///
     /// Thin columns are left to the 2D module (a domain of thin columns
     /// only gets 1 s).
     pub fn compute_dt(&self, state: &Solution3D, cfl: f64) -> f64 {
-        self.compute_dt_ssp(state, cfl, 1.0)
+        self.compute_dt_ssp(state, cfl, SspScheme::Rk3)
     }
 
-    /// [`Self::compute_dt`] for 3D stages of an SSP scheme with coefficient
-    /// `ssp` (1 for SSP-RK3, 2 for SSP-RK(4,3),
-    /// [`crate::time::SspScheme::ssp_coefficient`]):
-    /// the vertical advection's bound is a forward-Euler one (the stages'
-    /// upwind-limited reconstruction), so it holds for `ssp` times its step.
-    /// `cfl` sets the horizontal one, which is linear in the DG elements and
-    /// a forward-Euler (positivity) bound in the subcell elements: raise it
-    /// with the scheme (see `ModeSplitIntegrator::with_baroclinic_scheme`).
-    pub fn compute_dt_ssp(&self, state: &Solution3D, cfl: f64, ssp: f64) -> f64 {
-        let limits = self.time_step_limits(state, cfl);
+    /// The share of the scheme's reach along the imaginary axis
+    /// ([`SspScheme::imaginary_axis_limit`]) that the step takes of the
+    /// reference's waves along sloping levels: `ω Δt` at most this times
+    /// `√3` (SSP-RK3) or 2.156 (SSP-RK(4,3)). The rest is for what the
+    /// element's frequency does not count: the splitting from the
+    /// barotropic pass, the faces, a nonlinear equation of state, and the
+    /// power iteration's approach from below.
+    pub const SLOPING_LEVEL_MARGIN: f64 = 0.85;
+
+    /// How far from setting the step an element's bound on its sloping
+    /// levels' frequency has to be for the frequency not to be measured:
+    /// the bound is the pairs' (1.2 to 1.5 times their frequency) and does
+    /// not count the element's displacement, which has put the frequency
+    /// up to 3 % above it under a smooth reference.
+    const SLOPING_LEVEL_SLACK: f64 = 1.5;
+
+    /// The step element `k`'s sloping levels allow `scheme`, given the
+    /// bound `rate` on their frequency
+    /// ([`ReferenceFields::sloping_level_rate`]): with the measured
+    /// frequency if the bound comes within [`Self::SLOPING_LEVEL_SLACK`] of
+    /// the step `needed` of it (the step the other bounds allow), with the
+    /// bound itself otherwise (a shorter step than the element allows, and
+    /// longer than `needed`). `scratch` holds five numbers per node and
+    /// level.
+    #[allow(clippy::too_many_arguments)]
+    fn sloping_level_step(
+        &self,
+        state: &Solution3D,
+        k: usize,
+        reference: &ReferenceFields,
+        rate: f64,
+        scheme: SspScheme,
+        needed: f64,
+        scratch: &mut [f64],
+    ) -> f64 {
+        if rate == 0.0 {
+            return f64::INFINITY;
+        }
+        // A thin column: the barotropic pass's flow, on the bound
+        let nn = state.n_nodes;
+        if (0..nn).any(|i| self.is_thin(state, k * nn + i)) {
+            return 1.0 / rate;
+        }
+        let limit = Self::SLOPING_LEVEL_MARGIN * scheme.imaginary_axis_limit();
+        if limit / rate >= Self::SLOPING_LEVEL_SLACK * needed {
+            return limit / rate;
+        }
+        let frequency = reference
+            .sloping_level_frequency(
+                state,
+                &self.ops,
+                &self.geom,
+                &self.bathymetry,
+                &self.sigma,
+                self.g / self.rho0,
+                self.min_column_depth,
+                self.metric_form(),
+                k,
+                scratch,
+            )
+            .expect("no thin column");
+        limit / frequency
+    }
+
+    /// [`Self::compute_dt`] for 3D stages of the SSP scheme `scheme`: the
+    /// vertical advection's bound is a forward-Euler one (the stages'
+    /// upwind-limited reconstruction), so it holds for the scheme's SSP
+    /// coefficient times its step
+    /// ([`SspScheme::ssp_coefficient`]: 1 for SSP-RK3, 2 for SSP-RK(4,3)),
+    /// and the sloping levels' is the scheme's reach along the imaginary
+    /// axis. `cfl` sets the horizontal one, which is linear in the DG
+    /// elements and a forward-Euler (positivity) bound in the subcell
+    /// elements: raise it with the scheme (see
+    /// `ModeSplitIntegrator::with_baroclinic_scheme`).
+    pub fn compute_dt_ssp(&self, state: &Solution3D, cfl: f64, scheme: SspScheme) -> f64 {
+        let limits = self.time_step_limits(state, cfl, scheme);
         let mut dt = limits
             .advection
             .dt
@@ -1819,7 +1898,7 @@ where
             .min(limits.sloping_levels.dt)
             .min(limits.viscosity.dt);
         if self.implicit_vertical_advection.is_none() {
-            dt = dt.min(ssp * limits.vertical.dt);
+            dt = dt.min(scheme.ssp_coefficient() * limits.vertical.dt);
         }
         *self
             .last_time_step_limits
@@ -1931,58 +2010,72 @@ where
     /// 3 m/s sound, on its own bound, blew the tide up within four coarse
     /// steps). Infinite for an element of thin columns only with no wet
     /// neighbour, which no 3D bound limits.
-    pub fn element_steps_into(&self, state: &Solution3D, cfl: f64, ssp: f64, out: &mut [f64]) {
+    pub fn element_steps_into(
+        &self,
+        state: &Solution3D,
+        cfl: f64,
+        scheme: SspScheme,
+        out: &mut [f64],
+    ) {
         let ne = self.mesh.n_elements;
         assert_eq!(out.len(), ne, "one step per element");
         let order_factor = (self.ops.order as f64 + 1.0).powi(2);
         let explicit_vertical = self.implicit_vertical_advection.is_none();
+        let ssp = scheme.ssp_coefficient();
         // Each element's rates once: its advective bound, and its vertical
         // rate for the pass below
         let (mut vertical, mut sloping_levels) = (vec![0.0; ne], vec![0.0; ne]);
-        let nn = state.n_nodes;
+        let scratch = 5 * state.n_nodes * state.n_levels;
         self.with_reference_fields(state, |reference| {
             for_each_block(
                 ne,
                 [&mut out[..], &mut vertical[..], &mut sloping_levels[..]],
-                || vec![0.0; 5 * nn],
+                || vec![0.0; scratch],
                 |scratch, k, [dt, vertical, sloping_levels]| {
                     let rates = self.element_rates(state, k, reference, scratch);
                     dt[0] = cfl / rates.wave / order_factor;
                     vertical[0] = rates.vertical;
                     sloping_levels[0] = rates.sloping_levels;
                 },
-            )
+            );
+            // The advective bound over the face neighbours too, then the
+            // element's own others
+            let own = out.to_vec();
+            for_each_block(
+                ne,
+                [&mut out[..]],
+                || vec![0.0; scratch],
+                |scratch, k, [dt]| {
+                    let el = ElementIndex::new(k);
+                    let mut bound = (0..4)
+                        .filter_map(|face| self.mesh.neighbor(el, face))
+                        .map(|nb| own[nb.element])
+                        .fold(own[k], f64::min);
+                    let f = self
+                        .mesh
+                        .element_vertices(el)
+                        .iter()
+                        .map(|&[_, y]| self.coriolis.f_at(y).abs())
+                        .fold(0.0, f64::max);
+                    // The vertical advection's Courant number: one where it
+                    // is explicit, a few where its excess is implicit
+                    let courant = if explicit_vertical {
+                        1.0
+                    } else {
+                        Self::LOCAL_STEP_IMPLICIT_COURANT
+                    };
+                    bound = bound.min(1.0 / f).min(courant * ssp * (1.0 / vertical[k]));
+                    if let Some(reference) = reference {
+                        let rate = sloping_levels[k];
+                        bound =
+                            bound.min(self.sloping_level_step(
+                                state, k, reference, rate, scheme, bound, scratch,
+                            ));
+                    }
+                    dt[0] = bound;
+                },
+            );
         });
-        // The advective bound over the face neighbours too, then the
-        // element's own others
-        let own = out.to_vec();
-        for_each_block(
-            ne,
-            [&mut out[..]],
-            || (),
-            |_, k, [dt]| {
-                let el = ElementIndex::new(k);
-                let mut bound = (0..4)
-                    .filter_map(|face| self.mesh.neighbor(el, face))
-                    .map(|nb| own[nb.element])
-                    .fold(own[k], f64::min);
-                let f = self
-                    .mesh
-                    .element_vertices(el)
-                    .iter()
-                    .map(|&[_, y]| self.coriolis.f_at(y).abs())
-                    .fold(0.0, f64::max);
-                bound = bound.min(1.0 / f).min(1.0 / sloping_levels[k]);
-                // The vertical advection's Courant number: one where it is
-                // explicit, a few where its excess is implicit
-                let courant = if explicit_vertical {
-                    1.0
-                } else {
-                    Self::LOCAL_STEP_IMPLICIT_COURANT
-                };
-                dt[0] = bound.min(courant * ssp * (1.0 / vertical[k]));
-            },
-        );
         if !self.horizontal_viscosity.is_zero() {
             self.viscous_element_steps_into(state, cfl, out);
         }
@@ -2052,44 +2145,53 @@ where
             .collect()
     }
 
-    /// Each bound of [`Self::compute_dt`] at Courant number `cfl`, and the
-    /// element that sets it: horizontal advection and internal waves,
-    /// vertical advection (reported also where it is implicit, when
-    /// [`Self::compute_dt`] does not apply it), Coriolis, and the horizontal
-    /// viscosity. A bound nothing sets is infinite.
-    pub fn time_step_limits(&self, state: &Solution3D, cfl: f64) -> TimeStepLimits {
-        let nn = state.n_nodes;
-        let [advection, vertical, coriolis, sloping_levels] =
-            self.with_reference_fields(state, |reference| {
-                reduce_blocks::<f64, _, _, 0>(
-                    self.mesh.n_elements,
-                    [],
-                    || vec![0.0; 5 * nn],
-                    |scratch, k, []| {
-                        let ElementRates {
-                            wave: wave_rate,
-                            vertical: vertical_rate,
-                            sloping_levels: sloping_rate,
-                            ..
-                        } = self.element_rates(state, k, reference, scratch);
-                        let f = self
-                            .mesh
-                            .element_vertices(ElementIndex::new(k))
-                            .iter()
-                            .map(|&[_, y]| self.coriolis.f_at(y).abs())
-                            .fold(0.0, f64::max);
-                        let bound = |dt: f64| TimeStepLimit { dt, element: k };
-                        [
-                            bound(cfl / wave_rate / (self.ops.order as f64 + 1.0).powi(2)),
-                            bound(1.0 / vertical_rate),
-                            bound(1.0 / f),
-                            bound(1.0 / sloping_rate),
-                        ]
-                    },
-                    || [TimeStepLimit::NONE; 4],
-                    |a, b| [0, 1, 2, 3].map(|j| a[j].min(b[j])),
-                )
-            });
+    /// Each bound of [`Self::compute_dt_ssp`] at Courant number `cfl` for
+    /// 3D stages of `scheme`, and the element that sets it: horizontal
+    /// advection and internal waves, vertical advection (the forward-Euler
+    /// bound; reported also where it is implicit, when
+    /// [`Self::compute_dt_ssp`] does not apply it), Coriolis, the
+    /// reference's waves along sloping levels as `scheme` takes them, and
+    /// the horizontal viscosity. A bound nothing sets is infinite.
+    pub fn time_step_limits(
+        &self,
+        state: &Solution3D,
+        cfl: f64,
+        scheme: SspScheme,
+    ) -> TimeStepLimits {
+        let (ne, scratch) = (self.mesh.n_elements, 5 * state.n_nodes * state.n_levels);
+        // Every element's bound on its sloping levels' frequency, for the
+        // pass that measures the ones that could set the step
+        let mut sloping_rates = vec![0.0; ne];
+        let [advection, vertical, coriolis] = self.with_reference_fields(state, |reference| {
+            reduce_blocks(
+                ne,
+                [&mut sloping_rates[..]],
+                || vec![0.0; scratch],
+                |scratch, k, [sloping_rate]| {
+                    let ElementRates {
+                        wave: wave_rate,
+                        vertical: vertical_rate,
+                        sloping_levels,
+                        ..
+                    } = self.element_rates(state, k, reference, scratch);
+                    sloping_rate[0] = sloping_levels;
+                    let f = self
+                        .mesh
+                        .element_vertices(ElementIndex::new(k))
+                        .iter()
+                        .map(|&[_, y]| self.coriolis.f_at(y).abs())
+                        .fold(0.0, f64::max);
+                    let bound = |dt: f64| TimeStepLimit { dt, element: k };
+                    [
+                        bound(cfl / wave_rate / (self.ops.order as f64 + 1.0).powi(2)),
+                        bound(1.0 / vertical_rate),
+                        bound(1.0 / f),
+                    ]
+                },
+                || [TimeStepLimit::NONE; 3],
+                |a, b| [0, 1, 2].map(|j| a[j].min(b[j])),
+            )
+        });
 
         // The horizontal viscosity, explicit in the SSP stages: BR1
         // couples an element to its face neighbours' gradients, so each
@@ -2133,6 +2235,36 @@ where
                 viscosity = viscosity.min(TimeStepLimit { dt, element: k });
             }
         }
+
+        // The sloping levels, against the step the others allow
+        let mut needed = advection.dt.min(coriolis.dt).min(viscosity.dt);
+        if self.implicit_vertical_advection.is_none() {
+            needed = needed.min(scheme.ssp_coefficient() * vertical.dt);
+        }
+        let sloping_levels = self.with_reference_fields(state, |reference| {
+            let Some(reference) = reference else {
+                return TimeStepLimit::NONE;
+            };
+            reduce_blocks::<f64, _, _, 0>(
+                ne,
+                [],
+                || vec![0.0; scratch],
+                |scratch, k, []| TimeStepLimit {
+                    dt: self.sloping_level_step(
+                        state,
+                        k,
+                        reference,
+                        sloping_rates[k],
+                        scheme,
+                        needed,
+                        scratch,
+                    ),
+                    element: k,
+                },
+                || TimeStepLimit::NONE,
+                TimeStepLimit::min,
+            )
+        });
         TimeStepLimits {
             advection,
             vertical,

@@ -4391,8 +4391,16 @@ fn tidal_run_3d<'a>(
                 let set_by = match binding {
                     Some((name, limit)) if limit.element < ne => {
                         let (x, y, d) = element_place(limit.element);
+                        // The shallowest column too: an element with a thin
+                        // one has its sloping levels' bound from the subcell
+                        // interfaces, not from the pairs' measured frequency
+                        let shallowest = (0..nn)
+                            .map(|i| {
+                                s.eta.data[limit.element * nn + i] - bed[limit.element * nn + i]
+                            })
+                            .fold(f64::INFINITY, f64::min);
                         format!(
-                            "; the shortest set by {name} in element {} at ({x:.1}, {y:.1}) km, {d:.1} m mean depth",
+                            "; the shortest set by {name} in element {} at ({x:.1}, {y:.1}) km, {d:.1} m mean depth ({shallowest:.2} m at its shallowest node)",
                             limit.element
                         )
                     }
@@ -4459,8 +4467,7 @@ fn tidal_run_3d<'a>(
                     // viscosity's corners, then the Kuzmin limiter's vertex
                     // patches
                     let mut element_dt = vec![0.0; s.n_elements];
-                    let ssp = opts.rk_3d.ssp_coefficient();
-                    physics.element_steps_into(s, opts.cfl_3d, ssp, &mut element_dt);
+                    physics.element_steps_into(s, opts.cfl_3d, opts.rk_3d, &mut element_dt);
                     use dgcom::time::multirate::{MultirateStepper, RhsStencil};
                     let reads: [(&str, &[RhsStencil]); 3] = [
                         ("faces", &[RhsStencil::Faces]),
@@ -4494,7 +4501,7 @@ fn tidal_run_3d<'a>(
                         "           scheduled gain at L = 1/2/3/4, stage values reading {}",
                         planned.join("; ")
                     );
-                    let limits = physics.time_step_limits(s, opts.cfl_3d);
+                    let limits = physics.time_step_limits(s, opts.cfl_3d, opts.rk_3d);
                     println!(
                         "           limits now: advection {:.2} (element {}), viscosity {:.2} (element {}), coriolis {:.0}, vertical {:.2}, sloping levels {:.2} (element {}); last compute_dt's advection {:.2}",
                         limits.advection.dt,
@@ -5483,7 +5490,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     };
     // About the reference the step also resolves its waves along sloping
     // levels (TODO P1.3): binding on steep, strongly stratified elements
-    let limits = physics.time_step_limits(&state, cfl);
+    let limits = physics.time_step_limits(&state, cfl, opts.rk_3d);
     if limits.sloping_levels.dt.is_finite() {
         println!(
             "  The reference's waves along sloping levels bound the step at {:.2} s (element \
@@ -5495,13 +5502,12 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         );
     }
     let mut integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(opts.rk_3d);
-    let ssp = opts.rk_3d.ssp_coefficient();
     let mut t = 0.0;
     // The step of `dt_3d=`, or as `Simulation3D` takes it, every step
     let mut timed_step = |state: &mut Solution3D, t: &mut f64| -> f64 {
         let dt = opts
             .dt_3d
-            .unwrap_or_else(|| physics.compute_dt_ssp(state, cfl, ssp));
+            .unwrap_or_else(|| physics.compute_dt_ssp(state, cfl, opts.rk_3d));
         physics.update_density(state);
         integrator.step(state, &physics, dt, *t);
         physics.post_process(state);

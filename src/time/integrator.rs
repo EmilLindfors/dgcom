@@ -277,6 +277,20 @@ impl SspScheme {
         }
     }
 
+    /// How far the scheme's stability region reaches along the imaginary
+    /// axis: an undamped oscillation of frequency `ω` (Coriolis, a wave
+    /// carried by a skew operator) is stable for `ω Δt` up to this. `√3`
+    /// for SSP-RK3, whose stability polynomial is the exponential's to third
+    /// order; `√(√160 − 8) ≈ 2.156` for SSP-RK(4,3), with
+    /// `1 + z + z²/2 + z³/6 + z⁴/48` (on `z = iy` its modulus squared is
+    /// `1 − y⁴/24 + y⁶/144 + y⁸/2304`, which is 1 at `y⁴ + 16 y² = 96`).
+    pub fn imaginary_axis_limit(self) -> f64 {
+        match self {
+            SspScheme::Rk3 => 3.0_f64.sqrt(),
+            SspScheme::Rk43 => (160.0_f64.sqrt() - 8.0).sqrt(),
+        }
+    }
+
     /// Stage times as offsets from the step start.
     pub fn stage_times(self, dt: f64) -> Vec<f64> {
         self.stages().iter().map(|stage| stage.c * dt).collect()
@@ -1188,6 +1202,36 @@ mod tests {
         assert_eq!(SSPRK43.ssp_coefficient(), 2.0);
         assert_eq!(SSPRK3.ssp_coefficient(), 1.0);
         assert_eq!(ForwardEuler.ssp_coefficient(), 1.0);
+    }
+
+    /// The stages on `y′ = iωy`: the amplification's modulus is 1 at most
+    /// just inside [`SspScheme::imaginary_axis_limit`] and above 1 just
+    /// outside it, and stays at most 1 all the way in.
+    #[test]
+    fn test_ssp_schemes_hold_an_oscillation_up_to_their_imaginary_axis_limit() {
+        for scheme in [SspScheme::Rk3, SspScheme::Rk43] {
+            // |R(iy)|², stepping the complex scalar (re, im) through the stages
+            let amplification = |y: f64| {
+                let (mut re, mut im) = (1.0, 0.0);
+                for stage in scheme.stages() {
+                    // start·1 + input·u + beta·(iy)·u
+                    (re, im) = (
+                        stage.start + stage.input * re - stage.beta * y * im,
+                        stage.input * im + stage.beta * y * re,
+                    );
+                }
+                re * re + im * im
+            };
+            let limit = scheme.imaginary_axis_limit();
+            assert!(amplification(1.001 * limit) > 1.0, "{scheme:?}: above");
+            for fraction in (1..=1000).map(|i| 0.999 * i as f64 / 1000.0) {
+                assert!(
+                    amplification(fraction * limit) <= 1.0,
+                    "{scheme:?}: unstable at {fraction} of the limit"
+                );
+            }
+        }
+        assert!((SspScheme::Rk43.imaginary_axis_limit() - 2.1562).abs() < 1e-4);
     }
 
     #[test]

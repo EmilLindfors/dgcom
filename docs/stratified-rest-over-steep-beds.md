@@ -583,8 +583,8 @@ adds a term of rank one per element to `B` (the element's error `R`, taken
 back in the shape of `Γ g`); the bound below is for the pairs' `B`, and its
 gate measures it against the operator with step 3 in it: under a thermocline
 the bound holds with it, under a smooth reference the frequency can be a few
-per cent above the bound (0.97 in the review's second pass), inside the
-step's margin.
+per cent above the bound (0.97 in the review's second pass). The frequency
+the step is taken with has step 3's term in it.
 
 That frequency is the hydrostatic equations' own: water that moves along a
 surface of slope `s` through a stratification `N` oscillates at `N s` (the
@@ -598,25 +598,55 @@ quantity. The tangent takes the node's own `N²` for the whole
 rise, which is what the node's water does to first order, and what the
 adjoint needs.
 
-An explicit step must resolve the frequency: SSP-RK3 is stable on the
-imaginary axis for `ω Δt ≤ √3`. `Hydrostatic3D::compute_dt` bounds it, with a
-reference only (`TimeStepLimits::sloping_levels`,
-`ReferenceFields::sloping_level_rate`; the local steps take it per element):
-`ω Δt ≤ 1` with `ω = √(‖B‖₁ ‖B‖∞)`, the row and column sums of `B`, where
-`z_j − z_i = (1 + σ)(η_j − η_i) − σ(B_j − B_i)` is bounded over the levels by
-each column's largest `N` and largest `N |σ|`. That is `O(nodes²)` per
-element and step, and the fields it reads are the first stage's (the step's
-cost does not change). In a shore element the edges are step 5's subcell
-interfaces and the partner is the depth-mean velocity, `v̄ = ū √(ρ₀ m D)`:
-`B[a, l; a] = ¼ N_al √Δσ_l (z_b − z_a)_l w m/m_a` and the same times
-`√(m_a D_b/(m_b D_a))` for the other end, bounded in the same way. The gate
-`the_sloping_level_rate_bounds_the_pairs_frequency` assembles both `B`s from
-the kernels, column by column, on parallelograms and distorted elements in
-both metric forms over a 5 → 125 m cliff with a shore element: the bound is
-1.22 to 1.54 times the largest singular value on the pairs and 3.0 to 3.1
-times on the shore element's interfaces. With the margin of `√3` the model's
-step is 2.1 to 2.7 times below the scheme's limit where the pairs' bound sets
-it.
+An explicit step must resolve the frequency. The stages carry it on the
+imaginary axis, and reach along it to `ω Δt = √3` (SSP-RK3) or
+`√(√160 − 8) ≈ 2.156` (SSP-RK(4,3), whose stability polynomial is
+`1 + z + z²/2 + z³/6 + z⁴/48`; `SspScheme::imaginary_axis_limit`).
+`Hydrostatic3D::compute_dt_ssp` bounds the step with a reference only
+(`TimeStepLimits::sloping_levels`; the local steps take it per element), in
+two parts:
+
+- **A bound on the frequency in every element**
+  (`ReferenceFields::sloping_level_rate`): `√(‖B‖₁ ‖B‖∞)`, the row and column
+  sums of `B`, where `z_j − z_i = (1 + σ)(η_j − η_i) − σ(B_j − B_i)` is
+  bounded over the levels by each column's largest `N` and largest `N |σ|`.
+  That is `O(nodes²)` per element and step, and the fields it reads are the
+  first stage's. In a shore element the edges are step 5's subcell interfaces
+  and the partner is the depth-mean velocity, `v̄ = ū √(ρ₀ m D)`:
+  `B[a, l; a] = ¼ N_al √Δσ_l (z_b − z_a)_l w m/m_a` and the same times
+  `√(m_a D_b/(m_b D_a))` for the other end, bounded in the same way. The gate
+  `the_sloping_level_rate_bounds_the_pairs_frequency` assembles both `B`s
+  from the kernels, column by column, on parallelograms and distorted
+  elements in both metric forms over a 5 → 125 m cliff with a shore element:
+  the bound is 1.07 to 1.54 times the largest singular value on the pairs
+  and 2.1 to 3.1 times on the shore element's interfaces.
+- **The frequency itself where the bound could set the step**
+  (`ReferenceFields::sloping_level_frequency`): the largest singular value of
+  the element's `B` with step 3's term in it, by power iteration on `BᵀB`,
+  applied pair by pair (step 3's term in density: `−s n √(m D Δσ)/W` times
+  `Σ h e` over the pairs, with `e = 2(ρ̄_j − ρ̄_i) + (Γ_i + Γ_j)(z_j − z_i)`,
+  the transpose of the force's displacement term). The same gate holds it
+  within 1 % of the kernels' operator (0.4 % at most, from below). An element
+  is measured when its bound comes within a factor 1.5 of the step the other
+  bounds allow.
+
+The step keeps `ω Δt ≤ 0.85` of the scheme's reach with the measured
+frequency (`Hydrostatic3D::SLOPING_LEVEL_MARGIN`): 1.47 for SSP-RK3, 1.83 for
+SSP-RK(4,3). The margin is for what the element's operator does not count
+(the splitting from the barotropic pass, the faces, a nonlinear equation of
+state, the iteration's approach from below). On the 15 → 300 m cliff the rest
+state holds for 6 h up to 1.15 times the reach with either scheme and is lost
+at 1.3 times (`probe_sloping_level_step`): the model's step is a factor 1.35
+to 1.5 below where it fails there.
+
+In an element with a thin column the flow along the interfaces is the
+barotropic pass's, not the stages', and where its limit lies has not been
+derived or measured: the step keeps `ω Δt ≤ 1` there with the bound (2 to 3
+times the frequency), whatever the scheme.
+
+Until 2026-11-21 the rule was `ω Δt ≤ 1` with the bound everywhere: 2.1 to
+3.2 times below the scheme's reach where the pairs set it, and it set the
+production step (see `notes/geometry-mesh.md`, "The check on real data").
 
 So the cure does need a shorter step, exactly where `N |∇_σ z| Δt` was above
 the limit and the old scheme did not see it. The numbers are under
@@ -915,7 +945,7 @@ column, the splitting in time).
 | terrace, seeded with 1e-6 °C | 4.2e-7 m/s at 3 h, 1.3e-5 at 12 h | 4.7e-7 at 1 h, 3.75e-7 at 3 h, 4.6e-7 at 12 h |
 | the cliff from round-off, 6 h | 6.6e-10 m/s (2.3e-8 when its gate was written) | 1.5e-12 |
 | unsmoothed steps from round-off, 12 → 48 h | 15 → 300 m: 2.4e-6 → NaN; 0.5 → 150 m: 4.1e-8 → NaN; 15 → 60 m: 6.1e-11 → 5.0e-2 (e-folding 1.8 h); land → 300 m: 1.8e-12 → 2.6e-12 | at 48 h: 3.3e-12, 2.8e-12, 1.6e-12, 2.2e-12 |
-| the cliff at the model's own step (27.4 s), 2 h | | 1.7e-12 |
+| the cliff at the model's own step, 2 h | | 5.5e-13 (SSP-RK3, 45.3 s), 3.6e-13 (SSP-RK(4,3), 56.4 s); 1.7e-12 at the 27.4 s of the rule until 2026-11-21 |
 | 0.5 °C off the reference everywhere, the cliff, 1 h | 0 (the force of a uniform anomaly) | 1.2e-12 (0.41 m/s with the displacement of step 3's first version) |
 | the same on the terrace, 0.5 h | | 1.5e-12 (3.7e-2 m/s at 1 h with the first version) |
 
@@ -955,19 +985,26 @@ finite; the model's bounds at Courant number 1):
 | | before | after |
 |---|---|---|
 | terrace: largest stable step | 30 s (36 s blows up within the hour) | 30 s (36 s blows up) |
-| terrace: the model's bounds | advection and internal waves 10.3 s | the same; sloping levels 53.6 s, not binding |
+| terrace: the model's bounds | advection and internal waves 10.3 s | the same; sloping levels 57.7 s (a shore element's interfaces), not binding |
 | 15 → 300 m cliff: largest stable step | 240 s (360 s blows up; its round-off grows at any step) | 60 s (72 s blows up) |
-| 15 → 300 m cliff: the model's bounds | advection and internal waves 161.5 s | sloping levels 27.4 s |
-| 0.5 m beside 150 m: the model's bounds | 213.4 s | sloping levels 177.9 s |
-| 15 → 60 m: the model's bounds | 264.1 s | the same (sloping levels 303.9 s) |
+| 15 → 300 m cliff: the model's bounds | advection and internal waves 161.5 s | sloping levels 45.3 s with SSP-RK3, 56.4 s with SSP-RK(4,3) (measured frequency 3.25e-2 s⁻¹; 27.4 s by the rule until 2026-11-21) |
+| 0.5 m beside 150 m: the model's bounds | 213.4 s | the same (sloping levels 330 s with SSP-RK3) |
+| 15 → 60 m: the model's bounds | 264.1 s | the same (sloping levels 447 s with SSP-RK3) |
 | land beside 300 m: the model's bounds | 161.5 s | the same (sloping levels 617 s, the shore element's interfaces) |
 
 So the step the cure needs is the same on the fixture cut from the Frøya bed,
 and four times shorter on the cliff slice, where a level rises 142 m between
-two nodes 500 m apart through `N = 0.049 s⁻¹`. The model takes 27 s there by
-its own bound, a sixth of what it took before. Whether the bound sets the
-step of a real run depends on its steepest stratified element against its
-fastest current: the full-mesh run prints both (`notes/geometry-mesh.md`).
+two nodes 500 m apart through `N = 0.049 s⁻¹`. The model takes 45 s there by
+its own bound with SSP-RK3 and 56 s with SSP-RK(4,3), about a third of what
+it took before. At those steps the hour's map of the slice (`probe_slice_spectrum`
+with `DGRS_DT=0`, pseudo-energy coordinates, the totals deflated) has no
+Ritz value above 1: growth of the norm 0.99819 and leading value 0.99488 at
+30 vectors, 0.99971 and 0.99907 at 100, with SSP-RK3 at 46.9 s; 0.99818 /
+0.99492 and 0.99969 / 0.99907 with SSP-RK(4,3) at 58.4 s (at 36 s: the table
+above). Whether the bound sets the step of a real run depends on its
+steepest stratified element against its fastest current: the full-mesh run
+prints both, and the binding element's shallowest column
+(`notes/geometry-mesh.md`).
 
 **The cost per step** (minima of alternating runs, 2026-11-21, 4 cores):
 
@@ -980,3 +1017,9 @@ fastest current: the full-mesh run prints both (`notes/geometry-mesh.md`).
 A series an hour earlier on the same machine gave +9.7 % and +3.4 % for the
 benchmark on one and four threads: the cost is 7 to 10 % of a step, and the
 machine's noise is a few per cent.
+
+Measuring an element's frequency costs about an eighth of that element's
+step (terrace fixture, test profile, one thread: the bounds take 0.56 ms of a
+25 ms step with no element measured, 2.2 %, and 3.3 to 4.0 ms with nearly
+every one measured, 13 to 16 %). Only the elements within a factor 1.5 of
+setting the step are measured.
