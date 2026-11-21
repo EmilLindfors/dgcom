@@ -160,7 +160,7 @@ where
             )));
         }
         self.physics
-            .restore_vertical_reference(restart.vertical_reference.clone());
+            .set_reference_profile(restart.reference_profile.clone());
         self.integrator
             .restore_slow_forcing(restart.slow_forcing.clone());
         Ok(())
@@ -217,9 +217,9 @@ where
         F: FnMut(&Solution3D, f64, &RunContext3D<'_, EOS, MIX, BC>),
     {
         let start_wall = std::time::Instant::now();
-        // The vertical tracer advection about the initial stratification,
-        // unless the physics has its own reference or opted out
-        self.physics.ensure_vertical_reference(state);
+        // The initial stratification's mean profile as the reference,
+        // unless the physics has its own or opted out
+        self.physics.ensure_reference_profile(state);
         let mut t = t_start;
         let mut n_steps = 0;
         let mut dt_min_used = f64::INFINITY;
@@ -330,7 +330,6 @@ where
 
             // Post-process
             crate::profiling::scope("step: post_process", || self.physics.post_process(state));
-            self.physics.relax_vertical_reference(state, dt);
             // A blown-up step leaves NaN or infinities, which every later
             // step would carry on to `t_end` (the step's bound skips NaN)
             if let Some(bad) = non_finite_field(state) {
@@ -492,7 +491,7 @@ where
         domain: domain_fingerprint_3d(&physics.mesh, &physics.bathymetry.data, &physics.sigma),
         state: state.clone(),
         slow_forcing: integrator.slow_forcing_record(),
-        vertical_reference: physics.vertical_reference(),
+        reference_profile: physics.reference_profile().cloned(),
         driver: DriverData::default(),
     }
 }
@@ -519,7 +518,7 @@ mod tests {
     use crate::solver::rhs::{VerticalAdvection, w_cell_thicknesses};
     use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
     use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D, SWEState2D};
-    use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+    use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile};
     use crate::source::{
         CageDrag2D, CageFootprint, CoriolisSource2D, NetCage, River, RiverProfile, RiverSeries,
         RiverSources, SourceContext2D, SourceTerm2D,
@@ -1528,6 +1527,94 @@ mod tests {
         );
     }
 
+    /// TODO P1.3 gate: what a curved reference profile keeps
+    /// (`Hydrostatic3D::with_reference_profile`), under the 0.5 m seiche
+    /// over the bed rising from 12 to 4 m with sheared columns, a
+    /// thermocline at 5 m (6 °C across ≈ 3 m) and a linear salinity, on 3, 6
+    /// and 12 levels:
+    ///
+    /// - uniform tracers stay uniform, whatever the reference (they hold no
+    ///   share of its stratification);
+    /// - the water's volume is conserved to round-off;
+    /// - the tracers at rest in the reference keep their inventories to
+    ///   round-off: the reference's advection by the pressure gradient's
+    ///   adjoint is not in flux form, but what it makes in an element is
+    ///   taken back within the element. (Without that the basin's mean
+    ///   temperature changed by 4.5e-3, 9.3e-4 and 2.6e-4 °C over the period,
+    ///   the trapezoid rule's error of the thermocline's gradient.)
+    #[test]
+    fn a_curved_reference_keeps_constancy_and_the_tracers_inventories() {
+        let eos = LinearEOS::default();
+        let profile = |z: f64| (eos.t0 + 3.0 * ((z + 5.0) / 1.5).tanh(), eos.s0 + 0.05 * z);
+        let reference = Arc::new(TracerReferenceProfile::from_smooth_fn(
+            -14.0, 2.0, 1601, profile,
+        ));
+        for levels in [3, 6, 12] {
+            let mut case = SlopingTide::new();
+            case.sigma = SigmaGrid::new(levels, UniformStretching);
+            let physics = case.physics().with_reference_profile(reference.clone());
+
+            // Uniform tracers under the curved reference
+            let mut state = case.state(&physics, |_, _| (eos.t0 + 2.3, eos.s0 - 0.9));
+            let mut drift = 0.0_f64;
+            case.run(&physics, &mut state, |s, _| {
+                for (t, salt) in s.temp.iter().zip(&s.salt) {
+                    drift = drift
+                        .max((t - (eos.t0 + 2.3)).abs())
+                        .max((salt - (eos.s0 - 0.9)).abs());
+                }
+            });
+            assert!(
+                drift < 1e-11 * eos.s0,
+                "{levels} levels: uniform tracers drifted by {drift:.3e}"
+            );
+
+            // At rest in the reference, but for the seiche and the shear
+            let mut state = case.state(&physics, |_, _| (0.0, 0.0));
+            let (nn, nl) = (case.ops.n_nodes, levels);
+            for idx in 0..case.mesh.n_elements * nn {
+                let eta = state.eta.data[idx];
+                let depth = eta - case.bathymetry.data[idx];
+                for (l, &sigma) in case.sigma.sigma_rho().iter().enumerate() {
+                    (state.temp[idx * nl + l], state.salt[idx * nl + l]) =
+                        reference.at(eta + sigma * depth);
+                }
+            }
+            physics.update_density(&mut state);
+            let volume = case.volume(&state);
+            let (t0, s0) = (
+                case.inventory(&state, &state.temp),
+                case.inventory(&state, &state.salt),
+            );
+            let (mut volume_error, mut salt_error, mut temp_error) = (0.0_f64, 0.0_f64, 0.0_f64);
+            let mut moved = 0.0_f64;
+            let rest = state.temp.clone();
+            case.run(&physics, &mut state, |s, _| {
+                volume_error = volume_error.max((case.volume(s) - volume).abs() / volume);
+                salt_error = salt_error.max((case.inventory(s, &s.salt) - s0).abs() / s0);
+                temp_error = temp_error.max((case.inventory(s, &s.temp) - t0).abs() / t0);
+                for (t, r) in s.temp.iter().zip(&rest) {
+                    moved = moved.max((t - r).abs());
+                }
+            });
+            println!(
+                "{levels} levels: volume {volume_error:.1e}, S inventory {salt_error:.1e}, \
+                 T inventory {temp_error:.1e} (T moved by up to {moved:.2} °C at a node)"
+            );
+            assert!(moved > 0.3, "test regime: T moved by {moved:.2e} °C");
+            assert!(
+                volume_error < 1e-13,
+                "{levels} levels: volume {volume_error:.2e}"
+            );
+            // Measured ≤ 2.1e-14
+            assert!(
+                salt_error < 1e-12 && temp_error < 1e-12,
+                "{levels} levels: the inventories drifted by {temp_error:.2e} (T) and \
+                 {salt_error:.2e} (S)"
+            );
+        }
+    }
+
     /// TODO P4.5 gate: the 3D stages on SSP-RK(4,3)
     /// (`ModeSplitIntegrator::with_baroclinic_scheme`), at half SSP-RK3's
     /// steps per period (twice the step, as `cfl_3d` doubles with it): uniform
@@ -2348,8 +2435,9 @@ mod tests {
     /// A run that carries every kind of state from step to step: a stratified
     /// beach (bed −12 → +2 m) sloshing up and down its shore through the
     /// `WetDry` 2D module, with wind, GLS k-ε turbulence (`k`, `ψ`), log-layer
-    /// drag, implicit vertical advection, and a vertical reference relaxing
-    /// towards the state over an hour. `bed_shift` moves the bed (m).
+    /// drag, implicit vertical advection, and the stratification at rest as
+    /// the reference profile (cubic between its samples). `bed_shift` moves
+    /// the bed (m).
     fn restart_case(bed_shift: f64) -> (RestartPhysics, Solution3D) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 200.0, 10, 2);
         restart_case_on(mesh, bed_shift)
@@ -2414,8 +2502,12 @@ mod tests {
         )
         .with_bottom_drag(BottomDrag3D::log_layer(0.005))
         .with_implicit_vertical_advection(all_implicit())
-        .with_vertical_reference(&state)
-        .with_vertical_reference_timescale(3600.0);
+        .with_reference_profile(TracerReferenceProfile::from_smooth_fn(
+            -15.0,
+            3.0,
+            181,
+            move |z| (eos.t0 + 4.0 * (0.4 * (z + 4.0)).tanh(), eos.s0 - 0.05 * z),
+        ));
         physics.update_density(&mut state);
         (physics, state)
     }
@@ -2518,10 +2610,9 @@ mod tests {
     /// TODO P5.3 gate: a 3D run restarted halfway, from a file, in a new
     /// simulation, ends bit for bit where the uninterrupted run does
     /// (`restart_case`: wetting and drying, GLS, implicit vertical advection, a
-    /// relaxing vertical reference). The same state without
-    /// `Simulation3D::resume` (a fresh AB3 history of the slow forcing, the
-    /// initial reference) ends elsewhere, so the gate sees what the file adds
-    /// to the state.
+    /// reference profile). The same state without `Simulation3D::resume` (a
+    /// fresh AB3 history of the slow forcing) ends elsewhere, so the gate
+    /// sees what the file adds to the state.
     #[test]
     fn a_restarted_run_ends_bit_for_bit_where_the_uninterrupted_run_does() {
         let t_end = 900.0;
@@ -3419,7 +3510,6 @@ mod tests {
         bound: Option<ElementSlopeBound>,
         rho: impl Fn(f64) -> f64 + Copy,
     ) -> (Physics, Solution3D) {
-        use crate::physics::EquationOfState;
         use crate::vertical::SongHaidvogelStretching;
         let mesh = Arc::new(mesh);
         let ops = Arc::new(DGOperators2D::new(2));
@@ -3460,8 +3550,10 @@ mod tests {
             G,
             RHO0,
         );
-        // T of the density ρ(z) under the linear equation of state
+        // T of the density ρ(z) under the linear equation of state, as the
+        // reference stratification, and the state at rest in it
         let temp = |z: f64| eos.t0 - (rho(z) / eos.rho0 - 1.0) / eos.alpha;
+        let reference = Arc::new(sampled_reference(&bathymetry, |z| (temp(z), eos.s0)));
         let (nn, nl) = (ops.n_nodes, sigma.n_levels());
         let mut state = Solution3D::new(mesh.n_elements, nn, nl);
         for idx in 0..mesh.n_elements * nn {
@@ -3469,15 +3561,13 @@ mod tests {
             let eta = b.max(0.0);
             state.eta.data[idx] = eta;
             for (l, &s) in sigma.sigma_rho().iter().enumerate() {
-                state.temp[idx * nl + l] = temp(eta + s * (eta - b));
-                state.salt[idx * nl + l] = eos.s0;
+                (state.temp[idx * nl + l], state.salt[idx * nl + l]) =
+                    reference.at(eta + s * (eta - b));
             }
         }
         physics.update_density(&mut state);
-        let physics =
-            physics.with_reference_profile(&state, |z| eos.compute_density(temp(z), eos.s0, z));
-        // Experiment (TODO P1.3): DGRS_VADV picks the vertical tracer scheme,
-        // DGRS_VREF=1 reconstructs it about the state at rest
+        let physics = physics.with_reference_profile(reference);
+        // Probes (TODO P1.3): DGRS_VADV picks the vertical tracer scheme
         let physics = match std::env::var("DGRS_VADV").as_deref() {
             Ok("centred") => physics.with_vertical_advection(VerticalAdvection::Centred),
             Ok("akima") => physics.with_vertical_advection(VerticalAdvection::Akima),
@@ -3486,12 +3576,23 @@ mod tests {
             Ok("tvd") => physics.with_vertical_advection(VerticalAdvection::Tvd),
             _ => physics,
         };
-        let physics = if std::env::var("DGRS_VREF").is_ok_and(|v| v == "1") {
-            physics.with_vertical_reference(&state)
-        } else {
-            physics
-        };
         (physics, state)
+    }
+
+    /// `profile(z) = (T, S)` as a reference stratification over the heights
+    /// of the bed `bathymetry`: linear between samples every 5 cm (as a
+    /// run's mean profile is between its metres; the fixtures start in the
+    /// reference itself, so its distance from `profile`, ≈ 1e-4 of the
+    /// profile's range, is no departure from rest).
+    fn sampled_reference(
+        bathymetry: &Bathymetry2D,
+        profile: impl Fn(f64) -> (f64, f64),
+    ) -> TracerReferenceProfile {
+        let deepest = bathymetry.data.iter().copied().fold(0.0, f64::min);
+        let highest = bathymetry.data.iter().copied().fold(0.0, f64::max);
+        let (bottom, top) = (deepest - 1.0, highest + 1.0);
+        let n = ((top - bottom) / 0.05).ceil() as usize + 1;
+        TracerReferenceProfile::from_fn(bottom, top, n, profile)
     }
 
     /// [`channel_at_rest`] with a cliff: the bed falls from 15 to 300 m inside
@@ -3655,18 +3756,375 @@ mod tests {
         assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s");
     }
 
-    /// TODO P1.3 gate (fails today): the cliff under a pycnocline (2 kg/m³
-    /// across ≈ 8 m at 15 m depth, 4e-4 kg/m⁴ above and below). Where a
-    /// σ-level crosses the pycnocline between two nodes of one element, the
-    /// pair's chord is far steeper than the stratification at either node,
-    /// no conserved functional has its minimum at rest, and round-off grows
-    /// with an e-folding of ≈ 45 min (2.3e-8 m/s after 6 h; on the Frøya bed
-    /// ≈ 15 min).
+    /// TODO P1.3 gate: the cliff under a pycnocline (2 kg/m³ across ≈ 8 m at
+    /// 15 m depth, 4e-4 kg/m⁴ above and below), the bed not smoothed. Where
+    /// a σ-level crosses the pycnocline between two nodes of one element,
+    /// the pair's chord is far steeper than the stratification at either
+    /// node. The σ-pairs scheme of the full density has no conserved
+    /// functional with its minimum at rest there, and round-off grew with an
+    /// e-folding of 47 min (2.3e-8 m/s after 6 h when the gate was written;
+    /// on the Frøya bed ≈ 15 min). About the reference profile the scheme
+    /// conserves a pseudo-energy to first order
+    /// (`Hydrostatic3D::with_reference_profile`): measured 1.4e-12 m/s.
     #[test]
-    #[ignore = "known failure, TODO P1.3: the pycnocline over a cliff is unstable at rest"]
     fn a_pycnocline_over_a_cliff_stays_at_rest() {
         let speed = cliff_at_rest(|z| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z, 6.0);
         assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s");
+    }
+
+    /// TODO P1.3 gate: the pycnocline over beds that are not smoothed, each
+    /// step inside one 1 km element, for two days: the 15 → 300 m cliff,
+    /// 0.5 m of water beside 150 m, land beside 300 m of water (a shore
+    /// element with dry nodes), and 15 → 60 m (a third of the cliff, which
+    /// the σ-pairs scheme of the full density grew with an e-folding of
+    /// 1.8 h; the cliff and the shallows it blew up within 48 h). Round-off
+    /// stays round-off: measured ≤ 9.3e-12 m/s at 48 h.
+    #[test]
+    fn a_pycnocline_over_unsmoothed_steps_stays_at_rest_for_two_days() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        for (name, left, right) in [
+            ("cliff", -300.0, -15.0),
+            ("shallows", -150.0, -0.5),
+            ("shore", -300.0, 5.0),
+            ("step", -60.0, -15.0),
+        ] {
+            let speed =
+                channel_at_rest(|x| step_bed(x, 3, left, right), None, pycnocline, &[48.0])[0];
+            println!("unsmoothed {name}: {speed:.2e} m/s after 48 h");
+            assert!(
+                speed < 1e-9,
+                "the unsmoothed {name} spun up {speed:.3e} m/s"
+            );
+        }
+    }
+
+    /// TODO P1.3 gate: the step the model picks holds the reference over
+    /// the unsmoothed cliff. About a reference the scheme carries in full
+    /// the frequency `N |∇_σ z|` of a stratification displaced along a
+    /// sloping level (the chords of the full-density scheme carried less of
+    /// it): the 15 → 300 m cliff holds at steps of 36 and 60 s and blows up
+    /// at 90 s, where the full-density scheme ran at 180 s (and grew its
+    /// round-off). [`Hydrostatic3D::compute_dt`] bounds it
+    /// ([`TimeStepLimits::sloping_levels`]): 27.4 s in the cliff's element,
+    /// whatever the Courant number, where advection and the internal waves'
+    /// WKB speed allow 161 s at Courant number 1; the local steps take it
+    /// too. No such bound without a reference. At the model's step the rest
+    /// state holds (2 h here, measured 1.7e-12 m/s; at
+    /// 72 s it blows up within the hour).
+    #[test]
+    fn the_models_step_holds_the_reference_over_a_cliff() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let mesh = || Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+        let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
+        let (physics, rest) = basin_physics(mesh(), bed, None, pycnocline);
+        let limits = physics.time_step_limits(&rest, 1.0);
+        let bound = limits.sloping_levels;
+        assert_eq!(bound.element, 3, "the cliff's element binds");
+        assert!((25.0..30.0).contains(&bound.dt), "bound {} s", bound.dt);
+        assert!(limits.advection.dt > 150.0, "{:?}", limits.advection);
+        let dt = physics.compute_dt(&rest, 1.0);
+        assert_eq!(dt, bound.dt, "the model's step is the bound");
+        let mut steps = vec![0.0; rest.n_elements];
+        physics.element_steps_into(&rest, 1.0, 1.0, &mut steps);
+        assert_eq!(steps[3], bound.dt, "the cliff's own step");
+        assert!(steps[0] > 150.0, "the flat bed's step {} s", steps[0]);
+
+        let speed = basin_at_rest(mesh(), bed, None, pycnocline, &[2.0], dt).0[0];
+        assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s at {dt} s");
+
+        let plain = physics.without_reference_profile();
+        let limits = plain.time_step_limits(&rest, 1.0);
+        assert_eq!(limits.sloping_levels.dt, f64::INFINITY);
+        assert!(plain.compute_dt(&rest, 1.0) > 150.0);
+    }
+
+    /// TODO P1.3 gate (from the review of 2026-11-21): a state that is the
+    /// reference plus a uniform offset is at rest too. The trapezoid rule's
+    /// force of a uniform anomaly is zero, and it is no displacement of the
+    /// stratification ([`ReferenceFields::set_displacements`] measures the
+    /// displacement with the stratification's residual about each column's
+    /// line in `z`). With the displacement as the plain projection of the
+    /// anomaly on the stratification, 0.5 °C off the reference drove
+    /// 0.21 m/s within 15 min over the unsmoothed 15 → 300 m cliff and
+    /// 3.7e-2 m/s within the hour on the terrace of the smoothed Frøya bed.
+    /// An hour over the cliff (measured 1.2e-12 m/s) and half an hour on the
+    /// terrace (1.5e-12 m/s).
+    ///
+    /// An offset linear in `z` (3 °C over the cliff's 300 m) is no
+    /// displacement either, but its force is not exactly zero: the
+    /// pressure's mean over a column is the anomaly's first moment by the
+    /// midpoint rule (the partner of the layers' rise with the free
+    /// surface), second order for such an anomaly, a depth-mean force that
+    /// is a gradient. Measured 1.2e-4 m/s after the hour, the adjustment of
+    /// the free surface to it.
+    #[test]
+    fn an_offset_from_the_reference_stays_at_rest() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        type Offset = fn(f64) -> f64;
+        let offsets: [(&str, Offset, f64); 2] = [
+            ("uniform", |_| -0.5, 1e-9),
+            ("linear in z", |z| 0.5 + 0.01 * z, 1e-3),
+        ];
+        let run = |physics: &Physics, mut state: Solution3D, offset: Offset, dt: f64, steps| {
+            let (nl, sigma) = (state.n_levels, physics.sigma.clone());
+            for idx in 0..state.n_elements * state.n_nodes {
+                let eta = state.eta.data[idx];
+                let depth = eta - physics.bathymetry.data[idx];
+                for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                    state.temp[idx * nl + l] += offset(eta + s * depth);
+                }
+            }
+            let mut integrator = ModeSplitIntegrator::new();
+            for n in 0..steps {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+            }
+            max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)))
+        };
+        for (name, offset, bound) in offsets {
+            let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+            let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
+            let (physics, state) = basin_physics(mesh, bed, None, pycnocline);
+            let speed = run(&physics, state, offset, 36.0, 100);
+            println!("the cliff, {name} offset: {speed:.2e} m/s after 1 h");
+            assert!(speed < bound, "the cliff, {name} offset: {speed:.3e} m/s");
+        }
+        let (physics, state) = terrace_patch_physics(None);
+        let speed = run(&physics, state, offsets[0].1, 5.0, 360);
+        println!("the terrace, uniform offset: {speed:.2e} m/s after 0.5 h");
+        assert!(speed < 1e-9, "the terrace, uniform offset: {speed:.3e} m/s");
+    }
+
+    /// Probe (TODO P1.3): a seiche over the unsmoothed 15 → 300 m cliff, the
+    /// flow the gates at rest do not have. The free surface starts tilted by
+    /// `DGRS_TILT` (0.2 m end to end, a cosine), the tracers at rest in the
+    /// reference at their levels; steps of `DGRS_DT` (20 s) to the hours
+    /// `DGRS_HOURS` ("1,3,6,12"). Prints the largest layer speed, the largest
+    /// departure of T from the reference at the node's height, and the
+    /// change of the heat content.
+    #[test]
+    #[ignore = "probe: a seiche over the unsmoothed cliff"]
+    fn probe_seiche_over_a_cliff() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+        let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
+        let (physics, mut state) = basin_physics(mesh, bed, None, pycnocline);
+        let reference = physics.reference_profile().expect("a reference").clone();
+        let (nn, nl) = (state.n_nodes, state.n_levels);
+        let tilt = env_or("DGRS_TILT", 0.2);
+        let sigma = physics.sigma.clone();
+        for k in 0..state.n_elements {
+            for i in 0..nn {
+                let (r, s) = (physics.ops.nodes_r[i], physics.ops.nodes_s[i]);
+                let [x, _] = physics
+                    .mesh
+                    .reference_to_physical(ElementIndex::new(k), r, s);
+                let idx = k * nn + i;
+                let eta = 0.5 * tilt * (std::f64::consts::PI * x / 8000.0).cos();
+                state.eta.data[idx] = eta;
+                let depth = eta - physics.bathymetry.data[idx];
+                for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                    (state.temp[idx * nl + l], state.salt[idx * nl + l]) =
+                        reference.at(eta + s * depth);
+                }
+            }
+        }
+        physics.update_density(&mut state);
+        let heat = |state: &Solution3D| -> f64 {
+            (0..state.n_elements * nn)
+                .map(|idx| {
+                    let depth = state.eta.data[idx] - physics.bathymetry.data[idx];
+                    let mass = physics.geom.node_mass(idx / nn, idx % nn);
+                    (0..nl)
+                        .map(|l| mass * depth * sigma.d_sigma()[l] * state.temp[idx * nl + l])
+                        .sum::<f64>()
+                })
+                .sum()
+        };
+        let initial = heat(&state);
+        let dt = env_or("DGRS_DT", 20.0);
+        let hours: Vec<f64> = std::env::var("DGRS_HOURS")
+            .unwrap_or_else(|_| "1,3,6,12".into())
+            .split(',')
+            .filter_map(|h| h.parse().ok())
+            .collect();
+        let mut integrator = ModeSplitIntegrator::new();
+        let mut n = 0;
+        for until in hours {
+            while (n as f64) < (until * 3600.0 / dt).round() {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+                n += 1;
+            }
+            let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
+            let departure = max_or_nan((0..state.n_elements * nn * nl).map(|c| {
+                let idx = c / nl;
+                let eta = state.eta.data[idx];
+                let z = eta + sigma.sigma_rho()[c % nl] * (eta - physics.bathymetry.data[idx]);
+                (state.temp[c] - reference.at(z).0).abs()
+            }));
+            println!(
+                "seiche over the cliff, {until} h: largest speed {speed:.3e} m/s, |T − T̄(z)| \
+                 {departure:.3e} °C, heat {:+.2e} of itself",
+                heat(&state) / initial - 1.0
+            );
+        }
+    }
+
+    /// Probe (TODO P1.3): the bounds on the step over the unsmoothed steps
+    /// and on the terrace fixture, at Courant number 1.
+    #[test]
+    #[ignore = "probe: the step's bounds on the P1.3 fixtures"]
+    fn probe_step_bounds() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        for (name, left, right) in [
+            ("cliff", -300.0, -15.0),
+            ("shallows", -150.0, -0.5),
+            ("shore", -300.0, 5.0),
+            ("step", -60.0, -15.0),
+        ] {
+            let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+            let bed = |x: f64, _| step_bed(x, 3, left, right);
+            let (physics, rest) = basin_physics(mesh, bed, None, pycnocline);
+            println!("{name}: {:?}", physics.time_step_limits(&rest, 1.0));
+        }
+        let (physics, rest) = terrace_patch_physics(None);
+        println!("terrace: {:?}", physics.time_step_limits(&rest, 1.0));
+    }
+
+    /// TODO P1.3 gate, the property the gates above stand on: the
+    /// pseudo-energy of a departure from rest in the reference stratification
+    /// (kinetic energy, the free surface's, and `½ g ρ′²/Γ`;
+    /// [`EnergyCoordinates`]) does not grow, over the unsmoothed 15 → 300 m
+    /// cliff. A random departure of every field (1e-6 in the state's units
+    /// at most), an hour of 36 s steps: the pseudo-energy after every step
+    /// is at most the one before (but for the splitting's round-off-sized
+    /// exchanges), and it only falls, by the vertical viscosity and the
+    /// barotropic fluxes' dissipation. The σ-pairs scheme of the full density
+    /// multiplied this norm by up to 4.6 over the hour (a pair of modes with
+    /// an e-folding of 47 min).
+    #[test]
+    fn the_pseudo_energy_of_a_departure_from_rest_does_not_grow_over_a_cliff() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+        let bed = |x: f64, _| step_bed(x, 3, -300.0, -15.0);
+        let (physics, rest) = basin_physics(mesh, bed, None, pycnocline);
+        let tenths: Vec<f64> = (1..=10).map(|n| 0.1 * n as f64).collect();
+        let (history, largest_rise) = pseudo_energy_history(&physics, &rest, 36.0, &tenths);
+        let last = *history.last().expect("ten samples");
+        assert!(
+            last < 1.0,
+            "the pseudo-energy rose to {last:.6} of its start over the hour"
+        );
+        assert!(
+            largest_rise < 1e-6,
+            "the pseudo-energy rose by {largest_rise:.2e} of itself over a step"
+        );
+    }
+
+    /// The pseudo-energy ([`EnergyCoordinates`]) of a random departure from
+    /// `rest` in `physics`' reference stratification (every field, 1e-6 in
+    /// the state's units at most, each part of the pseudo-energy with its
+    /// share), in steps of `dt`: its fraction of the start after each of
+    /// `hours` (increasing; printed), and its largest relative rise over a
+    /// step.
+    fn pseudo_energy_history(
+        physics: &Physics,
+        rest: &Solution3D,
+        dt: f64,
+        hours: &[f64],
+    ) -> (Vec<f64>, f64) {
+        let reference = physics
+            .reference_profile()
+            .expect("the fixture's reference");
+        let coords = EnergyCoordinates::new(physics, rest, reference);
+        let mut x0 = Vec::new();
+        pack(rest, &mut x0);
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let random: Vec<f64> = (0..x0.len())
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+            })
+            .collect();
+        let mut departure = coords.departure_of(&coords.energy_of(&coords.departure_of(&random)));
+        // No change of the volume, the heat or the salt: such a departure
+        // ends in another state at rest, not in this one
+        conserve_totals(physics, rest, &mut departure);
+        let largest = departure.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+        let start: Vec<f64> = x0
+            .iter()
+            .zip(&departure)
+            .map(|(a, b)| a + 1e-6 / largest * b)
+            .collect();
+        let mut state = rest.clone();
+        unpack(&start, &mut state);
+        let mut x = Vec::new();
+        let mut energy = |state: &Solution3D| {
+            pack(state, &mut x);
+            let departure: Vec<f64> = x.iter().zip(&x0).map(|(a, b)| a - b).collect();
+            0.5 * coords
+                .energy_of(&departure)
+                .iter()
+                .map(|y| y * y)
+                .sum::<f64>()
+        };
+        let initial = energy(&state);
+        let mut integrator = ModeSplitIntegrator::new();
+        let (mut last, mut largest_rise, mut n) = (initial, 0.0_f64, 0);
+        let mut history = Vec::with_capacity(hours.len());
+        for &until in hours {
+            while (n as f64) < (until * 3600.0 / dt).round() {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+                n += 1;
+                let now = energy(&state);
+                largest_rise = largest_rise.max(now / last - 1.0);
+                last = now;
+            }
+            println!(
+                "pseudo-energy after {until:.1} h: {:.6} of the start",
+                last / initial
+            );
+            history.push(last / initial);
+        }
+        println!("largest rise over a step: {largest_rise:.2e}");
+        (history, largest_rise)
+    }
+
+    /// Probe (TODO P1.3): [`pseudo_energy_history`] on the terrace fixture
+    /// (or, with `DGRS_SLICE` = "left:right" bed elevations, on the step
+    /// inside one 1 km element of the channel), in steps of `DGRS_DT` (5 s;
+    /// 36 s on a slice) to the hours `DGRS_HOURS` ("1,2,4,8,12,24").
+    #[test]
+    #[ignore = "probe: the pseudo-energy of a departure from rest over hours"]
+    fn probe_pseudo_energy() {
+        let hours: Vec<f64> = std::env::var("DGRS_HOURS")
+            .unwrap_or_else(|_| "1,2,4,8,12,24".into())
+            .split(',')
+            .filter_map(|h| h.parse().ok())
+            .collect();
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let (physics, rest, dt) = match std::env::var("DGRS_SLICE") {
+            Ok(spec) => {
+                let (left, right) = spec.split_once(':').expect("DGRS_SLICE left:right");
+                let (left, right): (f64, f64) = (left.parse().unwrap(), right.parse().unwrap());
+                let mesh = Mesh2D::uniform_rectangle(0.0, 8000.0, 0.0, 1000.0, 8, 1);
+                let bed = move |x: f64, _| step_bed(x, 3, left, right);
+                let (physics, rest) = basin_physics(mesh, bed, None, pycnocline);
+                (physics, rest, env_or("DGRS_DT", 36.0))
+            }
+            Err(_) => {
+                let (physics, rest) = terrace_patch_physics(None);
+                (physics, rest, env_or("DGRS_DT", 5.0))
+            }
+        };
+        pseudo_energy_history(&physics, &rest, dt, &hours);
     }
 
     /// The pycnocline over the 15 → 300 m cliff, over 0.5 m of water beside
@@ -3765,14 +4223,10 @@ mod tests {
 
     /// [`terrace_patch`] at rest under [`summer_pycnocline`] as
     /// `froya_real_data` sets it up (20 stretched levels, P2, constant mixing,
-    /// no limiter, the profile as the PGF's reference), with the vertical
-    /// tracer scheme `scheme` (the default if none), about the rest state if
-    /// `about_rest`: the physics and the state at rest.
-    fn terrace_patch_physics(
-        scheme: Option<VerticalAdvection>,
-        about_rest: bool,
-    ) -> (Physics, Solution3D) {
-        use crate::physics::EquationOfState;
+    /// no limiter, the pycnocline as the reference stratification), with the
+    /// vertical tracer scheme `scheme` (the default if none): the physics and
+    /// the state at rest.
+    fn terrace_patch_physics(scheme: Option<VerticalAdvection>) -> (Physics, Solution3D) {
         use crate::solver::{StandardLimiter2D, WetDryConfig};
         use crate::vertical::SongHaidvogelStretching;
         let (mesh, mut bathymetry) = terrace_patch();
@@ -3805,7 +4259,7 @@ mod tests {
             bathymetry.clone(),
             Arc::new(f),
             eos,
-            // Experiment (TODO P1.3): DGRS_KV, DGRS_KT, DGRS_SMAG vary the
+            // Probes (TODO P1.3): DGRS_KV, DGRS_KT, DGRS_SMAG vary the
             // dissipation for the spectrum probe
             ConstantMixing::new(env_or("DGRS_KV", 1e-3), env_or("DGRS_KT", 0.0)),
             swe,
@@ -3815,6 +4269,9 @@ mod tests {
         )
         .with_bottom_drag(BottomDrag3D::log_layer(0.003))
         .with_smagorinsky_viscosity(env_or("DGRS_SMAG", 0.1));
+        let reference = Arc::new(sampled_reference(&bathymetry, |z| {
+            summer_pycnocline(&eos, z)
+        }));
         let (nn, nl) = (ops.n_nodes, sigma.n_levels());
         let mut state = Solution3D::new(mesh.n_elements, nn, nl);
         for idx in 0..mesh.n_elements * nn {
@@ -3823,40 +4280,24 @@ mod tests {
             state.eta.data[idx] = eta;
             for (l, &s) in sigma.sigma_rho().iter().enumerate() {
                 (state.temp[idx * nl + l], state.salt[idx * nl + l]) =
-                    summer_pycnocline(&eos, eta + s * (eta - b));
+                    reference.at(eta + s * (eta - b));
             }
         }
         physics.update_density(&mut state);
-        let physics = physics.with_reference_profile(&state, |z| {
-            let (t, s) = summer_pycnocline(&eos, z);
-            eos.compute_density(t, s, z)
-        });
+        let physics = physics.with_reference_profile(reference);
         let physics = match scheme {
             Some(scheme) => physics.with_vertical_advection(scheme),
             None => physics,
         };
-        let physics = if about_rest {
-            physics.with_vertical_reference(&state)
-        } else {
-            physics
-        };
         (physics, state)
     }
 
-    /// [`terrace_patch_physics`] with the default vertical scheme, from a
-    /// temperature perturbation of 1e-6 °C: the largest layer speed after
-    /// each of `hours`.
-    fn terrace_patch_at_rest(about_rest: bool, hours: &[f64]) -> Vec<f64> {
-        terrace_patch_run(None, about_rest, hours)
-    }
-
-    /// [`terrace_patch_at_rest`] with the vertical tracer scheme `scheme`.
-    fn terrace_patch_run(
-        scheme: Option<VerticalAdvection>,
-        about_rest: bool,
-        hours: &[f64],
-    ) -> Vec<f64> {
-        let (physics, mut state) = terrace_patch_physics(scheme, about_rest);
+    /// [`terrace_patch_physics`] with the vertical tracer scheme `scheme`
+    /// (the default if none), from a temperature perturbation of 1e-6 °C at
+    /// every wet point, in steps of `dt`: the largest layer speed after each
+    /// of `hours`.
+    fn terrace_patch_run(scheme: Option<VerticalAdvection>, hours: &[f64], dt: f64) -> Vec<f64> {
+        let (physics, mut state) = terrace_patch_physics(scheme);
         let rest = state.clone();
         let (nl, bathymetry) = (state.n_levels, physics.bathymetry.clone());
         // A deterministic perturbation of 1e-6 °C at every wet point
@@ -3869,7 +4310,6 @@ mod tests {
                 *t += 1e-6 * ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5);
             }
         }
-        let dt = 5.0;
         let mut integrator = ModeSplitIntegrator::new();
         let mut n = 0;
         let mut speeds = Vec::with_capacity(hours.len());
@@ -3888,12 +4328,23 @@ mod tests {
                     .zip(&rest.temp)
                     .map(|(a, b)| (a - b).abs()),
             );
-            println!(
-                "terrace patch (about rest: {about_rest}): {speed:.2e} m/s, |δT| {anomaly:.2e} °C                  after {until} h"
-            );
+            println!("terrace patch: {speed:.2e} m/s, |δT| {anomaly:.2e} °C after {until} h");
             speeds.push(speed);
         }
         speeds
+    }
+
+    /// The vertical tracer scheme of `DGRS_VADV` (centred, akima, hermite,
+    /// upwind, tvd), if any (the probes').
+    fn probed_vertical_advection() -> Option<VerticalAdvection> {
+        match std::env::var("DGRS_VADV").as_deref() {
+            Ok("centred") => Some(VerticalAdvection::Centred),
+            Ok("akima") => Some(VerticalAdvection::Akima),
+            Ok("hermite") => Some(VerticalAdvection::HermiteMean),
+            Ok("upwind") => Some(VerticalAdvection::Upwind),
+            Ok("tvd") => Some(VerticalAdvection::Tvd),
+            _ => None,
+        }
     }
 
     /// Probe (TODO P1.3): [`terrace_patch_run`] with the scheme from
@@ -3903,70 +4354,47 @@ mod tests {
     #[ignore = "probe: the terrace fixture at rest over hours"]
     fn probe_terrace_run() {
         set_curvature_weight();
-        let scheme = match std::env::var("DGRS_VADV").as_deref() {
-            Ok("centred") => Some(VerticalAdvection::Centred),
-            Ok("akima") => Some(VerticalAdvection::Akima),
-            Ok("hermite") => Some(VerticalAdvection::HermiteMean),
-            Ok("upwind") => Some(VerticalAdvection::Upwind),
-            Ok("tvd") => Some(VerticalAdvection::Tvd),
-            _ => None,
-        };
-        let about_rest = std::env::var("DGRS_VREF").is_ok_and(|v| v == "1");
         let hours: Vec<f64> = std::env::var("DGRS_HOURS")
             .unwrap_or_else(|_| "1,2,4,6,8".into())
             .split(',')
             .map(|h| h.parse().expect("DGRS_HOURS"))
             .collect();
-        terrace_patch_run(scheme, about_rest, &hours);
+        terrace_patch_run(probed_vertical_advection(), &hours, env_or("DGRS_DT", 5.0));
     }
 
-    /// TODO P1.3 gate: the 36-min mode of the smoothed Frøya coastline mesh
-    /// (`docs/stratified-rest-over-steep-beds.md`). With a dissipative or
-    /// higher-order vertical tracer scheme the rest state mixes its own
-    /// pycnocline at the rate of a perturbation's vertical flow, which drives
-    /// the perturbation (`the_default_vertical_scheme_grows_on_the_terrace`).
-    /// Reconstructed about the rest state (`with_vertical_reference`), the
-    /// background is advected centred and the 36-min mode is gone: measured
-    /// 4.0e-7 → 3.6e-7 m/s from 2 to 4 h (the seed's own transient). It is not
-    /// at rest for good: a slower mode emerges after ≈ 5 h (the ignored gate
-    /// below).
+    /// TODO P1.3 gate: the first three hours of the terrace fixture, seeded
+    /// (the gate of 2026-10-04, when the vertical scheme about the rest state
+    /// took out the 36-min mode of the smoothed Frøya coastline mesh): the
+    /// largest speed at 3 h is below twice the one at 1 h. About the
+    /// reference profile: measured 4.7e-7 → 3.7e-7 m/s (the seed's own
+    /// internal waves). The twelve hours are the gate below.
     #[test]
     fn a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference() {
-        let speeds = terrace_patch_at_rest(true, &[1.0, 3.0]);
+        let speeds = terrace_patch_run(None, &[1.0, 3.0], 5.0);
         assert!(
             speeds[1] < 2.0 * speeds[0],
-            "about the rest state the terrace grew: {speeds:?}"
+            "about its reference the terrace grew: {speeds:?}"
         );
     }
 
-    /// TODO P1.3 gate (fails today): the terrace about its reference over
-    /// 12 h. The gate above ends at 3 h, before a slower oscillatory mode
-    /// emerges from the seed's transient: e-folding ≈ 2 h, period ≈ 3.2 h,
-    /// in levels 2–4 of the 22.6–30.6 m terrace element and its deeper
-    /// neighbour (`probe_terrace_spectrum` with `DGRS_VREF=1`; measured
-    /// 3.6e-7 m/s at 4 h, 1.3e-5 m/s at 12 h). The same vertex grows on the
-    /// 95-element patch of the coastline mesh, so it is not the fixture's
-    /// walls.
+    /// TODO P1.3 gate: a terrace of the smoothed Frøya coastline bed (22.6 m
+    /// beside 30.6 and 41 m, where the bed levels cross the pycnocline's
+    /// lower flank) beside a shore element with a dry node, at rest in the
+    /// summer pycnocline, seeded with 1e-6 °C: over 12 h nothing grows.
+    ///
+    /// About its reference stratification the scheme conserves a
+    /// pseudo-energy to first order (`Hydrostatic3D::with_reference_profile`,
+    /// `docs/stratified-rest-over-steep-beds.md`): measured 3.7e-7 m/s at 3 h
+    /// and 4.6e-7 m/s at 12 h, the seed's own internal waves. Before, the
+    /// σ-pairs scheme grew an oscillatory mode here with an e-folding of
+    /// ≈ 2 h (4.2e-7 m/s at 3 h, 1.3e-5 m/s at 12 h), and with the vertical
+    /// scheme taken about no reference a real one of 33 min.
     #[test]
-    #[ignore = "known failure, TODO P1.3: the terrace grows about its reference after ≈ 5 h"]
     fn a_terrace_beside_a_shore_element_stays_at_rest_for_twelve_hours() {
-        let speeds = terrace_patch_at_rest(true, &[3.0, 12.0]);
+        let speeds = terrace_patch_run(None, &[3.0, 12.0], 5.0);
         assert!(
             speeds[1] < 2.0 * speeds[0],
-            "about the rest state the terrace grew: {speeds:?}"
-        );
-    }
-
-    /// The fixture of the gate above still holds the mode: the default
-    /// `LimitedAkima` grows (measured ×11 from 2 to 4 h, the e-folding
-    /// approaching 33 min as the mode emerges from the seed).
-    #[test]
-    #[ignore = "slow (≈ 2 min): the mode of the terrace fixture under the default vertical scheme"]
-    fn the_default_vertical_scheme_grows_on_the_terrace() {
-        let speeds = terrace_patch_at_rest(false, &[2.0, 4.0]);
-        assert!(
-            speeds[1] > 5.0 * speeds[0],
-            "the default should grow on the terrace: {speeds:?}"
+            "about its reference the terrace grew: {speeds:?}"
         );
     }
 
@@ -3998,6 +4426,50 @@ mod tests {
         }
     }
 
+    /// Take out of the departure `dx` from `rest` (the layout of [`pack`])
+    /// what changes the volume, the heat or the salt: a uniform `η` and
+    /// uniform `T` and `S` over the columns that are not thin. The step map
+    /// keeps the three totals, so the departures that change none of them
+    /// are an invariant subspace of it.
+    fn conserve_totals(physics: &Physics, rest: &Solution3D, dx: &mut [f64]) {
+        let (ne, nn, nl) = (rest.n_elements, rest.n_nodes, rest.n_levels);
+        let field = ne * nn * nl;
+        let d_sigma = physics.sigma.d_sigma();
+        let mass = |idx: usize| physics.geom.node_mass(idx / nn, idx % nn);
+        let depth = |idx: usize| rest.eta.data[idx] - physics.bathymetry.data[idx];
+        let deep: Vec<usize> = (0..ne * nn)
+            .filter(|&idx| depth(idx) >= physics.min_column_depth)
+            .collect();
+        let area: f64 = deep.iter().map(|&idx| mass(idx)).sum();
+        let volume: f64 = deep.iter().map(|&idx| mass(idx) * depth(idx)).sum();
+        // No volume
+        let eta = &mut dx[4 * field..4 * field + ne * nn];
+        let mean = deep.iter().map(|&idx| mass(idx) * eta[idx]).sum::<f64>() / area;
+        deep.iter().for_each(|&idx| eta[idx] -= mean);
+        // No heat, no salt: Σ m Δσ (D δC + C δη)
+        for (t, tracer) in [&rest.temp, &rest.salt].into_iter().enumerate() {
+            let total: f64 = deep
+                .iter()
+                .map(|&idx| {
+                    let eta = dx[4 * field + idx];
+                    (0..nl)
+                        .map(|l| {
+                            let c = idx * nl + l;
+                            let change = depth(idx) * dx[(2 + t) * field + c] + tracer[c] * eta;
+                            mass(idx) * d_sigma[l] * change
+                        })
+                        .sum::<f64>()
+                })
+                .sum();
+            let shift = total / volume;
+            for &idx in &deep {
+                dx[(2 + t) * field + idx * nl..][..nl]
+                    .iter_mut()
+                    .for_each(|c| *c -= shift);
+            }
+        }
+    }
+
     /// Probe (TODO P1.3): the leading eigenvalues of the linearised step map
     /// about rest on the terrace fixture, by Arnoldi on finite differences
     /// of `DGRS_SPECTRUM_SECONDS` (1800 s) of `DGRS_DT` (5 s) steps,
@@ -4021,22 +4493,10 @@ mod tests {
     #[test]
     #[ignore = "probe: the spectrum of the terrace fixture at rest"]
     fn probe_terrace_spectrum() {
-        let scheme = match std::env::var("DGRS_VADV").as_deref() {
-            Ok("centred") => Some(VerticalAdvection::Centred),
-            Ok("akima") => Some(VerticalAdvection::Akima),
-            Ok("hermite") => Some(VerticalAdvection::HermiteMean),
-            Ok("upwind") => Some(VerticalAdvection::Upwind),
-            Ok("tvd") => Some(VerticalAdvection::Tvd),
-            _ => None,
-        };
-        let about_rest = std::env::var("DGRS_VREF").is_ok_and(|v| v == "1");
+        let scheme = probed_vertical_advection();
         set_curvature_weight();
-        let (physics, rest) = terrace_patch_physics(scheme, about_rest);
-        print_spectrum(
-            &physics,
-            &rest,
-            &format!("terrace {scheme:?} about rest {about_rest}"),
-        );
+        let (physics, rest) = terrace_patch_physics(scheme);
+        print_spectrum(&physics, &rest, &format!("terrace {scheme:?}"));
     }
 
     /// DGRS_WEIGHT: the weight of Akima's curvature correction in the
@@ -4076,8 +4536,168 @@ mod tests {
         print_spectrum(&physics, &rest, &format!("slice {left}:{right} dx {dx}"));
     }
 
+    /// Pseudo-energy coordinates of a departure from the state at rest in a
+    /// reference stratification (the layout of [`pack`]): the shear times
+    /// `√(ρ₀ m H)`, the depth-mean velocity times `√(ρ₀ m D)`, the free
+    /// surface times `√(ρ₀ g m)`, and in the temperature's place the density
+    /// anomaly about the reference at the layer's own height,
+    /// `ρ′ = ρ_T δT + ρ_S δS + Γ (1 + σ) δη` (the layer rises by
+    /// `(1 + σ) δη` through the reference, which is fixed in `z`), times
+    /// `√(g m H/Γ)`, with `m` the node's mass, `H` the layer's thickness and
+    /// `Γ = −∂ρ̄/∂z` the reference's gradient over the layer. The squared norm is twice the pseudo-energy
+    /// (kinetic, free-surface and available potential energy, J). The part of
+    /// `(δT, δS)` that is not a displacement of the reference (it changes no
+    /// density to first order and is not changed by the flow) is left out, as
+    /// are thin columns.
+    struct EnergyCoordinates {
+        nl: usize,
+        velocity: Vec<f64>,
+        barotropic: Vec<f64>,
+        surface: Vec<f64>,
+        density: Vec<f64>,
+        gradient: [Vec<f64>; 2],
+        gamma: Vec<f64>,
+        partials: [f64; 2],
+        root_d_sigma: Vec<f64>,
+        /// `1 + σ` at the layer centres: a layer's rise per unit of `η`
+        lift: Vec<f64>,
+    }
+
+    impl EnergyCoordinates {
+        fn new(physics: &Physics, rest: &Solution3D, reference: &TracerReferenceProfile) -> Self {
+            let (nn, nl) = (rest.n_nodes, rest.n_levels);
+            let n2 = rest.n_elements * nn;
+            let sigma = &physics.sigma;
+            let eos = physics.eos;
+            let partials = [-eos.rho0 * eos.alpha, eos.rho0 * eos.beta];
+            let mut coords = Self {
+                nl,
+                velocity: vec![0.0; n2 * nl],
+                barotropic: vec![0.0; n2],
+                surface: vec![0.0; n2],
+                density: vec![0.0; n2 * nl],
+                gradient: [vec![0.0; n2 * nl], vec![0.0; n2 * nl]],
+                gamma: vec![0.0; n2 * nl],
+                partials,
+                root_d_sigma: sigma.d_sigma().iter().map(|d| d.sqrt()).collect(),
+                lift: sigma.sigma_rho().iter().map(|s| 1.0 + s).collect(),
+            };
+            for idx in 0..n2 {
+                let eta = rest.eta.data[idx];
+                let depth = eta - physics.bathymetry.data[idx];
+                if depth < physics.min_column_depth {
+                    continue;
+                }
+                let mass = physics.geom.node_mass(idx / nn, idx % nn);
+                coords.barotropic[idx] = (RHO0 * mass * depth).sqrt();
+                coords.surface[idx] = (RHO0 * G * mass).sqrt();
+                for l in 0..nl {
+                    let h = depth * sigma.d_sigma()[l];
+                    coords.velocity[idx * nl + l] = (RHO0 * mass * h).sqrt();
+                    let (below, above) = (
+                        eta + sigma.sigma_w()[l] * depth,
+                        eta + sigma.sigma_w()[l + 1] * depth,
+                    );
+                    let (lo, hi) = (reference.at(below), reference.at(above));
+                    let (gt, gs) = ((hi.0 - lo.0) / h, (hi.1 - lo.1) / h);
+                    let gamma = -(partials[0] * gt + partials[1] * gs);
+                    coords.gradient[0][idx * nl + l] = gt;
+                    coords.gradient[1][idx * nl + l] = gs;
+                    coords.gamma[idx * nl + l] = gamma;
+                    if gamma > 1e-12 {
+                        coords.density[idx * nl + l] = (G * mass * h / gamma).sqrt();
+                    }
+                }
+            }
+            coords
+        }
+
+        /// The departure `dx` (state units) in energy coordinates.
+        fn energy_of(&self, dx: &[f64]) -> Vec<f64> {
+            let nl = self.nl;
+            let field = self.velocity.len();
+            let n2 = self.barotropic.len();
+            let mut y = vec![0.0; dx.len()];
+            for idx in 0..n2 {
+                for f in 0..2 {
+                    let column = &dx[f * field + idx * nl..f * field + (idx + 1) * nl];
+                    let mean: f64 = column
+                        .iter()
+                        .zip(&self.root_d_sigma)
+                        .map(|(u, r)| u * r * r)
+                        .sum();
+                    for l in 0..nl {
+                        y[f * field + idx * nl + l] =
+                            self.velocity[idx * nl + l] * (column[l] - mean);
+                    }
+                }
+                // The anomaly about the reference at the layer's own height,
+                // which rises by (1 + σ) δη
+                let eta = dx[4 * field + idx];
+                for l in 0..nl {
+                    let i = idx * nl + l;
+                    let anomaly = self.partials[0] * dx[2 * field + i]
+                        + self.partials[1] * dx[3 * field + i]
+                        + self.gamma[i] * self.lift[l] * eta;
+                    y[2 * field + i] = self.density[i] * anomaly;
+                }
+                y[4 * field + idx] = self.surface[idx] * dx[4 * field + idx];
+                y[4 * field + n2 + idx] = self.barotropic[idx] * dx[4 * field + n2 + idx];
+                y[4 * field + 2 * n2 + idx] = self.barotropic[idx] * dx[4 * field + 2 * n2 + idx];
+            }
+            y
+        }
+
+        /// The departure (state units) of the energy coordinates `y`.
+        fn departure_of(&self, y: &[f64]) -> Vec<f64> {
+            let nl = self.nl;
+            let field = self.velocity.len();
+            let n2 = self.barotropic.len();
+            let mut dx = vec![0.0; y.len()];
+            let over = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
+            for idx in 0..n2 {
+                for f in 0..2 {
+                    let bar = over(y[4 * field + (f + 1) * n2 + idx], self.barotropic[idx]);
+                    dx[4 * field + (f + 1) * n2 + idx] = bar;
+                    let mut mean = 0.0;
+                    for l in 0..nl {
+                        let i = idx * nl + l;
+                        let shear = over(y[f * field + i], self.velocity[i]);
+                        dx[f * field + i] = shear;
+                        mean += self.root_d_sigma[l] * self.root_d_sigma[l] * shear;
+                    }
+                    if self.barotropic[idx] > 0.0 {
+                        for l in 0..nl {
+                            dx[f * field + idx * nl + l] += bar - mean;
+                        }
+                    }
+                }
+                let eta = over(y[4 * field + idx], self.surface[idx]);
+                dx[4 * field + idx] = eta;
+                for l in 0..nl {
+                    let i = idx * nl + l;
+                    if self.density[i] == 0.0 {
+                        continue;
+                    }
+                    // The displacement of the reference with this anomaly,
+                    // at the layer's risen height
+                    let displacement =
+                        y[2 * field + i] / self.density[i] / self.gamma[i] - self.lift[l] * eta;
+                    dx[2 * field + i] = -self.gradient[0][i] * displacement;
+                    dx[3 * field + i] = -self.gradient[1][i] * displacement;
+                }
+            }
+            dx
+        }
+    }
+
     /// The leading eigenvalues of the step map about `rest` (see
-    /// [`probe_terrace_spectrum`]) and where the leading modes live.
+    /// [`probe_terrace_spectrum`]) and where the leading modes live. With
+    /// `DGRS_ENERGY=1` and a `reference`, in pseudo-energy coordinates
+    /// ([`EnergyCoordinates`]): the Ritz values then lie in the map's
+    /// numerical range in that norm, and the largest singular value of the
+    /// Arnoldi matrix is the largest growth of the pseudo-energy's root over
+    /// the horizon among the Krylov vectors.
     fn print_spectrum(physics: &Physics, rest: &Solution3D, label: &str) {
         let weight = env_or("DGRS_WEIGHT", 0.5);
         let horizon = env_or("DGRS_SPECTRUM_SECONDS", 1800.0);
@@ -4107,13 +4727,49 @@ mod tests {
         // nonlinearity
         let epsilon = 1e-6;
         let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let coords = physics
+            .reference_profile()
+            .filter(|_| env_or("DGRS_ENERGY", 1.0) != 0.0)
+            .map(|reference| EnergyCoordinates::new(physics, rest, reference));
+        // The conserved totals (volume, heat, salt) each have a neutral
+        // direction: a departure that changes one ends in another state at
+        // rest, an eigenvalue of exactly 1 that Arnoldi approaches slowly
+        // and from both sides (its tracers settle over days). With
+        // `DGRS_DEFLATE` (on by default) the map is taken on the departures
+        // that change none of them, an invariant subspace: a uniform η and
+        // uniform T and S over the columns that are not thin are taken out
+        // of every departure before it is advanced.
+        let deflate = env_or("DGRS_DEFLATE", 1.0) != 0.0;
+        let conserve_totals = |dx: &mut [f64]| conserve_totals(physics, rest, dx);
+        let (ne, nn, nl) = (rest.n_elements, rest.n_nodes, rest.n_levels);
+        let field = ne * nn * nl;
         let apply = |v: &[f64]| -> Vec<f64> {
-            let x: Vec<f64> = x0.iter().zip(v).map(|(a, b)| a + epsilon * b).collect();
-            advance(&x)
+            // In energy coordinates the departure is scaled so that its
+            // largest component is `epsilon` in the state's units
+            let (mut dx, scale) = match &coords {
+                Some(coords) => {
+                    let mut dx = coords.departure_of(v);
+                    if deflate {
+                        conserve_totals(&mut dx);
+                    }
+                    let largest = dx.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                    (dx, epsilon / largest)
+                }
+                None => (v.to_vec(), epsilon),
+            };
+            if deflate && coords.is_none() {
+                conserve_totals(&mut dx);
+            }
+            let x: Vec<f64> = x0.iter().zip(&dx).map(|(a, b)| a + scale * b).collect();
+            let out: Vec<f64> = advance(&x)
                 .iter()
                 .zip(&base)
-                .map(|(a, b)| (a - b) / epsilon)
-                .collect()
+                .map(|(a, b)| (a - b) / scale)
+                .collect();
+            match &coords {
+                Some(coords) => coords.energy_of(&out),
+                None => out,
+            }
         };
         // Arnoldi with full re-orthogonalisation, from a deterministic start
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
@@ -4125,6 +4781,9 @@ mod tests {
                 (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
             })
             .collect();
+        if let Some(coords) = &coords {
+            start = coords.energy_of(&coords.departure_of(&start));
+        }
         let s = norm(&start);
         start.iter_mut().for_each(|x| *x /= s);
         let mut basis = vec![start];
@@ -4149,6 +4808,21 @@ mod tests {
             basis.push(w);
         }
         let hessenberg = faer::Mat::<f64>::from_fn(size, size, |i, j| h[i][j]);
+        // The largest growth of the norm over the horizon among the Krylov
+        // vectors: the largest singular value of the (size + 1) × size
+        // Arnoldi matrix
+        let rows = (size + 1).min(m + 1);
+        let gram = faer::Mat::<f64>::from_fn(size, size, |i, j| {
+            (0..rows).map(|r| h[r][i] * h[r][j]).sum::<f64>()
+        });
+        let largest_growth = gram
+            .eigen()
+            .expect("Gram eigendecomposition")
+            .S()
+            .column_vector()
+            .iter()
+            .fold(0.0_f64, |m, e| m.max(e.re))
+            .sqrt();
         let eigen = hessenberg.eigen().expect("Hessenberg eigendecomposition");
         let values = eigen.S().column_vector();
         let vectors = eigen.U();
@@ -4163,8 +4837,20 @@ mod tests {
             env_or("DGRS_KT", 0.0),
             env_or("DGRS_SMAG", 0.1)
         );
-        let (ne, nn, nl) = (rest.n_elements, rest.n_nodes, rest.n_levels);
-        let field = ne * nn * nl;
+        println!(
+            "  {} coordinates{}: the largest growth of the norm over the horizon among the \
+             Krylov vectors is {largest_growth:.6}",
+            if coords.is_some() {
+                "pseudo-energy"
+            } else {
+                "state"
+            },
+            if deflate {
+                ", the departures that keep the volume, the heat and the salt"
+            } else {
+                ""
+            }
+        );
         let bathymetry = physics.bathymetry.clone();
         for (rank, &k) in order.iter().take(10).enumerate() {
             let mu = values[k];
@@ -4228,6 +4914,35 @@ mod tests {
                 sv / total,
                 st / total,
                 barotropic / total
+            );
+            // The barotropic part by field (η, ū, v̄) and element
+            let per = ne * nn;
+            let mut fields = [0.0; 3];
+            let mut by_element = vec![[0.0; 3]; ne];
+            for i in 4 * field..n {
+                let (f, r) = ((i - 4 * field) / per, (i - 4 * field) % per);
+                fields[f] += power(i);
+                by_element[r / nn][f] += power(i);
+            }
+            let rows: Vec<String> = by_element
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.iter().sum::<f64>() > 0.02 * barotropic)
+                .map(|(e, p)| {
+                    format!(
+                        "e{e} {:.2}/{:.2}/{:.2}",
+                        p[0] / barotropic,
+                        p[1] / barotropic,
+                        p[2] / barotropic
+                    )
+                })
+                .collect();
+            println!(
+                "    barotropic: η {:.3}, ū {:.3}, v̄ {:.3}; by element (η/ū/v̄): {}",
+                fields[0] / barotropic,
+                fields[1] / barotropic,
+                fields[2] / barotropic,
+                rows.join(", ")
             );
             for (name, part, sum) in [("velocity", &velocity, sv), ("tracers", &tracer, st)] {
                 let mut top: Vec<(f64, usize)> =
@@ -4381,12 +5096,12 @@ mod tests {
         );
     }
 
-    /// `Simulation3D` takes a stratified initial state as the vertical
-    /// tracer advection's reference (TODO P1.3), and only then: an unmixed
-    /// state, a reference of the caller's, or `without_vertical_reference`
+    /// `Simulation3D` takes a stratified initial state's mean profile as the
+    /// reference stratification (TODO P1.3), and only then: an unmixed
+    /// state, a reference of the caller's, or `without_reference_profile`
     /// keep theirs.
     #[test]
-    fn simulation_takes_a_stratified_initial_state_as_the_vertical_reference() {
+    fn simulation_takes_a_stratified_initial_states_mean_profile_as_the_reference() {
         let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, 300.0, 0.0, 100.0, 3, 1));
         let ops = Arc::new(DGOperators2D::new(1));
         let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
@@ -4419,18 +5134,29 @@ mod tests {
             let mut simulation = Simulation3D::new(physics, ModeSplitIntegrator::new());
             let mut state = state.clone();
             simulation.run(&mut state, 0.0, 1.0);
-            simulation.physics.vertical_reference()
+            simulation.physics.reference_profile().cloned()
         };
         assert!(reference_after(physics(), &uniform).is_none(), "unmixed");
+        // Every column is the same: their mean is each one's profile, linear
+        // between the layer centres (20 m in three layers; on the mean's
+        // 1 m grid, which has the kink at the middle centre)
         let taken = reference_after(physics(), &stratified).expect("stratified");
-        assert_eq!(taken[0], stratified.temp, "the initial temperature");
+        for (z, t) in [(-50.0 / 3.0, 8.0), (-10.0, 9.0), (-10.0 / 3.0, 12.0)] {
+            assert!(
+                (taken.temperature(z) - t).abs() < 1e-12,
+                "the mean profile at {z:.2} m: {} for {t}",
+                taken.temperature(z)
+            );
+            assert_eq!(taken.salinity(z), 35.0);
+        }
         assert!(
-            reference_after(physics().without_vertical_reference(), &stratified).is_none(),
+            reference_after(physics().without_reference_profile(), &stratified).is_none(),
             "opted out"
         );
-        let own = reference_after(physics().with_vertical_reference(&uniform), &stratified)
+        let own = TracerReferenceProfile::new(vec![-20.0, 0.0], vec![7.0, 7.5], vec![34.0, 34.0]);
+        let kept = reference_after(physics().with_reference_profile(own.clone()), &stratified)
             .expect("the caller's");
-        assert_eq!(own[0], uniform.temp, "the caller's reference is kept");
+        assert_eq!(*kept, own, "the caller's reference is kept");
     }
 
     /// A stratified seamount at rest (Beckmann & Haidvogel 1993; TODO P4.6):

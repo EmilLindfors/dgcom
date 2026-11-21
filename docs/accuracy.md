@@ -235,6 +235,11 @@ its adjoint.
 | Tilted η (full PGF = −g∇η); linear ρ(x, y) over a flat bed | 9.7e-16 m/s² each (of 1e-3, 1e-4) |
 | Net PGF force over level σ-surfaces, rough ρ (periodic) | ≤ 5.3e-17 of Σ\|F\| |
 | Stratified seamount at rest, 36 h, Kuzmin limiter (6 × 6 P2, 10 levels) | 3.6e-11 m/s (rectangles: 7.9e-11) |
+| A pycnocline at rest about its reference profile over steps of the bed that are not smoothed, each inside one 1 km element, 48 h (15 → 300 m, 0.5 m beside 150 m, land beside 300 m, 15 → 60 m) | ≤ 1e-11 m/s (`docs/stratified-rest-over-steep-beds.md`) |
+| The pseudo-energy's exchange about a reference: the force's work against the available potential energy's rate, any transports, distorted elements, a shore element | 1e-11 of its terms |
+| The pseudo-energy of a random departure from rest over the 15 → 300 m cliff | falls at every step (96 h) |
+| A state 0.5 °C off its reference everywhere, at rest over the 15 → 300 m cliff, 1 h | 1.2e-12 m/s |
+| Tracer inventories and volume under a 0.5 m seiche with a 6 °C thermocline in the reference | 2.2e-14 / 1.9e-14 relative |
 | Uniform T, S under a 0.5 m seiche over a sloping bed | 7.0e-13; Ω surface residual 3.5e-18 of Ω 7.3e-3 m/s |
 | Tracer inventories and volume, same run with gradients and the limiter | 2.9e-15 / 1.3e-14 relative |
 | Momentum, flat periodic bed, shear + viscosity | 5.1e-14 of the transport |

@@ -98,14 +98,174 @@
 //! profile there is none once a σ-level crosses the pycnocline between two
 //! nodes of one element, as at the cliffs of a fjord coast. There the pair's
 //! chord `Δρ/Δz` is far steeper than the stratification at either node, and
-//! round-off grows (e-folding ≈ 15 min on the Frøya bed, ≈ 45 min in the
-//! x–z cliff of `a_pycnocline_over_a_cliff_stays_at_rest`; TODO P1.3).
+//! round-off grows (e-folding ≈ 15 min on the Frøya bed, 47 min in the x–z
+//! cliff of `a_pycnocline_over_a_cliff_stays_at_rest`). The cure is a
+//! reference stratification (next section).
+//!
+//! # About a reference: the anomaly, and the advection that is its adjoint
+//!
+//! With a reference stratification, a horizontally uniform `T̄(z)`, `S̄(z)`
+//! with the density `ρ̄(z)` of its water
+//! ([`crate::physics::Hydrostatic3D::with_reference_profile`]), the force is
+//! the σ-pairs force of the anomaly `ρ′ = ρ − ρ̄(z)`, `ρ̄` taken at every
+//! node's own height at the stage's `η` ([`reference_density_into`]), with
+//! the anomaly's pressure integrated by the trapezoid rule,
+//! `p_l − p_{l+1} = ½(ρ′_l + ρ′_{l+1})(z_{l+1} − z_l)`: linear in `ρ′`
+//! (the monotone cubic's slopes are not). A fluid at rest in the reference
+//! feels no force at all, over any bed (Mellor et al. 1998).
+//!
+//! **The force's work.** The layers move their volume along the edges of a
+//! graph: the pairs of nodes `(i, j)` of an element on a level, each with the
+//! volume flux `Φ_ij = m_i Dx_ij·Q_i − m_j Dx_ji·Q_j` from `i` to `j`
+//! (`m = wJ` the nodal mass; on a parallelogram `2 m_i Dx_ij·{{Q}}_ij`, the
+//! split form's), the element faces, and the σ-surfaces between the layers
+//! of a column, each with `m Ω`. Summing the force against the layer
+//! transports `Q`, by parts with the layers' continuity (the pressure
+//! differences of the pairs and faces become those across the σ-surfaces):
+//!
+//! ```text
+//!     −(ρ₀/g) Σ_a m_a Q_a·F_a = Σ_edges F_ab ½(ρ′_a + ρ′_b)(z_b − z_a)
+//!                             = Σ_a m_a ρ′_a (H_z w)_a,
+//!     (H_z w)_a = (1/m_a) Σ_b ½ F_ab (z_b − z_a),
+//! ```
+//!
+//! over the edges the force acts along: the pairs of an element without a
+//! thin column, and the σ-surfaces of the columns that are not thin (a face
+//! joins nodes at one height, where the bed is continuous). `w` is the rate
+//! at which the layer's water rises relative to its node, `u·∇_σ z + Ω`, in
+//! the split form and with `Ω` averaged to the layer centre by the
+//! trapezoid rule's weights: the force's adjoint.
+//!
+//! **A depth mean, and the free surface.** Transports with a depth mean move
+//! the free surface, the layers thicken by `Δσ_l ∂η/∂t`, and a layer's
+//! centre rises through the reference by `(1 + σ) ∂η/∂t`: the anomaly gets
+//! `Γ (1 + σ) ∂η/∂t` besides. Summing by parts as above, what is left of the
+//! force's work is `−g Σ_i m_i ∂η/∂t Σ_l Δσ_l p_l`, and of the potential
+//! energy's rate `g Σ_i m_i ∂η/∂t Σ_l ρ′_l H_z (1 + σ_l)`: the two cancel if
+//! the pressure's mean over a column is the anomaly's first moment about
+//! the bed,
+//!
+//! ```text
+//!     Σ_l Δσ_l p_l = Σ_l Δσ_l ρ′_l (z_l − B),
+//! ```
+//!
+//! which is the mean of the exact pressure of layers of uniform `ρ′` (the
+//! layer centres are the midpoints of their σ-surfaces). The trapezoid
+//! rule's mean differs from it on stretched levels, and by the mean
+//! displacement's term below, so the column's pressure is shifted by the
+//! difference, the same at every level: only the depth-mean force changes,
+//! by a term of the size of the rule's error, and a uniform anomaly still
+//! exerts none (an anomaly linear in `z` does, at second order: the moment
+//! is the midpoint rule's). With it the identity holds to round-off for any
+//! transports, with a depth mean or without, for the layers' rise as the
+//! tangent takes it, with the reference's gradient over the layer; the
+//! model's reference, at the layer centre, rises at its gradient there,
+//! which is the same where a layer resolves it (gate
+//! `the_reference_advection_and_the_pressure_gradient_exchange_pseudo_energy_exactly`:
+//! on parallelograms and distorted elements, both metric forms, stretched
+//! levels, over a cliff, with a shore element).
+//!
+//! **An element with a thin column** moves its layers through the GLL
+//! subcell interfaces of the 2D wet/dry kernel, each with its share
+//! `Δσ_l F̄` of the barotropic flux, and exchanges no baroclinic transport
+//! within itself. Between two of its columns that are not thin that flux
+//! moves the stratification along the sloping levels like any other, so the
+//! interface is an edge of the graph too: the reference is advected by the
+//! tangent along it, and the force has the adjoint, a depth-mean term
+//! (`subcell_mean_term`) on the barotropic flow. An interface with a thin
+//! column on one side stays outside (the wet/dry front: the 2D kernel's
+//! hydrostatic reconstruction decides its flux).
+//!
+//! **The tracers.** The conservative advection moves a tracer along an
+//! edge by `−½ F_ab (C_b − C_a)/m_a`. In a fluid at rest in the reference
+//! that jump is the reference's chord `C̄(z_b) − C̄(z_a)`, which across a
+//! pair that straddles the pycnocline has nothing to do with the
+//! stratification at either end. [`add_reference_advection`] replaces the
+//! chord by the tangent, `γ_a (z_b − z_a)` with `γ_a` the reference's mean
+//! gradient over the layer of `a`, on exactly the edges the force acts
+//! along, so that the reference is advected as
+//!
+//! ```text
+//!     H_z ∂C/∂t = −γ^C H_z w,    hence    H_z ∂ρ′/∂t = Γ H_z w,
+//!     Γ = −(ρ_T γ^T + ρ_S γ^S) ≥ 0  (a statically stable reference),
+//! ```
+//!
+//! with the same `w`. Then, for the scheme linearised about rest in the
+//! reference,
+//!
+//! ```text
+//!     d/dt [ ½ρ₀ Σ m H_z |u|² + ½ g Σ m H_z ρ′²/Γ ] = −g b + g b = 0,
+//! ```
+//!
+//! `b` the sum above: the kinetic energy and the available potential energy
+//! (Holliday & McIntyre 1981) with positive weights exchange exactly, the
+//! operator is skew-adjoint in that norm (Bell, Peixoto & Thuburn 2017), and
+//! no mode grows, whatever the bed, the mesh, or how the σ-levels cross the
+//! pycnocline. The weights are those of the stratification at each node, so
+//! none is singular: the fastest mode is an internal wave's, among them the
+//! one along a sloping level, `N |∇_σ z|`, which the step must resolve
+//! ([`ReferenceFields::sloping_level_rate`]). Where `Γ = 0` the anomaly does
+//! not change. Coriolis does no work; the viscosities and the upwind faces
+//! only remove kinetic energy.
+//!
+//! **Conservation, and the element's displacement.** The tangent is not a
+//! flux between two cells: along an edge the two ends' terms add up to
+//! `F_ab τ_ab`, `τ_ab = (C̄_b − C̄_a) − ½(γ_a + γ_b)(z_b − z_a)`, the
+//! trapezoid rule's error of the reference's gradient. (No single-valued
+//! flux between cells paired by level index has this structure with bounded
+//! weights: the conservative one's linearisation is the stiff pair
+//! density's, `docs/stratified-rest-over-steep-beds.md`.) The element takes
+//! that back: with `R = Σ_edges F_ab τ_ab` over its edges, every layer gets
+//! `−H_z Γ g R/N`, a displacement of the element's stratification at the
+//! rate `R/N` in the shape of `g`, the stratification's residual about its
+//! column's own line in `z` ([`ReferenceFields::residual`]), with
+//! `N = Σ m H_z Γ g`. So each element keeps its inventories of `T` and `S`
+//! to round-off, as the conservative scheme does (gates
+//! `the_reference_advection_and_the_pressure_gradient_exchange_pseudo_energy_exactly`,
+//! `a_curved_reference_keeps_constancy_and_the_tracers_inventories`).
+//!
+//! The force has the adjoint of that step. With the element's displacement
+//! `κ = Σ m H_z g ρ′/N` (the regression of the anomaly on the stratification
+//! within the columns; [`ReferenceFields::set_displacements`]), every
+//! pressure difference along an edge of the element leaves out the
+//! trapezoid rule's error of that displacement's anomaly,
+//!
+//! ```text
+//!     ½(ρ′_a + ρ′_b)(z_b − z_a) − κ [(ρ̄_b − ρ̄_a) + ½(Γ_a + Γ_b)(z_b − z_a)],
+//! ```
+//!
+//! which integrates `κΓ` along the edge exactly, as `−κ(ρ̄_b − ρ̄_a)`. A
+//! stratification displaced as a whole within an element (`ρ′ = κΓ`) then
+//! exerts no force within it, where the trapezoid rule alone gives the σ
+//! form's error of the displaced profile at every straddle. With both, the
+//! identity above holds term by term again: the rate of the potential
+//! energy gets `−g κ R`, and the force's work `+g κ R`.
+//!
+//! The residual, and not the stratification itself, because `κ` multiplies
+//! the trapezoid error of the reference along the edge, which at a straddle
+//! is the tangent's overshoot. An anomaly that is uniform or linear in `z`
+//! in each column (a state warmer than its reference) is no displacement,
+//! and must have no `κ`: `g` is orthogonal to both in every column. With the
+//! plain projection `Σ m H_z ρ′/Σ m H_z Γ`, a state 0.5 °C off its
+//! reference everywhere, which is at rest, was driven to 0.2 m/s within 15
+//! minutes over a 15 → 300 m cliff (gate
+//! `an_offset_from_the_reference_stays_at_rest`).
+//!
+//! Of a tracer's jump along an edge only the reference's share `θ_ab` is
+//! treated so (`θ = clamp(ΔC/ΔC̄, 0, 1)`: none of a uniform tracer, all of
+//! the reference itself), so constancy holds, and a stratification that has
+//! drifted from the reference falls back on the conservative scheme. The
+//! identity is exact for an equation of state linear in `T` and `S` (for
+//! another, `Γ` is taken with its partials at the reference, and the
+//! reference density's chords differ from the tracers' at the equation's
+//! curvature).
 //!
 //! # Balanced reference
 //!
-//! The price of σ-pairs is the σ form's error at rest. A stored reference
-//! state `ρ_s` (the initial stratification, or a parent model's) takes it
-//! back ([`BalancedReference`]):
+//! The price of σ-pairs is the σ form's error at rest, for what is not in
+//! the reference stratification. A stored reference state `ρ_s` (the
+//! initial stratification, or a parent model's) takes it back
+//! ([`BalancedReference`]):
 //!
 //! ```text
 //!     F(ρ) = F_σ(ρ) + [F_z(ρ_s) − F_σ(ρ_s)],
@@ -114,8 +274,8 @@
 //! with `F_σ`, `F_z` the σ-pair and constant-depth forces. The bracket is a
 //! fixed field, so the dynamics (and their stability) are σ-pairs', while a
 //! fluid resting in the reference state feels the constant-depth form's
-//! force; for a horizontally uniform `ρ_s(z)` this is the subtraction of a
-//! reference profile of Mellor et al. (1998), here for any reference field.
+//! force. (For a horizontally uniform `ρ_s(z)` take the reference
+//! stratification above instead: it is exact at rest.)
 //!
 //! # Curvilinear elements
 //!
@@ -184,8 +344,12 @@
 use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::TracerReferenceProfile;
 use crate::solver::core::blocks::{Blocks, Pooled, for_each_block};
-use crate::solver::rhs::transport_3d::MetricForm;
+use crate::solver::rhs::subcells::{
+    line_metric, line_node, subcell_interfaces, subcell_slot, telescoped_interfaces,
+};
+use crate::solver::rhs::transport_3d::{LayerTransport, MAX_N_1D, MetricForm};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -227,7 +391,8 @@ pub struct BalancedReference {
 
 impl BalancedReference {
     /// The correction of `state` (its `rho` must be current), with the
-    /// arguments of [`compute_pressure_gradient`].
+    /// arguments of [`compute_pressure_gradient`]: with a `reference`, of
+    /// the state's anomaly about it in both forms.
     pub fn new(
         state: &Solution3D,
         mesh: &Mesh2D,
@@ -240,6 +405,7 @@ impl BalancedReference {
         rho_ref: f64,
         min_column_depth: f64,
         metric: MetricForm,
+        reference: Option<&ReferenceFields>,
     ) -> Self {
         let n = state.n_elements * ops.n_nodes * sigma.n_levels();
         let force = |form| {
@@ -257,6 +423,7 @@ impl BalancedReference {
                 min_column_depth,
                 form,
                 metric,
+                reference,
                 &mut fx,
                 &mut fy,
                 Blocks::All(state.n_elements),
@@ -270,66 +437,6 @@ impl BalancedReference {
         }
         Self {
             correction: [zx, zy],
-        }
-    }
-
-    /// The correction of a horizontally uniform reference density
-    /// `profile(z)` (kg/m³), sampled at the levels of `state` (its `η`):
-    /// `−F_σ(ρ_s)`, since the true force of a horizontally uniform field is
-    /// zero (the subtraction of a reference profile of Mellor et al. 1998).
-    /// A fluid resting in the profile then feels no force at all, where
-    /// [`Self::new`] leaves the constant-depth form's interpolation error
-    /// (1.7e-4 m/s² at Frøya's cliff shores for a summer pycnocline, which
-    /// drove 0.6 m/s within half an hour); in motion only the σ-pairs' error
-    /// of the departure from the profile remains. The arguments are
-    /// [`Self::new`]'s.
-    pub fn from_profile(
-        state: &Solution3D,
-        mesh: &Mesh2D,
-        bathymetry: &Bathymetry2D,
-        sigma: &SigmaGrid,
-        ops: &DGOperators2D,
-        geom: &GeometricFactors2D,
-        g: f64,
-        rho_0: f64,
-        rho_ref: f64,
-        min_column_depth: f64,
-        metric: MetricForm,
-        profile: impl Fn(f64) -> f64,
-    ) -> Self {
-        let nl = sigma.n_levels();
-        let mut reference = state.clone();
-        for (idx, column) in reference.rho.chunks_exact_mut(nl).enumerate() {
-            let eta = state.eta.data[idx];
-            let depth = eta - bathymetry.data[idx];
-            for (rho, &s) in column.iter_mut().zip(sigma.sigma_rho()) {
-                *rho = profile(eta + s * depth);
-            }
-        }
-        let n = reference.rho.len();
-        let (mut fx, mut fy) = (vec![0.0; n], vec![0.0; n]);
-        compute_pressure_gradient(
-            &reference,
-            mesh,
-            bathymetry,
-            sigma,
-            ops,
-            geom,
-            g,
-            rho_0,
-            rho_ref,
-            min_column_depth,
-            PressureGradientForm::SigmaPairs,
-            metric,
-            &mut fx,
-            &mut fy,
-            Blocks::All(reference.n_elements),
-        );
-        for f in fx.iter_mut().chain(fy.iter_mut()) {
-            *f = -*f;
-        }
-        Self {
-            correction: [fx, fy],
         }
     }
 
@@ -353,6 +460,44 @@ impl BalancedReference {
 /// density slope is taken as zero.
 const MIN_LEVEL_SPACING: f64 = 1e-9;
 
+/// The most σ-levels a reference stratification's kernels take (their
+/// per-level buffers are on the stack).
+const MAX_LEVELS: usize = 128;
+
+/// The least `Σ m H_z g Γ⁺` of an element, as a fraction of `Σ m H_z Γ⁺²`,
+/// for which its stratification has a residual to displace
+/// ([`ReferenceFields::set_displacements`], [`add_reference_advection`]).
+const RESIDUAL_FLOOR: f64 = 1e-12;
+
+/// Whether an element's stratification has a residual about its columns'
+/// lines in `z`: `weight = Σ m H_z g Γ⁺` against `scale = Σ m H_z Γ⁺²`.
+#[inline]
+fn has_residual(weight: f64, scale: f64) -> bool {
+    weight > RESIDUAL_FLOOR * scale
+}
+
+/// A column's stratification `gamma` (its negative parts counted as zero)
+/// less its line in `z` by least squares over the layers, weighted by their
+/// thicknesses `d_sigma`, into `out`: `g = Γ⁺ − α − β σ` at the layer centres
+/// `sigma_rho` (a line in `σ` is one in `z` in a column). Then
+/// `Σ Δσ g = Σ Δσ σ g = 0`, and `Σ Δσ Γ⁺ g = Σ Δσ g² ≥ 0`.
+fn stratification_residual(gamma: &[f64], sigma_rho: &[f64], d_sigma: &[f64], out: &mut [f64]) {
+    let (mut mean, mut centre) = (0.0, 0.0);
+    for ((&g, &s), &w) in gamma.iter().zip(sigma_rho).zip(d_sigma) {
+        mean += w * g.max(0.0);
+        centre += w * s;
+    }
+    let (mut spread, mut slope) = (0.0, 0.0);
+    for ((&g, &s), &w) in gamma.iter().zip(sigma_rho).zip(d_sigma) {
+        spread += w * (s - centre) * (s - centre);
+        slope += w * (s - centre) * (g.max(0.0) - mean);
+    }
+    let slope = if spread > 0.0 { slope / spread } else { 0.0 };
+    for ((o, &g), &s) in out.iter_mut().zip(gamma).zip(sigma_rho) {
+        *o = g.max(0.0) - mean - slope * (s - centre);
+    }
+}
+
 /// One water column's density anomaly as a piecewise Hermite cubic in `z`,
 /// and its hydrostatic pressure (per `g`) at the level centres.
 #[derive(Clone, Copy)]
@@ -374,6 +519,10 @@ struct ColumnView<'a> {
     bed: f64,
     /// At least the minimum column depth deep.
     wet: bool,
+    /// The reference stratification's density and gradient `Γ` at the
+    /// levels (zeros without one, where `rho` is not an anomaly).
+    reference: &'a [f64],
+    stratification: &'a [f64],
 }
 
 impl ColumnView<'_> {
@@ -437,10 +586,17 @@ fn hermite_integral_of(t: f64, rho: &[f64], slope: &[f64], m: usize, h: f64) -> 
 /// A column's pressure at its own level is its table value, and the depths
 /// at which each column is evaluated in the other rise with the level, so
 /// one upward walk per column finds every interval.
+///
+/// `displacement` is the displacement `κ` of the two columns' element
+/// about its reference stratification (zero without one, and for the two
+/// sides of a face): the σ-pairs difference then leaves out the trapezoid
+/// rule's error of that displacement's anomaly along the pair,
+/// `κ [(ρ̄_b − ρ̄_a) + ½(Γ_a + Γ_b)(z_b − z_a)]` (see "About a reference").
 fn pressure_differences(
     a: &ColumnView,
     b: &ColumnView,
     form: PressureGradientForm,
+    displacement: f64,
     out: &mut [f64],
 ) {
     if !(a.wet && b.wet) {
@@ -450,6 +606,13 @@ fn pressure_differences(
     if form == PressureGradientForm::SigmaPairs {
         for (l, dp) in out.iter_mut().enumerate() {
             *dp = (b.at_level[l] - a.at_level[l]) + 0.5 * (a.rho[l] + b.rho[l]) * (b.z[l] - a.z[l]);
+        }
+        if displacement != 0.0 {
+            for (l, dp) in out.iter_mut().enumerate() {
+                *dp -= displacement
+                    * ((b.reference[l] - a.reference[l])
+                        + 0.5 * (a.stratification[l] + b.stratification[l]) * (b.z[l] - a.z[l]));
+            }
         }
         return;
     }
@@ -482,6 +645,9 @@ struct Columns {
     bed: Vec<f64>,
     wet: Vec<bool>,
     min_column_depth: f64,
+    /// The reference's density and gradient at the levels (zeros without)
+    reference: Vec<f64>,
+    stratification: Vec<f64>,
 }
 
 impl Columns {
@@ -497,6 +663,8 @@ impl Columns {
             pressure: vec![0.0; n],
             at_level: vec![0.0; n],
             bed: vec![0.0; n_columns],
+            reference: vec![0.0; n],
+            stratification: vec![0.0; n],
         }
     }
 
@@ -507,14 +675,16 @@ impl Columns {
             rho: &self.rho[range.clone()],
             slope: &self.slope[range.clone()],
             pressure: &self.pressure[range.clone()],
-            at_level: &self.at_level[range],
+            at_level: &self.at_level[range.clone()],
             bed: self.bed[c],
             wet: self.wet[c],
+            reference: &self.reference[range.clone()],
+            stratification: &self.stratification[range],
         }
     }
 
     /// Fill column `c` from `ρ − rho_ref` of the state's column at (`el`,
-    /// `node`).
+    /// `node`), or with a `reference` from the density anomaly about it.
     fn fill(
         &mut self,
         c: usize,
@@ -524,6 +694,7 @@ impl Columns {
         el: ElementIndex,
         node: usize,
         rho_ref: f64,
+        reference: Option<&ReferenceFields>,
     ) {
         let nl = self.n_levels;
         let range = c * nl..(c + 1) * nl;
@@ -536,57 +707,104 @@ impl Columns {
         let rho = &mut self.rho[range.clone()];
         let slope = &mut self.slope[range.clone()];
         let pressure = &mut self.pressure[range.clone()];
-        let at_level = &mut self.at_level[range];
-        for (l, (zl, &s)) in z.iter_mut().zip(sigma.sigma_rho()).enumerate() {
+        let at_level = &mut self.at_level[range.clone()];
+        for (zl, &s) in z.iter_mut().zip(sigma.sigma_rho()) {
             *zl = eta + s * depth;
-            rho[l] = state.rho_column(el, node)[l] - rho_ref;
         }
-
-        // Monotone slopes: harmonic mean of the neighbouring secants, zero at
-        // extrema; one-sided at the ends. Exact for linear ρ(z).
-        let secant = |l: usize| {
-            let h = z[l + 1] - z[l];
-            if h > MIN_LEVEL_SPACING {
-                (rho[l + 1] - rho[l]) / h
-            } else {
-                0.0
+        let column = state.rho_column(el, node);
+        let Some(fields) = reference else {
+            for (r, &c) in rho.iter_mut().zip(column) {
+                *r = c - rho_ref;
             }
-        };
-        if nl == 1 {
-            slope[0] = 0.0;
-        } else {
-            slope[0] = secant(0);
-            slope[nl - 1] = secant(nl - 2);
-            for (l, s) in slope.iter_mut().enumerate().take(nl - 1).skip(1) {
-                let (a, b) = (secant(l - 1), secant(l));
-                *s = if a * b > 0.0 {
-                    2.0 * a * b / (a + b)
+            monotone_slopes(z, rho, slope);
+            // ∫_z^η from the surface down: the top half-layer with the
+            // linear continuation, then exact integrals of the cubic
+            // between levels
+            let dz = eta - z[nl - 1];
+            pressure[nl - 1] = rho[nl - 1] * dz + 0.5 * slope[nl - 1] * dz * dz;
+            for l in (0..nl - 1).rev() {
+                let h = z[l + 1] - z[l];
+                pressure[l] = pressure[l + 1]
+                    + h * (0.5 * (rho[l] + rho[l + 1]) + h * (slope[l] - slope[l + 1]) / 12.0);
+            }
+            // `pressure_at(z[l])`: the end levels exactly, the others from
+            // the interval above them at t = 0
+            for (l, p) in at_level.iter_mut().enumerate() {
+                *p = if l == 0 || l == nl - 1 {
+                    pressure[l]
                 } else {
-                    0.0
+                    let h = z[l + 1] - z[l];
+                    pressure[l + 1]
+                        + h * (hermite_integral_of(1.0, rho, slope, l, h)
+                            - hermite_integral_of(0.0, rho, slope, l, h))
                 };
             }
-        }
+            return;
+        };
 
-        // ∫_z^η from the surface down: the top half-layer with the linear
-        // continuation, then exact integrals of the cubic between levels
-        let dz = eta - z[nl - 1];
-        pressure[nl - 1] = rho[nl - 1] * dz + 0.5 * slope[nl - 1] * dz * dz;
+        // The anomaly about the reference at the column's own levels, its
+        // pressure by the trapezoid rule (no slopes: linear in the anomaly,
+        // so that the force has an adjoint), less the rule's error of the
+        // element's displacement κ (see "About a reference")
+        let start = (el.as_usize() * state.n_nodes + node) * nl;
+        let density = &fields.density[start..start + nl];
+        let gamma = &fields.stratification[start..start + nl];
+        self.reference[range.clone()].copy_from_slice(density);
+        self.stratification[range].copy_from_slice(gamma);
+        let displacement = fields.displacement[el.as_usize()];
+        for ((r, &c), &b) in rho.iter_mut().zip(column).zip(density) {
+            *r = c - b;
+        }
+        slope.fill(0.0);
+        pressure[nl - 1] = rho[nl - 1] * (eta - z[nl - 1]);
         for l in (0..nl - 1).rev() {
             let h = z[l + 1] - z[l];
-            pressure[l] = pressure[l + 1]
-                + h * (0.5 * (rho[l] + rho[l + 1]) + h * (slope[l] - slope[l + 1]) / 12.0);
+            let trapezoid_error =
+                (density[l + 1] - density[l]) + 0.5 * (gamma[l] + gamma[l + 1]) * h;
+            pressure[l] =
+                pressure[l + 1] + h * 0.5 * (rho[l] + rho[l + 1]) - displacement * trapezoid_error;
         }
+        // The pressure's mean over the column is the anomaly's first moment
+        // about the bed, Σ Δσ ρ′ (z − B): the adjoint of the layers' rise
+        // through the reference with η, (1 + σ) ∂η/∂t. The rule's own mean
+        // differs from it on stretched levels and by the displacement's
+        // term; the same offset at every level changes the depth-mean force
+        // alone
+        let (mut mean, mut moment) = (0.0, 0.0);
+        for (((&p, &r), &zl), &ds) in pressure.iter().zip(&*rho).zip(&*z).zip(sigma.d_sigma()) {
+            mean += ds * p;
+            moment += ds * r * (zl - bed);
+        }
+        let offset = moment - mean;
+        pressure.iter_mut().for_each(|p| *p += offset);
+        at_level.copy_from_slice(pressure);
+    }
+}
 
-        // `pressure_at(z[l])`: the end levels exactly, the others from the
-        // interval above them at t = 0
-        for (l, p) in at_level.iter_mut().enumerate() {
-            *p = if l == 0 || l == nl - 1 {
-                pressure[l]
+/// Monotone slopes `∂ρ/∂z` at the levels `z` of the profile `rho`: the
+/// harmonic mean of the neighbouring secants, zero at extrema; one-sided at
+/// the ends. Exact for linear `ρ(z)`.
+fn monotone_slopes(z: &[f64], rho: &[f64], slope: &mut [f64]) {
+    let nl = z.len();
+    let secant = |l: usize| {
+        let h = z[l + 1] - z[l];
+        if h > MIN_LEVEL_SPACING {
+            (rho[l + 1] - rho[l]) / h
+        } else {
+            0.0
+        }
+    };
+    if nl == 1 {
+        slope[0] = 0.0;
+    } else {
+        slope[0] = secant(0);
+        slope[nl - 1] = secant(nl - 2);
+        for (l, s) in slope.iter_mut().enumerate().take(nl - 1).skip(1) {
+            let (a, b) = (secant(l - 1), secant(l));
+            *s = if a * b > 0.0 {
+                2.0 * a * b / (a + b)
             } else {
-                let h = z[l + 1] - z[l];
-                pressure[l + 1]
-                    + h * (hermite_integral_of(1.0, rho, slope, l, h)
-                        - hermite_integral_of(0.0, rho, slope, l, h))
+                0.0
             };
         }
     }
@@ -639,6 +857,7 @@ pub fn compute_pressure_gradient(
     min_column_depth: f64,
     form: PressureGradientForm,
     metric: MetricForm,
+    reference: Option<&ReferenceFields>,
     grad_px: &mut [f64],
     grad_py: &mut [f64],
     elements: Blocks,
@@ -669,8 +888,8 @@ pub fn compute_pressure_gradient(
                 dp,
             } = &mut **scratch;
             pressure_gradient_element(
-                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, form, metric, own, across,
-                px, py, dp,
+                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, reference, form, metric,
+                own, across, px, py, dp,
             );
             for ((fx, fy), (&dx, &dy)) in out_x.iter_mut().zip(out_y).zip(px.iter().zip(&*py)) {
                 *fx = scale * dx;
@@ -720,6 +939,7 @@ fn pressure_gradient_element(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     rho_ref: f64,
+    reference: Option<&ReferenceFields>,
     form: PressureGradientForm,
     metric: MetricForm,
     own: &mut Columns,
@@ -731,7 +951,7 @@ fn pressure_gradient_element(
     let nn = ops.n_nodes;
     let el = ElementIndex::new(k);
     for i in 0..nn {
-        own.fill(i, state, bathymetry, sigma, el, i, rho_ref);
+        own.fill(i, state, bathymetry, sigma, el, i, rho_ref, reference);
     }
     px.fill(0.0);
     py.fill(0.0);
@@ -740,7 +960,25 @@ fn pressure_gradient_element(
     // with their barotropic shares only (`LayerTransport`): no baroclinic
     // exchange within it, so no force within it either
     if own.wet[..nn].iter().all(|&w| w) {
-        dg_volume_term(k, ops, geom, form, metric, own, px, py, dp);
+        // The element's displacement about its reference, if any
+        let displacement = reference.map_or(0.0, |fields| fields.displacement[k]);
+        dg_volume_term(k, ops, geom, form, metric, displacement, own, px, py, dp);
+    } else if let Some(fields) = reference {
+        // About a reference, the depth-mean force along the subcell
+        // interfaces between its columns that are not thin: the adjoint of
+        // the layers' shares of the barotropic flux there
+        subcell_mean_term(
+            k,
+            ops,
+            geom,
+            sigma,
+            form,
+            fields.displacement[k],
+            own,
+            px,
+            py,
+            dp,
+        );
     }
 
     // Face terms: LIFT (n·(p* − p⁻)), p* − p⁻ = ½ Δp at a common depth
@@ -752,10 +990,14 @@ fn pressure_gradient_element(
         let nb_el = ElementIndex::new(nb.element);
         for fi in 0..nfn {
             let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
-            across.fill(fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref);
+            across.fill(
+                fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref, reference,
+            );
         }
         for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-            pressure_differences(&own.view(node), &across.view(fi), form, dp);
+            // The two sides of a face are at one height: no displacement
+            // term (their pressures hold their own elements')
+            pressure_differences(&own.view(node), &across.view(fi), form, 0.0, dp);
             let normal = geom.normal(k, f, fi);
             let lift_scale = geom.lift_scale(k, f, fi, node);
             for (l, &dp) in dp.iter().enumerate() {
@@ -774,15 +1016,58 @@ fn pressure_gradient_element(
     }
 }
 
+/// The derivative coefficients of the pair of nodes `(i, j)` of element `k`:
+/// `(Dx, Dy)_ij` (the force at `i`) and `(Dx, Dy)_ji` (at `j`), with the
+/// contravariant vectors the pair is differenced with at each node, each
+/// node's own or both their mean (`averaged`, see "Curvilinear elements").
+/// The pressure gradient's volume term and its adjoint
+/// ([`add_reference_advection`]) take the same.
+#[inline]
+fn pair_derivatives(
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    k: usize,
+    i: usize,
+    j: usize,
+    averaged: bool,
+) -> [(f64, f64); 2] {
+    let (ar_i, as_i) = geom.contravariant(k, i);
+    let j_inv_i = geom.jacobian_inv(k, i);
+    let (ar_j, as_j) = geom.contravariant(k, j);
+    let j_inv_j = geom.jacobian_inv(k, j);
+    let ((ar_ij, as_ij), (ar_ji, as_ji)) = if averaged {
+        let mean = |a: (f64, f64), b: (f64, f64)| (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
+        let m = (mean(ar_i, ar_j), mean(as_i, as_j));
+        (m, m)
+    } else {
+        ((ar_i, as_i), (ar_j, as_j))
+    };
+    let (dr_ij, ds_ij) = (ops.dr[(i, j)], ops.ds[(i, j)]);
+    let (dr_ji, ds_ji) = (ops.dr[(j, i)], ops.ds[(j, i)]);
+    [
+        (
+            j_inv_i * (ar_ij.0 * dr_ij + as_ij.0 * ds_ij),
+            j_inv_i * (ar_ij.1 * dr_ij + as_ij.1 * ds_ij),
+        ),
+        (
+            j_inv_j * (ar_ji.0 * dr_ji + as_ji.0 * ds_ji),
+            j_inv_j * (ar_ji.1 * dr_ji + as_ji.1 * ds_ji),
+        ),
+    ]
+}
+
 /// The DG volume term of `pressure_gradient_element`: `Σ_j Dx_ij Δp_ij`,
 /// with `Δp_ji = −Δp_ij`, and the metric of the pair in the advection's form
-/// (see "Curvilinear elements").
+/// (see "Curvilinear elements"); `displacement` is the element's (see
+/// [`pressure_differences`]).
+#[allow(clippy::too_many_arguments)]
 fn dg_volume_term(
     k: usize,
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     form: PressureGradientForm,
     metric: MetricForm,
+    displacement: f64,
     own: &Columns,
     px: &mut [f64],
     py: &mut [f64],
@@ -792,32 +1077,10 @@ fn dg_volume_term(
     let averaged = metric.averaged_on(geom, k);
     for i in 0..nn {
         let a = own.view(i);
-        let (ar_i, as_i) = geom.contravariant(k, i);
-        let j_inv_i = geom.jacobian_inv(k, i);
         for j in i + 1..nn {
             let b = own.view(j);
-            let (ar_j, as_j) = geom.contravariant(k, j);
-            let j_inv_j = geom.jacobian_inv(k, j);
-            // The contravariant vectors the pair is differenced with at i
-            // and at j: each node's own, or both their mean
-            let ((ar_ij, as_ij), (ar_ji, as_ji)) = if averaged {
-                let mean = |a: (f64, f64), b: (f64, f64)| (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
-                let m = (mean(ar_i, ar_j), mean(as_i, as_j));
-                (m, m)
-            } else {
-                ((ar_i, as_i), (ar_j, as_j))
-            };
-            let (dr_ij, ds_ij) = (ops.dr[(i, j)], ops.ds[(i, j)]);
-            let (dr_ji, ds_ji) = (ops.dr[(j, i)], ops.ds[(j, i)]);
-            let (dx_ij, dy_ij) = (
-                j_inv_i * (ar_ij.0 * dr_ij + as_ij.0 * ds_ij),
-                j_inv_i * (ar_ij.1 * dr_ij + as_ij.1 * ds_ij),
-            );
-            let (dx_ji, dy_ji) = (
-                j_inv_j * (ar_ji.0 * dr_ji + as_ji.0 * ds_ji),
-                j_inv_j * (ar_ji.1 * dr_ji + as_ji.1 * ds_ji),
-            );
-            pressure_differences(&a, &b, form, dp);
+            let [(dx_ij, dy_ij), (dx_ji, dy_ji)] = pair_derivatives(ops, geom, k, i, j, averaged);
+            pressure_differences(&a, &b, form, displacement, dp);
             for (l, &dp) in dp.iter().enumerate() {
                 px[i * nl + l] += dx_ij * dp;
                 py[i * nl + l] += dy_ij * dp;
@@ -825,6 +1088,796 @@ fn dg_volume_term(
                 py[j * nl + l] -= dy_ji * dp;
             }
         }
+    }
+}
+
+/// The force within an element with a thin column, about a reference: such
+/// an element moves its layers through the GLL subcell interfaces of the 2D
+/// wet/dry kernel, each with its share `Δσ_l F̄` of the barotropic flux
+/// ([`LayerTransport`]; central, `F̄ = ½ m·(Q̄_a + Q̄_b)` with `m` the
+/// interface's metric and `Q̄` the columns' transports, but for the 2D
+/// flux's dissipation). Between two columns that are not thin the reference
+/// is advected by the tangent along the interface
+/// ([`add_reference_advection`]), and the adjoint of that is a force that is
+/// the same at every level, the mean over the column of the pair's pressure
+/// differences `Δp_l`:
+///
+/// ```text
+///     ∂p/∂x at a and at b, every level:  ½ w m (Σ_l Δσ_l Δp_l) / m_node
+/// ```
+///
+/// (`w` the line's quadrature weight). The barotropic flow that moves the
+/// stratification along a shore element's sloping levels then feels the
+/// anomaly it makes; the layers exchange no baroclinic transport there, and
+/// get no baroclinic force.
+#[allow(clippy::too_many_arguments)]
+fn subcell_mean_term(
+    k: usize,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    sigma: &SigmaGrid,
+    form: PressureGradientForm,
+    displacement: f64,
+    own: &Columns,
+    px: &mut [f64],
+    py: &mut [f64],
+    dp: &mut [f64],
+) {
+    let (n1, nl) = (ops.n_1d, own.n_levels);
+    let mut metric = [(0.0, 0.0); MAX_N_1D];
+    let mut interfaces = [(0.0, 0.0); MAX_N_1D + 1];
+    for dir in 0..2 {
+        for line in 0..n1 {
+            let affine = line_metric(ops, geom, k, dir, line, &mut metric[..n1]);
+            telescoped_interfaces(
+                &ops.weights_1d,
+                &ops.dr_1d_row_major,
+                &metric[..n1],
+                affine,
+                &mut interfaces,
+            );
+            for a in 0..n1 - 1 {
+                let (i, j) = (line_node(n1, dir, line, a), line_node(n1, dir, line, a + 1));
+                if !(own.wet[i] && own.wet[j]) {
+                    continue;
+                }
+                pressure_differences(&own.view(i), &own.view(j), form, displacement, dp);
+                let mean: f64 = dp.iter().zip(sigma.d_sigma()).map(|(dp, ds)| dp * ds).sum();
+                let (mx, my) = interfaces[a + 1];
+                let half = 0.5 * ops.weights_1d[line] * mean;
+                for node in [i, j] {
+                    let scale = half / geom.node_mass(k, node);
+                    for l in 0..nl {
+                        px[node * nl + l] += scale * mx;
+                        py[node * nl + l] += scale * my;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The reference stratification at a stage's levels (see "About a
+/// reference"): what the pressure gradient ([`compute_pressure_gradient`])
+/// and the tracers' advection ([`add_reference_advection`], and the vertical
+/// reconstruction about it, [`crate::solver::rhs::AdvectedTracer::reference`])
+/// read of it. All `[element][node][level]` but the displacements.
+#[derive(Clone, Debug, Default)]
+pub struct ReferenceFields {
+    /// `T̄` and `S̄` at the layer centres.
+    pub tracers: [Vec<f64>; 2],
+    /// Their gradients over each layer,
+    /// `γ = (C̄(z_{l+½}) − C̄(z_{l−½})) / H_z` between the σ-surfaces that
+    /// bound it (zero in a column without water).
+    pub gradients: [Vec<f64>; 2],
+    /// `ρ̄`, the density of `(T̄, S̄)`, at the layer centres.
+    pub density: Vec<f64>,
+    /// The stratification `Γ = −(ρ_T γ^T + ρ_S γ^S)` of each layer, with the
+    /// equation of state's partials at the layer centre's `(T̄, S̄)`
+    /// (positive where the reference is statically stable).
+    pub stratification: Vec<f64>,
+    /// The stratification's residual `g = Γ⁺ − α − β z` about each
+    /// column's own line in `z` (least squares over the column's layers,
+    /// weighted by their thickness; `Γ⁺ = max(Γ, 0)`): the shape an
+    /// element's displacement is measured and its tracer error taken back
+    /// with ([`Self::set_displacements`], [`add_reference_advection`]).
+    /// Orthogonal to a constant and to `z` in every column, so an anomaly
+    /// that is uniform or linear in `z` in each column is no displacement.
+    pub residual: Vec<f64>,
+    /// The displacement `κ` (m) of every element's stratification about the
+    /// reference, `[element]` ([`Self::set_displacements`]).
+    pub displacement: Vec<f64>,
+    /// The free surface the fields of each column were last filled at
+    /// (`[element][node]`, NaN before the first): [`Self::fill`] leaves an
+    /// element whose columns have not moved as it is.
+    filled_at: Vec<f64>,
+}
+
+impl ReferenceFields {
+    /// `profile` at the levels of the columns of `elements` at `state`'s
+    /// `η`, with the density `density(T, S)` and its partials
+    /// `partials(T, S) = (∂ρ/∂T, ∂ρ/∂S)` (the state's equation of state).
+    /// A layer's gradient is the reference's mean over the layer, so that
+    /// the gradients of a column add up to the reference's change over it
+    /// whatever the levels resolve.
+    ///
+    /// The fields are functions of the columns' `η` alone, so an element
+    /// whose `η` is that of its last fill is left as it is (a stage's
+    /// pressure gradient and its transport take the same levels, and a fluid
+    /// at rest never moves them): the same profile, equation of state, bed
+    /// and levels must be given every time (a new [`Self::default`] for
+    /// others).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill(
+        &mut self,
+        profile: &TracerReferenceProfile,
+        density: impl Fn(f64, f64) -> f64 + Sync,
+        partials: impl Fn(f64, f64) -> (f64, f64) + Sync,
+        state: &Solution3D,
+        bathymetry: &Bathymetry2D,
+        sigma: &SigmaGrid,
+        elements: Blocks,
+    ) {
+        let (nn, nl) = (state.n_nodes, sigma.n_levels());
+        let n = state.n_elements * nn * nl;
+        let Self {
+            tracers: [temp, salt],
+            gradients: [temp_gradient, salt_gradient],
+            density: rho,
+            stratification,
+            residual,
+            displacement,
+            filled_at,
+        } = self;
+        for field in [
+            &mut *temp,
+            &mut *salt,
+            &mut *temp_gradient,
+            &mut *salt_gradient,
+            &mut *rho,
+            &mut *stratification,
+            &mut *residual,
+        ] {
+            field.resize(n, 0.0);
+        }
+        displacement.resize(state.n_elements, 0.0);
+        filled_at.resize(state.n_elements * nn, f64::NAN);
+        let (sigma_rho, sigma_w) = (sigma.sigma_rho(), sigma.sigma_w());
+        // 1/Δσ of every layer: a layer's thickness is Δσ times the depth
+        assert!(nl <= MAX_LEVELS, "at most {MAX_LEVELS} levels, not {nl}");
+        let mut inverse_d_sigma = [0.0; MAX_LEVELS];
+        for (inverse, w) in inverse_d_sigma.iter_mut().zip(sigma_w.windows(2)) {
+            *inverse = 1.0 / (w[1] - w[0]);
+        }
+        for_each_block(
+            elements,
+            [
+                &mut temp[..],
+                &mut salt[..],
+                &mut temp_gradient[..],
+                &mut salt_gradient[..],
+                &mut rho[..],
+                &mut stratification[..],
+                &mut residual[..],
+                &mut filled_at[..],
+            ],
+            || (),
+            |_,
+             k,
+             [
+                temp,
+                salt,
+                temp_gradient,
+                salt_gradient,
+                rho,
+                stratification,
+                residual,
+                filled_at,
+            ]| {
+                let eta_k = &state.eta.data[k * nn..(k + 1) * nn];
+                if filled_at.iter().zip(eta_k).all(|(a, b)| a == b) {
+                    return;
+                }
+                filled_at.copy_from_slice(eta_k);
+                for (i, &eta) in eta_k.iter().enumerate() {
+                    let depth = eta - bathymetry.data[k * nn + i];
+                    // No gradient in a column without water
+                    let inverse_depth = if depth > MIN_LEVEL_SPACING {
+                        1.0 / depth
+                    } else {
+                        0.0
+                    };
+                    let mut below = profile.at(eta + sigma_w[0] * depth);
+                    for l in 0..nl {
+                        let c = i * nl + l;
+                        let (t, s) = profile.at(eta + sigma_rho[l] * depth);
+                        (temp[c], salt[c]) = (t, s);
+                        rho[c] = density(t, s);
+                        let above = profile.at(eta + sigma_w[l + 1] * depth);
+                        let inverse = inverse_d_sigma[l] * inverse_depth;
+                        let (gt, gs) =
+                            ((above.0 - below.0) * inverse, (above.1 - below.1) * inverse);
+                        (temp_gradient[c], salt_gradient[c]) = (gt, gs);
+                        let (rho_t, rho_s) = partials(t, s);
+                        stratification[c] = -(rho_t * gt + rho_s * gs);
+                        below = above;
+                    }
+                    stratification_residual(
+                        &stratification[i * nl..(i + 1) * nl],
+                        sigma_rho,
+                        sigma.d_sigma(),
+                        &mut residual[i * nl..(i + 1) * nl],
+                    );
+                }
+            },
+        );
+    }
+
+    /// Set the displacement of the elements of `elements` from `state`'s
+    /// density (after [`Self::fill`] on them): the part of the anomaly
+    /// `ρ′ = ρ − ρ̄` that is a displacement of the element's stratification
+    /// (whose anomaly is `κ Γ`),
+    ///
+    /// ```text
+    ///     κ = Σ m H_z g ρ′ / Σ m H_z g Γ⁺,
+    /// ```
+    ///
+    /// over the element's columns at least `min_column_depth` deep, with `g`
+    /// the stratification's residual about each column's own line in `z`
+    /// ([`Self::residual`]): the regression of the anomaly on the
+    /// stratification within the columns. An anomaly that is uniform or
+    /// linear in `z` in each column has none (the trapezoid rule's force of
+    /// it is exact), and `κ Γ` has `κ`.
+    ///
+    /// Where the levels see no residual in the stratification (one or two
+    /// levels, or a reference quadratic in `z` over the element, to
+    /// [`RESIDUAL_FLOOR`]) they cannot tell a displacement from an offset,
+    /// and the element's mean anomaly counts as one, `g = 1`:
+    /// `κ = Σ m H_z ρ′ / Σ m H_z Γ⁺` over its stratified layers. The
+    /// element's tracer error is taken back in the same shape either way
+    /// ([`add_reference_advection`]), so the inventories are kept always;
+    /// in this case a state offset from its reference is not held at rest
+    /// where the tangents make an error.
+    pub fn set_displacements(
+        &mut self,
+        state: &Solution3D,
+        geom: &GeometricFactors2D,
+        bathymetry: &Bathymetry2D,
+        sigma: &SigmaGrid,
+        min_column_depth: f64,
+        elements: Blocks,
+    ) {
+        let (nn, nl) = (state.n_nodes, sigma.n_levels());
+        let (density, stratification, residual) =
+            (&self.density, &self.stratification, &self.residual);
+        let d_sigma = sigma.d_sigma();
+        for_each_block(
+            elements,
+            [&mut self.displacement[..state.n_elements]],
+            || (),
+            |_, k, [displacement]| {
+                // Against the residual, and against the stratification
+                // itself where it has no residual
+                let (mut anomaly, mut weight, mut scale) = (0.0, 0.0, 0.0);
+                let (mut mean_anomaly, mut mean_weight) = (0.0, 0.0);
+                for i in 0..nn {
+                    let idx = k * nn + i;
+                    let depth = state.eta.data[idx] - bathymetry.data[idx];
+                    if depth < min_column_depth {
+                        continue;
+                    }
+                    let mass = geom.node_mass(k, i) * depth;
+                    for l in 0..nl {
+                        let c = idx * nl + l;
+                        let (gamma, g) = (stratification[c].max(0.0), residual[c]);
+                        let volume = mass * d_sigma[l];
+                        let departure = state.rho[c] - density[c];
+                        anomaly += volume * g * departure;
+                        weight += volume * g * gamma;
+                        scale += volume * gamma * gamma;
+                        if gamma > 0.0 {
+                            mean_anomaly += volume * departure;
+                            mean_weight += volume * gamma;
+                        }
+                    }
+                }
+                displacement[0] = if has_residual(weight, scale) {
+                    anomaly / weight
+                } else if mean_weight > 0.0 {
+                    mean_anomaly / mean_weight
+                } else {
+                    0.0
+                };
+            },
+        );
+    }
+
+    /// A bound (1/s) on the frequency of the reference's internal waves
+    /// along the σ-levels of element `k` (after [`Self::fill`] on it): of
+    /// the oscillation in which the flow along a pair of nodes on a sloping
+    /// level displaces the stratification, [`add_reference_advection`], and
+    /// the anomaly's pressure gradient pushes back. `buoyancy` is `g/ρ₀`;
+    /// `scratch` holds five numbers per node. In an element with a column
+    /// thinner than `min_column_depth` the edges are the subcell interfaces
+    /// between its other columns, the flow the barotropic one (below).
+    ///
+    /// In the pseudo-energy's coordinates, `r = ρ′ √(g m H_z/Γ)` and
+    /// `v = u √(ρ₀ m H_z)`, the pairs' part of the operator linearised about
+    /// rest is `[[0, −Bᵀ], [B, 0]]` on each level, with
+    ///
+    /// ```text
+    ///     B[i; i]  =  ½ N_i Σ_j (z_j − z_i) D_ij              (½ N ∇_σ z)
+    ///     B[i; j]  = −½ N_i (z_j − z_i) √(m_j D_j / m_i D_i) D_ji
+    /// ```
+    ///
+    /// (`N² = (g/ρ₀) Γ`, `D_ij` the pair's derivative coefficients, `D_i`
+    /// the depth): frequencies `N |∇_σ z|`, the buoyancy frequency times
+    /// the slope of the level. Its eigenvalues are `±i` times `B`'s singular
+    /// values, at most `√(‖B‖₁ ‖B‖∞)`: the row and column sums here, with
+    /// `z_j − z_i = (1 + σ)(η_j − η_i) − σ (B_j − B_i)` bounded over the
+    /// levels by each column's largest `N` and largest `N |σ|`. The
+    /// element's displacement adds a term of rank one to `B`, which this
+    /// bound does not count; the gate measures the bound against the
+    /// operator with it (1.2 to 1.5 times its largest singular value).
+    ///
+    /// Along a subcell interface between the columns `a` and `b` every layer
+    /// carries its share of one flux, `Δσ_l w ½ m·(Q̄_a + Q̄_b)`, so the
+    /// partner is the depth-mean velocity, `v̄ = ū √(ρ₀ m D)`:
+    ///
+    /// ```text
+    ///     B[a, l; a]  = ¼ N_al √Δσ_l (z_b − z_a)_l w m / m_a
+    ///     B[a, l; b]  = ¼ N_al √Δσ_l (z_b − z_a)_l w m √(D_b / (m_a m_b D_a)),
+    /// ```
+    ///
+    /// bounded in the same way (its rows with the largest `√Δσ`, its columns
+    /// with `Σ √Δσ`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sloping_level_rate(
+        &self,
+        state: &Solution3D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        bathymetry: &Bathymetry2D,
+        sigma: &SigmaGrid,
+        buoyancy: f64,
+        min_column_depth: f64,
+        metric: MetricForm,
+        k: usize,
+        scratch: &mut [f64],
+    ) -> f64 {
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let eta = |i: usize| state.eta.data[k * nn + i];
+        let bed = |i: usize| bathymetry.data[k * nn + i];
+        let wet = |i: usize| eta(i) - bed(i) >= min_column_depth;
+        // Each column's largest N and largest N |σ|
+        let (strata, sums) = scratch[..5 * nn].split_at_mut(2 * nn);
+        let (largest, deepest) = strata.split_at_mut(nn);
+        for i in 0..nn {
+            let column = &self.stratification[(k * nn + i) * nl..][..nl];
+            let (mut n2, mut n2_sigma2) = (0.0_f64, 0.0_f64);
+            for (&gamma, &s) in column.iter().zip(sigma.sigma_rho()) {
+                let gamma = gamma.max(0.0);
+                n2 = n2.max(gamma);
+                n2_sigma2 = n2_sigma2.max(gamma * s * s);
+            }
+            (largest[i], deepest[i]) = if wet(i) {
+                ((buoyancy * n2).sqrt(), (buoyancy * n2_sigma2).sqrt())
+            } else {
+                (0.0, 0.0)
+            };
+        }
+        if largest.iter().all(|&n| n == 0.0) {
+            return 0.0;
+        }
+        let weight = |i: usize| geom.node_mass(k, i) * (eta(i) - bed(i));
+        if !(0..nn).all(wet) {
+            // The subcell interfaces between two columns that are not thin
+            let n1 = ops.n_1d;
+            let (row, columns) = sums.split_at_mut(nn);
+            let (column_x, column_y) = columns.split_at_mut(nn);
+            row.fill(0.0);
+            column_x.fill(0.0);
+            column_y.fill(0.0);
+            let mut line = [(0.0, 0.0); MAX_N_1D];
+            let mut interfaces = [(0.0, 0.0); MAX_N_1D + 1];
+            for dir in 0..2 {
+                for at in 0..n1 {
+                    let affine = line_metric(ops, geom, k, dir, at, &mut line[..n1]);
+                    telescoped_interfaces(
+                        &ops.weights_1d,
+                        &ops.dr_1d_row_major,
+                        &line[..n1],
+                        affine,
+                        &mut interfaces,
+                    );
+                    for a in 0..n1 - 1 {
+                        let (i, j) = (line_node(n1, dir, at, a), line_node(n1, dir, at, a + 1));
+                        if !(wet(i) && wet(j)) {
+                            continue;
+                        }
+                        let (mx, my) = interfaces[a + 1];
+                        let (mx, my) =
+                            (ops.weights_1d[at] * mx.abs(), ops.weights_1d[at] * my.abs());
+                        let (d_eta, d_bed) = ((eta(j) - eta(i)).abs(), (bed(j) - bed(i)).abs());
+                        // N |z_b − z_a| at most, in each end's stratification
+                        let rise = |a: usize| largest[a] * d_eta + deepest[a] * d_bed;
+                        let (m_i, m_j) = (geom.node_mass(k, i), geom.node_mass(k, j));
+                        let ratio = (weight(j) / weight(i)).sqrt();
+                        // √(D_b / (m_a m_b D_a)), and with a and b exchanged
+                        let (cross_ij, cross_ji) = (ratio / m_j, 1.0 / (ratio * m_i));
+                        row[i] += rise(i) * (mx + my) * (1.0 / m_i + cross_ij);
+                        row[j] += rise(j) * (mx + my) * (1.0 / m_j + cross_ji);
+                        let to_i = rise(i) / m_i + rise(j) * cross_ji;
+                        let to_j = rise(j) / m_j + rise(i) * cross_ij;
+                        column_x[i] += to_i * mx;
+                        column_y[i] += to_i * my;
+                        column_x[j] += to_j * mx;
+                        column_y[j] += to_j * my;
+                    }
+                }
+            }
+            let (mut widest, mut total) = (0.0_f64, 0.0);
+            for &ds in sigma.d_sigma() {
+                widest = widest.max(ds.sqrt());
+                total += ds.sqrt();
+            }
+            let rows = 0.25 * widest * row.iter().fold(0.0_f64, |m, &r| m.max(r));
+            let columns = 0.25
+                * total
+                * column_x
+                    .iter()
+                    .zip(&*column_y)
+                    .fold(0.0_f64, |m, (&x, &y)| m.max(x).max(y));
+            return (rows * columns).sqrt();
+        }
+        let averaged = metric.averaged_on(geom, k);
+        let (mut rows, mut columns) = (0.0_f64, 0.0_f64);
+        for i in 0..nn {
+            // ∇η and ∇B at the node, and the sums over the other nodes of
+            // its row and of its velocity's two columns
+            let (mut grad_eta, mut grad_bed) = ((0.0, 0.0), (0.0, 0.0));
+            let (mut row, mut column) = (0.0, (0.0, 0.0));
+            for j in (0..nn).filter(|&j| j != i) {
+                let [(dx_ij, dy_ij), (dx_ji, dy_ji)] =
+                    pair_derivatives(ops, geom, k, i, j, averaged);
+                let (d_eta, d_bed) = (eta(j) - eta(i), bed(j) - bed(i));
+                grad_eta = (grad_eta.0 + dx_ij * d_eta, grad_eta.1 + dy_ij * d_eta);
+                grad_bed = (grad_bed.0 + dx_ij * d_bed, grad_bed.1 + dy_ij * d_bed);
+                let ratio = (weight(j) / weight(i)).sqrt();
+                row += (largest[i] * d_eta.abs() + deepest[i] * d_bed.abs())
+                    * ratio
+                    * (dx_ji.abs() + dy_ji.abs());
+                let from_j = (largest[j] * d_eta.abs() + deepest[j] * d_bed.abs()) / ratio;
+                column = (
+                    column.0 + from_j * dx_ij.abs(),
+                    column.1 + from_j * dy_ij.abs(),
+                );
+            }
+            let own_x = largest[i] * grad_eta.0.abs() + deepest[i] * grad_bed.0.abs();
+            let own_y = largest[i] * grad_eta.1.abs() + deepest[i] * grad_bed.1.abs();
+            rows = rows.max(0.5 * (own_x + own_y + row));
+            columns = columns.max(0.5 * (own_x + column.0).max(own_y + column.1));
+        }
+        (rows * columns).sqrt()
+    }
+}
+
+/// Add to the tracers' inventory tendencies `rhs` (`[T, S]`, `∂(H_z C)/∂t`,
+/// layout of [`Solution3D`]) what turns the conservative advection of the
+/// reference stratification into its advection by the vertical velocity
+/// that is the pressure gradient's adjoint (see "About a reference").
+///
+/// The edges are those the pressure gradient acts along: the pairs of nodes
+/// of an element on a level (where no column of the element is thin and its
+/// layers move by the pairs, not on the subcells), in a subcell element the
+/// interfaces between two columns that are not thin (the layers' shares of
+/// the barotropic flux), and the σ-surfaces between the layers of a column
+/// that is not thin. Each carries a volume flux `f_ab` out of node `a` (per
+/// unit horizontal area of `a`): the split form's `Φ_ij/m_i`, the subcell
+/// interface's, or `±Ω`. The conservative advection changes `C_a` by
+/// `−½ f_ab (C_b − C_a)` along it. Of that jump the reference's share is
+/// `θ_ab (C̄_b − C̄_a)` (`θ` is 1 in a fluid stratified like the reference),
+/// and this adds
+///
+/// ```text
+///     ½ f_ab θ_ab [(C̄_b − C̄_a) − γ_a (z_b − z_a)]
+/// ```
+///
+/// so that the reference's share is advected as `−γ_a w_a`, with `γ_a` the
+/// reference's gradient over the layer ([`ReferenceFields::gradients`]) and
+/// `H_z,a w_a = ½ Σ_b f_ab (z_b − z_a)`, the adjoint of the pressure
+/// gradient's sum over the same edges. The other edges (the element faces,
+/// which join nodes at one height, and an interface to a thin column) are
+/// left to the conservative advection.
+///
+/// The tracer these terms would make in an element (the trapezoid rule's
+/// error of the reference's gradient along its edges) is taken back as a
+/// displacement of the element's stratification, `−H_z Γ g R/N` at every
+/// layer with `R` the element's sum of the terms, `g` the stratification's
+/// residual about its column's line in `z` ([`ReferenceFields::residual`])
+/// and `N = Σ m H_z Γ g` (`g = 1`, a uniform displacement, where the levels
+/// see no residual: one or two levels, a reference quadratic in `z`): every
+/// element with a stratified layer keeps its inventory of `T` and of `S` to
+/// round-off. The pressure gradient's displacement term
+/// ([`ReferenceFields::set_displacements`]) is this step's adjoint.
+///
+/// `tracers` are the advected concentrations, `reference` the reference at
+/// the levels of `state`'s `η`, `transport` the stage's layer transports.
+/// A uniform tracer gets nothing (`θ = 0`); a reference linear in `z` adds
+/// nothing (its chords are its tangents).
+#[allow(clippy::too_many_arguments)]
+pub fn add_reference_advection(
+    rhs: [&mut [f64]; 2],
+    tracers: [&[f64]; 2],
+    reference: &ReferenceFields,
+    state: &Solution3D,
+    transport: &LayerTransport,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    sigma: &SigmaGrid,
+    bathymetry: &Bathymetry2D,
+    min_column_depth: f64,
+    elements: Blocks,
+) {
+    let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+    assert!(nl <= MAX_LEVELS, "at most {MAX_LEVELS} levels, not {nl}");
+    let n = state.n_elements * nn * nl;
+    let (sigma_rho, d_sigma) = (sigma.sigma_rho(), sigma.d_sigma());
+    let metric = transport.metric;
+    let [rhs_t, rhs_s] = rhs;
+    for_each_block(
+        elements,
+        [&mut rhs_t[..n], &mut rhs_s[..n]],
+        || (),
+        |_, k, [rhs_t, rhs_s]| {
+            let mut out = [rhs_t, rhs_s];
+            let block = k * nn * nl..(k + 1) * nn * nl;
+            let fields = [0, 1].map(|t| EdgeFields {
+                reference: &reference.tracers[t][block.clone()],
+                gradient: &reference.gradients[t][block.clone()],
+                tracer: &tracers[t][block.clone()],
+            });
+            let (hu, hv) = (&transport.hu[block.clone()], &transport.hv[block.clone()]);
+            let eta = |i: usize| state.eta.data[k * nn + i];
+            let depth = |i: usize| state.eta.data[k * nn + i] - bathymetry.data[k * nn + i];
+            let wet = |i: usize| depth(i) >= min_column_depth;
+            // What the edges' terms make of each tracer in the element, per
+            // level (m² · m C/s)
+            let mut made = [[0.0; MAX_LEVELS]; 2];
+            // An edge's half flux (½ F, out of its first end) and height
+            // difference on every level
+            let (mut half, mut dz) = ([0.0; MAX_LEVELS], [0.0; MAX_LEVELS]);
+
+            // The pairs of the split form, with the pressure gradient's own
+            // coefficients, where it has its volume term: in an element
+            // without a thin column that moves its layers by the pairs
+            if !transport.subcell_elements[k] && (0..nn).all(wet) {
+                let averaged = metric.averaged_on(geom, k);
+                // Only nodes on one GLL line are a pair
+                let apart = |a: usize, b: usize| ops.dr[(a, b)] == 0.0 && ops.ds[(a, b)] == 0.0;
+                for i in 0..nn {
+                    let m_i = geom.node_mass(k, i);
+                    for j in (i + 1..nn).filter(|&j| !(apart(i, j) && apart(j, i))) {
+                        let [(dx_ij, dy_ij), (dx_ji, dy_ji)] =
+                            pair_derivatives(ops, geom, k, i, j, averaged);
+                        let m_j = geom.node_mass(k, j);
+                        let (ci, cj) = (i * nl..(i + 1) * nl, j * nl..(j + 1) * nl);
+                        // The pair's volume flux from i to j on every level,
+                        // m_i Dx_ij·Q_i − m_j Dx_ji·Q_j, and z_j − z_i,
+                        // (η_j − η_i) + σ_l (D_j − D_i)
+                        let (ax, ay) = (m_i * dx_ij, m_i * dy_ij);
+                        let (bx, by) = (m_j * dx_ji, m_j * dy_ji);
+                        let (d_eta, d_depth) = (eta(j) - eta(i), depth(j) - depth(i));
+                        let (hu_i, hv_i) = (&hu[ci.clone()], &hv[ci.clone()]);
+                        let (hu_j, hv_j) = (&hu[cj.clone()], &hv[cj.clone()]);
+                        for l in 0..nl {
+                            half[l] = 0.5
+                                * ((ax * hu_i[l] + ay * hv_i[l]) - (bx * hu_j[l] + by * hv_j[l]));
+                            dz[l] = d_eta + sigma_rho[l] * d_depth;
+                        }
+                        for (t, field) in fields.iter().enumerate() {
+                            // i < j: the two ends' rows are disjoint
+                            let (low, high) = out[t].split_at_mut(cj.start);
+                            edges_over_levels(
+                                &half[..nl],
+                                &dz[..nl],
+                                field.rows(ci.clone()),
+                                field.rows(cj.clone()),
+                                (1.0 / m_i, 1.0 / m_j),
+                                &mut low[ci.clone()],
+                                &mut high[..nl],
+                                &mut made[t][..nl],
+                            );
+                        }
+                    }
+                }
+            } else if transport.subcell_elements[k] {
+                // The subcell interfaces between two columns that are not
+                // thin, where the layers carry their shares of the
+                // barotropic flux and the force has its depth-mean term
+                // (`subcell_mean_term`): the flux out of the line's node a
+                // towards a + 1 is the interface's times the line's weight
+                let n1 = ops.n_1d;
+                let n_sub = subcell_interfaces(n1);
+                let sub = &transport.subcell[k * n_sub * nl..(k + 1) * n_sub * nl];
+                for dir in 0..2 {
+                    for line in 0..n1 {
+                        let weight = ops.weights_1d[line];
+                        for a in 0..n1 - 1 {
+                            let (i, j) =
+                                (line_node(n1, dir, line, a), line_node(n1, dir, line, a + 1));
+                            if !(wet(i) && wet(j)) {
+                                continue;
+                            }
+                            let q = &sub[subcell_slot(n1, dir, line, a) * nl..][..nl];
+                            let (d_eta, d_depth) = (eta(j) - eta(i), depth(j) - depth(i));
+                            for l in 0..nl {
+                                half[l] = 0.5 * weight * q[l];
+                                dz[l] = d_eta + sigma_rho[l] * d_depth;
+                            }
+                            let (ci, cj) = (i * nl..(i + 1) * nl, j * nl..(j + 1) * nl);
+                            let masses = (1.0 / geom.node_mass(k, i), 1.0 / geom.node_mass(k, j));
+                            for (t, field) in fields.iter().enumerate() {
+                                let (low, high) = out[t].split_at_mut(cj.start);
+                                edges_over_levels(
+                                    &half[..nl],
+                                    &dz[..nl],
+                                    field.rows(ci.clone()),
+                                    field.rows(cj.clone()),
+                                    masses,
+                                    &mut low[ci.clone()],
+                                    &mut high[..nl],
+                                    &mut made[t][..nl],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // The σ-surfaces of every column that is not thin: Ω up through
+            // surface l, between the layers l − 1 and l (per unit area: the
+            // node's mass in `made`)
+            let (mut lower, mut upper) = ([0.0; MAX_LEVELS], [0.0; MAX_LEVELS]);
+            let mut made_column = [0.0; MAX_LEVELS];
+            let surfaces = nl - 1;
+            for i in (0..nn).filter(|&i| wet(i)) {
+                let (depth, mass) = (depth(i), geom.node_mass(k, i));
+                let omega = &transport.omega[(k * nn + i) * (nl + 1)..][..nl + 1];
+                for l in 1..nl {
+                    half[l - 1] = 0.5 * omega[l];
+                    dz[l - 1] = (sigma_rho[l] - sigma_rho[l - 1]) * depth;
+                }
+                let column = i * nl..(i + 1) * nl;
+                for (t, field) in fields.iter().enumerate() {
+                    lower[..surfaces].fill(0.0);
+                    upper[..surfaces].fill(0.0);
+                    made_column[..surfaces].fill(0.0);
+                    edges_over_levels(
+                        &half[..surfaces],
+                        &dz[..surfaces],
+                        field.rows(column.start..column.end - 1),
+                        field.rows(column.start + 1..column.end),
+                        (1.0, 1.0),
+                        &mut lower[..surfaces],
+                        &mut upper[..surfaces],
+                        &mut made_column[..surfaces],
+                    );
+                    let out = &mut out[t][column.clone()];
+                    for l in 0..surfaces {
+                        out[l] += lower[l];
+                        out[l + 1] += upper[l];
+                        made[t][l] += mass * made_column[l];
+                    }
+                }
+            }
+            // Taken back as a displacement of the element's stratification,
+            // in the shape of its residual about each column's line in z
+            // (`ReferenceFields::residual`): the element keeps its
+            // inventories
+            let made = made.map(|levels| levels[..nl].iter().sum::<f64>());
+            if made == [0.0; 2] {
+                return;
+            }
+            let stratification = &reference.stratification[block.clone()];
+            let residual = &reference.residual[block];
+            let (mut weight, mut scale, mut mean_weight) = (0.0, 0.0, 0.0);
+            for i in (0..nn).filter(|&i| wet(i)) {
+                let mass = geom.node_mass(k, i) * depth(i);
+                for l in 0..nl {
+                    let gamma = stratification[i * nl + l].max(0.0);
+                    weight += mass * d_sigma[l] * gamma * residual[i * nl + l];
+                    scale += mass * d_sigma[l] * gamma * gamma;
+                    mean_weight += mass * d_sigma[l] * gamma;
+                }
+            }
+            // Without a residual: a uniform displacement
+            // (`ReferenceFields::set_displacements`)
+            let shaped = has_residual(weight, scale);
+            let weight = if shaped { weight } else { mean_weight };
+            if weight <= 0.0 {
+                return;
+            }
+            for i in (0..nn).filter(|&i| wet(i)) {
+                let share = depth(i) / weight;
+                let column = i * nl..(i + 1) * nl;
+                for (t, out) in out.iter_mut().enumerate() {
+                    let taken = share * made[t];
+                    for (((o, &gamma), &g), &ds) in out[column.clone()]
+                        .iter_mut()
+                        .zip(&stratification[column.clone()])
+                        .zip(&residual[column.clone()])
+                        .zip(d_sigma)
+                    {
+                        let shape = if shaped { g } else { 1.0 };
+                        *o -= taken * ds * gamma.max(0.0) * shape;
+                    }
+                }
+            }
+        },
+    );
+}
+
+/// One tracer's rows of an element for [`add_reference_advection`]
+/// (`[node][level]`): the reference, its gradient over each layer, and the
+/// tracer itself.
+#[derive(Clone, Copy)]
+struct EdgeFields<'a> {
+    reference: &'a [f64],
+    gradient: &'a [f64],
+    tracer: &'a [f64],
+}
+
+impl<'a> EdgeFields<'a> {
+    /// The fields over `range` of the element's rows: one end of an edge
+    /// per level.
+    fn rows(&self, range: std::ops::Range<usize>) -> EdgeFields<'a> {
+        EdgeFields {
+            reference: &self.reference[range.clone()],
+            gradient: &self.gradient[range.clone()],
+            tracer: &self.tracer[range],
+        }
+    }
+}
+
+/// The terms of [`add_reference_advection`] of one edge per level, between
+/// the ends `a` and `b`: with the half flux `half` (½ F, out of `a`) and the
+/// height difference `dz = z_b − z_a` of every level's edge,
+/// `½ F θ [(C̄_b − C̄_a) − γ dz]` at each end with its own `γ`, added to
+/// `out_a`, `out_b` over the ends' masses (`inverse_mass`), and their sum to
+/// `made`. `θ` is the share of the reference's jump along the edge that the
+/// tracer's own jump holds, in `[0, 1]`: 1 in a fluid stratified like the
+/// reference, `b` at a fraction `b` of its strength, 0 where the tracer is
+/// uniform or stratified the other way. Every slice has one value per level.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn edges_over_levels(
+    half: &[f64],
+    dz: &[f64],
+    a: EdgeFields,
+    b: EdgeFields,
+    inverse_mass: (f64, f64),
+    out_a: &mut [f64],
+    out_b: &mut [f64],
+    made: &mut [f64],
+) {
+    let n = half.len();
+    let (dz, out_a, out_b, made) = (&dz[..n], &mut out_a[..n], &mut out_b[..n], &mut made[..n]);
+    let (ref_a, ref_b) = (&a.reference[..n], &b.reference[..n]);
+    let (grad_a, grad_b) = (&a.gradient[..n], &b.gradient[..n]);
+    let (c_a, c_b) = (&a.tracer[..n], &b.tracer[..n]);
+    // Not inlined: the slices are then known not to overlap, and the loop
+    // (a division per level) is taken several levels at once
+    for l in 0..n {
+        let chord = ref_b[l] - ref_a[l];
+        // No reference jump, no share (0/0 is NaN, which `clamp` keeps)
+        let ratio = ((c_b[l] - c_a[l]) / chord).clamp(0.0, 1.0);
+        let share = if chord == 0.0 { 0.0 } else { ratio };
+        let weight = half[l] * share;
+        let at_a = weight * (chord - grad_a[l] * dz[l]);
+        let at_b = weight * (chord - grad_b[l] * dz[l]);
+        out_a[l] += at_a * inverse_mass.0;
+        out_b[l] += at_b * inverse_mass.1;
+        made[l] += at_a + at_b;
     }
 }
 
@@ -903,6 +1956,69 @@ mod tests {
                 0.0,
                 form,
                 MetricForm::Conservative,
+                None,
+                &mut fx,
+                &mut fy,
+                Blocks::All(self.state.n_elements),
+            );
+            (fx, fy)
+        }
+
+        /// The σ-pairs force of the density anomaly about `profile(z)`, as
+        /// the model takes it: the reference's density at the layer
+        /// centres, its gradient over each layer, the residual and the
+        /// elements' displacements of the state.
+        fn anomaly_pgf(&self, profile: impl Fn(f64) -> f64) -> (Vec<f64>, Vec<f64>) {
+            let n = self.state.rho.len();
+            let nl = self.sigma.n_levels();
+            let mut reference = ReferenceFields {
+                density: vec![0.0; n],
+                stratification: vec![0.0; n],
+                residual: vec![0.0; n],
+                displacement: vec![0.0; self.state.n_elements],
+                ..ReferenceFields::default()
+            };
+            for idx in 0..n / nl {
+                let eta = self.state.eta.data[idx];
+                let depth = eta - self.bathymetry.data[idx];
+                let column = idx * nl..(idx + 1) * nl;
+                for l in 0..nl {
+                    let at = |s: f64| profile(eta + s * depth);
+                    let (below, above) = (self.sigma.sigma_w()[l], self.sigma.sigma_w()[l + 1]);
+                    reference.density[idx * nl + l] = at(self.sigma.sigma_rho()[l]);
+                    reference.stratification[idx * nl + l] =
+                        -(at(above) - at(below)) / ((above - below) * depth);
+                }
+                stratification_residual(
+                    &reference.stratification[column.clone()],
+                    self.sigma.sigma_rho(),
+                    self.sigma.d_sigma(),
+                    &mut reference.residual[column],
+                );
+            }
+            reference.set_displacements(
+                &self.state,
+                &self.geom,
+                &self.bathymetry,
+                &self.sigma,
+                0.0,
+                Blocks::All(self.state.n_elements),
+            );
+            let (mut fx, mut fy) = (vec![f64::NAN; n], vec![f64::NAN; n]);
+            compute_pressure_gradient(
+                &self.state,
+                &self.mesh,
+                &self.bathymetry,
+                &self.sigma,
+                &self.ops,
+                &self.geom,
+                G,
+                RHO0,
+                RHO0,
+                0.0,
+                PressureGradientForm::SigmaPairs,
+                MetricForm::Conservative,
+                Some(&reference),
                 &mut fx,
                 &mut fy,
                 Blocks::All(self.state.n_elements),
@@ -930,6 +2046,7 @@ mod tests {
                 RHO0,
                 0.0,
                 MetricForm::Conservative,
+                None,
             );
             let (mut fx, mut fy) = self.pgf(RHO0, PressureGradientForm::SigmaPairs);
             reference.add_to(&mut fx, &mut fy, Blocks::All(self.state.n_elements));
@@ -1051,14 +2168,14 @@ mod tests {
         }
     }
 
-    /// The profile reference ([`BalancedReference::from_profile`]) on the
-    /// review's stratified fjord: at rest in the profile the σ-pairs force
-    /// vanishes exactly (the state reference leaves the constant-depth form's
-    /// interpolation error, ≈ 2e-7–2e-6 m/s² here), and a departure from the
-    /// profile that is uniform in each column (a horizontal density gradient)
-    /// feels exactly the σ-pairs force of the departure alone: adding it
-    /// leaves the monotone Hermite slopes, so the pressure differences are
-    /// linear in it.
+    /// The anomaly about a reference profile on the review's stratified
+    /// fjord: at rest in the profile the force vanishes exactly (the σ-pairs
+    /// form of the full density leaves ≈ 1e-3 m/s² here, and a balanced
+    /// reference state the constant-depth form's interpolation error,
+    /// ≈ 2e-7–2e-6 m/s²), and a departure from the profile that is uniform in
+    /// each column (a horizontal density gradient) feels exactly the σ-pairs
+    /// force of the departure alone: the anomaly's pressure is its trapezoid
+    /// rule, which is the monotone cubic's of a column-uniform density.
     #[test]
     fn a_reference_profile_balances_the_fjord_at_rest_exactly() {
         let a = 1e-4;
@@ -1076,36 +2193,797 @@ mod tests {
                     )
                 };
                 let stratified = case(&|x, z| pycnocline(z) + anomaly * (x - 1500.0));
-                let reference = BalancedReference::from_profile(
-                    &stratified.state,
-                    &stratified.mesh,
-                    &stratified.bathymetry,
-                    &stratified.sigma,
-                    &stratified.ops,
-                    &stratified.geom,
-                    G,
-                    RHO0,
-                    RHO0,
-                    0.0,
-                    MetricForm::Conservative,
-                    pycnocline,
-                );
-                let (mut fx, mut fy) = stratified.pgf(RHO0, PressureGradientForm::SigmaPairs);
-                reference.add_to(&mut fx, &mut fy, Blocks::All(stratified.state.n_elements));
+                let (fx, fy) = stratified.anomaly_pgf(pycnocline);
                 let departure = case(&|x, _| RHO0 + anomaly * (x - 1500.0));
                 let (dx, dy) = departure.pgf(RHO0, PressureGradientForm::SigmaPairs);
                 let error = largest(
                     &fx.iter().zip(&dx).map(|(f, d)| f - d).collect::<Vec<_>>(),
                     &fy.iter().zip(&dy).map(|(f, d)| f - d).collect::<Vec<_>>(),
                 );
-                // Measured 0 at rest, ≤ 5.5e-17 with the departure (the
-                // round-off of the profile's forces, ≈ 1e-3 m/s², cancelling)
+                // Measured 0 at rest; with the departure the round-off of
+                // subtracting the profile (1e-13 kg/m³ of 1e3)
                 assert!(
                     error < 1e-14,
                     "P{order}, anomaly {anomaly}: off the departure's force by {error:.3e} m/s²"
                 );
+                if anomaly == 0.0 {
+                    assert_eq!(largest(&fx, &fy), 0.0, "P{order}: a force at rest");
+                }
             }
         }
+    }
+
+    /// A basin of 3 × 2 P2 elements (distorted by `distort` of an element)
+    /// over a cliff from 5 to 125 m with land in one corner, 6 stretched
+    /// levels, at rest but for a velocity `amplitude × random` with no depth
+    /// mean in every column that is not thin (0.1 m): the mesh, the
+    /// operators, the bed, the levels and the state (its `rho` not set).
+    fn cliff_basin(
+        distort: f64,
+        amplitude: f64,
+    ) -> (
+        Mesh2D,
+        DGOperators2D,
+        GeometricFactors2D,
+        Bathymetry2D,
+        SigmaGrid,
+        Solution3D,
+    ) {
+        cliff_basin_with(distort, amplitude, false, 6)
+    }
+
+    /// [`cliff_basin`] with `levels` levels, the velocity with its depth
+    /// mean if `depth_mean`.
+    fn cliff_basin_with(
+        distort: f64,
+        amplitude: f64,
+        depth_mean: bool,
+        levels: usize,
+    ) -> (
+        Mesh2D,
+        DGOperators2D,
+        GeometricFactors2D,
+        Bathymetry2D,
+        SigmaGrid,
+        Solution3D,
+    ) {
+        use std::f64::consts::PI;
+        let (lx, ly) = (900.0, 600.0);
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, lx, 0.0, ly, 3, 2);
+        for v in &mut mesh.vertices {
+            let [x, y] = *v;
+            let bump = (PI * x / lx).sin() * (PI * y / ly).sin();
+            *v = [x + distort * 300.0 * bump, y - distort * 300.0 * bump];
+        }
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            let cliff = -65.0 - 60.0 * ((x - 450.0) / 120.0).tanh();
+            let land =
+                0.25 * (1.0 + ((x - 750.0) / 60.0).tanh()) * (1.0 + ((y - 450.0) / 60.0).tanh());
+            cliff + (2.0 - cliff) * land
+        });
+        let sigma = SigmaGrid::new(levels, SongHaidvogelStretching::new(5.0, 0.4, 10.0));
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        for idx in 0..mesh.n_elements * nn {
+            let bed = bathymetry.data[idx];
+            let eta = bed.max(0.0);
+            state.eta.data[idx] = eta;
+            if eta - bed < 0.1 {
+                continue;
+            }
+            for field in [&mut state.u, &mut state.v] {
+                let column = &mut field[idx * nl..(idx + 1) * nl];
+                column.iter_mut().for_each(|u| *u = amplitude * random());
+                if !depth_mean {
+                    let mean: f64 = column.iter().zip(sigma.d_sigma()).map(|(u, d)| u * d).sum();
+                    column.iter_mut().for_each(|u| *u -= mean);
+                }
+            }
+        }
+        (mesh, ops, geom, bathymetry, sigma, state)
+    }
+
+    /// The layer transports of `state` alone (no barotropic pass), in
+    /// `metric`'s form, with walls around.
+    fn own_transports(
+        state: &Solution3D,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        sigma: &SigmaGrid,
+        bathymetry: &Bathymetry2D,
+        metric: MetricForm,
+    ) -> LayerTransport {
+        use crate::solver::rhs::{Boundaries3D, Exterior3D};
+        let mut transport =
+            LayerTransport::new(state.n_elements, ops, sigma.n_levels()).with_metric(metric);
+        transport.compute(
+            state,
+            None,
+            mesh,
+            ops,
+            geom,
+            sigma,
+            bathymetry,
+            &Boundaries3D::default(),
+            &Exterior3D::default(),
+            0.1,
+            Blocks::All(state.n_elements),
+        );
+        transport
+    }
+
+    /// A thermocline over a stratification that is stable everywhere, as a
+    /// reference profile (S uniform), for the linear equation of state
+    /// [`thermocline_density`].
+    fn thermocline() -> TracerReferenceProfile {
+        TracerReferenceProfile::from_smooth_fn(-130.0, 5.0, 2701, |z| {
+            (10.0 + 4.0 * ((z + 15.0) / 4.0).tanh() + 0.01 * z, 34.0)
+        })
+    }
+
+    /// Thermal expansion of [`thermocline_density`] (1/°C).
+    const ALPHA: f64 = 2e-4;
+
+    /// `ρ = ρ₀ (1 − α (T − 10))`.
+    fn thermocline_density(t: f64, _s: f64) -> f64 {
+        RHO0 * (1.0 - ALPHA * (t - 10.0))
+    }
+
+    /// `(∂ρ/∂T, ∂ρ/∂S)` of [`thermocline_density`].
+    fn thermocline_partials(_t: f64, _s: f64) -> (f64, f64) {
+        (-RHO0 * ALPHA, 0.0)
+    }
+
+    /// TODO P1.3 gate, the identity the stability at rest stands on: about
+    /// rest in a reference profile, the advection of the reference and the
+    /// anomaly's pressure gradient exchange pseudo-energy exactly. For any
+    /// layer transports `Q`, with a depth mean or without, and any density
+    /// anomaly `ρ′`,
+    ///
+    /// ```text
+    ///     g Σ m (ρ′/Γ) H_z ∂ρ′/∂t = −ρ₀ Σ m Q·F(ρ′),
+    /// ```
+    ///
+    /// the rate of the available potential energy `½ g ρ′²/Γ` against the
+    /// work of the force on the flow. The anomaly's rate is the tracers'
+    /// whole advection of the fluid at rest in the reference (the
+    /// conservative kernel, about the reference, with
+    /// [`add_reference_advection`]) and, where the transports have a depth
+    /// mean, the layer's own rise through the reference with the free
+    /// surface, `Γ (1 + σ) ∂η/∂t`. On parallelograms and distorted elements,
+    /// in both metric forms, over a cliff from 5 to 125 m under a
+    /// thermocline, on stretched levels, through element faces, and in a
+    /// shore element with dry nodes (the subcell interfaces between its
+    /// columns that are not thin carry the layers' shares of the barotropic
+    /// flux, and the force its depth-mean term). The element's inventory of
+    /// the advected reference is kept, too.
+    ///
+    /// Without the pressure's offset to the anomaly's first moment the
+    /// identity misses by 8 % of the work for transports with a depth mean
+    /// on these levels (3 % on uniform ones, the displacement's part), and
+    /// without the shore element's terms by another 4 %.
+    ///
+    /// One term of the identity is the proof's and not the model's: the
+    /// layers' rise is taken with the reference's gradient over the layer
+    /// (what the tangent and the potential energy's weight take), while the
+    /// model's reference, at the layer centre, changes with the free surface
+    /// at its gradient there. The two agree where a layer resolves the
+    /// reference, and the last assertion measures what the difference
+    /// leaves of the identity for transports with a depth mean.
+    #[test]
+    fn the_reference_advection_and_the_pressure_gradient_exchange_pseudo_energy_exactly() {
+        use crate::solver::rhs::{
+            AdvectedTracer, Boundaries3D, ExtrapolationTracerBC3D, VerticalAdvection,
+            apply_tracer_transport_3d,
+        };
+        // The identity's miss with the layers' true rise through the
+        // reference, by the number of levels
+        let mut missed = Vec::new();
+        for (distort, metric, depth_mean, levels) in [
+            (0.0, MetricForm::Conservative, false, 6),
+            (0.12, MetricForm::Conservative, false, 6),
+            (0.12, MetricForm::Averaged, false, 6),
+            (0.0, MetricForm::Conservative, true, 6),
+            (0.12, MetricForm::Conservative, true, 6),
+            (0.12, MetricForm::Averaged, true, 6),
+            (0.12, MetricForm::Averaged, true, 12),
+            (0.12, MetricForm::Averaged, true, 24),
+            (0.12, MetricForm::Averaged, true, 48),
+        ] {
+            let (mesh, ops, geom, bathymetry, sigma, mut state) =
+                cliff_basin_with(distort, 1.0, depth_mean, levels);
+            let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+            let n = mesh.n_elements * nn * nl;
+            let all = Blocks::All(mesh.n_elements);
+            let (profile, density, partials) =
+                (thermocline(), thermocline_density, thermocline_partials);
+            let mut fields = ReferenceFields::default();
+            fields.fill(
+                &profile,
+                density,
+                partials,
+                &state,
+                &bathymetry,
+                &sigma,
+                all,
+            );
+            // Any anomaly about the reference
+            let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+            let anomaly: Vec<f64> = (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    0.3 * ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5)
+                })
+                .collect();
+            for ((rho, &base), &a) in state.rho.iter_mut().zip(&fields.density).zip(&anomaly) {
+                *rho = base + a;
+            }
+            fields.set_displacements(&state, &geom, &bathymetry, &sigma, 0.1, all);
+            let transport = own_transports(&state, &mesh, &ops, &geom, &sigma, &bathymetry, metric);
+
+            // The force of the anomaly, and its work on the transports
+            let (mut fx, mut fy) = (vec![0.0; n], vec![0.0; n]);
+            compute_pressure_gradient(
+                &state,
+                &mesh,
+                &bathymetry,
+                &sigma,
+                &ops,
+                &geom,
+                G,
+                RHO0,
+                RHO0,
+                0.1,
+                PressureGradientForm::SigmaPairs,
+                metric,
+                Some(&fields),
+                &mut fx,
+                &mut fy,
+                all,
+            );
+
+            // The tracers at rest in the reference: their whole advection,
+            // and the layers' own (a uniform field's), as inventory rates
+            let [reference_t, reference_s] = &fields.tracers;
+            let ones = vec![1.0; n];
+            let boundaries = Boundaries3D::default();
+            let (mut rate_t, mut rate_s) = (vec![0.0; n], vec![0.0; n]);
+            apply_tracer_transport_3d(
+                [
+                    AdvectedTracer {
+                        reference: Some(reference_t),
+                        ..AdvectedTracer::new(&mut rate_t, reference_t, &ExtrapolationTracerBC3D)
+                    },
+                    AdvectedTracer {
+                        reference: Some(reference_s),
+                        ..AdvectedTracer::new(&mut rate_s, reference_s, &ExtrapolationTracerBC3D)
+                    },
+                ],
+                &transport,
+                &mesh,
+                &ops,
+                &geom,
+                &boundaries,
+                VerticalAdvection::LimitedAkima,
+                all,
+            );
+            let (mut rate_h, mut unused) = (vec![0.0; n], vec![0.0; n]);
+            apply_tracer_transport_3d(
+                [
+                    AdvectedTracer::new(&mut rate_h, &ones, &ExtrapolationTracerBC3D),
+                    AdvectedTracer::new(&mut unused, &ones, &ExtrapolationTracerBC3D),
+                ],
+                &transport,
+                &mesh,
+                &ops,
+                &geom,
+                &boundaries,
+                VerticalAdvection::LimitedAkima,
+                all,
+            );
+            let conservative: f64 = (0..n)
+                .map(|p| geom.node_mass(p / nl / nn, p / nl % nn) * rate_t[p])
+                .sum();
+            add_reference_advection(
+                [&mut rate_t, &mut rate_s],
+                [reference_t, reference_s],
+                &fields,
+                &state,
+                &transport,
+                &ops,
+                &geom,
+                &sigma,
+                &bathymetry,
+                0.1,
+                all,
+            );
+
+            let (rho_t, _) = partials(0.0, 0.0);
+            let (mut potential, mut work, mut scale) = (0.0, 0.0, 0.0);
+            let (mut inventory, mut inventory_scale) = (0.0, 0.0);
+            let mut point_rate = 0.0;
+            for p in 0..n {
+                let (idx, mass) = (p / nl, geom.node_mass(p / nl / nn, p / nl % nn));
+                inventory += mass * rate_t[p];
+                inventory_scale += mass * rate_t[p].abs();
+                work += mass * RHO0 * (transport.hu[p] * fx[p] + transport.hv[p] * fy[p]);
+                // H ∂ρ/∂t at the node: the temperature's rate less the
+                // layer's own, times ∂ρ/∂T
+                let gamma = fields.stratification[p];
+                if state.eta.data[idx] - bathymetry.data[idx] < 0.1 {
+                    continue;
+                }
+                assert!(gamma > 0.0, "test regime: Γ = {gamma:.2e} at a wet node");
+                // … and the layer's own rise through the reference,
+                // (1 + σ) ∂η/∂t, with ∂η/∂t the column's layers' rates
+                let rise: f64 = rate_h[idx * nl..(idx + 1) * nl].iter().sum();
+                let l = p % nl;
+                let h = (state.eta.data[idx] - bathymetry.data[idx]) * sigma.d_sigma()[l];
+                let lifted = rho_t * (rate_t[p] - reference_t[p] * rate_h[p])
+                    + gamma * h * (1.0 + sigma.sigma_rho()[l]) * rise;
+                potential += mass * G * anomaly[p] / gamma * lifted;
+                scale += mass * (G * anomaly[p] / gamma * lifted).abs();
+                // The reference at the layer centre itself changes with the
+                // free surface at its gradient there, not over the layer
+                let z = state.eta.data[idx]
+                    + sigma.sigma_rho()[l] * (state.eta.data[idx] - bathymetry.data[idx]);
+                let at = |z: f64| {
+                    let (t, s) = profile.at(z);
+                    density(t, s)
+                };
+                let point = -(at(z + 1e-3) - at(z - 1e-3)) / 2e-3;
+                point_rate += mass * G * anomaly[p] / gamma
+                    * (point - gamma)
+                    * h
+                    * (1.0 + sigma.sigma_rho()[l])
+                    * rise;
+            }
+            if depth_mean && distort > 0.0 && metric == MetricForm::Averaged {
+                println!(
+                    "{levels} levels: with the reference's gradient at the layer centres in \
+                     the layers' rise, the identity misses by {:.2e} of its terms",
+                    (point_rate / scale).abs()
+                );
+                missed.push((point_rate / scale).abs());
+            }
+            println!(
+                "distortion {distort}, {metric:?}, depth mean {depth_mean}, {levels} levels: the potential energy's rate {potential:.6e}, \
+                 the force's work {work:.6e} (scale {scale:.2e}); the elements' inventory \
+                 rate {inventory:.2e} (conservative {conservative:.2e}, scale \
+                 {inventory_scale:.2e})"
+            );
+            assert!(scale > 1.0, "test regime: scale {scale:.2e}");
+            assert!(
+                (potential + work).abs() < 1e-11 * scale,
+                "distortion {distort}, {metric:?}: the potential energy's rate \
+                 {potential:.12e} against the force's work {work:.12e} (scale {scale:.2e})"
+            );
+            // Walls around: the advected reference's inventory does not change
+            assert!(
+                inventory.abs() < 1e-12 * inventory_scale,
+                "distortion {distort}, {metric:?}: the inventory changes at {inventory:.3e} \
+                 (scale {inventory_scale:.2e})"
+            );
+        }
+        // Measured 3.0e-2, 1.4e-2, 7.6e-4 and 4.5e-7 of the identity's terms
+        // on 6, 12, 24 and 48 levels: gone once the layers resolve the
+        // thermocline (8 m thick, in 5 to 125 m of water)
+        assert!(
+            missed.windows(2).all(|m| m[1] < m[0]) && missed[2] < 2e-3 && missed[3] < 1e-5,
+            "the miss with the reference's own rise does not vanish with the levels: {missed:?}"
+        );
+    }
+
+    /// The step's bound on the reference's waves along sloping levels
+    /// ([`ReferenceFields::sloping_level_rate`]) against the kernels. In the
+    /// pseudo-energy's coordinates, the pairs' advection of the reference
+    /// (the split form's chords with [`add_reference_advection`], no flux
+    /// through the σ-surfaces) is a matrix `B` from the layers' velocities
+    /// to the anomaly's rate, assembled here column by column in every
+    /// element of the cliff basin; its largest singular value (power
+    /// iteration on `BᵀB`) is the largest frequency of the oscillation the
+    /// pairs and the anomaly's pressure gradient make. The bound is at
+    /// least that in every element without a thin column (measured 1.2 to
+    /// 1.5 times it; on distorted elements too, in both metric forms). In
+    /// the shore element the edges are the subcell interfaces between its
+    /// columns that are not thin and the flow is the barotropic one: `B`
+    /// from the depth-mean velocities, and the bound on it.
+    ///
+    /// The assembled operator has the element's displacement in it, which
+    /// the bound does not count. Under a smooth reference (an exponential
+    /// over 100 m) it is a larger part: the bound is then 1.07 to 1.54 times
+    /// the frequency here, and the review of 2026-11-21 measured 0.97 for
+    /// one such reference, so the gate allows the frequency 10 % over the
+    /// bound there. The step takes `ω Δt ≤ 1`, where SSP-RK3 holds to `√3`.
+    #[test]
+    fn the_sloping_level_rate_bounds_the_pairs_frequency() {
+        // A smooth reference too (T̄ exponential over 100 m): the element's
+        // displacement is then a larger part of the operator
+        let smooth = TracerReferenceProfile::from_smooth_fn(-130.0, 5.0, 2701, |z| {
+            (10.0 + 6.0 * (z / 100.0).exp(), 34.0)
+        });
+        for (distort, metric, profile, sharp) in [
+            (0.0, MetricForm::Conservative, thermocline(), true),
+            (0.12, MetricForm::Conservative, thermocline(), true),
+            (0.12, MetricForm::Averaged, thermocline(), true),
+            (0.12, MetricForm::Averaged, smooth, false),
+        ] {
+            let (mesh, ops, geom, bathymetry, sigma, state) = cliff_basin(distort, 0.0);
+            let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+            let (ne, per_element) = (mesh.n_elements, nn * nl);
+            let n = ne * per_element;
+            let mut fields = ReferenceFields::default();
+            fields.fill(
+                &profile,
+                thermocline_density,
+                thermocline_partials,
+                &state,
+                &bathymetry,
+                &sigma,
+                Blocks::All(ne),
+            );
+            let depth =
+                |k: usize, i: usize| state.eta.data[k * nn + i] - bathymetry.data[k * nn + i];
+            let wet = |k: usize| (0..nn).all(|i| depth(k, i) >= 0.1);
+            // m H_z of a layer
+            let volume = |k: usize, i: usize, l: usize| {
+                geom.node_mass(k, i) * depth(k, i) * sigma.d_sigma()[l]
+            };
+            let [reference_t, reference_s] = &fields.tracers;
+            let mut transport = LayerTransport::new(ne, &ops, nl).with_metric(metric);
+            // B of every element, [row = node, level][column = node, level, x|y]
+            let columns = 2 * per_element;
+            let mut b = vec![0.0; ne * per_element * columns];
+            let (mut rate_t, mut rate_s) = (vec![0.0; n], vec![0.0; n]);
+            for column in 0..columns {
+                let (at, y) = (column / 2, column % 2 == 1);
+                // A unit of √(ρ₀ m H_z) u at the column's node and level of
+                // every element, as its layer transport H_z u
+                transport.hu.fill(0.0);
+                transport.hv.fill(0.0);
+                for k in (0..ne).filter(|&k| wet(k)) {
+                    let (i, l) = (at / nl, at % nl);
+                    let h = depth(k, i) * sigma.d_sigma()[l];
+                    let q = h / (RHO0 * volume(k, i, l)).sqrt();
+                    let field = if y {
+                        &mut transport.hv
+                    } else {
+                        &mut transport.hu
+                    };
+                    field[k * per_element + at] = q;
+                }
+                rate_t.fill(0.0);
+                rate_s.fill(0.0);
+                add_reference_advection(
+                    [&mut rate_t, &mut rate_s],
+                    [reference_t, reference_s],
+                    &fields,
+                    &state,
+                    &transport,
+                    &ops,
+                    &geom,
+                    &sigma,
+                    &bathymetry,
+                    0.1,
+                    Blocks::All(ne),
+                );
+                for k in (0..ne).filter(|&k| wet(k)) {
+                    let averaged = metric.averaged_on(&geom, k);
+                    let block = k * per_element;
+                    // The split form's own advection of the reference along
+                    // the pairs, −(1/m_i) Σ_j ½ Φ_ij (T̄_j − T̄_i)
+                    for i in 0..nn {
+                        for j in i + 1..nn {
+                            let [(dx_ij, dy_ij), (dx_ji, dy_ji)] =
+                                pair_derivatives(&ops, &geom, k, i, j, averaged);
+                            let (m_i, m_j) = (geom.node_mass(k, i), geom.node_mass(k, j));
+                            for l in 0..nl {
+                                let (a, c) = (block + i * nl + l, block + j * nl + l);
+                                let half = 0.5
+                                    * (m_i * (dx_ij * transport.hu[a] + dy_ij * transport.hv[a])
+                                        - m_j
+                                            * (dx_ji * transport.hu[c] + dy_ji * transport.hv[c]));
+                                let chord = reference_t[c] - reference_t[a];
+                                rate_t[a] -= half * chord / m_i;
+                                rate_t[c] -= half * chord / m_j;
+                            }
+                        }
+                    }
+                    // … as the rate of ρ′ √(g m H_z / Γ)
+                    for row in 0..per_element {
+                        let (i, l) = (row / nl, row % nl);
+                        let gamma = fields.stratification[block + row];
+                        assert!(gamma > 0.0, "the reference is stable");
+                        let h = depth(k, i) * sigma.d_sigma()[l];
+                        let rate = -RHO0 * ALPHA * rate_t[block + row] / h;
+                        b[(block + row) * columns + column] =
+                            rate * (G * volume(k, i, l) / gamma).sqrt();
+                    }
+                }
+            }
+            // In an element with a thin column: the subcell interfaces
+            // between its other columns, with the layers' shares of the
+            // barotropic flux. B from the depth-mean velocities, one unit of
+            // √(ρ₀ m D) ū at a node of every such element at a time
+            let n1 = ops.n_1d;
+            let n_sub = subcell_interfaces(n1);
+            let deep = |k: usize, i: usize| depth(k, i) >= 0.1;
+            let shore_columns = 2 * nn;
+            let mut shore = vec![0.0; ne * per_element * shore_columns];
+            for column in 0..shore_columns {
+                let (at, y) = (column / 2, column % 2 == 1);
+                let mut flow = state.clone();
+                for k in (0..ne).filter(|&k| !wet(k) && deep(k, at)) {
+                    let unit = 1.0 / (RHO0 * geom.node_mass(k, at) * depth(k, at)).sqrt();
+                    let field = if y { &mut flow.v } else { &mut flow.u };
+                    field[(k * nn + at) * nl..][..nl].fill(unit);
+                }
+                let mut transport =
+                    own_transports(&flow, &mesh, &ops, &geom, &sigma, &bathymetry, metric);
+                transport.omega.fill(0.0);
+                rate_t.fill(0.0);
+                rate_s.fill(0.0);
+                add_reference_advection(
+                    [&mut rate_t, &mut rate_s],
+                    [reference_t, reference_s],
+                    &fields,
+                    &state,
+                    &transport,
+                    &ops,
+                    &geom,
+                    &sigma,
+                    &bathymetry,
+                    0.1,
+                    Blocks::All(ne),
+                );
+                for k in (0..ne).filter(|&k| !wet(k)) {
+                    assert!(transport.subcell_elements[k], "element {k} on the subcells");
+                    let block = k * per_element;
+                    // The interfaces' own (central) advection of the reference
+                    for dir in 0..2 {
+                        for line in 0..n1 {
+                            for a in 0..n1 - 1 {
+                                let (i, j) =
+                                    (line_node(n1, dir, line, a), line_node(n1, dir, line, a + 1));
+                                let slot = k * n_sub + subcell_slot(n1, dir, line, a);
+                                for l in 0..nl {
+                                    let (a, c) = (block + i * nl + l, block + j * nl + l);
+                                    let half = 0.5
+                                        * ops.weights_1d[line]
+                                        * transport.subcell[slot * nl + l];
+                                    let chord = reference_t[c] - reference_t[a];
+                                    rate_t[a] -= half * chord / geom.node_mass(k, i);
+                                    rate_t[c] -= half * chord / geom.node_mass(k, j);
+                                }
+                            }
+                        }
+                    }
+                    for row in (0..per_element).filter(|row| deep(k, row / nl)) {
+                        let (i, l) = (row / nl, row % nl);
+                        let gamma = fields.stratification[block + row];
+                        let h = depth(k, i) * sigma.d_sigma()[l];
+                        let rate = -RHO0 * ALPHA * rate_t[block + row] / h;
+                        shore[(block + row) * shore_columns + column] =
+                            rate * (G * volume(k, i, l) / gamma).sqrt();
+                    }
+                }
+            }
+            // The largest singular value of an element's B, from below
+            let largest = |b: &[f64], columns: usize| {
+                let mut x: Vec<f64> = (0..columns)
+                    .map(|c| 1.0 + 0.37 * (c as f64).sin())
+                    .collect();
+                let mut y = vec![0.0; per_element];
+                let mut frequency = 0.0_f64;
+                for _ in 0..500 {
+                    for (row, y) in y.iter_mut().enumerate() {
+                        *y = b[row * columns..(row + 1) * columns]
+                            .iter()
+                            .zip(&x)
+                            .map(|(b, x)| b * x)
+                            .sum();
+                    }
+                    let norm_x = x.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    let norm_y = y.iter().map(|y| y * y).sum::<f64>().sqrt();
+                    frequency = norm_y / norm_x;
+                    if frequency == 0.0 {
+                        break;
+                    }
+                    for (c, x) in x.iter_mut().enumerate() {
+                        *x = (0..per_element)
+                            .map(|row| b[row * columns + c] * y[row])
+                            .sum();
+                    }
+                    let norm = x.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    x.iter_mut().for_each(|x| *x /= norm);
+                }
+                frequency
+            };
+            let mut scratch = vec![0.0; 5 * nn];
+            let (mut steep, mut shores) = (0, 0);
+            for k in 0..ne {
+                let bound = fields.sloping_level_rate(
+                    &state,
+                    &ops,
+                    &geom,
+                    &bathymetry,
+                    &sigma,
+                    G / RHO0,
+                    0.1,
+                    metric,
+                    k,
+                    &mut scratch,
+                );
+                let b = &b[k * per_element * columns..(k + 1) * per_element * columns];
+                if !wet(k) {
+                    assert!(b.iter().all(|&x| x == 0.0), "pairs act in element {k}");
+                    let rows =
+                        k * per_element * shore_columns..(k + 1) * per_element * shore_columns;
+                    let frequency = largest(&shore[rows], shore_columns);
+                    println!(
+                        "distortion {distort}, {metric:?}, shore element {k}: frequency \
+                         {frequency:.4e} 1/s, bound {bound:.4e} ({:.2})",
+                        bound / frequency
+                    );
+                    assert!(
+                        frequency <= bound,
+                        "shore element {k}: frequency {frequency:.4e} above the bound {bound:.4e}"
+                    );
+                    assert!(
+                        bound < 4.0 * frequency,
+                        "shore element {k}: the bound {bound:.4e} is slack on {frequency:.4e}"
+                    );
+                    shores += usize::from(frequency > 0.0);
+                    continue;
+                }
+                let frequency = largest(b, columns);
+                println!(
+                    "distortion {distort}, {metric:?}, {} reference, element {k}: frequency \
+                     {frequency:.4e} 1/s, bound {bound:.4e} ({:.2})",
+                    if sharp { "thermocline" } else { "smooth" },
+                    bound / frequency
+                );
+                // The bound is the pairs': the element's displacement, a
+                // term of rank one, is not in it. Under a thermocline the
+                // bound holds with it; under a smooth reference it may not,
+                // by a few per cent
+                assert!(
+                    frequency <= if sharp { bound } else { 1.1 * bound },
+                    "element {k}: frequency {frequency:.4e} above the bound {bound:.4e}"
+                );
+                if sharp {
+                    assert!(
+                        bound < 2.5 * frequency,
+                        "element {k}: the bound {bound:.4e} is slack on {frequency:.4e}"
+                    );
+                }
+                steep += usize::from(frequency > 5e-3);
+            }
+            if sharp {
+                assert!(steep >= 2, "the cliff's elements carry the frequency");
+            }
+            assert!(shores >= 1, "the shore element carries its own");
+        }
+    }
+
+    /// Constancy, a linear reference, and every element's inventory: a
+    /// uniform tracer gets nothing from [`add_reference_advection`] whatever
+    /// the reference and the flow (it holds no share of the reference's
+    /// stratification); a tracer in a reference linear in `z` gets nothing
+    /// either (the reference's chords are its tangents), to round-off; and
+    /// what a tracer in a curved reference gets adds up to nothing in every
+    /// element.
+    ///
+    /// On 6 levels, and on 1 and 2, where the levels see no residual in the
+    /// stratification and the element's error is taken back as a uniform
+    /// displacement; and for a reference that is nearly quadratic in `z`
+    /// (an exponential with a scale of 20 km), which is under the floor of
+    /// the residual.
+    #[test]
+    fn the_reference_advection_keeps_constancy_a_linear_reference_and_the_elements_inventories() {
+        for levels in [1, 2, 6] {
+            constancy_and_inventories_on(levels);
+        }
+    }
+
+    /// The body of the gate above on `levels` levels.
+    fn constancy_and_inventories_on(levels: usize) {
+        // (the flow with its depth mean: one level has no other)
+        let (mesh, ops, geom, bathymetry, sigma, state) = cliff_basin_with(0.12, 1.0, true, levels);
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let n = mesh.n_elements * nn * nl;
+        let transport = own_transports(
+            &state,
+            &mesh,
+            &ops,
+            &geom,
+            &sigma,
+            &bathymetry,
+            MetricForm::Averaged,
+        );
+        let all = Blocks::All(mesh.n_elements);
+        let (density, partials) = (thermocline_density, thermocline_partials);
+        let apply = |profile: &TracerReferenceProfile, tracers: [&[f64]; 2]| {
+            let mut fields = ReferenceFields::default();
+            fields.fill(profile, density, partials, &state, &bathymetry, &sigma, all);
+            let (mut t, mut s) = (vec![0.0; n], vec![0.0; n]);
+            add_reference_advection(
+                [&mut t, &mut s],
+                tracers,
+                &fields,
+                &state,
+                &transport,
+                &ops,
+                &geom,
+                &sigma,
+                &bathymetry,
+                0.1,
+                all,
+            );
+            (fields, t, s)
+        };
+        let largest = |x: &[f64]| x.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        // A thermocline (and a linear salinity) as the reference, uniform
+        // tracers
+        let curved = TracerReferenceProfile::from_smooth_fn(-130.0, 5.0, 2701, |z| {
+            (
+                10.0 + 4.0 * ((z + 15.0) / 4.0).tanh() + 0.01 * z,
+                34.0 - 0.01 * z,
+            )
+        });
+        let (uniform_t, uniform_s) = (vec![11.5; n], vec![33.0; n]);
+        let (fields, t, s) = apply(&curved, [&uniform_t, &uniform_s]);
+        assert_eq!(largest(&t), 0.0, "uniform T");
+        assert_eq!(largest(&s), 0.0, "uniform S");
+        // The tracers in the curved reference: a term of the advection's
+        // size, which adds up to nothing in every element
+        let (_, t, _) = apply(&curved, [&fields.tracers[0], &fields.tracers[1]]);
+        assert!(largest(&t) > 1e-3, "test regime: {:.2e}", largest(&t));
+        let kept = |t: &[f64], name: &str| {
+            for (k, element) in t.chunks_exact(nn * nl).enumerate() {
+                let (mut sum, mut scale) = (0.0, 0.0);
+                for (i, column) in element.chunks_exact(nl).enumerate() {
+                    let mass = geom.node_mass(k, i);
+                    sum += mass * column.iter().sum::<f64>();
+                    scale += mass * column.iter().map(|c| c.abs()).sum::<f64>();
+                }
+                assert!(
+                    sum.abs() <= 1e-13 * scale,
+                    "{levels} levels, {name}: element {k} gains {sum:.3e} (scale {scale:.2e})"
+                );
+            }
+        };
+        kept(&t, "the thermocline");
+        // … and in a reference with next to no residual
+        let gentle = TracerReferenceProfile::from_smooth_fn(-130.0, 5.0, 2701, |z| {
+            (10.0 + 6.0 * (z / 2e4).exp(), 34.0)
+        });
+        let (fields, _, _) = apply(&gentle, [&uniform_t, &uniform_s]);
+        let (_, t, _) = apply(&gentle, [&fields.tracers[0], &fields.tracers[1]]);
+        kept(&t, "a nearly quadratic reference");
+        // The tracers in a linear reference: nothing
+        let linear = TracerReferenceProfile::new(
+            vec![-130.0, 5.0],
+            vec![4.0, 4.0 + 0.03 * 135.0],
+            vec![36.0, 36.0 - 0.01 * 135.0],
+        );
+        let (fields, _, _) = apply(&linear, [&uniform_t, &uniform_s]);
+        let (_, t, s) = apply(&linear, [&fields.tracers[0], &fields.tracers[1]]);
+        // Against Ω and the pairs' fluxes of ≈ 1 m/s times a degree
+        assert!(largest(&t) < 1e-12, "linear T: {:.3e}", largest(&t));
+        assert!(largest(&s) < 1e-12, "linear S: {:.3e}", largest(&s));
     }
 
     /// A density that varies only horizontally, over a flat bed: the force

@@ -36,8 +36,8 @@
 //! (`Hydrostatic3D::with_balanced_reference`), `nu`/`kappa` vertical
 //! viscosity and diffusivity, `nuh` or `cs` horizontal viscosity (constant
 //! or Smagorinsky), `vadv`/`madv` the tracers' and the momentum's vertical
-//! advection (`vref=0`: without the initial stratification as the vertical
-//! reference, `Hydrostatic3D::with_vertical_reference`, the default as in
+//! advection (`ref=0`: without the initial stratification as the reference
+//! profile, `Hydrostatic3D::with_reference_profile`, the default as in
 //! `Simulation3D`), `mform` the momentum's horizontal advection (`split`, the
 //! default, or `conservative`), `kuzmin=1` the horizontal Kuzmin tracer limiter (`kuzmin=2`
 //! with the initial stratification as its reference profile; `relax` its
@@ -221,11 +221,19 @@ fn main() {
         }
     }
     physics.update_density(&mut state);
+    // The initial stratification as the reference profile (cubic between
+    // samples every 5 cm), unless `ref=0`
+    physics.set_reference_profile((arg("ref", 1usize) != 0).then(|| {
+        let samples = (20.0 * (depth + 2.0)) as usize + 1;
+        Arc::new(TracerReferenceProfile::from_smooth_fn(
+            -depth - 1.0,
+            1.0,
+            samples,
+            |z| (temperature(z), eos.s0),
+        ))
+    }));
     if balanced != 0 {
         physics.set_balanced_reference(&state);
-    }
-    if arg("vref", 1usize) != 0 {
-        physics.set_vertical_reference(&state);
     }
 
     // Steepness: the largest r_x0 between neighbouring nodes of an element

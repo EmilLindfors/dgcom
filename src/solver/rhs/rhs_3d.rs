@@ -21,7 +21,8 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::Blocks;
 use crate::solver::rhs::advection_3d::TracerBoundaryCondition3D;
 use crate::solver::rhs::baroclinic::{
-    BalancedReference, PressureGradientForm, compute_pressure_gradient,
+    BalancedReference, PressureGradientForm, ReferenceFields, add_reference_advection,
+    compute_pressure_gradient,
 };
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D};
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
@@ -63,12 +64,18 @@ pub struct Rhs3DConfig<'a> {
     /// A reference state balanced by the constant-depth form, if any (with
     /// [`PressureGradientForm::SigmaPairs`]).
     pub balanced_reference: Option<&'a BalancedReference>,
+    /// The reference stratification at the levels of `state`
+    /// ([`ReferenceFields::fill`]), if any. The pressure gradient is the
+    /// density anomaly's about it ([`compute_momentum_rhs_3d`], which needs
+    /// it on the elements' face neighbours too, with the elements'
+    /// displacements, [`ReferenceFields::set_displacements`]); the tracers'
+    /// vertical reconstruction is taken about it, and the reference itself
+    /// is advected by the pressure gradient's adjoint
+    /// ([`compute_transport_rhs_3d`]).
+    pub reference: Option<&'a ReferenceFields>,
     /// The volume form of the horizontal divergences, the 2D module's (the
     /// pressure gradient takes its adjoint).
     pub metric: MetricForm,
-    /// Temperature and salinity at rest (`[element][node][level]`), about
-    /// which the vertical advection reconstructs, if any (experimental).
-    pub tracer_reference: [Option<&'a [f64]>; 2],
     /// The temperature's and the salinity's physical ranges `(min, max)`, which the
     /// vertical advection keeps the water leaving an end layer within
     /// ([`UNBOUNDED`](super::transport_3d::UNBOUNDED) for none).
@@ -105,6 +112,7 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         config.min_column_depth,
         config.pressure_gradient,
         config.metric,
+        config.reference,
         &mut rhs.u,
         &mut rhs.v,
         config.elements,
@@ -127,7 +135,9 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
 /// layer transports `transport` (computed from `state` for this stage) to
 /// `rhs.u` and `rhs.v`, and overwrite `rhs.temp` and `rhs.salt` with the
 /// tracers' inventory tendencies `∂(H_z C)/∂t`. The advected fields are
-/// `state`'s.
+/// `state`'s. With a reference stratification ([`Rhs3DConfig::reference`])
+/// the tracers' vertical reconstruction is taken about it and its own
+/// advection is the pressure gradient's adjoint ([`add_reference_advection`]).
 pub fn compute_transport_rhs_3d(
     rhs: &mut Solution3D,
     state: &Solution3D,
@@ -155,7 +165,7 @@ pub fn compute_transport_rhs_3d(
             tracer: &state.temp,
             bc: config.temp_bc,
             exterior: config.exterior.temp,
-            reference: config.tracer_reference[0],
+            reference: config.reference.map(|r| &r.tracers[0][..]),
             range: config.tracer_range[0],
         },
         AdvectedTracer {
@@ -163,7 +173,7 @@ pub fn compute_transport_rhs_3d(
             tracer: &state.salt,
             bc: config.salt_bc,
             exterior: config.exterior.salt,
-            reference: config.tracer_reference[1],
+            reference: config.reference.map(|r| &r.tracers[1][..]),
             range: config.tracer_range[1],
         },
     ];
@@ -177,4 +187,21 @@ pub fn compute_transport_rhs_3d(
         config.vertical_advection,
         config.elements,
     );
+    if let Some(reference) = config.reference {
+        let start = crate::profiling::start();
+        add_reference_advection(
+            [&mut rhs.temp, &mut rhs.salt],
+            [&state.temp, &state.salt],
+            reference,
+            state,
+            transport,
+            config.ops,
+            config.geom,
+            config.sigma,
+            config.bathymetry,
+            config.min_column_depth,
+            config.elements,
+        );
+        crate::profiling::stop("3d: reference advection", start);
+    }
 }

@@ -29,6 +29,21 @@ pub trait EquationOfState: Send + Sync {
     /// Returns density [kg/m^3].
     fn compute_density(&self, t: f64, s: f64, z: f64) -> f64;
 
+    /// `(∂ρ/∂T, ∂ρ/∂S)` at `(t, s)` at the surface (kg/m³ per °C and per
+    /// psu): how a temperature and a salinity anomaly add up to a density
+    /// anomaly, for the stratification of a reference profile
+    /// (`crate::solver::rhs::ReferenceFields`). By central differences of
+    /// [`Self::compute_density`] unless an equation of state knows better.
+    fn density_partials(&self, t: f64, s: f64) -> (f64, f64) {
+        let (dt, ds) = (1e-3, 1e-3);
+        (
+            (self.compute_density(t + dt, s, 0.0) - self.compute_density(t - dt, s, 0.0))
+                / (2.0 * dt),
+            (self.compute_density(t, s + ds, 0.0) - self.compute_density(t, s - ds, 0.0))
+                / (2.0 * ds),
+        )
+    }
+
     /// Update the density field in the 3D solution.
     fn update_density(&self, state: &mut Solution3D) {
         let all = Blocks::All(state.n_elements);
@@ -85,6 +100,10 @@ impl EquationOfState for LinearEOS {
     fn compute_density(&self, t: f64, s: f64, _z: f64) -> f64 {
         self.rho0 * (1.0 - self.alpha * (t - self.t0) + self.beta * (s - self.s0))
     }
+
+    fn density_partials(&self, _t: f64, _s: f64) -> (f64, f64) {
+        (-self.rho0 * self.alpha, self.rho0 * self.beta)
+    }
 }
 
 /// UNESCO 1980 Equation of State (simplified).
@@ -130,6 +149,35 @@ mod tests {
         // Saltier -> heavier
         let rho_salty = eos.compute_density(10.0, 36.0, 0.0);
         assert!(rho_salty > 1025.0);
+    }
+
+    /// The partials are the linear equation's coefficients, and the
+    /// default's central differences those of the UNESCO polynomial (against
+    /// a difference over a tenth of the step).
+    #[test]
+    fn density_partials_are_the_derivatives() {
+        let eos = LinearEOS::default();
+        let (rho_t, rho_s) = eos.density_partials(7.0, 31.0);
+        assert_eq!(rho_t, -eos.rho0 * eos.alpha);
+        assert_eq!(rho_s, eos.rho0 * eos.beta);
+        let unesco = UnescoEOS { rho0: 1025.0 };
+        let (rho_t, rho_s) = unesco.density_partials(8.0, 33.0);
+        let h = 1e-4;
+        let fine_t = (unesco.compute_density(8.0 + h, 33.0, 0.0)
+            - unesco.compute_density(8.0 - h, 33.0, 0.0))
+            / (2.0 * h);
+        let fine_s = (unesco.compute_density(8.0, 33.0 + h, 0.0)
+            - unesco.compute_density(8.0, 33.0 - h, 0.0))
+            / (2.0 * h);
+        assert!(
+            (rho_t - fine_t).abs() < 1e-6 * fine_t.abs(),
+            "{rho_t} {fine_t}"
+        );
+        assert!(
+            (rho_s - fine_s).abs() < 1e-6 * fine_s.abs(),
+            "{rho_s} {fine_s}"
+        );
+        assert!(rho_t < 0.0 && rho_s > 0.0);
     }
 
     #[test]

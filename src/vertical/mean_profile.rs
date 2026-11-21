@@ -6,7 +6,11 @@
 //! bed, in a 3D run started from a parent's columns.
 //!
 //! At each height it is the mean of the columns that reach it, interpolated
-//! between their layer centres, then made statically stable: adjacent
+//! between their layer centres (and continued along the end pair's line
+//! through the half-layers at the bed and the surface, so that a
+//! stratification linear in `z` is its own mean over any bed, and a model at
+//! rest in it is at rest in its mean profile), then made statically stable:
+//! adjacent
 //! heights where the density decreases downwards are pooled into their
 //! weighted mean (pool-adjacent-violators on `density(T, S)`; for a density
 //! linear in T and S a pool's density is its mean's).
@@ -69,15 +73,17 @@ impl MeanProfile {
                 while l + 1 < nl && z(l + 1) <= zi {
                     l += 1;
                 }
-                let (value_t, value_s) = if zi <= z(0) {
+                // Linear between the two layer centres around the height;
+                // in the half-layers at the bed and the surface, the end
+                // pair's line continued (one layer: its value)
+                let (value_t, value_s) = if nl == 1 {
                     (t[0], sal[0])
-                } else if l + 1 >= nl {
-                    (t[nl - 1], sal[nl - 1])
                 } else {
-                    let w = (zi - z(l)) / (z(l + 1) - z(l));
+                    let a = l.min(nl - 2);
+                    let w = (zi - z(a)) / (z(a + 1) - z(a));
                     (
-                        t[l] + w * (t[l + 1] - t[l]),
-                        sal[l] + w * (sal[l + 1] - sal[l]),
+                        t[a] + w * (t[a + 1] - t[a]),
+                        sal[a] + w * (sal[a + 1] - sal[a]),
                     )
                 };
                 sum_t[i] += value_t;
@@ -128,6 +134,12 @@ impl MeanProfile {
         Some(Self { z0, temp, salt })
     }
 
+    /// The heights of the grid points (m, increasing) and T and S there.
+    pub fn samples(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let heights = (0..self.temp.len()).map(|i| self.z0 + i as f64).collect();
+        (heights, self.temp.clone(), self.salt.clone())
+    }
+
     /// T and S at height `z` (m), linear between grid points and held beyond
     /// them.
     pub fn at(&self, z: f64) -> (f64, f64) {
@@ -166,17 +178,18 @@ mod tests {
         (state, bed, sigma)
     }
 
-    /// A stable linear stratification is its own mean wherever every column
-    /// that reaches a height has layer centres around it (between −1 and
-    /// −9 m both columns, between −10 and −19 m the deep one); each column
-    /// holds its end layers' values beyond them, and the profile is held
-    /// above the surface and below the deepest bed.
+    /// A stable linear stratification is its own mean from the deepest bed
+    /// to the surface, in the half-layers at the columns' beds (−9.5 to
+    /// −10 m, −19 to −20 m) and at the surface too: each column is continued
+    /// along its end pair's line there (held, the 10 m column's bottom value
+    /// put the mean off by 2.5e-3 °C at −9.8 m). The profile is held above
+    /// the surface and below the deepest bed.
     #[test]
     fn a_stable_linear_profile_is_its_own_mean() {
         let (state, bed, sigma) = columns(|z| 10.0 + 0.1 * z, |z| 33.0 - 0.05 * z);
         let density = |t: f64, s: f64| 1025.0 - 0.2 * (t - 10.0) + 0.8 * (s - 35.0);
         let mean = MeanProfile::of(&state, &bed, &sigma, |_| true, density).unwrap();
-        for z in [-2.0, -3.5, -6.0, -12.0, -15.5] {
+        for z in [-0.2, -2.0, -3.5, -6.0, -9.8, -12.0, -15.5, -19.6] {
             let (t, s) = mean.at(z);
             assert!((t - (10.0 + 0.1 * z)).abs() < 1e-12, "T at {z}: {t}");
             assert!((s - (33.0 - 0.05 * z)).abs() < 1e-12, "S at {z}: {s}");
