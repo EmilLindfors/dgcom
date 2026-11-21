@@ -288,7 +288,7 @@ pub fn subcell_divergence_element(
 
 /// Largest number of GLL nodes per direction of the subcell kernels' stack
 /// buffers (polynomial order 15).
-const MAX_N_1D: usize = 16;
+pub(crate) const MAX_N_1D: usize = 16;
 
 /// The DG divergence of the advective flux `q φ` of a field `φ` carried by
 /// the transport `q = (hu, hv)` on element `k`, with the volume term in

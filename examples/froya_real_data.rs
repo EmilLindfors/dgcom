@@ -5481,6 +5481,19 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     } else {
         physics.with_reference_profile(reference)
     };
+    // About the reference the step also resolves its waves along sloping
+    // levels (TODO P1.3): binding on steep, strongly stratified elements
+    let limits = physics.time_step_limits(&state, cfl);
+    if limits.sloping_levels.dt.is_finite() {
+        println!(
+            "  The reference's waves along sloping levels bound the step at {:.2} s (element \
+             {}), advection and internal waves at {:.2} s (element {})",
+            limits.sloping_levels.dt,
+            limits.sloping_levels.element,
+            limits.advection.dt,
+            limits.advection.element
+        );
+    }
     let mut integrator = ModeSplitIntegrator::new().with_baroclinic_scheme(opts.rk_3d);
     let ssp = opts.rk_3d.ssp_coefficient();
     let mut t = 0.0;

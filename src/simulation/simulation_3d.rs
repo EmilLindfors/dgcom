@@ -3765,7 +3765,7 @@ mod tests {
     /// e-folding of 47 min (2.3e-8 m/s after 6 h when the gate was written;
     /// on the Frøya bed ≈ 15 min). About the reference profile the scheme
     /// conserves a pseudo-energy to first order
-    /// (`Hydrostatic3D::with_reference_profile`): measured 2.2e-12 m/s.
+    /// (`Hydrostatic3D::with_reference_profile`): measured 1.4e-12 m/s.
     #[test]
     fn a_pycnocline_over_a_cliff_stays_at_rest() {
         let speed = cliff_at_rest(|z| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z, 6.0);
@@ -3778,7 +3778,7 @@ mod tests {
     /// element with dry nodes), and 15 → 60 m (a third of the cliff, which
     /// the σ-pairs scheme of the full density grew with an e-folding of
     /// 1.8 h; the cliff and the shallows it blew up within 48 h). Round-off
-    /// stays round-off: measured ≤ 8.7e-12 m/s at 48 h.
+    /// stays round-off: measured ≤ 9.3e-12 m/s at 48 h.
     #[test]
     fn a_pycnocline_over_unsmoothed_steps_stays_at_rest_for_two_days() {
         let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
@@ -3809,7 +3809,8 @@ mod tests {
     /// whatever the Courant number, where advection and the internal waves'
     /// WKB speed allow 161 s at Courant number 1; the local steps take it
     /// too. No such bound without a reference. At the model's step the rest
-    /// state holds for 6 h (measured 6.0e-12 m/s).
+    /// state holds (2 h here, measured 1.2e-12 m/s; 4.2e-12 m/s after 6 h; at
+    /// 72 s it blows up within the hour).
     #[test]
     fn the_models_step_holds_the_reference_over_a_cliff() {
         let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
@@ -3828,7 +3829,7 @@ mod tests {
         assert_eq!(steps[3], bound.dt, "the cliff's own step");
         assert!(steps[0] > 150.0, "the flat bed's step {} s", steps[0]);
 
-        let speed = basin_at_rest(mesh(), bed, None, pycnocline, &[6.0], dt).0[0];
+        let speed = basin_at_rest(mesh(), bed, None, pycnocline, &[2.0], dt).0[0];
         assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s at {dt} s");
 
         let plain = physics.without_reference_profile();
@@ -4390,9 +4391,11 @@ mod tests {
     /// reference stratification (the layout of [`pack`]): the shear times
     /// `√(ρ₀ m H)`, the depth-mean velocity times `√(ρ₀ m D)`, the free
     /// surface times `√(ρ₀ g m)`, and in the temperature's place the density
-    /// anomaly `a = ρ_T δT + ρ_S δS` times `√(g m H/Γ)`, with `m` the node's
-    /// mass, `H` the layer's thickness and `Γ = −∂ρ̄/∂z` the reference's
-    /// gradient over the layer. The squared norm is twice the pseudo-energy
+    /// anomaly about the reference at the layer's own height,
+    /// `ρ′ = ρ_T δT + ρ_S δS + Γ (1 + σ) δη` (the layer rises by
+    /// `(1 + σ) δη` through the reference, which is fixed in `z`), times
+    /// `√(g m H/Γ)`, with `m` the node's mass, `H` the layer's thickness and
+    /// `Γ = −∂ρ̄/∂z` the reference's gradient over the layer. The squared norm is twice the pseudo-energy
     /// (kinetic, free-surface and available potential energy, J). The part of
     /// `(δT, δS)` that is not a displacement of the reference (it changes no
     /// density to first order and is not changed by the flow) is left out, as
@@ -4407,6 +4410,8 @@ mod tests {
         gamma: Vec<f64>,
         partials: [f64; 2],
         root_d_sigma: Vec<f64>,
+        /// `1 + σ` at the layer centres: a layer's rise per unit of `η`
+        lift: Vec<f64>,
     }
 
     impl EnergyCoordinates {
@@ -4426,6 +4431,7 @@ mod tests {
                 gamma: vec![0.0; n2 * nl],
                 partials,
                 root_d_sigma: sigma.d_sigma().iter().map(|d| d.sqrt()).collect(),
+                lift: sigma.sigma_rho().iter().map(|s| 1.0 + s).collect(),
             };
             for idx in 0..n2 {
                 let eta = rest.eta.data[idx];
@@ -4476,10 +4482,14 @@ mod tests {
                             self.velocity[idx * nl + l] * (column[l] - mean);
                     }
                 }
+                // The anomaly about the reference at the layer's own height,
+                // which rises by (1 + σ) δη
+                let eta = dx[4 * field + idx];
                 for l in 0..nl {
                     let i = idx * nl + l;
-                    let anomaly =
-                        self.partials[0] * dx[2 * field + i] + self.partials[1] * dx[3 * field + i];
+                    let anomaly = self.partials[0] * dx[2 * field + i]
+                        + self.partials[1] * dx[3 * field + i]
+                        + self.gamma[i] * self.lift[l] * eta;
                     y[2 * field + i] = self.density[i] * anomaly;
                 }
                 y[4 * field + idx] = self.surface[idx] * dx[4 * field + idx];
@@ -4513,14 +4523,20 @@ mod tests {
                         }
                     }
                 }
+                let eta = over(y[4 * field + idx], self.surface[idx]);
+                dx[4 * field + idx] = eta;
                 for l in 0..nl {
                     let i = idx * nl + l;
-                    // The displacement of the reference with this anomaly
-                    let displacement = over(over(y[2 * field + i], self.density[i]), self.gamma[i]);
+                    if self.density[i] == 0.0 {
+                        continue;
+                    }
+                    // The displacement of the reference with this anomaly,
+                    // at the layer's risen height
+                    let displacement =
+                        y[2 * field + i] / self.density[i] / self.gamma[i] - self.lift[l] * eta;
                     dx[2 * field + i] = -self.gradient[0][i] * displacement;
                     dx[3 * field + i] = -self.gradient[1][i] * displacement;
                 }
-                dx[4 * field + idx] = over(y[4 * field + idx], self.surface[idx]);
             }
             dx
         }

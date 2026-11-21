@@ -301,9 +301,10 @@ eigenvalues appear: the modes of the cliff and of the terrace.
 
 ### The scheme
 
-Three changes, all on exactly the edges the force acts along: the pairs of an
-element without a thin column that moves its layers by the pairs, and the
-σ-surfaces of the columns that are not thin.
+Five changes, all on exactly the edges the force acts along: the pairs of an
+element without a thin column that moves its layers by the pairs, the subcell
+interfaces between two columns that are not thin in an element with a thin
+one (step 5), and the σ-surfaces of the columns that are not thin.
 
 1. **The force is the anomaly's, and linear.** `ρ′_a = ρ_a − ρ̄(z_a)` with
    `ρ̄(z) = ρ(T̄(z), S̄(z))` at the node's own height at the stage's `η`, and
@@ -338,6 +339,41 @@ element without a thin column that moves its layers by the pairs, and the
        ½(ρ′_a + ρ′_b)(z_b − z_a) − κ [(ρ̄_b − ρ̄_a) + ½(Γ_a + Γ_b)(z_b − z_a)].
    ```
 
+4. **The pressure's mean over a column is the anomaly's first moment about
+   the bed.** Transports with a depth mean move the free surface, and a
+   layer's centre rises through the reference (which is fixed in `z`) by
+   `(1 + σ) ∂η/∂t`: the anomaly gets `Γ (1 + σ) ∂η/∂t` besides the
+   advection's. Its partner in the force's work is the pressure's mean over
+   the column, times the column's `∂η/∂t` (the proof below). So every
+   column's pressure is shifted, by the same amount at every level, to
+
+   ```text
+       Σ_l Δσ_l p_l = Σ_l Δσ_l ρ′_l (z_l − B),
+   ```
+
+   the mean of the exact pressure of layers of uniform `ρ′` (the layer
+   centres are the midpoints of their σ-surfaces, in every stretching of the
+   crate). The trapezoid rule's own mean differs from it on stretched levels
+   and by step 3's term. Only the depth-mean force changes, by a term of the
+   size of the rule's error; a uniform anomaly still exerts none.
+5. **An element with a thin column** (a shore element) moves its layers
+   through the GLL subcell interfaces of the 2D wet/dry kernel, each with its
+   share `Δσ_l F̄` of the barotropic flux, and exchanges no baroclinic
+   transport within itself (since 2026-10-04). That flux moves the
+   stratification along the element's sloping levels like any other. So an
+   interface between two columns that are not thin is an edge of the graph:
+   the reference is advected by the tangent along it (step 2, and step 3 for
+   the element), and the force gets the adjoint of that, which for a flux
+   that is the same share of one barotropic flux at every level is a force
+   that is the same at every level: with `m` the interface's metric and `w`
+   the line's quadrature weight, `∂p/∂x` at both its nodes gets
+   `½ w m Σ_l Δσ_l Δp_l / m_node`, the mean over the column of the pair's
+   pressure differences. The barotropic flow in a shore element then feels
+   the anomaly it makes. The layers there still get no baroclinic force and
+   exchange no baroclinic transport, and an interface with a thin column on
+   one side stays outside (the wet/dry front; the 2D kernel's hydrostatic
+   reconstruction decides its flux).
+
 In a fluid at rest in the reference `θ = 1`, the chord of (chord) cancels, and
 what is left of the advection is
 
@@ -371,17 +407,28 @@ equation of state is linear in `T` and `S`. The bed is continuous across
 element faces. The state is at rest in the reference (`u = 0`, `η` flat,
 `T = T̄(z_a)`, `S = S̄(z_a)` at every node). The force is the σ-pairs form.
 
-**Claim.** For the semi-discrete scheme linearised about that state, and
-perturbations whose transports have no depth mean (the 3D operator at a fixed
-barotropic state, between walls),
+**Claim.** For the semi-discrete scheme linearised about that state, between
+walls, with any layer transports (with a depth mean or without; the free
+surface follows them by the layers' continuity, and the layer fluxes are
+their central ones),
 
 ```text
-    d/dt [ ½ρ₀ Σ_a m_a H_a |δu_a|² + ½ g Σ_{Γ_a > 0} m_a H_a δρ_a²/Γ_a ] = −D ≤ 0,
+    ρ₀ Σ_a m_a H_a δu_a·(∂δu_a/∂t)_force + g Σ_{Γ_a > 0} m_a H_a (ρ′_a/Γ_a) ∂ρ′_a/∂t = 0,
+    ρ′_a = ρ_T δT_a + ρ_S δS_a + Γ_a (1 + σ_a) δη_a :
 ```
 
-with `δρ = ρ_T δT + ρ_S δS` and `D` the dissipation of the vertical and
-horizontal viscosities. Where `Γ_a = 0` the anomaly `δρ_a` does not change.
-And every element's inventories of `T` and `S` change only through its faces.
+the baroclinic force's work and the rate of the available potential energy
+`½ g ρ′²/Γ` cancel, for the anomaly about the reference at the layer's own
+height. Where `Γ_a = 0` the anomaly does not change. With the 2D module's own
+exchange between the depth-mean flow and `½ρ₀ g η²`, and the viscosities'
+dissipation `D`, the pseudo-energy
+
+```text
+    ½ρ₀ Σ_a m_a H_a |δu_a|² + ½ρ₀ g Σ_i m_i δη_i² + ½ g Σ_{Γ_a > 0} m_a H_a ρ′_a²/Γ_a
+```
+
+changes at `−D ≤ 0` less what the 2D module's Riemann fluxes dissipate. And
+every element's inventories of `T` and `S` change only through its faces.
 
 **Proof.** (i) From the scheme,
 `m_a H_a ∂δρ_a/∂t = Γ_a [m_a (H w)_a − m_a H_a R/N]`, with
@@ -396,7 +443,17 @@ energy's rate is `g Σ_a (δρ_a/Γ_a) m_a H_a ∂δρ_a/∂t = g Σ_a m_a δρ_
 each edge gives `½ F_ab (z_b − z_a)` to `m_a (H w)_a` and
 `½ F_ba (z_a − z_b)`, the same number, to `m_b (H w)_b`, and the second sum is
 `κ` by its definition. The two rates cancel. (iv) The inventory: the edges'
-terms add up to `R` in the element, and step 3 takes `Σ m H Γ R/N = R` back. ∎
+terms add up to `R` in the element, and step 3 takes `Σ m H Γ R/N = R` back.
+(v) A depth mean. The sum (work) is by parts with the layers' continuity,
+`Σ_b F_ab = −m_a (Δσ ∂η/∂t + Ω_{a+½} − Ω_{a−½})`: the pressure differences
+along the horizontal edges become `Σ_a p_a Σ_b F_ab`, whose `Ω` part is the
+vertical edges' share of `(H w)` (and of `R`, for step 3's term in the
+pressure), and whose `∂η/∂t` part is `−Σ_i m_i ∂η_i/∂t Σ_l Δσ_l p_l`. The
+anomaly's rate has `Γ (1 + σ) ∂η/∂t` more, which gives the potential energy
+`g Σ_i m_i ∂η_i/∂t Σ_l Δσ_l ρ′_l (z_l − B_i)`. Step 4 makes the two equal,
+column by column. (vi) A subcell interface carries `F_l = Δσ_l w ½ m·(Q̄_a +
+Q̄_b)`, `Q̄` the columns' transports; `Σ_l F_l Δp_l` is the work of step 5's
+force on them. ∎
 
 The quantity is positive definite on the dynamic variables, with the weights
 of the available potential energy of Holliday & McIntyre (1981); the operator
@@ -412,12 +469,16 @@ step".
 
 The whole exchange is checked to round-off, with the actual kernels, by the
 gate `the_reference_advection_and_the_pressure_gradient_exchange_pseudo_energy_exactly`:
-random transports without a depth mean and random anomalies, the tracers at
-rest in a thermocline, on parallelograms and distorted elements in both
-metric forms, over a 5 → 125 m cliff, across faces, with a shore element. The
-rate of the potential energy (from the conservative tracer kernel about the
-reference plus `add_reference_advection`) and the force's work agree to 1e-11
-of their terms, and the inventory's rate is round-off. In time it is checked
+random transports, without a depth mean and with one, and random anomalies,
+the tracers at rest in a thermocline, on parallelograms and distorted
+elements in both metric forms, on stretched levels, over a 5 → 125 m cliff,
+across faces, with a shore element with dry nodes. The rate of the potential
+energy (from the conservative tracer kernel about the reference plus
+`add_reference_advection`, and the layers' rise with the free surface) and
+the force's work agree to 1e-11 of their terms, and the inventory's rate is
+round-off. Without step 4 the two differ by 8 % of the work for transports
+with a depth mean on those levels (3 % on uniform levels: step 3's term), and
+without step 5 by another 4 %. In time it is checked
 by `the_pseudo_energy_of_a_departure_from_rest_does_not_grow_over_a_cliff`
 and by the spectrum probes in pseudo-energy coordinates (below).
 
@@ -490,13 +551,17 @@ reference only (`TimeStepLimits::sloping_levels`,
 `z_j − z_i = (1 + σ)(η_j − η_i) − σ(B_j − B_i)` is bounded over the levels by
 each column's largest `N` and largest `N |σ|`. That is `O(nodes²)` per
 element and step, and the fields it reads are the first stage's (the step's
-cost does not change). The gate
-`the_sloping_level_rate_bounds_the_pairs_frequency` assembles `B` from the
-kernels, column by column, on parallelograms and distorted elements in both
-metric forms over a 5 → 125 m cliff: the bound is 1.22 to 1.54 times its
-largest singular value, and zero where the pairs do not act (a shore element).
-With the margin of `√3` the model's step is 2.1 to 2.7 times below the
-scheme's limit where this bound sets it.
+cost does not change). In a shore element the edges are step 5's subcell
+interfaces and the partner is the depth-mean velocity, `v̄ = ū √(ρ₀ m D)`:
+`B[a, l; a] = ¼ N_al √Δσ_l (z_b − z_a)_l w m/m_a` and the same times
+`√(m_a D_b/(m_b D_a))` for the other end, bounded in the same way. The gate
+`the_sloping_level_rate_bounds_the_pairs_frequency` assembles both `B`s from
+the kernels, column by column, on parallelograms and distorted elements in
+both metric forms over a 5 → 125 m cliff with a shore element: the bound is
+1.22 to 1.54 times the largest singular value on the pairs and 3.0 to 3.1
+times on the shore element's interfaces. With the margin of `√3` the model's
+step is 2.1 to 2.7 times below the scheme's limit where the pairs' bound sets
+it.
 
 So the cure does need a shorter step, exactly where `N |∇_σ z| Δt` was above
 the limit and the old scheme did not see it. The numbers are under
@@ -523,17 +588,15 @@ force `g ρ′ Δz/ρ₀` along every sloping level.
   an anomaly that is not a displacement (a river plume over a cliff) it is a
   term of the size of the σ form's own error there, and vanishes with it
   under refinement.
-- **The barotropic mode.** The claim is for the 3D operator at a fixed
-  barotropic state. The depth mean of the force reaches the 2D module as the
-  slow forcing, and the layers carry their shares of the 2D mass flux, so the
-  pairing extends to the depth-mean flow along the pairs and the central part
-  of the face fluxes. Two parts of the 2D mass flux have no partner: the
-  dissipative part of its Riemann flux, and its subcell interfaces inside
-  shore elements, where the force has no volume term (as before 2026-11-20:
-  the layers there move the reference along the σ-levels with the barotropic
-  flow, conservatively). Both couple the two modes with a feedback of relative
-  size `Δρ/ρ₀`, and the 2D scheme's own dissipation is larger. The step maps
-  below include the barotropic variables.
+- **The barotropic mode.** The exchange is exact for the central layer
+  fluxes, whatever their depth mean (steps 4 and 5). The depth mean of the
+  force reaches the 2D module as the slow forcing, and the layers carry their
+  shares of the 2D mass flux. What has no partner is the dissipative part of
+  the 2D Riemann flux (at faces and on the subcell interfaces: it moves the
+  stratification with a flux proportional to the jump of `η`, not to a
+  transport the force acts on), and the interfaces to a thin column. Both
+  couple the two modes with a feedback of relative size `Δρ/ρ₀` times the 2D
+  dissipation. The step maps below include the barotropic variables.
 - **A discontinuous bed.** Across a face whose two sides are at different
   heights the upwind face value advects the background at a rate set by
   `|F|`, and the force's face term has a `ρ′ Δz` part: neither is covered.
@@ -586,25 +649,160 @@ force `g ρ′ Δz/ρ₀` along every sloping level.
   proportion to `H Γ` for both tracers it is the uniform displacement above,
   and its partner is bounded.
 - **Cancelling the reference's advection where the force has no term** (the
-  first prototype did, on shore elements' subcell interfaces). Not needed for
-  the claim (those edges carry no flux in it), and it gives up conservation
-  to first order under a tide. The spectra are the same with and without
-  (terrace 0.9977 against 0.9979, shore slice 0.9974 against 0.9973).
+  first prototype did, on shore elements' subcell interfaces). It gives up
+  conservation to first order under a tide, and the 30-vector spectra were
+  the same with and without (terrace 0.9977 against 0.9979, shore slice
+  0.9974 against 0.9973). What those interfaces needed was the force's
+  partner (step 5).
+- **A weight below one on the pair's term of the force, with its adjoint in
+  the advection**, to take the frequency `N |∇_σ z|` out of the levels that
+  do not resolve the stratification they cross. It keeps the skew structure,
+  but the pair's term and the pressure difference cancel for a uniform
+  anomaly only at weight one: a uniform `ρ′` of 1 kg/m³ across a level that
+  rises 142 m would get a force of `g ρ′ Δz/ρ₀` times the weight's defect,
+  1 m/s in minutes. A window-mean gradient at the node (so that the tangent
+  never exceeds the reference's range over the pair) makes the node's
+  vertical advection of the reference too weak by the same factor instead.
+
+### What the probes showed on the way to steps 4 and 5
+
+Steps 1 to 3 were the scheme of the first day, with a proof for transports
+without a depth mean. Its 30-vector spectra contracted (terrace 0.99795 for
+the pseudo-energy norm over the half hour). More Krylov vectors did not: on
+the terrace the leading Ritz value was 1.00099 at 60 vectors and 1.01272 at
+100 (real, residual 5e-2), in the bed layers' tracers of the shore elements
+and in the barotropic fields, and the pseudo-energy of a random departure,
+0.1477 of its start after 96 h, was 0.1507 after 144 h. Three things were in
+that, and the harness and the scheme have each changed for them.
+
+- **The conserved totals have neutral directions.** A departure that changes
+  the volume, the heat or the salt ends in another state at rest, an
+  eigenvalue of exactly 1. Arnoldi approaches it slowly and from both sides,
+  because its tracers settle over days: on the day map of the fully wet
+  cliff slice the leading Ritz value was 1.040 (residual 2.8e-2), and its
+  vector's barotropic part was 99.9 % a uniform `η` over all eight elements.
+  The step map keeps the three totals, so the departures that change none of
+  them are an invariant subspace. The probes now take the map on it (a
+  uniform `η`, `T` and `S` are taken out of every departure before it is
+  advanced; `DGRS_DEFLATE=0` for the whole space), and the same day map gives
+  1.0003 for the norm and 0.9995 for the leading Ritz value.
+- **The anomaly is about the reference at the layer's own height**, which
+  rises with the free surface: `ρ′ = ρ_T δT + ρ_S δS + Γ (1 + σ) δη`. The
+  probe's coordinates had the first two terms only (`EnergyCoordinates`).
+- **The identity with a depth mean.** With the gate's transports left with
+  their depth mean, and the layers' rise in the anomaly's rate, the
+  potential energy's rate and the force's work differed by 8 % of the work
+  (3 % on uniform levels), and by 4 % more with the shore element in the
+  mesh. The two terms of the first are in the proof's part (v): the
+  trapezoid pressure's mean over a column is not the anomaly's first moment
+  on stretched levels, and step 3's term in the pressure has a mean with no
+  partner. The second is the barotropic flux on a shore element's subcell
+  interfaces, which moved the stratification along the levels with the
+  chord and with no force answering. Steps 4 and 5 are the cures, and the
+  identity is exact with them.
+
+On the terrace, with the totals taken out, 100 vectors gave 1.00987 for the
+norm and a leading Ritz value of 1.00613 (e-folding 82 h, tracers) before
+steps 4 and 5, and give 1.00028 and 0.99978 with them.
 
 ### Measurements
 
-The probes now run in pseudo-energy coordinates (`EnergyCoordinates`: the
-shear times `√(ρ₀ m H)`, the depth mean times `√(ρ₀ m D)`, `η` times
-`√(ρ₀ g m)`, the density anomaly times `√(g m H/Γ)`; the squared norm is
-twice the pseudo-energy). Arnoldi's Ritz values then lie in the step map's
-numerical range in that norm, whatever their residuals, and the largest
-singular value of the Arnoldi matrix is the largest growth of the norm over
-the horizon among the Krylov vectors: for a stable scheme the Ritz values
-crowd the unit circle and do not converge one by one (residuals 0.1–0.4), but
-they and the growth are bounded by the map's norm.
+The probes run in pseudo-energy coordinates (`EnergyCoordinates`: the shear
+times `√(ρ₀ m H)`, the depth mean times `√(ρ₀ m D)`, `η` times `√(ρ₀ g m)`,
+the density anomaly about the reference at the layer's height times
+`√(g m H/Γ)`; the squared norm is twice the pseudo-energy), on the departures
+that keep the volume, the heat and the salt. Arnoldi's Ritz values then lie
+in the step map's numerical range in that norm, whatever their residuals,
+and the largest singular value of the Arnoldi matrix is the largest growth
+of the norm over the horizon among the Krylov vectors. For a stable scheme
+without tracer diffusion the Ritz values crowd the unit circle from inside
+and do not converge one by one (the leading ones' residuals are 1e-2 to
+1e-1), so three things are reported: that growth, the leading Ritz values at
+30 and at 100 vectors, and the pseudo-energy of a random departure over days
+(`probe_pseudo_energy`), which a growing mode of any shape would raise.
 
 "Before" is the code of 2026-11-17 (σ-pairs of the full density with the
 profile's force subtracted, LimitedAkima about the per-node vertical
-reference); "after" this scheme. Constant mixing (ν 1e-3 m²/s), no limiter.
+reference); "after" this scheme, steps 1 to 5. Constant mixing
+(ν 1e-3 m²/s), no tracer diffusion, no limiter. The terrace fixture is 22
+elements of the smoothed Frøya bed around a terrace beside shore elements
+with dry nodes, in 5 s steps; the slices are a step of the bed inside one
+1 km P2 element of an 8 km channel, in 36 s steps, not smoothed.
 
-MEASUREMENTS
+**The spectrum of the step map** (largest growth of the norm over the
+horizon / leading Ritz value):
+
+| | before | after, 30 vectors | after, 100 vectors |
+|---|---|---|---|
+| terrace, 1800 s | a pair at 1.2974 (e-folding 115.2 min, ω 5.46e-4 rad/s, residual 8.7e-3), a second at 153 min | 0.99747 / 0.99531 | 1.00028 / 0.99978; then a pair at 0.97971, ω 5.72e-4 rad/s, velocity and anomaly in equal parts: the old mode's oscillation, decaying |
+| 15 → 300 m cliff, 3600 s | pairs with e-folding 46.9, 47.6, 48.5 min (residuals ≤ 2e-7); the norm grows 4.62× | 0.99817 / 0.99485 | 0.99968 / 0.99907 |
+| land beside 300 m, 3600 s | on the day map, tracer modes at 2.24, 1.73, 1.37 (e-folding 30, 44, 76 h; residuals 3e-14, 2e-9, 4e-4) | 0.99948 / 0.98955 | 1.00242 / 0.99808 |
+| 0.5 m beside 150 m, 3600 s | | 1.00056 / 0.99731 | 1.00195 / 0.99965 |
+| 15 → 60 m, 3600 s | | 0.99880 / 0.99793 | 0.99974 / 0.99960 |
+
+No Ritz value is above 1. The norm's growth over the horizon is above 1 by
+3e-4 to 2.4e-3 on the terrace and beside shallow or dry columns at 100
+vectors: transient, in the parts that have no partner (the 2D Riemann
+flux's dissipation moves the stratification too, an interface to a thin
+column, the splitting in time).
+
+**At rest** (largest layer speed):
+
+| | before | after |
+|---|---|---|
+| terrace, seeded with 1e-6 °C | 4.2e-7 m/s at 3 h, 1.3e-5 at 12 h | 3.7e-7 at 3 h, 4.6e-7 at 12 h |
+| the cliff from round-off, 6 h | 6.6e-10 m/s (2.3e-8 when its gate was written) | 1.4e-12 |
+| unsmoothed steps from round-off, 12 → 48 h | 15 → 300 m: 2.4e-6 → NaN; 0.5 → 150 m: 4.1e-8 → NaN; 15 → 60 m: 6.1e-11 → 5.0e-2 (e-folding 1.8 h); land → 300 m: 1.8e-12 → 2.6e-12 | at 48 h: 9.3e-12, 2.4e-12, 2.2e-12, 2.2e-12 |
+| the cliff at the model's own step (27.4 s), 6 h | | 4.2e-12 |
+
+**The pseudo-energy of a random departure** (every field, 1e-6 at most, the
+totals kept; fraction of its start):
+
+| hours | 1 | 6 | 24 | 48 | 96 | 144 |
+|---|---|---|---|---|---|---|
+| 15 → 300 m cliff | 0.525 | 0.399 | 0.286 | 0.237 | 0.203 | |
+| land beside 300 m | 0.723 | 0.546 | 0.366 | 0.272 | 0.206 | |
+| 0.5 m beside 150 m | 0.472 | 0.381 | 0.301 | 0.268 | 0.248 | |
+| terrace | | 0.233 | 0.168 | 0.154 | 0.146 | 0.142 |
+
+On the slices it falls at every one of the 9600 steps. On the terrace it falls
+from each sampled time to the next through 144 h (0.193 at 12 h), and over a
+single step it rises by 1.3e-7 of itself at most (the splitting's exchanges
+between the two modes). With steps 1 to 3 alone, and the totals not kept, the
+terrace gave 0.229, 0.164, 0.151 and 0.1477 at 6, 24, 48 and 96 h, and 0.1507
+at 144 h, with single steps rising by up to 1.4e-6.
+
+**Conservation.** A 0.5 m seiche over a 12 → 4 m slope with a 6 °C
+thermocline in the reference, one period, on 3, 6 and 12 levels
+(`a_curved_reference_keeps_constancy_and_the_tracers_inventories`): the
+volume to 1.9e-14, the inventories of `T` and `S` to 2.2e-14, a uniform
+tracer uniform, while `T` moves by up to 2.6 °C at a node. With steps 1 and 2
+alone the basin's mean `T` changed by 4.5e-3, 9.3e-4 and 2.6e-4 °C.
+
+**The time step** (largest stable step: the hour's or two hours' map stays
+finite; the model's bounds at Courant number 1):
+
+| | before | after |
+|---|---|---|
+| terrace: largest stable step | 30 s (36 s blows up within the hour) | 30 s (36 s blows up) |
+| terrace: the model's bounds | advection and internal waves 10.3 s | the same; sloping levels 53.6 s, not binding |
+| 15 → 300 m cliff: largest stable step | 240 s (360 s blows up; its round-off grows at any step) | 60 s (72 s blows up) |
+| 15 → 300 m cliff: the model's bounds | advection and internal waves 161.5 s | sloping levels 27.4 s |
+| 0.5 m beside 150 m: the model's bounds | 213.4 s | sloping levels 177.9 s |
+| 15 → 60 m: the model's bounds | 264.1 s | the same (sloping levels 303.9 s) |
+| land beside 300 m: the model's bounds | 161.5 s | the same (sloping levels 617 s, the shore element's interfaces) |
+
+So the step the cure needs is the same on the fixture cut from the Frøya bed,
+and four times shorter on the cliff slice, where a level rises 142 m between
+two nodes 500 m apart through `N = 0.049 s⁻¹`. The model takes 27 s there by
+its own bound, a sixth of what it took before. Whether the bound sets the
+step of a real run depends on its steepest stratified element against its
+fastest current: the full-mesh run prints both (`notes/geometry-mesh.md`).
+
+**The cost per step** (minima of alternating runs, 2026-11-21, 4 cores):
+
+| | before | after |
+|---|---|---|
+| `profile_3d nx=64 ny=16 order=2 levels=20` (1024 elements, release), 1 thread | 353.6 ms | 388.0 ms (+9.7 %): the momentum stages 61.1 → 71.4, the tracer stages 75.1 → 92.0, `compute_dt` 8.9 → 14.4 (the reference's fields, which the first stage then finds filled), the barotropic pass and the rest unchanged |
+| the same, 4 threads | 146.4 ms | 151.3 ms (+3.4 %) |
+| terrace fixture (22 elements, 20 levels, test profile), 1 thread | 20.3 ms | 21.9 ms (+7.8 %) |

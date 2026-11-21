@@ -301,7 +301,9 @@ pub struct TimeStepLimits {
     /// The reference stratification's internal waves along sloping
     /// σ-levels, `ω Δt ≤ 1` with `ω` the bound of
     /// [`ReferenceFields::sloping_level_rate`] on `N |∇_σ z|` (none without
-    /// a reference profile, [`Hydrostatic3D::with_reference_profile`]).
+    /// a reference profile, [`Hydrostatic3D::with_reference_profile`]; in an
+    /// element with a thin column, along the subcell interfaces between its
+    /// other columns).
     pub sloping_levels: TimeStepLimit,
     /// Horizontal viscosity.
     pub viscosity: TimeStepLimit,
@@ -431,7 +433,12 @@ where
     /// - the baroclinic pressure gradient is that of the density anomaly
     ///   `ρ − ρ̄(z)` at every node's own height, integrated by the trapezoid
     ///   rule (linear in the anomaly, so the force has an adjoint;
-    ///   [`crate::solver::rhs::baroclinic`]);
+    ///   [`crate::solver::rhs::baroclinic`]), its mean over a column the
+    ///   anomaly's first moment about the bed (the partner of the layers'
+    ///   rise through the reference with the free surface), and in an
+    ///   element with a thin column a depth-mean force between its other
+    ///   columns (the partner of the barotropic flux that moves the
+    ///   stratification along the element's levels);
     /// - the tracers' advection moves the reference's share of their
     ///   stratification by the vertical velocity that is that force's
     ///   adjoint, times the reference's gradient over the layer
@@ -457,6 +464,11 @@ where
     /// element's mean displacement exerts no force within it). The water's
     /// volume and a uniform tracer are as before, and a reference linear in
     /// `z` changes nothing but the pressure integral.
+    ///
+    /// The step is bounded by the frequency of the stratification displaced
+    /// along sloping levels, `N |∇_σ z|`
+    /// ([`TimeStepLimits::sloping_levels`]), which this scheme carries in
+    /// full.
     ///
     /// The profile is fixed in `z`: where the stratification drifts from it
     /// (mixing, rivers, a parent model's water), only the share of the
@@ -1917,7 +1929,7 @@ where
             for_each_block(
                 ne,
                 [&mut out[..], &mut vertical[..], &mut sloping_levels[..]],
-                || vec![0.0; 2 * nn],
+                || vec![0.0; 5 * nn],
                 |scratch, k, [dt, vertical, sloping_levels]| {
                     let rates = self.element_rates(state, k, reference, scratch);
                     dt[0] = cfl / rates.wave / order_factor;
@@ -2037,7 +2049,7 @@ where
                 reduce_blocks::<f64, _, _, 0>(
                     self.mesh.n_elements,
                     [],
-                    || vec![0.0; 2 * nn],
+                    || vec![0.0; 5 * nn],
                     |scratch, k, []| {
                         let ElementRates {
                             wave: wave_rate,
