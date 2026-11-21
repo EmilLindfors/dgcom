@@ -155,8 +155,12 @@
 //! displacement's term below, so the column's pressure is shifted by the
 //! difference, the same at every level: only the depth-mean force changes,
 //! by a term of the size of the rule's error, and a uniform anomaly still
-//! exerts none. With it the identity holds to round-off for any transports,
-//! with a depth mean or without (gate
+//! exerts none (an anomaly linear in `z` does, at second order: the moment
+//! is the midpoint rule's). With it the identity holds to round-off for any
+//! transports, with a depth mean or without, for the layers' rise as the
+//! tangent takes it, with the reference's gradient over the layer; the
+//! model's reference, at the layer centre, rises at its gradient there,
+//! which is the same where a layer resolves it (gate
 //! `the_reference_advection_and_the_pressure_gradient_exchange_pseudo_energy_exactly`:
 //! on parallelograms and distorted elements, both metric forms, stretched
 //! levels, over a cliff, with a shore element).
@@ -464,6 +468,13 @@ const MAX_LEVELS: usize = 128;
 /// for which its stratification has a residual to displace
 /// ([`ReferenceFields::set_displacements`], [`add_reference_advection`]).
 const RESIDUAL_FLOOR: f64 = 1e-12;
+
+/// Whether an element's stratification has a residual about its columns'
+/// lines in `z`: `weight = Σ m H_z g Γ⁺` against `scale = Σ m H_z Γ⁺²`.
+#[inline]
+fn has_residual(weight: f64, scale: f64) -> bool {
+    weight > RESIDUAL_FLOOR * scale
+}
 
 /// A column's stratification `gamma` (its negative parts counted as zero)
 /// less its line in `z` by least squares over the layers, weighted by their
@@ -1316,9 +1327,17 @@ impl ReferenceFields {
     /// ([`Self::residual`]): the regression of the anomaly on the
     /// stratification within the columns. An anomaly that is uniform or
     /// linear in `z` in each column has none (the trapezoid rule's force of
-    /// it is exact), and `κ Γ` has `κ`. Zero where the stratification has no
-    /// residual to speak of (a reference linear or quadratic in `z` over the
-    /// element, whose tangents make no error either).
+    /// it is exact), and `κ Γ` has `κ`.
+    ///
+    /// Where the levels see no residual in the stratification (one or two
+    /// levels, or a reference quadratic in `z` over the element, to
+    /// [`RESIDUAL_FLOOR`]) they cannot tell a displacement from an offset,
+    /// and the element's mean anomaly counts as one, `g = 1`:
+    /// `κ = Σ m H_z ρ′ / Σ m H_z Γ⁺` over its stratified layers. The
+    /// element's tracer error is taken back in the same shape either way
+    /// ([`add_reference_advection`]), so the inventories are kept always;
+    /// in this case a state offset from its reference is not held at rest
+    /// where the tangents make an error.
     pub fn set_displacements(
         &mut self,
         state: &Solution3D,
@@ -1337,7 +1356,10 @@ impl ReferenceFields {
             [&mut self.displacement[..state.n_elements]],
             || (),
             |_, k, [displacement]| {
+                // Against the residual, and against the stratification
+                // itself where it has no residual
                 let (mut anomaly, mut weight, mut scale) = (0.0, 0.0, 0.0);
+                let (mut mean_anomaly, mut mean_weight) = (0.0, 0.0);
                 for i in 0..nn {
                     let idx = k * nn + i;
                     let depth = state.eta.data[idx] - bathymetry.data[idx];
@@ -1349,13 +1371,20 @@ impl ReferenceFields {
                         let c = idx * nl + l;
                         let (gamma, g) = (stratification[c].max(0.0), residual[c]);
                         let volume = mass * d_sigma[l];
-                        anomaly += volume * g * (state.rho[c] - density[c]);
+                        let departure = state.rho[c] - density[c];
+                        anomaly += volume * g * departure;
                         weight += volume * g * gamma;
                         scale += volume * gamma * gamma;
+                        if gamma > 0.0 {
+                            mean_anomaly += volume * departure;
+                            mean_weight += volume * gamma;
+                        }
                     }
                 }
-                displacement[0] = if weight > RESIDUAL_FLOOR * scale {
+                displacement[0] = if has_residual(weight, scale) {
                     anomaly / weight
+                } else if mean_weight > 0.0 {
+                    mean_anomaly / mean_weight
                 } else {
                     0.0
                 };
@@ -1566,11 +1595,11 @@ impl ReferenceFields {
 /// displacement of the element's stratification, `−H_z Γ g R/N` at every
 /// layer with `R` the element's sum of the terms, `g` the stratification's
 /// residual about its column's line in `z` ([`ReferenceFields::residual`])
-/// and `N = Σ m H_z Γ g`: every element keeps its inventory of `T` and of
-/// `S` to round-off (unless its stratification has no residual; its
-/// tangents then make no error either). The pressure gradient's
-/// displacement term ([`ReferenceFields::set_displacements`]) is this
-/// step's adjoint.
+/// and `N = Σ m H_z Γ g` (`g = 1`, a uniform displacement, where the levels
+/// see no residual: one or two levels, a reference quadratic in `z`): every
+/// element with a stratified layer keeps its inventory of `T` and of `S` to
+/// round-off. The pressure gradient's displacement term
+/// ([`ReferenceFields::set_displacements`]) is this step's adjoint.
 ///
 /// `tracers` are the advected concentrations, `reference` the reference at
 /// the levels of `state`'s `η`, `transport` the stage's layer transports.
@@ -1751,16 +1780,21 @@ pub fn add_reference_advection(
             }
             let stratification = &reference.stratification[block.clone()];
             let residual = &reference.residual[block];
-            let (mut weight, mut scale) = (0.0, 0.0);
+            let (mut weight, mut scale, mut mean_weight) = (0.0, 0.0, 0.0);
             for i in (0..nn).filter(|&i| wet(i)) {
                 let mass = geom.node_mass(k, i) * depth(i);
                 for l in 0..nl {
                     let gamma = stratification[i * nl + l].max(0.0);
                     weight += mass * d_sigma[l] * gamma * residual[i * nl + l];
                     scale += mass * d_sigma[l] * gamma * gamma;
+                    mean_weight += mass * d_sigma[l] * gamma;
                 }
             }
-            if weight <= RESIDUAL_FLOOR * scale {
+            // Without a residual: a uniform displacement
+            // (`ReferenceFields::set_displacements`)
+            let shaped = has_residual(weight, scale);
+            let weight = if shaped { weight } else { mean_weight };
+            if weight <= 0.0 {
                 return;
             }
             for i in (0..nn).filter(|&i| wet(i)) {
@@ -1774,7 +1808,8 @@ pub fn add_reference_advection(
                         .zip(&residual[column.clone()])
                         .zip(d_sigma)
                     {
-                        *o -= taken * ds * gamma.max(0.0) * g;
+                        let shape = if shaped { g } else { 1.0 };
+                        *o -= taken * ds * gamma.max(0.0) * shape;
                     }
                 }
             }
@@ -2565,12 +2600,25 @@ mod tests {
     /// the shore element the edges are the subcell interfaces between its
     /// columns that are not thin and the flow is the barotropic one: `B`
     /// from the depth-mean velocities, and the bound on it.
+    ///
+    /// The assembled operator has the element's displacement in it, which
+    /// the bound does not count. Under a smooth reference (an exponential
+    /// over 100 m) it is a larger part: the bound is then 1.07 to 1.54 times
+    /// the frequency here, and the review of 2026-11-21 measured 0.97 for
+    /// one such reference, so the gate allows the frequency 10 % over the
+    /// bound there. The step takes `ω Δt ≤ 1`, where SSP-RK3 holds to `√3`.
     #[test]
     fn the_sloping_level_rate_bounds_the_pairs_frequency() {
-        for (distort, metric) in [
-            (0.0, MetricForm::Conservative),
-            (0.12, MetricForm::Conservative),
-            (0.12, MetricForm::Averaged),
+        // A smooth reference too (T̄ exponential over 100 m): the element's
+        // displacement is then a larger part of the operator
+        let smooth = TracerReferenceProfile::from_smooth_fn(-130.0, 5.0, 2701, |z| {
+            (10.0 + 6.0 * (z / 100.0).exp(), 34.0)
+        });
+        for (distort, metric, profile, sharp) in [
+            (0.0, MetricForm::Conservative, thermocline(), true),
+            (0.12, MetricForm::Conservative, thermocline(), true),
+            (0.12, MetricForm::Averaged, thermocline(), true),
+            (0.12, MetricForm::Averaged, smooth, false),
         ] {
             let (mesh, ops, geom, bathymetry, sigma, state) = cliff_basin(distort, 0.0);
             let (nn, nl) = (ops.n_nodes, sigma.n_levels());
@@ -2578,7 +2626,7 @@ mod tests {
             let n = ne * per_element;
             let mut fields = ReferenceFields::default();
             fields.fill(
-                &thermocline(),
+                &profile,
                 thermocline_density,
                 thermocline_partials,
                 &state,
@@ -2657,7 +2705,7 @@ mod tests {
                     for row in 0..per_element {
                         let (i, l) = (row / nl, row % nl);
                         let gamma = fields.stratification[block + row];
-                        assert!(gamma > 0.0, "the thermocline is stable");
+                        assert!(gamma > 0.0, "the reference is stable");
                         let h = depth(k, i) * sigma.d_sigma()[l];
                         let rate = -RHO0 * ALPHA * rate_t[block + row] / h;
                         b[(block + row) * columns + column] =
@@ -2802,21 +2850,30 @@ mod tests {
                 }
                 let frequency = largest(b, columns);
                 println!(
-                    "distortion {distort}, {metric:?}, element {k}: frequency {frequency:.4e} \
-                     1/s, bound {bound:.4e} ({:.2})",
+                    "distortion {distort}, {metric:?}, {} reference, element {k}: frequency \
+                     {frequency:.4e} 1/s, bound {bound:.4e} ({:.2})",
+                    if sharp { "thermocline" } else { "smooth" },
                     bound / frequency
                 );
+                // The bound is the pairs': the element's displacement, a
+                // term of rank one, is not in it. Under a thermocline the
+                // bound holds with it; under a smooth reference it may not,
+                // by a few per cent
                 assert!(
-                    frequency <= bound,
+                    frequency <= if sharp { bound } else { 1.1 * bound },
                     "element {k}: frequency {frequency:.4e} above the bound {bound:.4e}"
                 );
-                assert!(
-                    bound < 2.5 * frequency,
-                    "element {k}: the bound {bound:.4e} is slack on {frequency:.4e}"
-                );
+                if sharp {
+                    assert!(
+                        bound < 2.5 * frequency,
+                        "element {k}: the bound {bound:.4e} is slack on {frequency:.4e}"
+                    );
+                }
                 steep += usize::from(frequency > 5e-3);
             }
-            assert!(steep >= 2, "the cliff's elements carry the frequency");
+            if sharp {
+                assert!(steep >= 2, "the cliff's elements carry the frequency");
+            }
             assert!(shores >= 1, "the shore element carries its own");
         }
     }
@@ -2828,9 +2885,23 @@ mod tests {
     /// either (the reference's chords are its tangents), to round-off; and
     /// what a tracer in a curved reference gets adds up to nothing in every
     /// element.
+    ///
+    /// On 6 levels, and on 1 and 2, where the levels see no residual in the
+    /// stratification and the element's error is taken back as a uniform
+    /// displacement; and for a reference that is nearly quadratic in `z`
+    /// (an exponential with a scale of 20 km), which is under the floor of
+    /// the residual.
     #[test]
     fn the_reference_advection_keeps_constancy_a_linear_reference_and_the_elements_inventories() {
-        let (mesh, ops, geom, bathymetry, sigma, state) = cliff_basin(0.12, 1.0);
+        for levels in [1, 2, 6] {
+            constancy_and_inventories_on(levels);
+        }
+    }
+
+    /// The body of the gate above on `levels` levels.
+    fn constancy_and_inventories_on(levels: usize) {
+        // (the flow with its depth mean: one level has no other)
+        let (mesh, ops, geom, bathymetry, sigma, state) = cliff_basin_with(0.12, 1.0, true, levels);
         let (nn, nl) = (ops.n_nodes, sigma.n_levels());
         let n = mesh.n_elements * nn * nl;
         let transport = own_transports(
@@ -2880,18 +2951,28 @@ mod tests {
         // size, which adds up to nothing in every element
         let (_, t, _) = apply(&curved, [&fields.tracers[0], &fields.tracers[1]]);
         assert!(largest(&t) > 1e-3, "test regime: {:.2e}", largest(&t));
-        for (k, element) in t.chunks_exact(nn * nl).enumerate() {
-            let (mut sum, mut scale) = (0.0, 0.0);
-            for (i, column) in element.chunks_exact(nl).enumerate() {
-                let mass = geom.node_mass(k, i);
-                sum += mass * column.iter().sum::<f64>();
-                scale += mass * column.iter().map(|c| c.abs()).sum::<f64>();
+        let kept = |t: &[f64], name: &str| {
+            for (k, element) in t.chunks_exact(nn * nl).enumerate() {
+                let (mut sum, mut scale) = (0.0, 0.0);
+                for (i, column) in element.chunks_exact(nl).enumerate() {
+                    let mass = geom.node_mass(k, i);
+                    sum += mass * column.iter().sum::<f64>();
+                    scale += mass * column.iter().map(|c| c.abs()).sum::<f64>();
+                }
+                assert!(
+                    sum.abs() <= 1e-13 * scale,
+                    "{levels} levels, {name}: element {k} gains {sum:.3e} (scale {scale:.2e})"
+                );
             }
-            assert!(
-                sum.abs() <= 1e-13 * scale,
-                "element {k} gains {sum:.3e} (scale {scale:.2e})"
-            );
-        }
+        };
+        kept(&t, "the thermocline");
+        // … and in a reference with next to no residual
+        let gentle = TracerReferenceProfile::from_smooth_fn(-130.0, 5.0, 2701, |z| {
+            (10.0 + 6.0 * (z / 2e4).exp(), 34.0)
+        });
+        let (fields, _, _) = apply(&gentle, [&uniform_t, &uniform_s]);
+        let (_, t, _) = apply(&gentle, [&fields.tracers[0], &fields.tracers[1]]);
+        kept(&t, "a nearly quadratic reference");
         // The tracers in a linear reference: nothing
         let linear = TracerReferenceProfile::new(
             vec![-130.0, 5.0],

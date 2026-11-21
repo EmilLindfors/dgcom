@@ -427,11 +427,13 @@ where
     /// bed, and for the scheme linearised about that state the baroclinic
     /// force's work and the rate of the available potential energy
     /// `½ g ρ′²/Γ` (`Γ = −∂ρ̄/∂z` over each layer) cancel exactly with the
-    /// layers' central fluxes, so that exchange cannot make round-off grow.
-    /// What the proof does not cover (the 2D module's Riemann fluxes, the
-    /// splitting in time, a state that has left the reference) is listed
-    /// with the measurements in `docs/stratified-rest-over-steep-beds.md`
-    /// (TODO P1.3). With it:
+    /// layers' central fluxes for transports without a depth mean (and with
+    /// one where the layers resolve the reference), so that exchange cannot
+    /// make round-off grow. What the proof does not cover (the 2D module's
+    /// Riemann fluxes, the splitting in time, a state that has left the
+    /// reference: only the reference, with or without a uniform offset, is
+    /// held at rest) is listed with the measurements in
+    /// `docs/stratified-rest-over-steep-beds.md` (TODO P1.3). With it:
     ///
     /// - the baroclinic pressure gradient is that of the density anomaly
     ///   `ρ − ρ̄(z)` at every node's own height, integrated by the trapezoid

@@ -231,8 +231,10 @@ density anomaly about it, and the tracers' advection moves the reference by
 the vertical velocity that is that force's exact adjoint. For the scheme
 linearised about rest in the reference, with the layers' central fluxes, the
 force's work and the rate of the available potential energy `½ g ρ′²/Γ` then
-cancel exactly, with the stratification's own weights at every node, and
-every element keeps its tracer inventories. That is a proof for this
+cancel exactly for transports without a depth mean, and for those with one
+up to the difference between the reference's gradient over a layer and at
+its centre, with the stratification's own weights at every node; and every
+element keeps its tracer inventories. That is a proof for this
 exchange, not for the whole model: what it leaves out is under "Where the
 proof stops", and the evidence for the rest is the step maps and the long
 runs under "Measurements". The price is
@@ -350,9 +352,11 @@ one (step 5), and the σ-surfaces of the columns that are not thin.
    columns: a stratification displaced as a whole has its displacement
    (`ρ′ = κΓ` gives `κ`), and an anomaly that is uniform or linear in `z` in
    each column has none, so the force of such an anomaly is the trapezoid
-   rule's, as without step 3. Where the stratification has no residual (a
-   reference linear or quadratic in `z` over the element) there is nothing
-   to take back (`τ = 0`), and no `κ`.
+   rule's, as without step 3. Where the levels see no residual in the
+   stratification (one or two levels, or a reference quadratic in `z` over
+   the element) they cannot tell a displacement from an offset: there `g = 1`
+   (a uniform displacement, the element's mean anomaly as its `κ`), so that
+   the inventories are kept in every case.
 4. **The pressure's mean over a column is the anomaly's first moment about
    the bed.** Transports with a depth mean move the free surface, and a
    layer's centre rises through the reference (which is fixed in `z`) by
@@ -404,8 +408,9 @@ is defined by the force: `Σ_a m_a ρ′_a (H w)_a` is the sum (work), term by
 term. Step 3 reads the same way: the force integrates the part `κΓ` of the
 anomaly along each edge exactly, as `−κ(ρ̄_b − ρ̄_a)`, instead of by the
 trapezoid rule. A stratification displaced as a whole within an element then
-exerts no force within it, where the trapezoid rule alone leaves the σ form's
-error of the displaced profile at every straddle: the well-known limit of
+exerts no force within it but a depth-mean one (step 4's moment is the
+midpoint rule's), where the trapezoid rule alone leaves the σ form's error
+of the displaced profile at every straddle: the well-known limit of
 subtracting a reference profile, that the error comes back once the
 isopycnals move, is gone for the element's displacement.
 
@@ -422,7 +427,25 @@ felt nothing. With the residual `g`, a uniform offset is exactly at rest
 again (gate `an_offset_from_the_reference_stays_at_rest`, 1.2e-12 m/s), and
 a general anomaly's `κ` is bounded by its correlation with the
 stratification within the columns: the term is then of the size of the σ
-form's own error of that anomaly at a straddle, not seventeen times it.
+form's own error of that anomaly at a straddle, not seventeen times it (the
+review's second pass measured it at 0.05 to 0.9 of the force without it, for
+a layer 0.5 °C warmer above 15 m and for a stratification displaced by 1 m
+in half the basin; a stratification displaced everywhere by 1 m over the
+cliff feels a tenth of the trapezoid rule's force).
+
+The residual has a price of its own. Its weights `Γ g/N` sum to one with
+both signs, so the take-back adds tracer in some layers of the element and
+removes it in others, and it does not shrink with the error it returns: for
+a smooth reference (an exponential over 100 to 2000 m) in a steep element
+the review measured the largest take-back at a quarter of the reference's
+advection while the element's error fell from 1e-4 to 4e-7 of it. It is
+exchanged without loss with the force's term, it leaves a uniform tracer and
+an unstratified layer alone, and under a thermocline it is of the size of
+the error (0.35 for an error of 0.1 to 0.46). It is the tangents' own order:
+replacing a chord by a tangent moves `½ F Γ′ Δz²` between the two ends of
+every edge. But a new extremum can come of it, which the conservative
+scheme's did not, and where the residual falls under its floor the take-back
+changes to the uniform one at once.
 
 ### The statement and its proof
 
@@ -558,7 +581,10 @@ Its eigenvalues are `±i` times the singular values of `B`: frequencies
 `N |∇_σ z|`, the buoyancy frequency times the slope of the level. Step 3
 adds a term of rank one per element to `B` (the element's error `R`, taken
 back in the shape of `Γ g`); the bound below is for the pairs' `B`, and its
-gate measures it against the operator with step 3 in it.
+gate measures it against the operator with step 3 in it: under a thermocline
+the bound holds with it, under a smooth reference the frequency can be a few
+per cent above the bound (0.97 in the review's second pass), inside the
+step's margin.
 
 That frequency is the hydrostatic equations' own: water that moves along a
 surface of slope `s` through a stratification `N` oscillates at `N s` (the
@@ -620,9 +646,16 @@ force `g ρ′ Δz/ρ₀` along every sloping level.
   anomaly's regression on the stratification within the columns: of the size
   of the σ form's own error of that anomaly at a straddle. Under flow with
   `0 < θ < 1` at a straddle the tracer's own jump is advected at the
-  tangent's rate over the chord's (up to 34 on the cliff slice): bounded by
-  the step's bound (`θ ≤ 1`), but no gate runs a tide over an unsmoothed
-  straddle, and none can pass before the full-mesh check.
+  tangent's rate over the chord's (up to 34 on the cliff slice). `θ ≤ 1`
+  bounds the jump that is treated so, not its rate, and the step's bound has
+  no velocity in it: by the same estimate as for `B`, the rate over the
+  bound's `ω` is about `u N ρ₀/(2 g Δρ̄)`, 0.7 at 0.3 m/s on the cliff. No
+  gate runs a tide over an unsmoothed straddle. And only the reference, with
+  or without a uniform offset, is held at rest: another stratification that
+  is at rest in the ocean (a layer 0.5 °C warmer above 15 m) reaches
+  2.6e-2 m/s over the cliff and 1.2e-2 m/s on the smoothed terrace within
+  the hour by the σ form's error of its anomaly, with step 3's term or
+  without (the review's second pass).
 - **The layers' rise at the centre.** Step 4 pairs the layers' rise with the
   reference's gradient over the layer, `Γ (1 + σ) ∂η/∂t`, as the tangent and
   the potential energy's weight take it. The model's reference is taken at
@@ -631,7 +664,10 @@ force `g ρ′ Δz/ρ₀` along every sloping level.
   that does not, the exchange with a depth-mean flow misses by their
   difference: with the gate's random transports and anomalies over the
   5 → 125 m cliff under an 8 m thermocline, 3.0e-2, 1.4e-2, 7.6e-4 and
-  4.5e-7 of the identity's terms on 6, 12, 24 and 48 levels. And the
+  4.5e-7 of the sum of the identity's terms' magnitudes on 6, 12, 24 and 48
+  levels (of the work itself, which is their net: 10 %, 44 %, 1.6 % and
+  1e-5). The steep fixtures, 20 levels in 300 m under an 8 m pycnocline, are
+  on the unresolved side of that. And the
   pressure's mean being the midpoint rule's moment makes the force of an
   anomaly linear in `z` second order instead of zero: a depth-mean force
   that is a gradient (3 °C over the cliff's 300 m: 1.2e-4 m/s while the free
@@ -644,8 +680,12 @@ force `g ρ′ Δz/ρ₀` along every sloping level.
   there a uniform anomaly gets a depth-mean force of the centres' offset.
 - **Layers without stratification.** Where `Γ = 0` the potential energy has
   no weight for an anomaly that the force still feels: the claim is for
-  `ρ′ = 0` there. An element with no residual in its stratification takes no
-  tracer back; its tangents make none either.
+  `ρ′ = 0` there. An element with no stratified layer at all takes no tracer
+  back.
+- **One or two levels, or no residual.** Step 3 then falls back on the
+  uniform displacement, and a state offset from its reference is not held at
+  rest where the tangents make an error (the review's first finding, in
+  that corner).
 - **The barotropic mode.** The exchange is exact for the central layer
   fluxes, whatever their depth mean (steps 4 and 5, with the limit above).
   The depth mean of the force reaches the 2D module as the slow forcing, and
@@ -757,7 +797,8 @@ that, and the harness and the scheme have each changed for them.
   them are an invariant subspace. The probes now take the map on it (a
   uniform `η`, `T` and `S` are taken out of every departure before it is
   advanced; `DGRS_DEFLATE=0` for the whole space), and the same day map gives
-  1.0003 for the norm and 0.9995 for the leading Ritz value.
+  1.0009 for the norm and 0.9999 for the leading Ritz value (land beside
+  300 m: 1.00004 and 0.9972).
 - **The anomaly is about the reference at the layer's own height**, which
   rises with the free surface: `ρ′ = ρ_T δT + ρ_S δS + Γ (1 + σ) δη`. The
   probe's coordinates had the first two terms only (`EnergyCoordinates`).
@@ -813,6 +854,18 @@ and `B` with both bounds, and found them right. It ran what the gates did not:
   ("stable by construction", "cancel exactly for any layer transports"):
   the claim is now stated for the exchange that is proved, with the central
   fluxes.
+
+Its second pass, on the cure, confirmed the adjoint pair and the inventory
+with the residual (5e-13 and 9e-17 of their scales), the offsets at rest on
+the cliff, the 15 → 60 m step and the terrace (≤ 2.3e-12 m/s), and that the
+term is now at most the size of the force without it. It found the
+inventories lost on one and two levels and under the residual's floor (no
+residual, no take-back, but an error to take back: cured by the uniform
+displacement there, and gated on 1, 2 and 6 levels and for a nearly
+quadratic reference), the take-back that does not shrink with its error and
+the bound that a smooth reference can exceed by 3 % (both stated above, the
+second in its gate), and three sentences still too strong, which are
+corrected.
 
 ### Measurements
 
