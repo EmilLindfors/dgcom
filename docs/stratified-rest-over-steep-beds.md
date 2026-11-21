@@ -221,7 +221,7 @@ On the 11048 patch from rest, 8.8 h:
 - **`vref`**: 1.4e-3 m/s, still rising slowly and close to linearly, in shallow shore elements 13 and 63 (5–28 m). That is the GLS creep at the slopes.
 - **Centred**: 1.5e-3 m/s, in the same elements as `vref`.
 
-## The cure: a reference stratification, advected by the pressure gradient's adjoint (2026-11-20)
+## The cure: a reference stratification, advected by the pressure gradient's adjoint (2026-11-20, 2026-11-21)
 
 The rest state is now stable by construction, on beds that are not smoothed.
 `Hydrostatic3D::with_reference_profile` takes a horizontally uniform `T̄(z)`,
