@@ -288,6 +288,41 @@ impl TimeStepLimit {
     }
 }
 
+/// The lowest and highest temperature and salinity of a 3D state, in the
+/// columns at least the thin depth deep and in the thinner ones
+/// ([`Hydrostatic3D::tracer_ranges`]): a run's progress line. A thin column
+/// takes no surface flux and its transport is monotone, so its range lies
+/// within the range the others have had; one that does not is a defect
+/// (TODO P4.5: thin columns at 3.6–29.0 °C beside 5.3–15.3 °C in a 72 h
+/// run).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TracerRanges {
+    /// `[(T low, T high), (S low, S high)]` over the columns at least the
+    /// thin depth deep; `None` without one.
+    pub resolved: Option<[(f64, f64); 2]>,
+    /// The same over the thin columns, dry nodes included.
+    pub thin: Option<[(f64, f64); 2]>,
+}
+
+impl std::fmt::Display for TracerRanges {
+    /// `T 8.19 to 11.07 °C (thin 9.92 to 11.03), S 32.99 to 33.94 (thin
+    /// 33.00 to 33.36)`; `none` where there is no such column.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pair = |ranges: Option<[(f64, f64); 2]>, j: usize| match ranges {
+            Some(ranges) => format!("{:.2} to {:.2}", ranges[j].0, ranges[j].1),
+            None => "none".to_string(),
+        };
+        write!(
+            f,
+            "T {} °C (thin {}), S {} (thin {})",
+            pair(self.resolved, 0),
+            pair(self.thin, 0),
+            pair(self.resolved, 1),
+            pair(self.thin, 1)
+        )
+    }
+}
+
 /// The bounds of [`Hydrostatic3D::compute_dt_ssp`]
 /// ([`Hydrostatic3D::time_step_limits`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1178,6 +1213,25 @@ where
         }
     }
 
+    /// The range of `state`'s temperature and salinity in the columns that
+    /// are not thin and in the thin ones, dry nodes included (see
+    /// [`TracerRanges`]).
+    pub fn tracer_ranges(&self, state: &Solution3D) -> TracerRanges {
+        let nl = state.n_levels;
+        // [not thin, thin][T, S]
+        let mut seen = [[(f64::INFINITY, f64::NEG_INFINITY); 2]; 2];
+        for idx in 0..state.eta.data.len() {
+            let kind = &mut seen[usize::from(self.is_thin(state, idx))];
+            for (range, field) in kind.iter_mut().zip([&state.temp, &state.salt]) {
+                for &x in &field[idx * nl..(idx + 1) * nl] {
+                    *range = (range.0.min(x), range.1.max(x));
+                }
+            }
+        }
+        let [resolved, thin] = seen.map(|ranges| (ranges[0].0 <= ranges[0].1).then_some(ranges));
+        TracerRanges { resolved, thin }
+    }
+
     /// Whether the column at node `idx` (`[element][node]`) is thin.
     #[inline]
     fn is_thin(&self, state: &Solution3D, idx: usize) -> bool {
@@ -1593,7 +1647,7 @@ where
             drop(fields);
             // The water no transport carries (the 2D module's own mass
             // sources) at the concentrations and velocities it joins
-            let means = barotropic.element_means;
+            let pooled = barotropic.pooled;
             for (out, field) in [
                 (&mut rhs.temp, &state.temp),
                 (&mut rhs.salt, &state.salt),
@@ -1604,10 +1658,8 @@ where
                     out,
                     field,
                     self.sigma.d_sigma(),
-                    &state.eta.data,
-                    &self.bathymetry,
                     &self.geom,
-                    means,
+                    pooled,
                     elements,
                 );
             }
@@ -1709,10 +1761,8 @@ where
                 out,
                 field,
                 &d_sigma_w,
-                &state.eta.data,
-                &self.bathymetry,
                 &self.geom,
-                barotropic.element_means,
+                barotropic.pooled,
                 elements,
             );
         }
@@ -2629,13 +2679,7 @@ where
 
     /// The implicit part of `Ω` of the last [`Self::transport_rhs_into`],
     /// if any ([`Self::with_implicit_vertical_advection`]).
-    fn implicit_vertical_advection(
-        &self,
-        stage: &mut Solution3D,
-        elements: Blocks,
-        dt: &[f64],
-        element_means: &[bool],
-    ) {
+    fn implicit_vertical_advection(&self, stage: &mut Solution3D, elements: Blocks, dt: &[f64]) {
         if self.implicit_vertical_advection.is_none() {
             return;
         }
@@ -2652,8 +2696,6 @@ where
             self.sigma.d_sigma(),
             &split.d_sigma_w,
             &self.bathymetry,
-            &self.geom,
-            element_means,
             elements,
             dt,
         );
@@ -2661,6 +2703,10 @@ where
 
     fn initial_turbulence(&self) -> Option<[f64; 2]> {
         self.mixing.initial_turbulence()
+    }
+
+    fn min_column_depth(&self) -> f64 {
+        self.min_column_depth
     }
 
     /// The vertical diffusion with the surface stress and fluxes at the

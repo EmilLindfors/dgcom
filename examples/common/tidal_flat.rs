@@ -452,6 +452,9 @@ pub struct Outcome {
     /// The largest change of T at a node that was dry before and after a
     /// step (a dry node keeps its value)
     pub dry_change: f64,
+    /// Thin cells carried with their neighbours, and cells flushed
+    /// (`ModeSplitIntegrator::merged_cells`)
+    pub merged: [usize; 2],
 }
 
 /// The elements within `rings` elements of each element (sharing a vertex,
@@ -641,6 +644,7 @@ pub fn run(
         thin_excess_at,
         local_excess,
         dry_change,
+        merged: sim.integrator().merged_cells(),
     }
 }
 

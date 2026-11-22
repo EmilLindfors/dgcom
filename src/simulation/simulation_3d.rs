@@ -5393,7 +5393,7 @@ mod tests {
         let subcell = vec![f64::NAN; ne * n_sub];
         let eta_rate = vec![1e-5; ne * nn];
         let euler_dt = vec![150.0; ne];
-        let means = vec![false; ne];
+        let pooled = vec![false; ne];
         let barotropic = BarotropicFlux {
             dt: 300.0,
             euler_dt: &euler_dt,
@@ -5403,7 +5403,7 @@ mod tests {
             subcell: &subcell,
             eta_rate: &eta_rate,
             rivers: None,
-            element_means: &means,
+            pooled: &pooled,
         };
         let rhs = |elements: Blocks| {
             let mut out = Solution3D::new(ne, nn, nl);

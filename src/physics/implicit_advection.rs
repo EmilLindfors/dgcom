@@ -71,9 +71,8 @@
 //! 38–69.
 
 use crate::mesh::data::Bathymetry2D;
-use crate::operators::GeometricFactors2D;
 use crate::solver::core::blocks::{Blocks, Pooled, for_each_block};
-use crate::solver::rhs::transport_3d::{layer_thickness_of, layer_volume_of};
+use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 
@@ -165,12 +164,7 @@ impl ImplicitVerticalAdvection {
 /// the layers' σ-thicknesses `d_sigma`, the w-cells' `d_sigma_w`
 /// ([`crate::solver::rhs::w_cell_thicknesses`]).
 ///
-/// - Elements not marked in `element_means`: every column on its own.
-/// - Marked elements, whose fields the mode splitter carries as element
-///   means per level ([`crate::solver::rhs::from_inventory`]): one column of
-///   the element's volumes and mass-weighted fluxes per level, its change of
-///   inventory spread over the nodes by their volumes (only the means are
-///   read back).
+/// Every column on its own.
 ///
 /// The turbulence's bed and surface w-points hold the closure's boundary
 /// values: the solve takes them as their interior neighbours' (as the
@@ -181,8 +175,6 @@ pub(crate) fn apply_implicit_vertical_advection(
     d_sigma: &[f64],
     d_sigma_w: &[f64],
     bathymetry: &Bathymetry2D,
-    geom: &GeometricFactors2D,
-    element_means: &[bool],
     elements: Blocks,
     dt: &[f64],
 ) {
@@ -210,25 +202,17 @@ pub(crate) fn apply_implicit_vertical_advection(
             &mut tke[..],
             &mut gls[..],
         ],
-        || {
-            Pooled::take(
-                |s: &StageScratch| s.fits(nn, nl),
-                || StageScratch::new(nn, nl),
-            )
-        },
+        || Pooled::take(|s: &StageScratch| s.fits(nl), || StageScratch::new(nl)),
         |scratch, k, [u, v, temp, salt, tke, gls]| {
             let omega = &omega_implicit[k * nn * (nl + 1)..(k + 1) * nn * (nl + 1)];
             if omega.iter().all(|&w| w == 0.0) {
                 return;
             }
             let columns = ElementColumns {
-                k,
                 n_levels: nl,
                 eta: &eta[k * nn..(k + 1) * nn],
                 bed: bathymetry.element(ElementIndex::new(k)),
                 omega,
-                geom,
-                means: element_means[k],
             };
             let dt = dt[k];
             for field in [u, v, temp, salt] {
@@ -245,16 +229,12 @@ pub(crate) fn apply_implicit_vertical_advection(
 
 /// The columns of one element, for [`apply_implicit_vertical_advection`].
 struct ElementColumns<'a> {
-    k: usize,
     n_levels: usize,
     /// `η` and the bed of the element's nodes.
     eta: &'a [f64],
     bed: &'a [f64],
     /// `Ω_i` of the element's columns, `[node][n_levels + 1]`.
     omega: &'a [f64],
-    geom: &'a GeometricFactors2D,
-    /// Whether the element's fields are carried as element means.
-    means: bool,
 }
 
 impl ElementColumns<'_> {
@@ -288,8 +268,8 @@ impl ElementColumns<'_> {
     ///
     /// Every cell's inventory changes by `V_l (x_l − c_l)`, the solve's
     /// change from the concentration `c_l` it started from: the fluxes'
-    /// divergence, so the column (or element) total is kept, also where the
-    /// end w-points start from their neighbours' values.
+    /// divergence, so the column's total is kept, also where the end
+    /// w-points start from their neighbours' values.
     fn relax(
         &self,
         field: &mut [f64],
@@ -302,7 +282,6 @@ impl ElementColumns<'_> {
         let StageScratch {
             layers,
             w_cells,
-            volumes,
             start,
         } = scratch;
         let solve = if w_points { w_cells } else { layers };
@@ -313,56 +292,22 @@ impl ElementColumns<'_> {
         let starting_values = |solve: &mut ColumnSolve, start: &mut [f64]| {
             start[..nc].copy_from_slice(&solve.values);
         };
-        if !self.means {
-            for i in 0..nn {
-                if self.omega_at(i).iter().all(|&w| w == 0.0) {
-                    continue;
-                }
-                solve.up.fill(0.0);
-                solve.down.fill(0.0);
-                self.add_fluxes(i, nc, 1.0, &mut solve.up, &mut solve.down);
-                let column = &mut field[i * nc..(i + 1) * nc];
-                for l in 0..nc {
-                    solve.volume[l] = layer_thickness_of(depth(i), cells[l]);
-                    solve.values[l] = column[l] / solve.volume[l];
-                }
-                starting_values(solve, start);
-                solve.solve(dt, w_points);
-                for (l, q) in column.iter_mut().enumerate() {
-                    *q += solve.volume[l] * (solve.values[l] - start[l]);
-                }
-            }
-            return;
-        }
-        // One column of the element's means: mass-weighted volumes, fluxes
-        // and inventories
-        solve.up.fill(0.0);
-        solve.down.fill(0.0);
-        solve.volume.fill(0.0);
-        solve.values.fill(0.0);
         for i in 0..nn {
-            let mass = self.geom.node_mass(self.k, i);
-            self.add_fluxes(i, nc, mass, &mut solve.up, &mut solve.down);
-            for l in 0..nc {
-                let volume = layer_volume_of(depth(i), cells[l]);
-                volumes[i * nc + l] = volume;
-                solve.volume[l] += mass * volume;
-                solve.values[l] += mass * field[i * nc + l];
+            if self.omega_at(i).iter().all(|&w| w == 0.0) {
+                continue;
             }
-        }
-        for l in 0..nc {
-            // The inventories hold the cells' water, none at a dry node
-            solve.volume[l] = solve.volume[l].max(f64::MIN_POSITIVE);
-            solve.values[l] /= solve.volume[l];
-        }
-        starting_values(solve, start);
-        solve.solve(dt, w_points);
-        // Each node's share of the change of the element's inventory, by its
-        // volume: the mass-weighted sum over the nodes is the change
-        for l in 0..nc {
-            let change = solve.values[l] - start[l];
-            for i in 0..nn {
-                field[i * nc + l] += change * volumes[i * nc + l];
+            solve.up.fill(0.0);
+            solve.down.fill(0.0);
+            self.add_fluxes(i, nc, 1.0, &mut solve.up, &mut solve.down);
+            let column = &mut field[i * nc..(i + 1) * nc];
+            for l in 0..nc {
+                solve.volume[l] = layer_thickness_of(depth(i), cells[l]);
+                solve.values[l] = column[l] / solve.volume[l];
+            }
+            starting_values(solve, start);
+            solve.solve(dt, w_points);
+            for (l, q) in column.iter_mut().enumerate() {
+                *q += solve.volume[l] * (solve.values[l] - start[l]);
             }
         }
     }
@@ -372,24 +317,21 @@ impl ElementColumns<'_> {
 struct StageScratch {
     layers: ColumnSolve,
     w_cells: ColumnSolve,
-    /// The volume of every node's cell, `[node][cell]`.
-    volumes: Vec<f64>,
     /// The concentration of every cell the solve starts from.
     start: Vec<f64>,
 }
 
 impl StageScratch {
-    fn new(nn: usize, nl: usize) -> Self {
+    fn new(nl: usize) -> Self {
         Self {
             layers: ColumnSolve::new(nl),
             w_cells: ColumnSolve::new(nl + 1),
-            volumes: vec![0.0; nn * (nl + 1)],
             start: vec![0.0; nl + 1],
         }
     }
 
-    fn fits(&self, nn: usize, nl: usize) -> bool {
-        self.layers.len() == nl && self.volumes.len() == nn * (nl + 1)
+    fn fits(&self, nl: usize) -> bool {
+        self.layers.len() == nl
     }
 }
 

@@ -140,7 +140,9 @@ fn main() {
                     before.low,
                     before.high
                 );
-                println!("    node: depth before → after (m) | T before → after at level {l} | T column after (bed first)");
+                println!(
+                    "    node: depth before → after (m) | T before → after at level {l} | T column after (bed first)"
+                );
                 for j in 0..nn {
                     let n = k * nn + j;
                     let bed = physics.bathymetry.data[n];
@@ -193,12 +195,15 @@ fn main() {
         outcome.clips
     );
     println!(
-        "columns seen (node-steps): {} dry, {} thin with water, {} crossings of the thin depth",
-        outcome.seen[0], outcome.seen[1], outcome.seen[2]
+        "columns seen (node-steps): {} dry, {} thin with water, {} crossings of the thin depth;          {} thin cells carried with a neighbour, {} flushed",
+        outcome.seen[0], outcome.seen[1], outcome.seen[2], outcome.merged[0], outcome.merged[1]
     );
     println!(
         "initial: T {:.3}–{:.3} °C, S {:.3}–{:.3}",
-        outcome.initial[0].low, outcome.initial[0].high, outcome.initial[1].low, outcome.initial[1].high
+        outcome.initial[0].low,
+        outcome.initial[0].high,
+        outcome.initial[1].low,
+        outcome.initial[1].high
     );
     for (kind, ranges) in KINDS.iter().zip(&outcome.ranges.0) {
         if ranges[0].is_empty() {

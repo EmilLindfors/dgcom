@@ -68,7 +68,9 @@ pub use advection_3d::{
     UpwindTracerBC3D,
 };
 
+pub mod merged_cells;
 pub mod transport_3d;
+pub use merged_cells::{MergedCells, StepWater};
 pub use transport_3d::{
     AdvectedTracer, BarotropicFlux, LayerTransport, MetricForm, MomentumAdvectionForm, UNBOUNDED,
     VerticalAdvection, advective_divergence_element, apply_momentum_transport_3d,

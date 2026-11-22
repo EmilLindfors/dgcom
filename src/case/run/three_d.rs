@@ -367,7 +367,10 @@ impl CaseFile {
         // stopped run wrote out: its samples are the next interpolation's
         // start only
         let mut at_restart = resumed.is_some();
-        let mut on_step = |s: &Solution3D, t: f64, capture: &dyn Fn() -> Restart3D| {
+        let mut on_step = |s: &Solution3D,
+                           t: f64,
+                           ranges: &dyn Fn() -> crate::physics::TracerRanges,
+                           capture: &dyn Fn() -> Restart3D| {
             if failure.is_some() {
                 return;
             }
@@ -417,7 +420,10 @@ impl CaseFile {
             })();
             previous = Some((t, now));
             match written {
-                Ok(()) if on_field => progress(&summarize(domain, &q, t, t_end)),
+                Ok(()) if on_field => progress(&Progress {
+                    tracers: Some(ranges()),
+                    ..summarize(domain, &q, t, t_end)
+                }),
                 Ok(()) => {}
                 Err(e) => failure = Some(e),
             }
@@ -439,7 +445,9 @@ impl CaseFile {
             state = restart.state;
         }
         let result = sim.run_with_context_callback(&mut state, t_start, t_end, |s, t, context| {
-            on_step(s, t, &|| context.restart(s, t))
+            on_step(s, t, &|| context.physics.tracer_ranges(s), &|| {
+                context.restart(s, t)
+            })
         });
         if let Some(e) = failure {
             return Err(e);
