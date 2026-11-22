@@ -157,7 +157,7 @@
       | all | 3842 | 10.69 | +0.11 | +0.11 | +0.10 | +0.00 |
 
       Inside the mesh, NorKyst isn't cold at night: +0.11 overall, against −0.13 over the whole box. The model follows NorKyst within 0.1 °C. By the last night both lag the satellite's warming (+0.54 °C from 7 to 8 June against the model's +0.30). At night the model's 0–3 m difference is zero, as the satellite can't tell apart either.
-    - Thin columns go far out of range in both runs: −2.00 °C (the lower bound) around the low waters at 42–46 h and 66 h, and up to 21 °C (k-ε) or 36 °C (generic) at 54–58 h. The ordinary columns stay at 6.9–14.8 °C, and the scores above don't sample columns shallower than their depth.
+    - Thin columns go far out of range in both runs: −2.00 °C (the lower bound) at 41.5–45.5 h and from 66.5 h, and up to 21.4 °C (k-ε) or 40.00 °C (generic, at 55 h: the upper bound; this line said 36 until the logs were read again on 2026-11-22). The ordinary columns stay at 6.6–14.8 °C, and the scores above don't sample columns shallower than their depth. Found and cured 2026-11-22 (`notes/3d-numerics.md`, "3D tracers out of range in dry and thin columns": the transport's central value on the shore elements' subcell interfaces, which the closures' different mixing only fed differently).
 
 ## Out of TODO.md (2026-11-15)
 

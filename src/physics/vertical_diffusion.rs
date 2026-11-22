@@ -15,6 +15,7 @@ use crate::physics::vertical_mixing::{Column, Forcing, Turbulence, VerticalMixin
 #[cfg(test)]
 use crate::solver::algorithms::tridiagonal::solve_tridiagonal;
 use crate::solver::core::blocks::{Blocks, Pooled, for_each_block};
+use crate::solver::rhs::transport_3d::DRY_DEPTH;
 use crate::solver::state::Solution3D;
 use crate::time::StepDrag;
 use crate::types::ElementIndex;
@@ -31,6 +32,11 @@ pub struct SurfaceFields<'a> {
     pub roughness: Option<&'a [f64]>,
     /// Heat and freshwater fluxes (see [`SurfaceTracerFluxes`])
     pub tracers: Option<SurfaceTracerFluxes<'a>>,
+    /// With `Some(depth)`, the thin columns take the heat and freshwater
+    /// fluxes too, together with the bed under them, which holds heat and
+    /// salt as `depth` m of water does (see [`apply_vertical_diffusion`]);
+    /// `None`: a thin column takes none.
+    pub thin_bed: Option<f64>,
 }
 
 /// Per-column surface fluxes of heat and fresh water for
@@ -78,7 +84,18 @@ pub struct SurfaceTracerFluxes<'a> {
 /// Columns shallower than `min_column_depth` (m) are left alone: they carry
 /// no vertical structure (3D wetting and drying, see
 /// [`crate::physics::Hydrostatic3D::with_min_column_depth`]), and the solve
-/// would divide by vanishing layers.
+/// would divide by vanishing layers. With `surface.thin_bed = Some(h_b)`
+/// such a column with water takes its fluxes over its whole depth `D`, in
+/// one piece with the bed under it: every level warms by
+/// `dt·(Q_ns + Q_sw)/(ρ₀ c_p (D + h_b))` and its salinity changes by
+/// `dt·S F/(ρ_fw (D + h_b))`. The water takes the share `D/(D + h_b)` of
+/// the fluxes and the bed the rest, so a film warms no faster than `h_b` of
+/// water would (a flux over the water alone has no bound as `D → 0`).
+/// `h_b` is the water that holds the heat of the sediment a day's or a
+/// tide's heat wave reaches: about 0.1 m (wet sand: 2.9 MJ m⁻³ K⁻¹, a
+/// diffusivity of 0.7 mm²/s, so `√(κ/ω)` ≈ 0.07–0.1 m of sediment for the
+/// two periods, 0.05–0.07 m of water). Without it (the default) a thin
+/// column takes no flux.
 ///
 /// A closure with prognostic turbulence ([`VerticalMixing::initial_turbulence`],
 /// e.g. [`crate::physics::GlsMixing`]) steps `state.tke` and `state.gls` over
@@ -167,6 +184,23 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 // matching the PGF/advection paths.
                 let h = -bathymetry.get(ElementIndex::new(k), i);
                 if eta[idx] + h < min_column_depth {
+                    // A thin column: its fluxes over the whole of it and
+                    // the bed, if asked for
+                    let depth = eta[idx] + h;
+                    if let Some(bed) = surface.thin_bed.filter(|_| depth >= DRY_DEPTH) {
+                        let mut heat = forcing.surface_heat_flux;
+                        let mut fresh = 0.0;
+                        if let Some(fluxes) = &surface.tracers {
+                            heat += fluxes.nonsolar[idx] + fluxes.shortwave[idx];
+                            fresh = fluxes.freshwater[idx];
+                        }
+                        let warming = dt * heat / (rho0 * SEAWATER_HEAT_CAPACITY * (depth + bed));
+                        let salting = dt * fresh / (FRESH_WATER_DENSITY * (depth + bed));
+                        for l in 0..nl {
+                            temp[i * nl + l] += warming;
+                            salt[i * nl + l] *= 1.0 + salting;
+                        }
+                    }
                     continue;
                 }
                 let (local, column) = (i * nl..(i + 1) * nl, idx * nl..(idx + 1) * nl);
@@ -690,6 +724,85 @@ mod tests {
             "50 m and 500 m columns gave identical velocity profiles \
              (max diff {max_diff:.3e}); depth is likely still hardcoded"
         );
+    }
+
+    /// A thin column takes no surface flux, unless `thin_bed` asks for it:
+    /// then every level warms by the flux over the column and the bed,
+    /// `dt·Q/(ρ₀ c_p (D + h_b))`, and its salinity changes by the factor
+    /// `1 + dt·F/(ρ_fw (D + h_b))`; a dry column takes none, and a column
+    /// that is not thin is not touched by the option.
+    #[test]
+    fn thin_columns_take_the_fluxes_with_their_bed_if_asked() {
+        use crate::mesh::data::Bathymetry2D;
+        use crate::vertical::SigmaGrid;
+
+        let (n_levels, dt, rho0, bed) = (5, 60.0, 1025.0, 0.1);
+        let sigma = SigmaGrid::uniform(n_levels);
+        let mixing = ConstantMixing::new(1e-3, 1e-4);
+        let forcing = Forcing {
+            surface_stress: [0.0, 0.0],
+            bottom_stress: [0.0, 0.0],
+            surface_heat_flux: 40.0,
+        };
+        // (water depth, thin)
+        for (depth, thin) in [(0.3, true), (1e-3, true), (0.0, true), (2.0, false)] {
+            let run = |thin_bed: Option<f64>| {
+                let mut state = Solution3D::new(1, 1, n_levels);
+                for l in 0..n_levels {
+                    state.temp[l] = 10.0 + 0.2 * l as f64;
+                    state.salt[l] = 33.0 + 0.1 * l as f64;
+                }
+                let bathymetry = Bathymetry2D::constant(1, 1, -depth);
+                let (nonsolar, shortwave, freshwater) = ([-150.0], [600.0], [2e-4]);
+                apply_vertical_diffusion(
+                    &mut state,
+                    &sigma,
+                    &bathymetry,
+                    dt,
+                    &mixing,
+                    &forcing,
+                    SurfaceFields {
+                        tracers: Some(SurfaceTracerFluxes {
+                            nonsolar: &nonsolar,
+                            shortwave: &shortwave,
+                            freshwater: &freshwater,
+                            water: JerlovWater::III,
+                        }),
+                        thin_bed,
+                        ..SurfaceFields::default()
+                    },
+                    9.81,
+                    rho0,
+                    1.0,
+                    StepDrag::NONE,
+                    bathymetry.n_elements.into(),
+                );
+                (state.temp, state.salt)
+            };
+            let (without, with) = (run(None), run(Some(bed)));
+            if !thin {
+                assert_eq!(without, with, "a column that is not thin");
+                assert!(without.0[n_levels - 1] != 10.0 + 0.2 * (n_levels - 1) as f64);
+                continue;
+            }
+            let warming =
+                dt * (40.0 - 150.0 + 600.0) / (rho0 * SEAWATER_HEAT_CAPACITY * (depth + bed));
+            let salting = 1.0 + dt * 2e-4 / (FRESH_WATER_DENSITY * (depth + bed));
+            for l in 0..n_levels {
+                let (t0, s0) = (10.0 + 0.2 * l as f64, 33.0 + 0.1 * l as f64);
+                assert_eq!((without.0[l], without.1[l]), (t0, s0), "no flux by default");
+                if depth == 0.0 {
+                    assert_eq!((with.0[l], with.1[l]), (t0, s0), "a dry column");
+                } else {
+                    assert!((with.0[l] - (t0 + warming)).abs() < 1e-13, "{depth} m");
+                    assert!((with.1[l] - s0 * salting).abs() < 1e-12, "{depth} m");
+                }
+            }
+            // A millimetre of water warms as the bed's 0.1 m, not as itself
+            if depth == 1e-3 {
+                assert!(warming < 0.073 && warming > 0.070, "{warming} °C a minute");
+            }
+        }
     }
 
     /// The stresses are momentum fluxes at the column ends: one implicit step

@@ -65,20 +65,62 @@
 //! (an element that switched to the subcells during the step, or one the
 //! positivity limiter changed, see `BarotropicTransport`), the surface
 //! residual is such a volume source too. Besides the element's true source
-//! it integrates to zero over the element (the element balance), so every
-//! layer's continuity still holds for the element as a whole; the mode
-//! splitter carries the tracers of those elements as element means per
-//! level ([`from_inventory`]), and their volume sources bring the element's
-//! mean concentration: constant and conservative there too.
+//! it integrates to zero over the element (the element balance): it is
+//! water the pass moved between the element's nodes by no flux it reported.
+//! The nodes that lose it lose it at their own concentration, and the nodes
+//! that gain it gain it at the mean concentration of what the others lost,
+//! level by level ([`LayerTransport::add_volume_sources`]): every layer's
+//! continuity holds node by node, a constant tracer stays constant, the
+//! element's inventory is kept, and each node's new value is a mean of
+//! values the element held.
 //!
 //! [`apply_tracer_transport_3d`] then advects a tracer with these fluxes in
 //! inventory form: in split form within the elements
 //! ([`advective_divergence_element`], which the 3D model's energy balance
-//! over sloping σ-levels needs; central on the subcell interfaces of a
-//! subcell element), upwind in `C` on the face fluxes, and on
-//! `Ω` by one of
-//! the [`VerticalAdvection`] schemes (by default fourth-order Akima under a
-//! TVD limiter, [`VerticalAdvection::LimitedAkima`]).
+//! over sloping σ-levels needs; on the subcell interfaces of a subcell
+//! element central between two columns that are not thin, and the donor's
+//! value beside a thin one), upwind in `C` on the face fluxes, and on `Ω`
+//! by one of the [`VerticalAdvection`] schemes (by default fourth-order
+//! Akima under a TVD limiter, [`VerticalAdvection::LimitedAkima`]).
+//!
+//! # Thin and dry columns keep their tracers in range
+//!
+//! An element with a thin column is a subcell element. A thin column's
+//! layers carry their shares `Δσ_l` of the barotropic fluxes through its
+//! subcell's interfaces and faces and nothing else, so `Ω` is zero in it
+//! and each of its levels is a finite volume of the 2D mass fluxes, with
+//! the donor's value on every flux. One forward-Euler step then leaves it
+//! the mean of its own value and of what flowed in, weighted by their
+//! volumes, if no more water leaves it than it holds; where more does it
+//! is carried with its neighbours as one cell
+//! ([`crate::solver::rhs::MergedCells`]). Its water from a nodal residual
+//! comes at the mean of what the element's other nodes lost (above). The
+//! stages of the SSP schemes are convex combinations of such steps,
+//! [`from_inventory`] divides by the volume the same fluxes made, and a
+//! node with no water keeps its value. So a column thin at every stage of
+//! a step ends it within the range of the water that reached it: on a
+//! tidal flat at a 1 m thin depth no thin or dry value left that range,
+//! with either scheme, local time steps, explicit or implicit vertical
+//! advection (TODO P4.5).
+//!
+//! What this does not cover, measured on the same flat at a 0.1 m thin
+//! depth, where the columns just deeper than it drain to a fraction of
+//! their water within a step (thin columns up to 0.1 °C beyond what the
+//! others have had, 0.2 °C beyond the water around them; `notes/3d-numerics.md`):
+//! - a column that is not thin at some stage of the step takes the central
+//!   value on its interfaces with other such columns, the reference's
+//!   tangent, and vertical advection, none of which is monotone, and
+//!   carries what that made into its thin stages;
+//! - a merged group with members that are not thin, whose own faces and
+//!   `Ω` move water by levels, is convex for the group's column sums, not
+//!   level by level; a flushed element's shown value is convex only as
+//!   far as its neighbours' values at the stage are what it saw;
+//! - the subcell elements without the pass's interface fluxes
+//!   ([`LayerTransport::fallback`]) are not searched for over-drained
+//!   cells.
+//!
+//! The columns that are not thin are the limiter's to bound
+//! ([`crate::solver::TracerLimiter3DConfig`]).
 //!
 //! # Momentum
 //!
@@ -108,6 +150,7 @@ use crate::solver::SWEFormulation2D;
 use crate::solver::core::blocks::{Blocks, Neighbourhood, Pooled, for_each_block, max_over_blocks};
 use crate::solver::rhs::advection_3d::{TracerBCContext3D, TracerBoundaryCondition3D};
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D, ExteriorField, FaceExterior};
+use crate::solver::rhs::merged_cells::MergedCells;
 use crate::solver::rhs::subcells::{
     line_metric, line_node, subcell_interfaces, subcell_slot, telescoped_interfaces,
 };
@@ -683,11 +726,13 @@ pub struct BarotropicFlux<'a> {
     /// The rivers of the step, if any: volume sources of the layers, so
     /// that `∂η/∂t = −∇·DU_avg2 + Σ Q̄/A_k` (see [`crate::source::river`]).
     pub rivers: Option<RiverInflow<'a>>,
-    /// The elements whose fields the mode splitter carries as element means
-    /// per level (`[element]`; empty for none): there the volume source of
-    /// [`LayerTransport::volume_source`] brings the element's mean
-    /// concentration per level ([`LayerTransport::add_volume_sources`]).
-    pub element_means: &'a [bool],
+    /// The elements whose nodes the pass balanced only as a whole
+    /// (`[element]`; empty for none): there the volume source of
+    /// [`LayerTransport::volume_source`] is water moved between the
+    /// element's nodes, which the nodes that gain it get at the mean
+    /// concentration of what the others lost
+    /// ([`LayerTransport::add_volume_sources`]).
+    pub pooled: &'a [bool],
 }
 
 /// Layer transports and `Ω` of one 3D stage (see the module docs).
@@ -727,6 +772,16 @@ pub struct LayerTransport {
     /// [`Self::compute`]; the vertical advection bounds the water an end layer
     /// sheds by it ([`VerticalAdvection::LimitedAkima`]).
     pub dt_over_depth: Vec<f64>,
+    /// The columns thinner than the minimum column depth at the last
+    /// [`Self::compute`], in the subcell elements (`[element][node]`; not
+    /// set in the others): the tracers cross a subcell interface beside one
+    /// at the donor's value ([`apply_tracer_transport_3d`]).
+    pub thin: Vec<bool>,
+    /// The subcell elements the pass did not move on the subcells
+    /// throughout (`[element]`): their interfaces carry the column
+    /// transport's central value, and their volume sources are water the
+    /// pass moved between their nodes ([`Self::add_volume_sources`]).
+    pub fallback: Vec<bool>,
     /// σ-thickness `Δσ_l` of the layers (uniform until the first
     /// [`Self::compute`]).
     pub d_sigma: Vec<f64>,
@@ -755,6 +810,8 @@ impl LayerTransport {
             omega: vec![0.0; n_elements * nn * (n_levels + 1)],
             volume_source: vec![0.0; n_elements * nn],
             dt_over_depth: vec![0.0; n_elements * nn],
+            thin: vec![false; n_elements * nn],
+            fallback: vec![false; n_elements],
             d_sigma: vec![1.0 / n_levels as f64; n_levels],
             surface_residual: 0.0,
             metric: MetricForm::default(),
@@ -835,6 +892,8 @@ impl LayerTransport {
             omega: layer_omega,
             volume_source,
             dt_over_depth,
+            thin: thin_columns,
+            fallback,
             metric,
             neighbourhood,
             ..
@@ -842,17 +901,32 @@ impl LayerTransport {
         let metric = *metric;
         let thin = |flat: usize| state.eta.data[flat] - bathymetry.data[flat] < min_column_depth;
         // The subcell elements: those the pass moved on the subcells
-        // throughout (so the layers sum to its update node by node), or
-        // without a pass those with a thin column
+        // throughout (so the layers sum to its update node by node), and
+        // those with a thin column (their interfaces then carry the column
+        // transport's central value, none beside a thin column, and what
+        // the pass moved otherwise is a volume source, below). An element
+        // with a thin column whose layers moved by the DG pairs exchanged
+        // baroclinic transport within itself, which the pressure gradient
+        // does not balance there (it has no volume term in such an element,
+        // `crate::solver::rhs::baroclinic`), and moved its thin columns'
+        // tracers with a volume term that is not monotone (0.3 °C beyond
+        // the water around a film on a flat at a 0.1 m thin depth, 1.4 °C
+        // at 240 s steps)
         for k in elements.iter() {
-            subcell_elements[k] = match barotropic {
-                Some(b) => b.subcell[k * n_sub..(k + 1) * n_sub]
+            let pass = barotropic.is_some_and(|b| {
+                b.subcell[k * n_sub..(k + 1) * n_sub]
                     .iter()
-                    .all(|f| f.is_finite()),
-                None => (k * nn..(k + 1) * nn).any(thin),
-            };
+                    .all(|f| f.is_finite())
+            });
+            subcell_elements[k] = pass || (k * nn..(k + 1) * nn).any(thin);
+            fallback[k] = subcell_elements[k] && !pass;
         }
         let subcell_elements: &[bool] = subcell_elements;
+        for k in elements.iter().filter(|&k| subcell_elements[k]) {
+            for flat in k * nn..(k + 1) * nn {
+                thin_columns[flat] = thin(flat);
+            }
+        }
 
         // 1. Nodal layer transports, corrected to DU_avg2, on the elements
         // and their face neighbours (whose transports the faces read)
@@ -1123,10 +1197,11 @@ impl LayerTransport {
     fn element(&self, k: usize) -> ElementTransport<'_> {
         // Every field is `[element][…]`
         let n_elements = self.subcell_elements.len();
-        let block = |values: &'_ [f64]| {
+        fn block_of<T>(values: &[T], k: usize, n_elements: usize) -> std::ops::Range<usize> {
             let len = values.len() / n_elements;
             k * len..(k + 1) * len
-        };
+        }
+        let block = |values: &'_ [f64]| block_of(values, k, n_elements);
         ElementTransport {
             n_levels: self.n_levels,
             hu: &self.hu[block(&self.hu)],
@@ -1136,6 +1211,7 @@ impl LayerTransport {
             subcell_element: self.subcell_elements[k],
             omega: &self.omega[block(&self.omega)],
             dt_over_depth: &self.dt_over_depth[block(&self.dt_over_depth)],
+            thin: &self.thin[block_of(&self.thin, k, n_elements)],
             d_sigma: &self.d_sigma,
             metric: self.metric,
         }
@@ -1149,27 +1225,41 @@ impl LayerTransport {
     /// it joins, so the source changes no concentration (constancy) and
     /// adds exactly what its volume holds (conservation).
     ///
-    /// `C` is the node's own value, or in the elements of `element_means`
-    /// the element's mean per cell, `Σ w_i J_i H_ic C_ic / Σ w_i J_i H_ic`:
-    /// there the barotropic pass kept only the element balance, and the
-    /// nodal sources hold its nodal residual, which integrates to zero over
-    /// the element, besides the element's true source; at the mean
-    /// concentration the residual moves no tracer, as in
-    /// [`from_inventory`].
-    #[allow(clippy::too_many_arguments)]
+    /// `C` is the node's own value. In the elements of `pooled` (and the
+    /// subcell elements without the pass's interface fluxes,
+    /// [`Self::fallback`]) the barotropic pass kept only the element
+    /// balance, or the layers' divergence is not the pass's, and the nodal
+    /// sources
+    /// hold its nodal residual besides the element's true source: water the
+    /// pass moved from the nodes with a negative source to those with a
+    /// positive one. There a node that loses water loses it at its own
+    /// value, and a node that gains water gains it at the mean value of
+    /// what the others lost,
+    ///
+    /// ```text
+    ///     C_pool = Σ_{s_i < 0} w_i J_i |s_i| C_i / Σ_{s_i < 0} w_i J_i |s_i|
+    /// ```
+    ///
+    /// per cell (what it gains beyond what they lost, the element's true
+    /// source, at its own). The residual then moves the tracer with the
+    /// water: the element's inventory changes by its true source's only,
+    /// and every node's new value is a mean of values the element held,
+    /// with weights that are not negative. At one concentration for every
+    /// node (the element's mean, as before 2026-11-22) a node that lost
+    /// water kept `C_i + |s|Δt (C_i − C̄)/(V − |s|Δt)`, further from the
+    /// mean than it was.
     pub fn add_volume_sources(
         &self,
         rhs: &mut [f64],
         field: &[f64],
         cells: &[f64],
-        eta: &[f64],
-        bathymetry: &Bathymetry2D,
         geom: &GeometricFactors2D,
-        element_means: &[bool],
+        pooled: &[bool],
         elements: Blocks,
     ) {
-        let (nn, nc) = (bathymetry.n_nodes, cells.len());
-        let n_elements = bathymetry.n_elements;
+        let nc = cells.len();
+        let n_elements = self.subcell_elements.len();
+        let nn = self.volume_source.len() / n_elements.max(1);
         for_each_block(
             elements,
             [&mut rhs[..n_elements * nn * nc]],
@@ -1177,7 +1267,17 @@ impl LayerTransport {
             |_, k, [rhs_k]| {
                 let source = &self.volume_source[k * nn..(k + 1) * nn];
                 let field_k = &field[k * nn * nc..(k + 1) * nn * nc];
-                if !element_means.get(k).copied().unwrap_or(false) {
+                // What the element's nodes lose and gain (m³/s per unit of
+                // the reference element's area)
+                let (mut lost, mut gained) = (0.0, 0.0);
+                if pooled.get(k).copied().unwrap_or(false) || self.fallback[k] {
+                    for (i, &s) in source.iter().enumerate() {
+                        let rate = geom.node_mass(k, i) * s;
+                        lost += (-rate).max(0.0);
+                        gained += rate.max(0.0);
+                    }
+                }
+                if lost <= 0.0 || gained <= 0.0 {
                     for (i, &s) in source.iter().enumerate() {
                         for (c, &dc) in cells.iter().enumerate() {
                             rhs_k[i * nc + c] += dc * s * field_k[i * nc + c];
@@ -1185,21 +1285,22 @@ impl LayerTransport {
                     }
                     return;
                 }
-                let bed = bathymetry.element(ElementIndex::new(k));
-                let depth = |i: usize| eta[k * nn + i] - bed[i];
+                // The share of a gain that is the others' loss
+                let share = (lost / gained).min(1.0);
                 for (c, &dc) in cells.iter().enumerate() {
-                    let (mut inventory, mut volume) = (0.0, 0.0);
-                    for i in 0..nn {
-                        let weight = geom.node_mass(k, i) * layer_volume_of(depth(i), dc);
-                        inventory += weight * field_k[i * nc + c];
-                        volume += weight;
-                    }
+                    let mut pool = 0.0;
                     for (i, &s) in source.iter().enumerate() {
-                        // An element without water has no mean: its own values
-                        let value = if volume > 0.0 {
-                            inventory / volume
+                        if s < 0.0 {
+                            pool -= geom.node_mass(k, i) * s * field_k[i * nc + c];
+                        }
+                    }
+                    let pool = pool / lost;
+                    for (i, &s) in source.iter().enumerate() {
+                        let own = field_k[i * nc + c];
+                        let value = if s > 0.0 {
+                            share * pool + (1.0 - share) * own
                         } else {
-                            field_k[i * nc + c]
+                            own
                         };
                         rhs_k[i * nc + c] += dc * s * value;
                     }
@@ -1299,7 +1400,7 @@ pub(crate) fn layer_volume_of(depth: f64, d_sigma: f64) -> f64 {
 
 /// Depth (m) below which a node's (or, as a mean, an element's) tracers are
 /// left as they were: it holds no water to define a concentration.
-const DRY_DEPTH: f64 = 1e-6;
+pub(crate) const DRY_DEPTH: f64 = 1e-6;
 
 /// Multiply a field by the thickness of its cells under `η`: concentration
 /// `C` → inventory `H_z C`, with `H_z = D·Δσ` for the σ-thicknesses
@@ -1335,13 +1436,16 @@ pub fn to_inventory(
 }
 
 /// [`to_inventory`] of the concentrations `values` into `q`, on `elements`:
-/// the bits of copying them there first, in one pass.
+/// the bits of copying them there first, in one pass. Not in the flushed
+/// elements of `merged`, whose inventories are not their nodes' values
+/// times their volumes within a step ([`MergedCells::pass_through`]).
 pub(crate) fn inventory_of(
     q: &mut [f64],
     values: &[f64],
     eta: &[f64],
     d_sigma: &[f64],
     bathymetry: &Bathymetry2D,
+    merged: Option<&MergedCells>,
     elements: Blocks,
 ) {
     let (nn, nl) = (bathymetry.n_nodes, d_sigma.len());
@@ -1351,6 +1455,9 @@ pub(crate) fn inventory_of(
         [&mut q[..n_elements * nn * nl]],
         || (),
         |_, k, [block]| {
+            if merged.is_some_and(|m| m.is_flushed(k)) {
+                return;
+            }
             let nodes = k * nn..(k + 1) * nn;
             let values = &values[k * nn * nl..(k + 1) * nn * nl];
             for (((column, values), &e), &b) in block
@@ -1370,13 +1477,15 @@ pub(crate) fn inventory_of(
 /// [`to_inventory`] of `values` into `q` at the nodes with (almost) no water
 /// only, shallower than `DRY_DEPTH`, where [`from_inventory`] keeps the last
 /// value: their inventories become that value's, the rest are left alone
-/// (on `elements`).
+/// (on `elements`; not in the flushed elements of `merged`, as
+/// [`inventory_of`]).
 pub(crate) fn dry_inventories(
     q: &mut [f64],
     values: &[f64],
     eta: &[f64],
     d_sigma: &[f64],
     bathymetry: &Bathymetry2D,
+    merged: Option<&MergedCells>,
     elements: Blocks,
 ) {
     let (nl, nn) = (d_sigma.len(), bathymetry.n_nodes);
@@ -1386,6 +1495,9 @@ pub(crate) fn dry_inventories(
         [&mut q[..n_elements * nn * nl]],
         || (),
         |_, k, [block]| {
+            if merged.is_some_and(|m| m.is_flushed(k)) {
+                return;
+            }
             for (i, column) in block.chunks_exact_mut(nl).enumerate() {
                 let idx = k * nn + i;
                 let depth = eta[idx] - bathymetry.data[idx];
@@ -1401,54 +1513,49 @@ pub(crate) fn dry_inventories(
 }
 
 /// Inventory `q = H_z C` → concentration, written to `out`, for cells of
-/// σ-thickness `d_sigma` in a column (as [`to_inventory`]), on `elements`.
+/// σ-thickness `d_sigma` in a column (as [`to_inventory`]), on `elements`:
+/// `C = q / H_z` at every node.
 ///
-/// - Elements not marked in `element_means`: `C = q / H_z` at every node.
-/// - Marked elements: per level, the element's inventory over its volume,
-///   `M = Σ w_i J_i q_il / Σ w_i J_i H_z,il`, plus each node's departure from
-///   the same mean of the values `out` holds (the last ones):
-///   `C_il = out_il + (M − Σ w_i J_i H_z,il out_il / Σ w_i J_i H_z,il)`. The
-///   mode splitter marks the elements where the barotropic pass kept only
-///   the element balance, not the nodal identity `η̄ − ηⁿ = −Δt∇·DU_avg2`
-///   (`WetDry` subcell and positivity-limited elements, see
-///   `BarotropicTransport`): there the nodal quotient is not constant for a
-///   constant tracer, but the element means are (and are conservative, see
-///   the module docs). The departures are zero for a constant tracer and
-///   have zero weighted mean, so the conversion keeps both properties; and
-///   they keep the element's vertical structure, where the mean alone
-///   flattened the stratification along the σ-levels: across a shoreline
-///   element spanning 0.6 to 105 m of water a σ-level crosses 100 m of
-///   depth, and the flattened density drove 0.1–1 m/s at rest over the
-///   Frøya bed (2026-10-03). The structure within a marked element is held
-///   while it is marked; only its means move with the fluxes.
-/// - A node with (almost) no water, shallower than `DRY_DEPTH`, and a level
-///   of a marked element with a mean depth below it, keep the value `out`
-///   already holds (the last concentration) instead of dividing by a
-///   vanishing layer.
+/// - A node with (almost) no water, shallower than `DRY_DEPTH`, keeps the
+///   value `out` already holds (the last concentration) instead of dividing
+///   by a vanishing layer: a dry node keeps its last wet value.
+/// - The cells of a group of `merged` (thin cells that lose more than their
+///   water in a stage, with the neighbours they are carried with) take the
+///   group's inventory over its volume, whether they hold water or not
+///   ([`crate::solver::rhs::MergedCells`]).
+/// - A flushed element of `merged` takes its inventory over its volume at a
+///   step's `end`, and before that the value that passes its inflow
+///   through ([`MergedCells::pass_through`]), which is not its
+///   inventory's: do not set its inventory from it (`inventory_of`).
 ///
-/// Converting back with [`to_inventory`] keeps each element's
-/// inventory per level exactly.
+/// Converting back with [`to_inventory`] keeps each node's inventory, and
+/// each group's.
+///
+/// Until 2026-11-22 the elements where the barotropic pass kept only the
+/// element balance took the element's mean per level plus each node's
+/// departure from the mean of its last values. That kept a constant
+/// constant and the element's inventory, but not a node's value in range:
+/// with water moving from a node at 8° to one at 12°, both rose by the
+/// shift of the mean. Their nodal residual is now moved with its water
+/// ([`LayerTransport::add_volume_sources`]), so the nodal quotient is
+/// constant for a constant tracer there too, and no value is flattened
+/// along a σ-level (the mean alone drove 0.1–1 m/s at rest over the Frøya
+/// bed, 2026-10-03: across a shoreline element spanning 0.6 to 105 m of
+/// water a σ-level crosses 100 m of depth).
 pub fn from_inventory(
     q: &[f64],
     eta: &[f64],
     d_sigma: &[f64],
     bathymetry: &Bathymetry2D,
     geom: &GeometricFactors2D,
-    element_means: &[bool],
+    merged: Option<&MergedCells>,
     out: &mut [f64],
     elements: Blocks,
+    end: bool,
 ) {
     let keep = |_: usize, _: &mut [f64]| {};
     from_inventory_after(
-        q,
-        eta,
-        d_sigma,
-        bathymetry,
-        geom,
-        element_means,
-        out,
-        elements,
-        keep,
+        q, eta, d_sigma, bathymetry, geom, merged, out, elements, end, keep,
     );
 }
 
@@ -1463,9 +1570,10 @@ pub(crate) fn from_inventory_after(
     d_sigma: &[f64],
     bathymetry: &Bathymetry2D,
     geom: &GeometricFactors2D,
-    element_means: &[bool],
+    merged: Option<&MergedCells>,
     out: &mut [f64],
     elements: Blocks,
+    end: bool,
     last: impl Fn(usize, &mut [f64]) + Sync + Send,
 ) {
     let nl = d_sigma.len();
@@ -1480,43 +1588,24 @@ pub(crate) fn from_inventory_after(
             let bed = bathymetry.element(ElementIndex::new(k));
             let eta_k = &eta[k * nn..(k + 1) * nn];
             let q_k = &q[k * nn * nl..(k + 1) * nn * nl];
-            if !element_means[k] {
-                for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
-                    if e - b < DRY_DEPTH {
-                        continue;
-                    }
-                    for (l, &ds) in d_sigma.iter().enumerate() {
-                        out_k[i * nl + l] = q_k[i * nl + l] / layer_thickness_of(e - b, ds);
-                    }
+            let merged = merged.filter(|m| m.in_element(k));
+            for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
+                if e - b < DRY_DEPTH || merged.is_some_and(|m| m.carries(k, i)) {
+                    continue;
                 }
-                return;
+                for (l, &ds) in d_sigma.iter().enumerate() {
+                    out_k[i * nl + l] = q_k[i * nl + l] / layer_thickness_of(e - b, ds);
+                }
             }
-            let area: f64 = (0..nn).map(|i| geom.node_mass(k, i)).sum();
-            for (l, &ds) in d_sigma.iter().enumerate() {
-                // The new mean, and the last values' mean with the same
-                // weights: each node keeps its departure from it
-                let (mut inventory, mut last, mut volume) = (0.0, 0.0, 0.0);
-                for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
-                    let weight = geom.node_mass(k, i) * layer_volume_of(e - b, ds);
-                    inventory += geom.node_mass(k, i) * q_k[i * nl + l];
-                    last += weight * out_k[i * nl + l];
-                    volume += weight;
-                }
-                if volume > area * ds * DRY_DEPTH {
-                    // Not at a dry node: it has no weight in the mean, so
-                    // the shifts summed there step by step (a dry shore node
-                    // of the Frøya day drifted to 33 °C, and wetting brought
-                    // the drift back into the water, 2026-10-16)
-                    let shift = (inventory - last) / volume;
-                    for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
-                        if e - b >= DRY_DEPTH {
-                            out_k[i * nl + l] += shift;
-                        }
-                    }
-                }
+            if let Some(merged) = merged {
+                merged.convert_element(k, q_k, eta_k, bed, d_sigma, geom, out_k);
             }
         },
     );
+    // The flushed elements read their neighbours' values
+    if let Some(merged) = merged {
+        merged.pass_through(q, eta, d_sigma, bathymetry, geom, out, elements, end);
+    }
 }
 
 /// The form of the horizontal momentum advection `∇·(Q_l u_l)` within the
@@ -1785,8 +1874,10 @@ fn advect_fields<const N: usize>(
                             inflow(t, f, fi, node, tag, interior, flux, l)
                         };
                         let field = fields[t].0;
-                        let div =
-                            context.flux_divergence(transport, k, l, field, true, inflow, scratch);
+                        let interface = InterfaceValue::DonorBesideThin;
+                        let div = context.flux_divergence(
+                            transport, k, l, field, true, interface, inflow, scratch,
+                        );
                         for (i, &d) in div.iter().enumerate() {
                             rhs_k[i * nl + l] = -d;
                         }
@@ -2342,8 +2433,10 @@ pub fn apply_momentum_transport_3d(
                         let inflow = |f, fi, node, tag, interior, flux| {
                             inflow(t, f, fi, node, tag, interior, flux, l)
                         };
-                        let div =
-                            context.flux_divergence(transport, k, l, field, split, inflow, scratch);
+                        let interface = InterfaceValue::Central;
+                        let div = context.flux_divergence(
+                            transport, k, l, field, split, interface, inflow, scratch,
+                        );
                         for (i, &d) in div.iter().enumerate() {
                             rhs_k[i * nl + l] -= d;
                         }
@@ -2376,6 +2469,8 @@ struct ElementTransport<'a> {
     omega: &'a [f64],
     /// `[node]`
     dt_over_depth: &'a [f64],
+    /// `[node]`: the thin columns
+    thin: &'a [bool],
     d_sigma: &'a [f64],
     metric: MetricForm,
 }
@@ -2457,10 +2552,44 @@ impl WCellBlock {
             subcell_element: element.subcell_element,
             omega: &self.omega,
             dt_over_depth: &self.dt_over_depth,
+            thin: element.thin,
             d_sigma: &self.d_sigma,
             metric: element.metric,
         }
     }
+}
+
+/// The value a field crosses a subcell interface of a subcell element with
+/// ([`LayerContext::flux_divergence`]).
+///
+/// The central value is second order and moves no stratification along a
+/// σ-level that cuts through it, but it is not monotone: a node `a` that
+/// loses the share `c` of its water to a neighbour `b` in a forward-Euler
+/// step keeps
+///
+/// ```text
+///     C_a' = [V_a C_a − c V_a ½(C_a + C_b)] / [(1 − c) V_a]
+///          = C_a + c/(2(1 − c)) (C_a − C_b),
+/// ```
+///
+/// so its difference from the neighbour it drains into grows by
+/// `1 + c/(2(1 − c))` per step, `(V/V')^½` over a drain from `V` to `V'`,
+/// without bound as the node falls dry: 700× between half a metre and the
+/// micrometre below which a value is held (a draining film on a tidal flat
+/// at −2070 and 751 °C beside water at 8 to 11, TODO P4.5). A column that is
+/// not thin cannot drain that far. With the donor's value the water that
+/// leaves a node takes the node's own concentration and changes none, and
+/// the node's new value is the mean of its own and of what flowed in,
+/// weighted by their volumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterfaceValue {
+    /// `½(C_a + C_b)` on every interface (the momentum: thin columns are at
+    /// rest for it and take no tendency).
+    Central,
+    /// The donor's value on an interface beside a thin column, the central
+    /// one between two columns that are not thin (the tracers and the
+    /// turbulence).
+    DonorBesideThin,
 }
 
 /// Whether [`LayerContext::flux_divergence_levels`] takes the element of
@@ -2487,8 +2616,9 @@ impl LayerContext<'_> {
     /// ([`transport_divergence_element`] of `Q_l φ`); face flux `F_l φ↑`
     /// with `φ↑` upwind of `F_l`. On inflow through an open face `φ↑` is
     /// `inflow(face, face_node, node, tag, interior value, F_l)`, with `node`
-    /// the face node's `[element][node]` index. Written to (and returned
-    /// from) `scratch.div`.
+    /// the face node's `[element][node]` index. In a subcell element `φ`
+    /// crosses the subcell interfaces at `interface`'s value. Written to
+    /// (and returned from) `scratch.div`.
     #[allow(clippy::too_many_arguments)]
     fn flux_divergence<'s>(
         &self,
@@ -2497,6 +2627,7 @@ impl LayerContext<'_> {
         l: usize,
         field: &[f64],
         split: bool,
+        interface: InterfaceValue,
         inflow: impl Fn(usize, usize, usize, BoundaryTag, f64, f64) -> f64,
         scratch: &'s mut TransportScratch,
     ) -> &'s [f64] {
@@ -2539,10 +2670,13 @@ impl LayerContext<'_> {
         }
         if transport.subcell_element {
             // Through the subcell interfaces the 2D wet/dry kernel moves the
-            // water through, with the central value: no diffusion along
-            // σ-levels that cut steeply through the stratification (upwind
-            // moved a steep shore's stratification by 8e-3 °C)
+            // water through. Between two columns that are not thin, with the
+            // central value: no diffusion along σ-levels that cut steeply
+            // through the stratification (upwind moved a steep shore's
+            // stratification by 8e-3 °C). Beside a thin column a tracer
+            // takes the donor's value (see `InterfaceValue`)
             let n1 = ops.n_1d;
+            let donor = interface == InterfaceValue::DonorBesideThin;
             for dir in 0..2 {
                 for line in 0..n1 {
                     for a in 0..n1 - 1 {
@@ -2550,7 +2684,11 @@ impl LayerContext<'_> {
                         let flux = transport.subcell[slot * nl + l];
                         let (ia, ib) =
                             (line_node(n1, dir, line, a), line_node(n1, dir, line, a + 1));
-                        sub[slot] = flux * 0.5 * (phi[ia] + phi[ib]);
+                        sub[slot] = if donor && (transport.thin[ia] || transport.thin[ib]) {
+                            flux * if flux >= 0.0 { phi[ia] } else { phi[ib] }
+                        } else {
+                            flux * 0.5 * (phi[ia] + phi[ib])
+                        };
                     }
                 }
             }
@@ -2883,7 +3021,7 @@ mod tests {
                 subcell: &self.du_subcell,
                 eta_rate: &self.eta_rate,
                 rivers: None,
-                element_means: &[],
+                pooled: &[],
             };
             transport.compute(
                 &self.state,
@@ -4644,14 +4782,12 @@ mod tests {
         let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
         let n_el = case.mesh.n_elements;
         let d_sigma = case.sigma.d_sigma();
-        // As in `inventory_conversion_keeps_element_inventories`: dry nodes,
-        // a dry element, marked elements
+        // As in `inventory_conversion_is_each_nodes_own`: dry nodes, a dry
+        // element
         let mut eta = case.state.eta.data.clone();
         eta[0] = case.bathymetry.data[0];
         eta[nn..2 * nn].copy_from_slice(&case.bathymetry.data[nn..2 * nn]);
         eta[3 * nn] = case.bathymetry.data[3 * nn];
-        let mut marked = vec![false; n_el];
-        marked[1..4].fill(true);
         let concentration = case.state.temp.clone();
         let len = concentration.len();
         let block = |k: usize| k * nn * nl..(k + 1) * nn * nl;
@@ -4672,6 +4808,7 @@ mod tests {
                 &eta,
                 d_sigma,
                 &case.bathymetry,
+                None,
                 elements,
             );
             assert_eq!(one, two);
@@ -4686,9 +4823,10 @@ mod tests {
                 d_sigma,
                 &case.bathymetry,
                 &case.geom,
-                &marked,
+                None,
                 &mut two,
                 elements,
+                false,
             );
             let mut one = vec![-1.0; len];
             from_inventory_after(
@@ -4697,15 +4835,24 @@ mod tests {
                 d_sigma,
                 &case.bathymetry,
                 &case.geom,
-                &marked,
+                None,
                 &mut one,
                 elements,
+                false,
                 |k, out_k| out_k.copy_from_slice(&last[block(k)]),
             );
             assert_eq!(one, two);
 
             let mut q = inventory.clone();
-            dry_inventories(&mut q, &last, &eta, d_sigma, &case.bathymetry, elements);
+            dry_inventories(
+                &mut q,
+                &last,
+                &eta,
+                d_sigma,
+                &case.bathymetry,
+                None,
+                elements,
+            );
             let mut dry_nodes = 0;
             for idx in 0..n_el * nn {
                 let depth = eta[idx] - case.bathymetry.data[idx];
@@ -4724,26 +4871,24 @@ mod tests {
         }
     }
 
-    /// Inventory ↔ concentration: nodal in unmarked elements; in marked
-    /// elements the element's inventory over its volume per level plus each
-    /// node's departure from the mean of its last value, which converts back
-    /// to the same element inventory and keeps the element's structure; a
-    /// dry node, or a dry marked element, keeps its last concentration.
+    /// Inventory ↔ concentration: every node its own inventory over its
+    /// volume, so a stratified element converts back to itself (no value
+    /// is flattened along a σ-level, which over a steep shoreline drove
+    /// 0.1–1 m/s at rest, Frøya 2026-10-03); a dry node, or a dry element,
+    /// keeps its last concentration (a dry shore node of a marked element
+    /// once took every step's shift of its level's mean and drifted to
+    /// 33 °C, Frøya 2026-10-16).
     #[test]
-    fn inventory_conversion_keeps_element_inventories() {
+    fn inventory_conversion_is_each_nodes_own() {
         let case = Case::closed();
         let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
         let n_el = case.mesh.n_elements;
-        // Element 0 dry at one node, element 1 dry everywhere, element 2
-        // marked, element 3 marked and dry at one node
+        // Element 0 dry at one node, element 1 dry everywhere, element 3
+        // dry at one node
         let mut eta = case.state.eta.data.clone();
         eta[0] = case.bathymetry.data[0];
         eta[nn..2 * nn].copy_from_slice(&case.bathymetry.data[nn..2 * nn]);
         eta[3 * nn] = case.bathymetry.data[3 * nn];
-        let mut marked = vec![false; n_el];
-        marked[1] = true;
-        marked[2] = true;
-        marked[3] = true;
         let concentration = case.state.temp.clone();
         let mut inventory = concentration.clone();
         to_inventory(
@@ -4761,97 +4906,154 @@ mod tests {
             case.sigma.d_sigma(),
             &case.bathymetry,
             &case.geom,
-            &marked,
+            None,
             &mut out,
             case.bathymetry.n_elements.into(),
+            true,
         );
+        let (mut dry_nodes, mut spread) = (0, (f64::MAX, f64::MIN));
         for k in 0..n_el {
             for i in 0..nn {
                 let idx = k * nn + i;
                 let dry = eta[idx] - case.bathymetry.data[idx] < DRY_DEPTH;
+                dry_nodes += usize::from(dry);
                 for l in 0..nl {
                     let (c, got) = (concentration[idx * nl + l], out[idx * nl + l]);
-                    match (k, dry) {
-                        // Dry: the last value; the other nodes nodal.
-                        // Regression (Frøya, 2026-10-16): a marked element's
-                        // dry node took every step's shift of the level mean
-                        // and drifted (33 °C on a dry shore)
-                        (0 | 3, true) | (1, _) => {
-                            assert_eq!(got, -1.0, "element {k} node {i}")
+                    if dry {
+                        assert_eq!(got, -1.0, "element {k} node {i}");
+                    } else {
+                        assert!((got - c).abs() < 1e-12 * c.abs(), "{got} vs {c}");
+                        if k == 2 {
+                            spread = (spread.0.min(c), spread.1.max(c));
                         }
-                        (2 | 3, _) => {}
-                        _ => assert!((got - c).abs() < 1e-12 * c.abs(), "{got} vs {c}"),
                     }
                 }
             }
         }
-        // Element 2: one value per level, and its inventory per level kept
-        let mut back = out.clone();
-        to_inventory(
-            &mut back,
-            &eta,
-            case.sigma.d_sigma(),
-            &case.bathymetry,
-            case.bathymetry.n_elements.into(),
-        );
-        for l in 0..nl {
-            let level = |field: &[f64]| -> f64 {
-                (0..nn)
-                    .map(|i| case.geom.node_mass(2, i) * field[(2 * nn + i) * nl + l])
-                    .sum()
-            };
-            let value = out[(2 * nn) * nl + l];
-            for i in 0..nn {
-                assert_eq!(out[(2 * nn + i) * nl + l], value);
-            }
-            let (before, after) = (level(&inventory), level(&back));
-            assert!(
-                (before - after).abs() < 1e-13 * before.abs(),
-                "level {l}: {before} vs {after}"
-            );
-            // Element 3 too, with its dry node
-            let level_3 = |field: &[f64]| -> f64 {
-                (0..nn)
-                    .map(|i| case.geom.node_mass(3, i) * field[(3 * nn + i) * nl + l])
-                    .sum()
-            };
-            let (before, after) = (level_3(&inventory), level_3(&back));
-            assert!(
-                (before - after).abs() < 1e-13 * before.abs(),
-                "element 3, level {l}: {before} vs {after}"
-            );
-        }
-
-        // Regression (Frøya, 2026-10-03): a marked element keeps each node's
-        // departure from the level's mean, so a stratified element converts
-        // back to itself. With its last values the stratification that made
-        // its inventory, it is unchanged; the mean alone flattened it, and
-        // over a steep shoreline that drove 0.1–1 m/s at rest
-        let mut kept = vec![-1.0; concentration.len()];
-        let element_2 = 2 * nn * nl..3 * nn * nl;
-        kept[element_2.clone()].copy_from_slice(&concentration[element_2.clone()]);
-        from_inventory(
-            &inventory,
-            &eta,
-            case.sigma.d_sigma(),
-            &case.bathymetry,
-            &case.geom,
-            &marked,
-            &mut kept,
-            case.bathymetry.n_elements.into(),
-        );
-        let spread = concentration[element_2.clone()]
-            .iter()
-            .fold((f64::MAX, f64::MIN), |(a, b), &c| (a.min(c), b.max(c)));
+        assert_eq!(dry_nodes, nn + 2);
         assert!(
             spread.1 - spread.0 > 1e-3,
             "test regime: element 2 is stratified"
         );
-        for (got, c) in kept[element_2.clone()]
-            .iter()
-            .zip(&concentration[element_2])
-        {
-            assert!((got - c).abs() < 1e-12 * c.abs(), "{got} vs {c}");
+    }
+
+    /// The water a nodal residual moves within an element takes its tracer
+    /// with it ([`LayerTransport::add_volume_sources`]): the nodes that lose
+    /// water lose it at their own value, the nodes that gain it gain the
+    /// mean of what the others lost. A constant gets its volume's worth, the
+    /// element's inventory changes by its net source's only, and one
+    /// forward-Euler step leaves every node within the values the element
+    /// held, where one concentration for every node (the element's mean)
+    /// took a node that lost water away from the mean.
+    #[test]
+    fn a_nodal_residual_moves_its_tracer_with_its_water() {
+        let case = Case::closed();
+        let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
+        let n_el = case.mesh.n_elements;
+        let d_sigma = case.sigma.d_sigma();
+        let mut transport = LayerTransport::new(n_el, &case.ops, nl);
+        // Element 1: node 0 loses 3, node 4 loses 1, nodes 2 and 6 gain
+        // (by their masses) what the two lost; element 2: a net source too;
+        // element 3: the same residual, not pooled
+        let mass = |k: usize, i: usize| case.geom.node_mass(k, i);
+        let lost = |k: usize| 3e-4 * mass(k, 0) + 1e-4 * mass(k, 4);
+        for k in 1..4 {
+            let source = &mut transport.volume_source[k * nn..(k + 1) * nn];
+            source[0] = -3e-4;
+            source[4] = -1e-4;
+            let gain = if k == 2 { 1.5 } else { 1.0 } * lost(k);
+            source[2] = 0.25 * gain / mass(k, 2);
+            source[6] = 0.75 * gain / mass(k, 6);
+        }
+        let mut pooled = vec![false; n_el];
+        pooled[1] = true;
+        pooled[2] = true;
+        // A field that differs from node to node and level to level
+        let field: Vec<f64> = (0..n_el * nn * nl)
+            .map(|j| 8.0 + ((7 * j) % 13) as f64 * 0.4)
+            .collect();
+        let tendency = |field: &[f64]| {
+            let mut rhs = vec![0.0; n_el * nn * nl];
+            transport.add_volume_sources(
+                &mut rhs,
+                field,
+                d_sigma,
+                &case.geom,
+                &pooled,
+                n_el.into(),
+            );
+            rhs
+        };
+        // A constant: Δσ s C at every node, pooled or not
+        let constant = tendency(&vec![12.5; n_el * nn * nl]);
+        for (j, r) in constant.iter().enumerate() {
+            let expected = 12.5 * d_sigma[j % nl] * transport.volume_source[j / nl];
+            assert!((r - expected).abs() < 1e-18, "{r} vs {expected}");
+        }
+        let rhs = tendency(&field);
+        for l in 0..nl {
+            let at = |k: usize, i: usize| (k * nn + i) * nl + l;
+            let total = |k: usize| -> f64 { (0..nn).map(|i| mass(k, i) * rhs[at(k, i)]).sum() };
+            // Element 1: nothing but its own water moved
+            assert!(
+                total(1).abs() < 1e-13 * lost(1) * 10.0,
+                "level {l}: {}",
+                total(1)
+            );
+            // Element 2: the net source at the gaining nodes' own values
+            let pool = (3e-4 * mass(2, 0) * field[at(2, 0)] + 1e-4 * mass(2, 4) * field[at(2, 4)])
+                / lost(2);
+            let extra = 0.5 * lost(2) * (0.25 * field[at(2, 2)] + 0.75 * field[at(2, 6)]);
+            assert!(
+                (total(2) - d_sigma[l] * extra).abs() < 1e-13 * extra.abs(),
+                "level {l}: {} vs {}",
+                total(2),
+                d_sigma[l] * extra
+            );
+            for k in 1..3 {
+                // What leaves, at the node's own value
+                for i in [0, 4] {
+                    let s = transport.volume_source[k * nn + i];
+                    assert_eq!(rhs[at(k, i)], d_sigma[l] * s * field[at(k, i)]);
+                }
+            }
+            let gained = d_sigma[l] * transport.volume_source[2 * nn + 2];
+            let share = 1.0 / 1.5;
+            let expected = gained * (share * pool + (1.0 - share) * field[at(2, 2)]);
+            assert!((rhs[at(2, 2)] - expected).abs() < 1e-13 * expected.abs());
+            // Element 3: every node's own value
+            for i in 0..nn {
+                let s = transport.volume_source[3 * nn + i];
+                assert_eq!(rhs[at(3, i)], d_sigma[l] * s * field[at(3, i)]);
+            }
+
+            // One forward-Euler step of element 1, each node's layer 1 m
+            // thick: the new values within the element's
+            let dt = 2000.0;
+            let (low, high) = (0..nn)
+                .map(|i| field[at(1, i)])
+                .fold((f64::MAX, f64::MIN), |(a, b), x| (a.min(x), b.max(x)));
+            for i in 0..nn {
+                let s = transport.volume_source[nn + i];
+                let (old, new) = (d_sigma[l], d_sigma[l] * (1.0 + dt * s));
+                assert!(new > 0.2 * old, "test regime: node {i} keeps water");
+                let value = (old * field[at(1, i)] + dt * rhs[at(1, i)]) / new;
+                assert!(
+                    value >= low - 1e-12 && value <= high + 1e-12,
+                    "node {i}: {value} outside {low}..{high}"
+                );
+                // At the element's mean instead, the node that lost water
+                // and holds the level's extreme leaves the range
+                if s < 0.0
+                    && field[at(1, i)] == high.max(field[at(1, i)])
+                    && field[at(1, i)] == high
+                {
+                    let mean = (0..nn).map(|j| mass(1, j) * field[at(1, j)]).sum::<f64>()
+                        / (0..nn).map(|j| mass(1, j)).sum::<f64>();
+                    let at_mean = (old * high + dt * d_sigma[l] * s * mean) / new;
+                    assert!(at_mean > high, "{at_mean} vs {high}");
+                }
+            }
         }
     }
 

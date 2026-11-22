@@ -106,7 +106,8 @@ use crate::solver::rhs::ElementMassFluxes;
 use crate::solver::rhs::ElementRhsMassThen;
 use crate::solver::rhs::subcells::subcell_interfaces;
 use crate::solver::rhs::{
-    BarotropicFlux, MetricForm, from_inventory, subcell_divergence_element, to_inventory,
+    BarotropicFlux, MergedCells, MetricForm, StepWater, from_inventory, subcell_divergence_element,
+    to_inventory,
     transport_3d::{dry_inventories, from_inventory_after, inventory_of},
     transport_divergence_element, w_cell_thicknesses,
 };
@@ -132,7 +133,9 @@ pub const MIN_BAROTROPIC_SUBSTEPS: usize = 4;
 const MAX_BAROTROPIC_SUBSTEPS: usize = 1_000_000;
 
 /// Relative residual of `η̄ − ηⁿ = −Δt∇·DU_avg2` above which an element is
-/// treated as balanced only as a whole (round-off is ≈ 1e-13).
+/// treated as balanced only as a whole (round-off is ≈ 1e-13): its nodal
+/// residual is water moved between its nodes, which takes its tracers with
+/// it ([`crate::solver::rhs::LayerTransport::add_volume_sources`]).
 const NODAL_IDENTITY_TOLERANCE: f64 = 1e-9;
 
 /// ... and whose depth change over the step (relative to the element's
@@ -496,15 +499,16 @@ pub trait ModeSplitPhysics {
     /// every 3D stage `u⁽ⁱ⁾ = Σ_k α_ik u⁽ᵏ⁾ + β_i Δt L(u⁽ⁱ⁻¹⁾)`, with
     /// `dt[k] = β_i Δt_k` for element k (see
     /// [`crate::physics::implicit_advection`]), on the `elements` of that
-    /// call. The elements marked in `element_means` carry their fields as
-    /// element means for the step. By default nothing.
-    fn implicit_vertical_advection(
-        &self,
-        _stage: &mut Solution3D,
-        _elements: Blocks,
-        _dt: &[f64],
-        _element_means: &[bool],
-    ) {
+    /// call. By default nothing.
+    fn implicit_vertical_advection(&self, _stage: &mut Solution3D, _elements: Blocks, _dt: &[f64]) {
+    }
+
+    /// The depth (m) below which a column is thin: it carries its share of
+    /// the barotropic fluxes only, and where more water leaves its cell in
+    /// a stage than it holds, the splitter carries it with its neighbours
+    /// ([`crate::solver::rhs::MergedCells`]). By default none is.
+    fn min_column_depth(&self) -> f64 {
+        0.0
     }
 
     /// Runs on the 3D stage values a later stage's RHS reads (with the
@@ -1298,9 +1302,9 @@ impl BarotropicMultirate {
 struct Buffers {
     /// Horizontal momentum tendency `R₃D` at `tⁿ`, reused as the first 3D stage.
     rhs_n: Solution3D,
-    /// Elements where the pass kept only the element balance: their
-    /// inventory fields are element means per level for the step.
-    element_means: Vec<bool>,
+    /// Elements where the pass kept only the element balance: their nodal
+    /// residual is water moved between their nodes.
+    pooled: Vec<bool>,
     /// σ-thicknesses of the w-cells, for the turbulence's inventories.
     d_sigma_w: Vec<f64>,
     /// `∇·DU_avg2` of the step.
@@ -1342,6 +1346,12 @@ struct Buffers {
     layer_drag_rate: Vec<f64>,
     /// Its column mean `Λ̄ = Σ_l Δσ_l λ_l`.
     column_drag_rate: Vec<f64>,
+    /// The water of every column that no flux of the pass carried (m/s):
+    /// `∂η/∂t + ∇·DU_avg2` less the rivers'.
+    column_source: Vec<f64>,
+    /// The thin cells that lose more than their water in a stage, with the
+    /// neighbours they are carried with through the step.
+    merged: MergedCells,
 }
 
 impl Buffers {
@@ -1351,7 +1361,7 @@ impl Buffers {
         let n_subcell_values = ne * subcell_interfaces(ops.n_1d);
         Self {
             rhs_n: Solution3D::new(ne, nn, state.n_levels),
-            element_means: vec![false; ne],
+            pooled: vec![false; ne],
             d_sigma_w: vec![0.0; state.n_levels + 1],
             transport_divergence: DGSolution2D::new(ne, nn),
             q: SWESolution2D::new(ne, nn),
@@ -1375,6 +1385,8 @@ impl Buffers {
             drag_rate: vec![0.0; ne * nn],
             layer_drag_rate: Vec::new(),
             column_drag_rate: Vec::new(),
+            column_source: vec![0.0; ne * nn],
+            merged: MergedCells::new(ne, nn),
         }
     }
 }
@@ -1935,6 +1947,17 @@ impl ModeSplitIntegrator {
 
     /// Barotropic substeps per baroclinic step used by the last step (0 before
     /// the first step).
+    /// The thin cells carried with their neighbours because more water
+    /// left them in a stage than they held, and the cells of the groups
+    /// that kept their values because even their whole element did not hold
+    /// it (the one case in which a tracer's inventory is not kept), summed
+    /// over the steps so far ([`crate::solver::rhs::MergedCells`]).
+    pub fn merged_cells(&self) -> [usize; 2] {
+        self.buffers
+            .as_ref()
+            .map_or([0; 2], |buffers| buffers.merged.counts())
+    }
+
     pub fn last_substeps(&self) -> usize {
         self.filter.as_ref().map_or(0, BarotropicFilter::n_bt)
     }
@@ -1969,7 +1992,9 @@ impl ModeSplitIntegrator {
         }
         let Buffers {
             rhs_n,
-            element_means,
+            pooled,
+            column_source,
+            merged,
             d_sigma_w,
             transport_divergence,
             q,
@@ -2240,15 +2265,15 @@ impl ModeSplitIntegrator {
         });
         let geom = barotropic.geometry();
         // Elements where the pass broke the nodal identity ∂η/∂t = −∇·DU_avg2
-        // (WetDry subcells, positivity limiter) carry their tracers as element
-        // means for the step
+        // (WetDry subcells, positivity limiter): their nodal residual is
+        // water moved between their nodes
         transport.divergence_into(
             barotropic.operators(),
             geom,
             barotropic.metric_form(),
             transport_divergence,
         );
-        for (k, mark) in element_means.iter_mut().enumerate() {
+        for (k, mark) in pooled.iter_mut().enumerate() {
             let nodes = k * nn..(k + 1) * nn;
             let bed = bathymetry.element(ElementIndex::new(k));
             let (mut residual, mut scale, mut depth) = (0.0_f64, 0.0_f64, 0.0_f64);
@@ -2263,6 +2288,7 @@ impl ModeSplitIntegrator {
                 .enumerate()
             {
                 let source = river_inflow.map_or(0.0, |r| r.volume_rate(k, node));
+                column_source[k * nn + node] = rate + div - source;
                 let r = (rate + div - source - mass).abs();
                 residual = residual.max(r);
                 scale = scale
@@ -2280,15 +2306,73 @@ impl ModeSplitIntegrator {
                 && residual * dt > DEPTH_ROUND_OFF * depth)
                 || constancy > CONSTANCY_TOLERANCE;
         }
-        let means: &[bool] = element_means;
+        let pooled: &[bool] = pooled;
         w_cell_thicknesses(sigma.d_sigma(), d_sigma_w);
         // The σ-thicknesses of the cells of each inventory field
         let cells = [sigma.d_sigma(), &d_sigma_w[..]];
         let cells_of = |field: usize| cells[usize::from(field >= N_LAYER_FIELDS)];
+        // The 3D stages' steps: each element's forward-Euler step
+        let ne = state.n_elements;
+        let scheme = self.baroclinic_scheme;
+        let levels = self.baroclinic_levels;
+        let stages_3d = self
+            .stages_3d
+            .get_or_insert_with(|| Stages3D::new(state, scheme, levels));
+        stages_3d.fit(state);
+        if levels == 0 {
+            stages_3d.stepper.assign_one_level(ne);
+        } else {
+            assert!(
+                std::mem::take(&mut stages_3d.assigned),
+                "assign_baroclinic_levels before every step with local time stepping"
+            );
+        }
+        for (k, &level) in stages_3d.stepper.levels().iter().enumerate() {
+            let dt_l = dt / (1u64 << level) as f64;
+            stages_3d.euler_dt[k] = dt_l / scheme.ssp_coefficient();
+        }
+        // The thin cells that lose more than their water in a stage are
+        // carried with their neighbours, as one cell from the step's start
+        merged.find(&StepWater {
+            mesh: barotropic.mesh(),
+            ops: barotropic.operators(),
+            geom,
+            bathymetry,
+            eta: &state.eta.data,
+            eta_rate: &rate_eta.data,
+            dt,
+            euler_dt: &stages_3d.euler_dt,
+            face: &transport.face,
+            subcell: &transport.subcell,
+            source: column_source,
+            thin_depth: physics.min_column_depth(),
+        });
+        if !merged.elements().is_empty() {
+            let Solution3D {
+                eta,
+                temp,
+                salt,
+                tke,
+                gls,
+                ..
+            } = &mut *state;
+            let fields = [temp, salt, tke, gls].into_iter().enumerate();
+            for (slot, field) in fields.filter(|(_, field)| !field.is_empty()) {
+                let cells = cells_of(N_MOMENTUM_FIELDS + slot);
+                merged.start(field, cells, &eta.data, bathymetry, geom);
+            }
+            // Their density, which the stages read
+            physics.end_density(state, blocks_of(ne, merged.elements()));
+        }
+        let merged: &MergedCells = merged;
+        // The tracers and the turbulence of a group of cells are one
+        // cell's; the momentum is each node's own (a thin column's is the
+        // depth mean's)
+        let merged_of = |field: usize| (field >= N_MOMENTUM_FIELDS).then_some(merged);
         // Inventories of `s` → velocities and concentrations in `out`'s
         // inventory fields (which hold the last values, kept where there is
         // no water), on `elements`
-        let to_values = |s: &Solution3D, out: &mut Solution3D, elements: Blocks| {
+        let to_values = |s: &Solution3D, out: &mut Solution3D, elements: Blocks, end: bool| {
             let eta = &s.eta.data;
             let fields = inventory_fields(s)
                 .into_iter()
@@ -2296,7 +2380,8 @@ impl ModeSplitIntegrator {
             for (field, (q, out)) in fields.enumerate() {
                 if !q.is_empty() {
                     let cells = cells_of(field);
-                    from_inventory(q, eta, cells, bathymetry, geom, means, out, elements);
+                    let merged = merged_of(field);
+                    from_inventory(q, eta, cells, bathymetry, geom, merged, out, elements, end);
                 }
             }
         };
@@ -2330,7 +2415,7 @@ impl ModeSplitIntegrator {
             let Some(from) = from else {
                 stash.restore_into(values, elements);
                 copy_barotropic_rows(inv, values, elements);
-                to_values(inv, values, elements);
+                to_values(inv, values, elements, false);
                 return;
             };
             // Each field in one pass, element by element: the last values
@@ -2350,8 +2435,10 @@ impl ModeSplitIntegrator {
                     out_k.copy_from_slice(&last[k * len..(k + 1) * len]);
                     from.stash.restore_velocity(field, k, nn, out_k);
                 };
-                let cells = cells_of(field);
-                from_inventory_after(q, eta, cells, bathymetry, geom, means, out, elements, last);
+                let (cells, merged) = (cells_of(field), merged_of(field));
+                from_inventory_after(
+                    q, eta, cells, bathymetry, geom, merged, out, elements, false, last,
+                );
             }
             copy_barotropic_rows(inv, values, elements);
         };
@@ -2375,8 +2462,18 @@ impl ModeSplitIntegrator {
                 profiling::scope("3d: post_stage", || physics.post_stage(values, elements));
             }
             let convert = profiling::start();
+            // (not a flushed element's, whose values are not its inventory's)
             for (q, c) in [(&mut inv.temp, &values.temp), (&mut inv.salt, &values.salt)] {
-                inventory_of(q, c, &inv.eta.data, sigma.d_sigma(), bathymetry, elements);
+                let cells = sigma.d_sigma();
+                inventory_of(
+                    q,
+                    c,
+                    &inv.eta.data,
+                    cells,
+                    bathymetry,
+                    Some(merged),
+                    elements,
+                );
             }
             // Where a node has (almost) no water its value is the last one:
             // its inventory is that value's, as for T and S, so that it wets
@@ -2396,7 +2493,8 @@ impl ModeSplitIntegrator {
                 (5, gls, &values.gls),
             ] {
                 if !q.is_empty() {
-                    dry_inventories(q, c, &eta.data, cells_of(field), bathymetry, elements);
+                    let (cells, merged) = (cells_of(field), merged_of(field));
+                    dry_inventories(q, c, &eta.data, cells, bathymetry, merged, elements);
                 }
             }
             stash.forget(elements);
@@ -2404,21 +2502,6 @@ impl ModeSplitIntegrator {
             profiling::stop("3d: hook conversions", convert);
         };
 
-        let ne = state.n_elements;
-        let scheme = self.baroclinic_scheme;
-        let levels = self.baroclinic_levels;
-        let stages_3d = self
-            .stages_3d
-            .get_or_insert_with(|| Stages3D::new(state, scheme, levels));
-        stages_3d.fit(state);
-        if levels == 0 {
-            stages_3d.stepper.assign_one_level(ne);
-        } else {
-            assert!(
-                std::mem::take(&mut stages_3d.assigned),
-                "assign_baroclinic_levels before every step with local time stepping"
-            );
-        }
         let shu_osher = scheme.stages();
         let n_stages = shu_osher.len();
         let inventory_slot: Vec<usize> =
@@ -2460,7 +2543,7 @@ impl ModeSplitIntegrator {
             subcell: &transport.subcell,
             eta_rate: &rate_eta.data,
             rivers: river_inflow,
-            element_means: means,
+            pooled,
         };
         let all = Blocks::All(ne);
         // The values the substeps' first RHS reads: the step's start, masked
@@ -2479,6 +2562,23 @@ impl ModeSplitIntegrator {
             physics.mask_stage(values, all, stash);
         }
         to_inventories(state, all);
+        // What a flushed element's nodes show to the first stage: what
+        // passes through it
+        if !merged.elements().is_empty() {
+            let StageValues { values, .. } = &mut values[start_slot];
+            let fields = inventory_fields(state)
+                .into_iter()
+                .zip(inventory_fields_mut(values))
+                .enumerate()
+                .skip(N_MOMENTUM_FIELDS);
+            for (field, (q, out)) in fields {
+                if !q.is_empty() {
+                    let cells = cells_of(field);
+                    let eta = &state.eta.data;
+                    merged.pass_through(q, eta, cells, bathymetry, geom, out, all, false);
+                }
+            }
+        }
         let substeps = 1usize << stepper.finest_level();
         let mut finished = 0;
         let stage_time = profiling::start();
@@ -2561,7 +2661,7 @@ impl ModeSplitIntegrator {
                 // The implicit part of the vertical advection, on the
                 // stage's inventories and thicknesses
                 profiling::scope("3d: implicit vertical advection", || {
-                    physics.implicit_vertical_advection(out, elements, &implicit_dt[s], means)
+                    physics.implicit_vertical_advection(out, elements, &implicit_dt[s])
                 });
                 if read == write {
                     stage_values(out, &mut values[write], None, elements, end);
@@ -2629,7 +2729,8 @@ impl ModeSplitIntegrator {
                         .zip(inventory_fields(values));
                     for (field, (q, c)) in fields.enumerate() {
                         if !q.is_empty() {
-                            inventory_of(q, c, &eta.data, cells_of(field), bathymetry, elements);
+                            let (cells, merged) = (cells_of(field), merged_of(field));
+                            inventory_of(q, c, &eta.data, cells, bathymetry, merged, elements);
                         }
                     }
                     stash.forget(elements);
@@ -2667,7 +2768,7 @@ impl ModeSplitIntegrator {
         // Inventories back to velocities and concentrations, with the new H_z
         // (the last values where there is no water are the last stage's)
         profiling::scope("split: final conversion", || {
-            to_values(state, concentrations, all);
+            to_values(state, concentrations, all, true);
             for (x, y) in inventory_fields_mut(state)
                 .into_iter()
                 .zip(inventory_fields_mut(concentrations))
@@ -3169,6 +3270,8 @@ fn inventory_fields_mut(state: &mut Solution3D) -> [&mut Vec<f64>; 6] {
 
 /// How many of [`inventory_fields`] live on the layers.
 const N_LAYER_FIELDS: usize = 4;
+/// The first inventory fields are the momentum's (`u`, `v`).
+const N_MOMENTUM_FIELDS: usize = 2;
 
 /// Shift the columns of `elements` of `state.u` and `state.v` uniformly so
 /// that their depth means are `ū` and `v̄` (as [`depth_average`] and

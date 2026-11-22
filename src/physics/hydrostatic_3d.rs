@@ -141,6 +141,10 @@ where
     /// The optical water type that absorbs the shortwave of
     /// `surface_fluxes` (see [`Self::with_shortwave_absorption`]).
     pub shortwave_absorption: JerlovWater,
+    /// The bed's share in the thin columns' heat and freshwater fluxes, as
+    /// a depth of water (m), if they take any (see
+    /// [`Self::with_thin_column_fluxes`]).
+    pub thin_column_bed: Option<f64>,
     pub g: f64,
     pub rho0: f64,
     /// Temperature of water flowing in through a physical boundary (walls
@@ -288,6 +292,41 @@ impl TimeStepLimit {
     }
 }
 
+/// The lowest and highest temperature and salinity of a 3D state, in the
+/// columns at least the thin depth deep and in the thinner ones
+/// ([`Hydrostatic3D::tracer_ranges`]): a run's progress line. A thin column
+/// takes no surface flux and its transport is monotone, so its range lies
+/// within the range the others have had; one that does not is a defect
+/// (TODO P4.5: thin columns at 3.6–29.0 °C beside 5.3–15.3 °C in a 72 h
+/// run).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TracerRanges {
+    /// `[(T low, T high), (S low, S high)]` over the columns at least the
+    /// thin depth deep; `None` without one.
+    pub resolved: Option<[(f64, f64); 2]>,
+    /// The same over the thin columns, dry nodes included.
+    pub thin: Option<[(f64, f64); 2]>,
+}
+
+impl std::fmt::Display for TracerRanges {
+    /// `T 8.19 to 11.07 °C (thin 9.92 to 11.03), S 32.99 to 33.94 (thin
+    /// 33.00 to 33.36)`; `none` where there is no such column.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pair = |ranges: Option<[(f64, f64); 2]>, j: usize| match ranges {
+            Some(ranges) => format!("{:.2} to {:.2}", ranges[j].0, ranges[j].1),
+            None => "none".to_string(),
+        };
+        write!(
+            f,
+            "T {} °C (thin {}), S {} (thin {})",
+            pair(self.resolved, 0),
+            pair(self.thin, 0),
+            pair(self.resolved, 1),
+            pair(self.thin, 1)
+        )
+    }
+}
+
 /// The bounds of [`Hydrostatic3D::compute_dt_ssp`]
 /// ([`Hydrostatic3D::time_step_limits`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -389,6 +428,7 @@ where
             surface_roughness: None,
             surface_fluxes: None,
             shortwave_absorption: JerlovWater::default(),
+            thin_column_bed: None,
             g,
             rho0,
             temp_bc: Arc::new(ExtrapolationTracerBC3D),
@@ -632,8 +672,11 @@ where
     ///
     /// Where the pass still kept an element's balance only as a whole (it
     /// switched to the subcells during the step, or the positivity limiter
-    /// changed it), the mode splitter carries its tracers as element means
-    /// per level ([`crate::solver::rhs::from_inventory`]).
+    /// changed it), the water it moved between the element's nodes takes
+    /// their tracers with it
+    /// ([`crate::solver::rhs::LayerTransport::add_volume_sources`]); a thin
+    /// column's tracers stay within the range of the water that reaches it
+    /// as far as `crate::solver::rhs::transport_3d` says.
     ///
     /// Everything else stays 3D, including the wet nodes of shoreline
     /// elements.
@@ -974,6 +1017,32 @@ where
         self
     }
 
+    /// Give the thin columns ([`Self::with_min_column_depth`]) the surface
+    /// heat and freshwater fluxes too (by default they take none: a tidal
+    /// flat under a metre of water neither warms nor cools). A thin column
+    /// with water takes them over its whole depth `D`, in one piece with
+    /// the bed under it, which holds heat and salt as `bed_depth` m of
+    /// water does: every level changes by the flux over `D + bed_depth`
+    /// (see [`crate::physics::apply_vertical_diffusion`]; about 0.1 m for
+    /// the sediment a day's heat reaches). So a sunlit flat warms as a flat
+    /// does, and a film no faster than `bed_depth` of water: 7 °C an hour
+    /// under 800 W/m² at 0.1 m. The bed's share of the fluxes leaves the
+    /// model.
+    ///
+    /// Where a thin column lies beside deep water (a cliff shore), its
+    /// levels hold the deep column's levels' water, which the tide takes
+    /// back level by level: the heat it took at the surface then reaches
+    /// the deep column's lower levels too, by the thin column's share of
+    /// their water in a tide.
+    pub fn with_thin_column_fluxes(mut self, bed_depth: f64) -> Self {
+        assert!(
+            bed_depth > 0.0,
+            "the bed's depth of water must be positive, got {bed_depth}"
+        );
+        self.thin_column_bed = Some(bed_depth);
+        self
+    }
+
     /// A surface roughness `z₀ₛ` (m) per column (`[element][node]`), for a
     /// closure with one (GLS: the larger of it and its own, then Charnock's).
     /// From waves, Terray et al.'s (1996) `z₀ₛ ≈ 0.6 H_s` (ROMS `ZOS_HSIG`):
@@ -1178,6 +1247,25 @@ where
         }
     }
 
+    /// The range of `state`'s temperature and salinity in the columns that
+    /// are not thin and in the thin ones, dry nodes included (see
+    /// [`TracerRanges`]).
+    pub fn tracer_ranges(&self, state: &Solution3D) -> TracerRanges {
+        let nl = state.n_levels;
+        // [not thin, thin][T, S]
+        let mut seen = [[(f64::INFINITY, f64::NEG_INFINITY); 2]; 2];
+        for idx in 0..state.eta.data.len() {
+            let kind = &mut seen[usize::from(self.is_thin(state, idx))];
+            for (range, field) in kind.iter_mut().zip([&state.temp, &state.salt]) {
+                for &x in &field[idx * nl..(idx + 1) * nl] {
+                    *range = (range.0.min(x), range.1.max(x));
+                }
+            }
+        }
+        let [resolved, thin] = seen.map(|ranges| (ranges[0].0 <= ranges[0].1).then_some(ranges));
+        TracerRanges { resolved, thin }
+    }
+
     /// Whether the column at node `idx` (`[element][node]`) is thin.
     #[inline]
     fn is_thin(&self, state: &Solution3D, idx: usize) -> bool {
@@ -1326,6 +1414,7 @@ where
             &self.bathymetry,
             &self.sigma,
             &self.tracer_limiter,
+            self.min_column_depth,
             elements,
         );
         crate::profiling::stop("3d: tracer limiter", limiter);
@@ -1592,7 +1681,7 @@ where
             drop(fields);
             // The water no transport carries (the 2D module's own mass
             // sources) at the concentrations and velocities it joins
-            let means = barotropic.element_means;
+            let pooled = barotropic.pooled;
             for (out, field) in [
                 (&mut rhs.temp, &state.temp),
                 (&mut rhs.salt, &state.salt),
@@ -1603,10 +1692,8 @@ where
                     out,
                     field,
                     self.sigma.d_sigma(),
-                    &state.eta.data,
-                    &self.bathymetry,
                     &self.geom,
-                    means,
+                    pooled,
                     elements,
                 );
             }
@@ -1708,10 +1795,8 @@ where
                 out,
                 field,
                 &d_sigma_w,
-                &state.eta.data,
-                &self.bathymetry,
                 &self.geom,
-                barotropic.element_means,
+                barotropic.pooled,
                 elements,
             );
         }
@@ -2628,13 +2713,7 @@ where
 
     /// The implicit part of `Ω` of the last [`Self::transport_rhs_into`],
     /// if any ([`Self::with_implicit_vertical_advection`]).
-    fn implicit_vertical_advection(
-        &self,
-        stage: &mut Solution3D,
-        elements: Blocks,
-        dt: &[f64],
-        element_means: &[bool],
-    ) {
+    fn implicit_vertical_advection(&self, stage: &mut Solution3D, elements: Blocks, dt: &[f64]) {
         if self.implicit_vertical_advection.is_none() {
             return;
         }
@@ -2651,8 +2730,6 @@ where
             self.sigma.d_sigma(),
             &split.d_sigma_w,
             &self.bathymetry,
-            &self.geom,
-            element_means,
             elements,
             dt,
         );
@@ -2660,6 +2737,10 @@ where
 
     fn initial_turbulence(&self) -> Option<[f64; 2]> {
         self.mixing.initial_turbulence()
+    }
+
+    fn min_column_depth(&self) -> f64 {
+        self.min_column_depth
     }
 
     /// The vertical diffusion with the surface stress and fluxes at the
@@ -2695,6 +2776,7 @@ where
                     stress: field,
                     roughness: self.surface_roughness.as_deref(),
                     tracers,
+                    thin_bed: self.thin_column_bed,
                 },
                 self.g,
                 self.rho0,

@@ -1,0 +1,83 @@
+# The tidal channel of `case.toml` in 3D: 20 σ-layers of velocity, temperature
+# and salinity under the depth mean, needing no data.
+#
+# The water starts at rest, stratified by `[three_d] profile` (12 °C and 32
+# at the surface, 8 °C and 34.5 at 30 m). The tide floods and drains the
+# flats at the head: columns shallower than `three_d.thin_depth_m` (1 m)
+# carry no shear, and nodes fall dry. Every progress line gives the range of
+# T and S in the columns that are at least that deep and in the thinner
+# ones, dry nodes included; the thin columns' range lies within what the
+# others have had (they take no surface flux, and their transport makes no
+# new extreme: notes/3d-numerics.md, P4.5).
+#
+#   dgcom run cases/tidal_channel/three_d.toml   # half a minute in a release build
+#
+# Output goes to cases/tidal_channel/output/tidal_channel_3d/ (the 3D state
+# in tidal_channel_3d.dgsnap, for the viewer). Every `[three_d]` key and its
+# default: the `dgcom::case::schema` documentation.
+
+[run]
+name = "tidal_channel_3d"
+start = "2025-06-15T00:00:00Z"  # tidal phases below are Greenwich lags
+duration_hours = 25.0
+
+[mesh]
+order = 2
+drop_land = false               # keep the flats above mean sea level: they flood
+
+[mesh.rectangle]
+x_m = [0.0, 40000.0]
+y_m = [0.0, 4000.0]
+nx = 40
+ny = 4
+west = "open"                   # the other sides are walls
+
+[bathymetry.ramp]               # depth along the channel, constant across it
+from_m = [0.0, 2000.0]
+to_m = [40000.0, 2000.0]
+depth_m = [30.0, -2.0]          # negative: land at mean sea level
+
+[physics]
+coriolis = { latitude = 63.5 }  # the bed's drag is the 3D model's (three_d.bottom_roughness_m)
+
+[three_d]
+levels = 20
+# The start: T (°C) and S at heights z (m), from the top down
+profile = [[0.0, 12.0, 32.0], [-10.0, 10.0, 33.5], [-30.0, 8.0, 34.5]]
+
+[[boundary]]
+tag = "open"
+# The tide gives a level only, so the boundary needs a velocity outside:
+# "at_rest" (the default) holds the level at an antinode of a standing tide,
+# and a wave entering from outside arrives at half the amplitude below;
+# "incoming_wave" delivers a progressive tide at the full amplitude.
+velocity = "at_rest"
+[boundary.tide]
+ramp_hours = 2.0
+constituents = [
+  { name = "M2", amplitude_m = 1.0, phase_deg = 0.0 },
+  { name = "S2", amplitude_m = 0.35, phase_deg = 30.0 },
+]
+
+[output]
+interval_minutes = 30.0
+
+[[output.station]]
+name = "mouth"
+x_m = 2000.0
+y_m = 2000.0
+
+[[output.station]]
+name = "middle"
+x_m = 20000.0
+y_m = 2000.0
+
+[[output.station]]
+name = "head"
+x_m = 34000.0
+y_m = 2000.0
+# A station samples in open water: its surface where it is if its element is
+# at least `open_water_depth_m` deep (3 m by default), else in the nearest such
+# element; its current where the bed is that deep (`station_points.csv` lists
+# both points). The head is 2.8 m deep and stays wet through the tide.
+open_water_depth_m = 1.0

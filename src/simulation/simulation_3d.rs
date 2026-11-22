@@ -3046,8 +3046,9 @@ mod tests {
     }
 
     /// TODO P4.5 gate: on the beach, uniform T and S stay uniform (constancy
-    /// in the shoreline elements, whose tracers are element means per level)
-    /// and stratified tracers keep their inventories.
+    /// in the shoreline elements, whose nodal residual moves its tracers
+    /// with its water and whose film cells are merged with their
+    /// neighbours) and stratified tracers keep their inventories.
     /// The turbulence at the w-points, advected over the w-cells, too.
     #[test]
     fn beach_tracers_are_constant_and_conserved() {
@@ -3146,8 +3147,7 @@ mod tests {
     }
 
     /// TODO P1.3 gate: [`beach_tracers_are_constant_and_conserved`] with the
-    /// vertical advection implicit, through the shoreline elements whose
-    /// fields are element means per level.
+    /// vertical advection implicit, through the shoreline elements.
     #[test]
     fn beach_tracers_are_constant_and_conserved_with_implicit_vertical_advection() {
         let (physics, mut state, _) = beach_3d(0.3);
@@ -5393,7 +5393,7 @@ mod tests {
         let subcell = vec![f64::NAN; ne * n_sub];
         let eta_rate = vec![1e-5; ne * nn];
         let euler_dt = vec![150.0; ne];
-        let means = vec![false; ne];
+        let pooled = vec![false; ne];
         let barotropic = BarotropicFlux {
             dt: 300.0,
             euler_dt: &euler_dt,
@@ -5403,7 +5403,7 @@ mod tests {
             subcell: &subcell,
             eta_rate: &eta_rate,
             rivers: None,
-            element_means: &means,
+            pooled: &pooled,
         };
         let rhs = |elements: Blocks| {
             let mut out = Solution3D::new(ne, nn, nl);

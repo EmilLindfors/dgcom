@@ -4270,7 +4270,7 @@ fn tidal_run_3d<'a>(
         None => None,
     };
     println!(
-        "  time  |  η range (m)     | max |ū| (m/s) at (x, y km; h m) | max |u| (m/s), level at (x, y km; h m, element) | T range (°C), in thin columns | wall"
+        "  time  |  η range (m)     | max |ū| (m/s) at (x, y km; h m) | max |u| (m/s), level at (x, y km; h m, element) | T range (°C), in thin and dry columns | S range, in thin and dry columns | wall"
     );
 
     let mut q = domain.at_rest();
@@ -4530,20 +4530,8 @@ fn tidal_run_3d<'a>(
             let (x, y, h) = stats.fastest;
             // The fastest layer of a column at least the thin depth deep
             let (mut fastest, mut level, mut column) = (0.0_f64, 0, 0);
-            let (mut t_lo, mut t_hi) = (f64::INFINITY, f64::NEG_INFINITY);
-            // T in the thin (shore) columns too, where a drift is held at
-            // first and shows in the deeper columns only once it spreads; not
-            // the dry ones (under 1 μm), which keep their last value
-            let (mut thin_lo, mut thin_hi) = (f64::INFINITY, f64::NEG_INFINITY);
             for (idx, &b) in bed.iter().enumerate() {
-                let depth = s.eta.data[idx] - b;
-                if depth < opts.thin_depth() {
-                    if depth >= 1e-6 {
-                        for &temp in &s.temp[idx * nl..(idx + 1) * nl] {
-                            thin_lo = thin_lo.min(temp);
-                            thin_hi = thin_hi.max(temp);
-                        }
-                    }
+                if s.eta.data[idx] - b < opts.thin_depth() {
                     continue;
                 }
                 for l in 0..nl {
@@ -4552,22 +4540,24 @@ fn tidal_run_3d<'a>(
                     if speed.is_nan() || speed > fastest {
                         (fastest, level, column) = (speed, l, idx);
                     }
-                    t_lo = t_lo.min(s.temp[j]);
-                    t_hi = t_hi.max(s.temp[j]);
                 }
             }
+            // T and S in the thin (shore) columns too, the dry nodes with
+            // them: they lie within what the other columns have had (a thin
+            // column takes no surface flux, and its transport makes no new
+            // extreme: TODO P4.5)
+            let ranges = physics.tracer_ranges(s);
+            let pair = |ranges: Option<[(f64, f64); 2]>, j: usize| match ranges {
+                Some(r) => format!("{:5.2}–{:5.2}", r[j].0, r[j].1),
+                None => "none".to_string(),
+            };
             let [fx, fy] = domain.mesh.reference_to_physical(
                 ElementIndex::new(column / nn),
                 domain.ops.nodes_r[column % nn],
                 domain.ops.nodes_s[column % nn],
             );
-            let thin = if thin_lo <= thin_hi {
-                format!("{thin_lo:5.2}–{thin_hi:5.2}")
-            } else {
-                "none".to_string()
-            };
             println!(
-                "{:6.2} h | [{:+.3}, {:+.3}] | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {fastest:5.2}, level {level:2} at ({:6.1}, {:6.1}; {:5.1} m, element {}) | {t_lo:5.2}–{t_hi:5.2}, {thin} | {:.0} s",
+                "{:6.2} h | [{:+.3}, {:+.3}] | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {fastest:5.2}, level {level:2} at ({:6.1}, {:6.1}; {:5.1} m, element {}) | {}, {} | {}, {} | {:.0} s",
                 t / 3600.0,
                 stats.eta.0,
                 stats.eta.1,
@@ -4578,6 +4568,10 @@ fn tidal_run_3d<'a>(
                 fy / 1e3,
                 s.eta.data[column] - bed[column],
                 column / nn,
+                pair(ranges.resolved, 0),
+                pair(ranges.thin, 0),
+                pair(ranges.resolved, 1),
+                pair(ranges.thin, 1),
                 start.elapsed().as_secs_f64()
             );
             if let Some(restarts) = restarts.as_mut().filter(|r| r.due(t)) {

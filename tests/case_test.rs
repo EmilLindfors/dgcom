@@ -726,6 +726,57 @@ fn a_stratified_basin_at_rest_stays_at_rest_in_3d() {
     );
 }
 
+/// The shipped 3D example (`cases/tidal_channel/three_d.toml`, shortened)
+/// runs, and every progress line carries the range of T and S in the
+/// columns at least the thin depth deep and in the thinner ones, dry nodes
+/// included. The thin ones' lies within what the others have had (TODO
+/// P4.5: a thin column takes no surface flux and its transport makes no new
+/// extreme), so the next run shows a defect there without a script.
+#[test]
+fn the_3d_example_reports_its_tracer_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let example = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/cases/tidal_channel/three_d.toml"
+    );
+    let overrides = [
+        "run.duration_hours=2".to_string(),
+        format!("output.directory={:?}", dir.path().display().to_string()),
+    ];
+    let file = CaseFile::read(Path::new(example), &overrides).unwrap();
+    // The others' range so far, [T, S], from the start's range of every
+    // column (the land starts at the profile's surface values)
+    let mut had = [(f64::INFINITY, f64::NEG_INFINITY); 2];
+    let (mut lines, mut last) = (0, String::new());
+    let report = file
+        .run(&mut |p| {
+            let ranges = p.tracers.expect("a 3D run reports its tracers");
+            let resolved = ranges.resolved.expect("columns that are not thin");
+            let thin = ranges.thin.expect("thin columns: the flats");
+            for ((had, resolved), thin) in had.iter_mut().zip(resolved).zip(thin) {
+                *had = (had.0.min(resolved.0), had.1.max(resolved.1));
+                if p.time_s == 0.0 {
+                    *had = (had.0.min(thin.0), had.1.max(thin.1));
+                }
+                assert!(
+                    thin.0 >= had.0 - 1e-9 && thin.1 <= had.1 + 1e-9,
+                    "{:.2} h: thin columns at {thin:?} beside {had:?}",
+                    p.time_s / 3600.0
+                );
+            }
+            lines += 1;
+            last = ranges.to_string();
+        })
+        .unwrap();
+    assert_eq!(lines, 5, "a line every half hour");
+    assert!(report.notes.iter().any(|n| n.contains("three_d.profile")));
+    // `T 8.31 to 12.00 °C (thin 11.86 to 12.00), S 32.00 to 34.35 (thin …)`
+    assert!(
+        last.starts_with("T 8.") && last.contains(" °C (thin 11.") && last.contains("), S 3"),
+        "{last}"
+    );
+}
+
 /// A 3D run's stations are recorded at their times, between its steps by
 /// linear interpolation: with the fields hourly (the steps land on them)
 /// and the stations every 10 minutes, the series is the one of the run whose

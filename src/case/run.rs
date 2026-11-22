@@ -62,6 +62,10 @@ pub struct Progress {
     pub max_film_speed: f64,
     /// Largest significant wave height (m), with `[waves]`
     pub max_hs: Option<f64>,
+    /// In a 3D run, the range of temperature and salinity in the columns
+    /// at least the thin depth deep and in the thinner ones, dry nodes
+    /// included: the thin ones' lies within what the others have had
+    pub tracers: Option<crate::physics::TracerRanges>,
 }
 
 impl Progress {
@@ -93,6 +97,7 @@ impl Progress {
             max_speed: of.2,
             max_film_speed: films.2,
             max_hs: None,
+            tracers: None,
         }
     }
 }

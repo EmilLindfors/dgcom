@@ -19,8 +19,12 @@
 //!
 //! So the heat content `ρ₀ c_p ∫ T dz` of a column changes by exactly
 //! `Δt (Q_ns + Q_sw)` over a step, and its salt `∫ S dz` by `Δt S F/ρ_fw`.
-//! Columns thinner than the minimum column depth take no fluxes (their
-//! tracers are the 3D model's to mask). Implementations:
+//! Columns thinner than the minimum column depth take no fluxes, unless
+//! asked for
+//! ([`Hydrostatic3D::with_thin_column_fluxes`](crate::physics::Hydrostatic3D::with_thin_column_fluxes)):
+//! then such a column takes them over its whole depth together with the bed
+//! under it, so that a film warms no faster than a given depth of water.
+//! Implementations:
 //! [`crate::source::GriddedSurfaceFluxes`] (the COARE 3.5 bulk formulae on a
 //! weather model's fields), and anything with a closed form for tests.
 

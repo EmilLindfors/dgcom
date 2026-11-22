@@ -164,6 +164,10 @@ impl<P: ModeSplitPhysics> ModeSplitPhysics for Timed<'_, P> {
         self.inner.stage_stencils()
     }
 
+    fn min_column_depth(&self) -> f64 {
+        self.inner.min_column_depth()
+    }
+
     fn mask_stage(
         &self,
         state: &mut Solution3D,
