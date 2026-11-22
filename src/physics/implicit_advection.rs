@@ -60,8 +60,8 @@
 //!   thickness.
 //!
 //! The implicit part diffuses with `κ ≈ |Ω_i|H_z/2` where it acts, as ROMS's
-//! implicit part does; it is not reconstructed about the vertical reference
-//! stratification ([`crate::physics::Hydrostatic3D::with_vertical_reference`]),
+//! implicit part does; it is not reconstructed about the reference
+//! stratification ([`crate::physics::Hydrostatic3D::with_reference_profile`]),
 //! whose correction needs the explicit centred value. Columns below `c_min`,
 //! where every stratified rest state lives, are advected as before, bit for
 //! bit.

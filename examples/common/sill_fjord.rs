@@ -526,7 +526,7 @@ pub fn run(config: &Config, mut progress: impl FnMut(&Progress)) -> Outcome {
     let mut finite = true;
     while t < t_end - 1e-9 {
         let dt = physics
-            .compute_dt_ssp(&state, c.cfl, scheme.ssp_coefficient())
+            .compute_dt_ssp(&state, c.cfl, scheme)
             .min(c.dt_max)
             .min(next_report - t)
             .min(t_end - t);

@@ -288,7 +288,7 @@ pub fn subcell_divergence_element(
 
 /// Largest number of GLL nodes per direction of the subcell kernels' stack
 /// buffers (polynomial order 15).
-const MAX_N_1D: usize = 16;
+pub(crate) const MAX_N_1D: usize = 16;
 
 /// The DG divergence of the advective flux `q φ` of a field `φ` carried by
 /// the transport `q = (hu, hv)` on element `k`, with the volume term in
@@ -1542,7 +1542,8 @@ pub enum MomentumAdvectionForm {
 /// A tracer for [`apply_tracer_transport_3d`]: its concentration and
 /// where its inventory tendency goes, its exterior values, and the
 /// reference stratification its vertical reconstruction is taken about, if
-/// any (`[element][node][level]`, e.g. its values at rest).
+/// any (`[element][node][level]`: the reference profile at the stage's
+/// levels, [`crate::solver::rhs::ReferenceFields::tracers`]).
 pub struct AdvectedTracer<'a> {
     /// Overwritten with the inventory tendency (layout of [`Solution3D`]).
     pub rhs: &'a mut [f64],
@@ -1621,6 +1622,9 @@ impl<'a> AdvectedTracer<'a> {
 /// perturbation's own `|Ω|`, and that drives the perturbation (TODO P1.3,
 /// `docs/stratified-rest-over-steep-beds.md`: e-folding 26–75 min on the
 /// Frøya coastline mesh for upwind to the Hermite mean; centred holds).
+/// [`crate::solver::rhs::add_reference_advection`] then turns the
+/// reference's arithmetic mean into its tangent, the advection that is the
+/// pressure gradient's adjoint.
 ///
 /// - A uniform tracer stays uniform (`ψ = 0`): constancy, whatever the
 ///   reference.

@@ -9,7 +9,8 @@
 //! of advecting them. Every [`ModeSplitPhysics`]
 //! call is timed through a wrapper; the barotropic pass and the splitter's
 //! own work are the rest of the step. `mform=conservative` advects the
-//! momentum in conservative instead of split form.
+//! momentum in conservative instead of split form. With `DG_PROFILE=1` in the
+//! environment the kernels' own timers are listed after (`dgcom::profiling`).
 //!
 //! ```text
 //! cargo run --release --no-default-features --features parallel,simd --example profile_3d -- \
@@ -33,6 +34,7 @@ use dgcom::solver::rhs::{BarotropicFlux, MomentumAdvectionForm, VerticalAdvectio
 use dgcom::solver::state::Solution3D;
 use dgcom::solver::{
     Blocks, SWEFormulation2D, SWESolution2D, TracerLimiter3DConfig, TracerLimiterType3D,
+    TracerReferenceProfile,
 };
 use dgcom::source::CoriolisSource2D;
 use dgcom::time::{ModeSplitIntegrator, ModeSplitPhysics, StageElements, StepDrag};
@@ -267,9 +269,15 @@ fn main() {
         }
     }
     physics.update_density(&mut state);
-    // The vertical tracer advection about the initial stratification, as
-    // `Simulation3D` does
-    let physics = physics.with_vertical_reference(&state);
+    // The initial stratification as the reference profile, as `Simulation3D`
+    // takes one (linear between its samples, as a mean profile is)
+    let deepest = bathymetry.data.iter().copied().fold(0.0, f64::min);
+    let physics = physics.with_reference_profile(TracerReferenceProfile::from_fn(
+        deepest - 1.0,
+        1.0,
+        (20.0 * (2.0 - deepest)) as usize + 1,
+        |z| (eos.t0 + 4.0 * ((z + 15.0) / 5.0).tanh(), eos.s0),
+    ));
 
     println!(
         "profile_3d: {} elements × {nn} nodes × {nl} levels = {} 3D points, P{order}, dt {dt} s, \
@@ -362,6 +370,10 @@ fn main() {
     row("update_density", density_time, steps);
     row("post_process", post_time, steps);
     row("total", total, steps);
+    // `DG_PROFILE=1`: the kernels' own timers (the whole run, warm-up included)
+    if dgcom::profiling::enabled() {
+        print!("{}", dgcom::profiling::report());
+    }
 }
 
 fn rayon_threads() -> usize {

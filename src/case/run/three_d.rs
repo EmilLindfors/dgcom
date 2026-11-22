@@ -13,12 +13,12 @@
 //!    parent's shear about a depth mean at rest in columns at least the thin
 //!    depth deep.
 //! 3. The open faces' band relaxing to the parent's columns (or the start).
-//! 4. The physics, its density, and the pressure gradient's reference
-//!    profile; the run, landing on the field outputs.
+//! 4. The physics, its density, and the reference stratification (the mean
+//!    profile, or `three_d.profile`); the run, landing on the field outputs.
 //!
 //! A resumed run (`[restart] from`) builds all of this from the start as
-//! the run that wrote the restart did (the band's and the pressure
-//! gradient's references are of the start), then continues from the
+//! the run that wrote the restart did (the band's reference and the
+//! reference stratification are of the start), then continues from the
 //! restart's state, time and mode-splitting history. Its restarts are
 //! written at field outputs, where the steps land, so that the resumed
 //! run's steps land where the uninterrupted run's do.
@@ -161,11 +161,13 @@ impl CaseFile {
                     .into(),
             ));
         }
-        let profile = |z: f64| match &mean {
-            Some(m) => m.at(z),
-            None => d.profile_at(z).expect("checked: a profile"),
-        };
-        state.fill_tracers(&sigma, bed, |idx| !covered[idx], profile);
+        // The reference stratification: the parent's mean profile, or the
+        // case's. The nodes no parent covers start exactly in it
+        let reference = Arc::new(match &mean {
+            Some(mean) => TracerReferenceProfile::from_mean(mean),
+            None => d.reference_profile().expect("checked: a profile"),
+        });
+        state.fill_tracers(&sigma, bed, |idx| !covered[idx], |z| reference.at(z));
         let thin = d.thin_depth_m;
         let eta0 = state.eta.data.clone();
         let n_sheared =
@@ -214,17 +216,11 @@ impl CaseFile {
         });
 
         // 4. The physics
-        let deepest = bed.iter().copied().fold(0.0, f64::min);
         let limiter = TracerLimiter3DConfig {
             limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
             ..TracerLimiter3DConfig::default()
         }
-        .with_reference_profile(TracerReferenceProfile::from_fn(
-            deepest - 1.0,
-            1.0,
-            4001,
-            profile,
-        ));
+        .with_reference_profile(reference.clone());
         let coriolis = Arc::new(
             case.coriolis_source()
                 .unwrap_or_else(|| CoriolisSource2D::f_plane(0.0)),
@@ -286,11 +282,9 @@ impl CaseFile {
         // step otherwise
         physics = physics.with_implicit_vertical_advection(ImplicitVerticalAdvection::default());
         physics.update_density(&mut state);
-        // The pressure gradient about the mean profile (Mellor et al. 1998)
-        let physics = physics.with_reference_profile(&state, |z| {
-            let (t, s) = profile(z);
-            eos.compute_density(t, s, z)
-        });
+        // The anomalies about the mean profile: its pressure gradient
+        // (Mellor et al. 1998) and the advection that is its adjoint
+        let physics = physics.with_reference_profile(reference);
 
         // A resumed run: the restart's state, time, history and records
         let restart = match self.resume_path() {
@@ -493,7 +487,7 @@ impl CaseFile {
             ));
         }
         let mut steps = vec![0.0; domain.mesh.n_elements];
-        let scheme = ssp(d.scheme).ssp_coefficient();
+        let scheme = ssp(d.scheme);
         sim.physics()
             .element_steps_into(&state, d.cfl(), scheme, &mut steps);
         notes.extend(describe_element_steps(&steps, d.dt_max_s).map(|steps| {

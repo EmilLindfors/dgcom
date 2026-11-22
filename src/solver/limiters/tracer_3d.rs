@@ -179,8 +179,11 @@ impl TracerLimiter3DConfig {
     /// out, a fluid at rest in it has nothing to limit; with a
     /// stratification that varies horizontally, the limiter sees only the
     /// variation. Use the domain's typical (or initial) profile.
-    pub fn with_reference_profile(mut self, reference: TracerReferenceProfile) -> Self {
-        self.reference = Some(Arc::new(reference));
+    pub fn with_reference_profile(
+        mut self,
+        reference: impl Into<Arc<TracerReferenceProfile>>,
+    ) -> Self {
+        self.reference = Some(reference.into());
         self
     }
 }
@@ -199,6 +202,10 @@ pub struct TracerReferenceProfile {
     /// `1/Δz` if the heights are evenly spaced (to round-off): the sample
     /// below a height is then found without a search.
     inverse_spacing: Option<f64>,
+    /// `1/(z_{j+1} − z_j)` of every interval between samples: a lookup
+    /// divides by none (the 3D model looks the profile up at every layer of
+    /// every column, every stage).
+    inverse_widths: Vec<f64>,
 }
 
 /// One tracer of a [`TracerReferenceProfile`]: its samples, and their slopes
@@ -209,6 +216,7 @@ struct ProfileSamples<'a> {
     values: &'a [f64],
     slopes: Option<&'a [f64]>,
     inverse_spacing: Option<f64>,
+    inverse_widths: &'a [f64],
 }
 
 /// Where a height falls among a profile's samples: the first sample at or
@@ -255,7 +263,7 @@ impl ProfileSamples<'_> {
         SampleBracket {
             j,
             h,
-            t: (z - heights[j - 1]) / h,
+            t: (z - heights[j - 1]) * self.inverse_widths[j - 1],
         }
     }
 
@@ -314,12 +322,17 @@ impl TracerReferenceProfile {
                 .windows(2)
                 .all(|pair| ((pair[1] - pair[0]) * inverse - 1.0).abs() < 1e-6)
         });
+        let inverse_widths = heights
+            .windows(2)
+            .map(|pair| 1.0 / (pair[1] - pair[0]))
+            .collect();
         Self {
             heights,
             temp,
             salt,
             slopes: None,
             inverse_spacing: inverse_spacing.filter(|_| even),
+            inverse_widths,
         }
     }
 
@@ -379,17 +392,72 @@ impl TracerReferenceProfile {
         reference
     }
 
+    /// The profile of a domain's mean stratification `mean` (its 1 m grid,
+    /// linear between the grid points).
+    pub fn from_mean(mean: &crate::vertical::MeanProfile) -> Self {
+        let (heights, temp, salt) = mean.samples();
+        Self::new(heights, temp, salt)
+    }
+
+    /// The samples: their heights, temperatures and salinities (with
+    /// [`Self::slopes`], what [`Self::from_samples`] rebuilds the profile
+    /// from).
+    pub fn samples(&self) -> [&[f64]; 3] {
+        [&self.heights, &self.temp, &self.salt]
+    }
+
+    /// The slopes `[dT/dz, dS/dz]` at the samples, if the profile is cubic
+    /// between them.
+    pub fn slopes(&self) -> Option<[&[f64]; 2]> {
+        self.slopes.as_ref().map(|[t, s]| [&t[..], &s[..]])
+    }
+
+    /// [`Self::new`], cubic between the samples if `slopes`
+    /// (`[dT/dz, dS/dz]` at the heights) are given.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::new`], or if the slopes' lengths differ from the heights'.
+    pub fn from_samples(
+        heights: Vec<f64>,
+        temp: Vec<f64>,
+        salt: Vec<f64>,
+        slopes: Option<[Vec<f64>; 2]>,
+    ) -> Self {
+        let mut profile = Self::new(heights, temp, salt);
+        if let Some(slopes) = slopes {
+            assert!(
+                slopes.iter().all(|s| s.len() == profile.heights.len()),
+                "a reference profile needs as many slopes as heights"
+            );
+            profile.slopes = Some(slopes);
+        }
+        profile
+    }
+
+    /// Temperature and salinity at height `z` (one search for both).
+    #[inline]
+    pub fn at(&self, z: f64) -> (f64, f64) {
+        let temp = self.component(TracerComponent::Temperature);
+        let bracket = temp.bracket(z);
+        (
+            temp.at_bracket(bracket),
+            self.component(TracerComponent::Salinity)
+                .at_bracket(bracket),
+        )
+    }
+
     /// The temperature at height `z`.
     pub fn temperature(&self, z: f64) -> f64 {
-        self.samples(TracerComponent::Temperature).at(z)
+        self.component(TracerComponent::Temperature).at(z)
     }
 
     /// The salinity at height `z`.
     pub fn salinity(&self, z: f64) -> f64 {
-        self.samples(TracerComponent::Salinity).at(z)
+        self.component(TracerComponent::Salinity).at(z)
     }
 
-    fn samples(&self, component: TracerComponent) -> ProfileSamples<'_> {
+    fn component(&self, component: TracerComponent) -> ProfileSamples<'_> {
         let (values, j) = match component {
             TracerComponent::Temperature => (&self.temp, 0),
             TracerComponent::Salinity => (&self.salt, 1),
@@ -399,6 +467,7 @@ impl TracerReferenceProfile {
             values,
             slopes: self.slopes.as_ref().map(|slopes| &slopes[j][..]),
             inverse_spacing: self.inverse_spacing,
+            inverse_widths: &self.inverse_widths,
         }
     }
 }
@@ -1051,8 +1120,8 @@ fn apply_horizontal_kuzmin_fields(
     let (mut temp_references, mut salt_references) = (take(), take());
     if let Some(profile) = reference {
         let samples = [
-            profile.samples(TracerComponent::Temperature),
-            profile.samples(TracerComponent::Salinity),
+            profile.component(TracerComponent::Temperature),
+            profile.component(TracerComponent::Salinity),
         ];
         for_each_block(
             patches,
@@ -1759,7 +1828,7 @@ mod tests {
     #[test]
     fn the_even_lookup_is_the_search() {
         let profile = TracerReferenceProfile::from_fn(-381.7, 1.0, 4001, |z| (z, -z));
-        let samples = profile.samples(TracerComponent::Temperature);
+        let samples = profile.component(TracerComponent::Temperature);
         assert!(samples.inverse_spacing.is_some());
         let heights = &profile.heights;
         let mut probes: Vec<f64> = heights.clone();

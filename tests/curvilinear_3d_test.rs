@@ -228,6 +228,7 @@ impl Case {
             0.0,
             form,
             metric,
+            None,
             &mut fx,
             &mut fy,
             self.mesh.n_elements.into(),
