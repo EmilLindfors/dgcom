@@ -12,8 +12,8 @@
 //! its neighbour's keeps `C + c/(2(1 − c))` times its difference from the
 //! neighbour, without bound as it falls dry (`notes/3d-numerics.md`). On
 //! that code this flat's thin columns are at 2.7–12.1 °C beside 8.2–11.1 °C
-//! with the weather, at 10.0–12.0 °C without it, and at −2070 and 751 °C
-//! without it and without the limiter.
+//! with the weather, at 10.0–12.0 °C beside a start of 8.25–11.0 °C without
+//! it, and at −2070 and 751 °C without it and without the limiter.
 
 #[path = "../examples/common/tidal_flat.rs"]
 mod tidal_flat;
@@ -66,7 +66,7 @@ fn assert_regime(outcome: &Outcome, steps_per_cycle: usize, cycles: usize) {
 /// weather (here to 9.0–11.2 °C from 8.25–11.0 °C).
 ///
 /// Measured: no thin or dry column outside that range by any amount (5.5 °C
-/// before), the volume kept to 3.3e-13.
+/// and 1.14 in S before), the volume kept to 3.3e-13.
 #[test]
 fn thin_and_dry_columns_stay_in_range_on_a_sunlit_flat() {
     let config = Config::default();
@@ -104,7 +104,7 @@ fn thin_and_dry_columns_stay_in_range_on_a_sunlit_flat() {
 /// One tide of the gate above, for the fast tier (the others are slow
 /// gates, `.config/nextest.toml`): the flat floods and falls dry once under
 /// the sun, and the thin and dry columns stay in the range the others have
-/// had (4.4 °C outside it before).
+/// had (1.09 °C and 0.19 in S outside it before).
 #[test]
 fn thin_and_dry_columns_stay_in_range_through_one_tide() {
     let config = Config {
@@ -129,9 +129,10 @@ fn thin_and_dry_columns_stay_in_range_through_one_tide() {
 /// tides.
 ///
 /// Measured (SSP-RK(4,3) at 60 s, SSP-RK3, explicit, local steps): no value
-/// outside either range; inventories 3.1e-13, 1.5e-12, 3.1e-13, 3.1e-13
-/// (1.5e-12 to 6.2e-11 before, with thin columns 0.96 °C over the start's
-/// warmest water).
+/// outside either range (before: 0.91, 0.70, 2.58 and 0.30 °C outside the
+/// others' range, and 4000–5300 values a run outside their surroundings');
+/// inventories 3.1e-13, 1.5e-12, 3.1e-13, 3.1e-13 (6.2e-11, 4.4e-12,
+/// 7.9e-12, 8.0e-12).
 #[test]
 fn a_flats_tracers_are_bounded_and_conserved_without_the_weather() {
     let base = Config {
@@ -192,8 +193,9 @@ fn a_flats_tracers_are_bounded_and_conserved_without_the_weather() {
 /// fluxes would warm it) and at steps up to four minutes, where whole
 /// elements of film are flushed within a stage.
 ///
-/// Measured 8.0e-11 °C at 60 s (a 9 µm film: round-off of the pass's
-/// balance of a node over its water), 3.6e-13 of the inventories.
+/// Measured 7.3e-11 °C at 60 s and 9.3e-11 at 240 s (a 9 µm film: the
+/// round-off of the pass's balance of a node over its water; 1.4e-10 and
+/// 1.2e-10 before), 1.8e-13 and 2.4e-13 of the inventories.
 #[test]
 fn a_uniform_tracer_stays_uniform_on_the_flat() {
     for (dt_max, cfl) in [(60.0, 4.0), (240.0, 16.0)] {

@@ -754,9 +754,9 @@ pub struct LayerTransport {
     /// sheds by it ([`VerticalAdvection::LimitedAkima`]).
     pub dt_over_depth: Vec<f64>,
     /// The columns thinner than the minimum column depth at the last
-    /// [`Self::compute`] (`[element][node]`): the tracers cross a subcell
-    /// interface beside one at the donor's value
-    /// ([`apply_tracer_transport_3d`]).
+    /// [`Self::compute`], in the subcell elements (`[element][node]`; not
+    /// set in the others): the tracers cross a subcell interface beside one
+    /// at the donor's value ([`apply_tracer_transport_3d`]).
     pub thin: Vec<bool>,
     /// σ-thickness `Δσ_l` of the layers (uniform until the first
     /// [`Self::compute`]).
@@ -886,7 +886,7 @@ impl LayerTransport {
             };
         }
         let subcell_elements: &[bool] = subcell_elements;
-        for k in elements.iter() {
+        for k in elements.iter().filter(|&k| subcell_elements[k]) {
             for flat in k * nn..(k + 1) * nn {
                 thin_columns[flat] = thin(flat);
             }

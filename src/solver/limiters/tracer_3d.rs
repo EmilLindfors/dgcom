@@ -715,12 +715,18 @@ fn apply_horizontal_bounds_field(
     let block_stats = reduce_blocks(
         elements,
         [&mut field[..n_elements * n_nodes * n_levels]],
-        || (),
-        |_, k, [field]| {
+        || Pooled::take(|_: &Vec<bool>| true, Vec::new),
+        |thin, k, [field]| {
             let mut stats = TracerLimiter3DStats::default();
             let element = ElementIndex::new(k);
             // The thin columns are left alone
-            let thin = |i: usize| bathymetry.water_depth(element, i, eta.get(k, i)) < thin_depth;
+            thin.clear();
+            thin.extend(
+                (0..n_nodes)
+                    .map(|i| bathymetry.water_depth(element, i, eta.get(k, i)) < thin_depth),
+            );
+            let any_thin = thin.iter().any(|&t| t);
+            let thin = |i: usize| any_thin && thin[i];
             for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
                 let mut weight_sum = 0.0;
                 let mut inventory = 0.0;
@@ -1210,6 +1216,9 @@ fn apply_horizontal_kuzmin_fields(
             if thin.iter().all(|&t| t) {
                 return stats;
             }
+            // Most elements have none
+            let any_thin = thin.iter().any(|&t| t);
+            let thin = |i: usize| any_thin && thin[i];
             let vertices = mesh.element_vertex_indices(element);
             // The union of the element's vertex patches
             patches.clear();
@@ -1253,7 +1262,7 @@ fn apply_horizontal_kuzmin_fields(
                     let bracket = bracket_at(k, z, level);
                     height.push(z);
                     // A thin column weighs nothing and is not limited
-                    let node_weight = if thin[i] {
+                    let node_weight = if thin(i) {
                         0.0
                     } else {
                         columns.geom.node_mass(k, i)
@@ -1278,7 +1287,7 @@ fn apply_horizontal_kuzmin_fields(
                             relaxation,
                             node_scale,
                         );
-                        within_own[c] &= thin[i] || (lo..=hi).contains(&node_value);
+                        within_own[c] &= thin(i) || (lo..=hi).contains(&node_value);
                         weight_sum[c] += node_weight;
                         departure[c] += node_weight * (node_value - own);
                         scratch.reference.push(node_reference);
@@ -1389,7 +1398,7 @@ fn apply_horizontal_kuzmin_fields(
                     }
 
                     let alpha = (0..n_nodes)
-                        .filter(|&i| !thin[i])
+                        .filter(|&i| !thin(i))
                         .map(|i| {
                             let (lo, hi) = bounds[i];
                             compute_kuzmin_alpha(base[i], value[i], lo, hi)
@@ -1400,7 +1409,7 @@ fn apply_horizontal_kuzmin_fields(
                     }
 
                     let field = &mut *fields[c];
-                    for i in (0..n_nodes).filter(|&i| !thin[i]) {
+                    for i in (0..n_nodes).filter(|&i| !thin(i)) {
                         field[local(i, level)] =
                             reference[i] + base[i] + alpha * (value[i] - base[i]);
                     }

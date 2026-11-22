@@ -1305,12 +1305,6 @@ struct Buffers {
     /// Elements where the pass kept only the element balance: their nodal
     /// residual is water moved between their nodes.
     pooled: Vec<bool>,
-    /// The water of every column that no flux of the pass carried (m/s):
-    /// `∂η/∂t + ∇·DU_avg2` less the rivers'.
-    column_source: Vec<f64>,
-    /// The thin cells that lose more than their water in a stage, with the
-    /// neighbours they are carried with through the step.
-    merged: MergedCells,
     /// σ-thicknesses of the w-cells, for the turbulence's inventories.
     d_sigma_w: Vec<f64>,
     /// `∇·DU_avg2` of the step.
@@ -1352,6 +1346,12 @@ struct Buffers {
     layer_drag_rate: Vec<f64>,
     /// Its column mean `Λ̄ = Σ_l Δσ_l λ_l`.
     column_drag_rate: Vec<f64>,
+    /// The water of every column that no flux of the pass carried (m/s):
+    /// `∂η/∂t + ∇·DU_avg2` less the rivers'.
+    column_source: Vec<f64>,
+    /// The thin cells that lose more than their water in a stage, with the
+    /// neighbours they are carried with through the step.
+    merged: MergedCells,
 }
 
 impl Buffers {
@@ -1362,8 +1362,6 @@ impl Buffers {
         Self {
             rhs_n: Solution3D::new(ne, nn, state.n_levels),
             pooled: vec![false; ne],
-            column_source: vec![0.0; ne * nn],
-            merged: MergedCells::new(ne, nn),
             d_sigma_w: vec![0.0; state.n_levels + 1],
             transport_divergence: DGSolution2D::new(ne, nn),
             q: SWESolution2D::new(ne, nn),
@@ -1387,6 +1385,8 @@ impl Buffers {
             drag_rate: vec![0.0; ne * nn],
             layer_drag_rate: Vec::new(),
             column_drag_rate: Vec::new(),
+            column_source: vec![0.0; ne * nn],
+            merged: MergedCells::new(ne, nn),
         }
     }
 }
