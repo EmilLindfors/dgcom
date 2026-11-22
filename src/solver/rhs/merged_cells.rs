@@ -86,11 +86,35 @@
 //! within the step, so it is kept exactly, and at the step's end the
 //! element takes `C_A`. The run counts the merged and the flushed cells
 //! ([`MergedCells::counts`]).
+//!
+//! # What is assumed
+//!
+//! The groups and the flushed elements are found from column totals once
+//! per step, and the argument above holds level by level only where every
+//! member moves its levels' shares of the column's water and nothing
+//! else. It does not count:
+//! - members that are not thin, whose faces and `Ω` move water by levels
+//!   (the group stays conservative, but its value on a level is convex in
+//!   the column sums only);
+//! - the implicit vertical advection, which solves each member's column on
+//!   its own inventory;
+//! - for a flushed element, that `C_in` is its neighbours' values when the
+//!   splitter converts it, before the limiter changes them, before a
+//!   flushed neighbour later in the list is converted, and without the
+//!   water of rivers, open faces or the 2D module's own sources; and that
+//!   at the ends of local time steps within a step its values are not
+//!   written back, so the vertical terms there do nothing to it;
+//! - the pooled residual of the element's other nodes within the group,
+//!   which it counts as the group's loss (more merging than needed).
+//!
+//! They are open (`notes/3d-numerics.md`, the item on dry and thin
+//! columns).
 
 use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::blocks::Blocks;
+use crate::solver::rhs::advection_3d::MIN_LAYER_THICKNESS;
 use crate::solver::rhs::subcells::{line_node, subcell_interfaces, subcell_slot};
 use crate::solver::rhs::transport_3d::layer_volume_of;
 use crate::types::ElementIndex;
@@ -432,7 +456,7 @@ impl MergedCells {
                         inventory += weight * field_k[i * nc + c];
                         volume += weight;
                     }
-                    if volume > 0.0 {
+                    if volume > dry_volume(geom, k, members, dc) {
                         for &i in members {
                             field_k[i * nc + c] = inventory / volume;
                         }
@@ -495,7 +519,7 @@ impl MergedCells {
                     inventory += mass * q_k[i * nc + c];
                     volume += mass * layer_volume_of(eta_k[i] - bed[i], dc);
                 }
-                if volume > 0.0 {
+                if volume > dry_volume(geom, k, members, dc) {
                     for &i in members {
                         out_k[i * nc + c] = inventory / volume;
                     }
@@ -548,7 +572,9 @@ impl MergedCells {
                     inventory += mass * q[(k * nn + i) * nc + c];
                     volume += mass * layer_volume_of(eta[k * nn + i] - bed[i], dc);
                 }
-                let own = (volume > 0.0).then(|| inventory / volume);
+                let all: [usize; MAX_NODES] = std::array::from_fn(|i| i);
+                let own =
+                    (volume > dry_volume(geom, k, &all[..nn], dc)).then(|| inventory / volume);
                 let value = if end || passing == 0.0 {
                     own
                 } else {
@@ -570,6 +596,18 @@ impl MergedCells {
             }
         }
     }
+}
+
+/// The volume of members `members` of element `k` on a cell of σ-thickness
+/// `d_sigma` with the kernels' floor of a layer's thickness
+/// (`MIN_LAYER_THICKNESS`, 1e-12 m) of water: below it a group's
+/// inventory is round-off, and its value is kept. Not the nodes' dry depth
+/// (`DRY_DEPTH`, 1 µm): a group's film is divided as long as it is water,
+/// since the implicit vertical advection moves inventory into it, which
+/// keeping the value lost (5e-11 of the tidal flat's heat in 6 h).
+fn dry_volume(geom: &GeometricFactors2D, k: usize, members: &[usize], d_sigma: f64) -> f64 {
+    let area: f64 = members.iter().map(|&i| geom.node_mass(k, i)).sum();
+    area * d_sigma * MIN_LAYER_THICKNESS
 }
 
 /// The volume rate out of element `k` at face node `fi` of `face` (which is

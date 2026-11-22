@@ -2361,6 +2361,8 @@ impl ModeSplitIntegrator {
                 let cells = cells_of(N_MOMENTUM_FIELDS + slot);
                 merged.start(field, cells, &eta.data, bathymetry, geom);
             }
+            // Their density, which the stages read
+            physics.end_density(state, blocks_of(ne, merged.elements()));
         }
         let merged: &MergedCells = merged;
         // The tracers and the turbulence of a group of cells are one

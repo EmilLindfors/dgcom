@@ -672,8 +672,11 @@ where
     ///
     /// Where the pass still kept an element's balance only as a whole (it
     /// switched to the subcells during the step, or the positivity limiter
-    /// changed it), the mode splitter carries its tracers as element means
-    /// per level ([`crate::solver::rhs::from_inventory`]).
+    /// changed it), the water it moved between the element's nodes takes
+    /// their tracers with it
+    /// ([`crate::solver::rhs::LayerTransport::add_volume_sources`]); a thin
+    /// column's tracers stay within the range of the water that reaches it
+    /// as far as `crate::solver::rhs::transport_3d` says.
     ///
     /// Everything else stays 3D, including the wet nodes of shoreline
     /// elements.

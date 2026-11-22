@@ -85,23 +85,42 @@
 //!
 //! # Thin and dry columns keep their tracers in range
 //!
-//! A thin column's layers carry their shares `Δσ_l` of the barotropic
-//! fluxes through its subcell's interfaces and faces and nothing else, so
-//! `Ω` is zero in it and each of its levels is a finite volume of the 2D
-//! mass fluxes, with the donor's value on every flux. One forward-Euler
-//! step then leaves it the mean of its own value and of what flowed in,
-//! weighted by their volumes, if no more water leaves it than it holds;
-//! where more does it is carried with its neighbours as one cell
-//! ([`crate::solver::rhs::MergedCells`], with the argument). Its water from
-//! a nodal residual comes at the mean of what the element's other nodes
-//! lost (above). The stages of the SSP schemes are convex combinations of
-//! such steps, [`from_inventory`] divides by the volume the same fluxes
-//! made, and a node with no water keeps its value. So at every stage a
-//! thin column's value on a level is a mean, with weights that are not
-//! negative, of values that it and the columns that gave it water held
-//! before: it cannot leave their range. The columns that are not thin are
-//! not bound by this: their second-order fluxes are the limiter's to
-//! bound ([`crate::solver::TracerLimiter3DConfig`]).
+//! An element with a thin column is a subcell element. A thin column's
+//! layers carry their shares `Δσ_l` of the barotropic fluxes through its
+//! subcell's interfaces and faces and nothing else, so `Ω` is zero in it
+//! and each of its levels is a finite volume of the 2D mass fluxes, with
+//! the donor's value on every flux. One forward-Euler step then leaves it
+//! the mean of its own value and of what flowed in, weighted by their
+//! volumes, if no more water leaves it than it holds; where more does it
+//! is carried with its neighbours as one cell
+//! ([`crate::solver::rhs::MergedCells`]). Its water from a nodal residual
+//! comes at the mean of what the element's other nodes lost (above). The
+//! stages of the SSP schemes are convex combinations of such steps,
+//! [`from_inventory`] divides by the volume the same fluxes made, and a
+//! node with no water keeps its value. So a column thin at every stage of
+//! a step ends it within the range of the water that reached it: on a
+//! tidal flat at a 1 m thin depth no thin or dry value left that range,
+//! with either scheme, local time steps, explicit or implicit vertical
+//! advection (TODO P4.5).
+//!
+//! What this does not cover, measured on the same flat at a 0.1 m thin
+//! depth, where the columns just deeper than it drain to a fraction of
+//! their water within a step (thin columns up to 0.1 °C beyond what the
+//! others have had, 0.2 °C beyond the water around them; `notes/3d-numerics.md`):
+//! - a column that is not thin at some stage of the step takes the central
+//!   value on its interfaces with other such columns, the reference's
+//!   tangent, and vertical advection, none of which is monotone, and
+//!   carries what that made into its thin stages;
+//! - a merged group with members that are not thin, whose own faces and
+//!   `Ω` move water by levels, is convex for the group's column sums, not
+//!   level by level; a flushed element's shown value is convex only as
+//!   far as its neighbours' values at the stage are what it saw;
+//! - the subcell elements without the pass's interface fluxes
+//!   ([`LayerTransport::fallback`]) are not searched for over-drained
+//!   cells.
+//!
+//! The columns that are not thin are the limiter's to bound
+//! ([`crate::solver::TracerLimiter3DConfig`]).
 //!
 //! # Momentum
 //!
@@ -758,6 +777,11 @@ pub struct LayerTransport {
     /// set in the others): the tracers cross a subcell interface beside one
     /// at the donor's value ([`apply_tracer_transport_3d`]).
     pub thin: Vec<bool>,
+    /// The subcell elements the pass did not move on the subcells
+    /// throughout (`[element]`): their interfaces carry the column
+    /// transport's central value, and their volume sources are water the
+    /// pass moved between their nodes ([`Self::add_volume_sources`]).
+    pub fallback: Vec<bool>,
     /// σ-thickness `Δσ_l` of the layers (uniform until the first
     /// [`Self::compute`]).
     pub d_sigma: Vec<f64>,
@@ -787,6 +811,7 @@ impl LayerTransport {
             volume_source: vec![0.0; n_elements * nn],
             dt_over_depth: vec![0.0; n_elements * nn],
             thin: vec![false; n_elements * nn],
+            fallback: vec![false; n_elements],
             d_sigma: vec![1.0 / n_levels as f64; n_levels],
             surface_residual: 0.0,
             metric: MetricForm::default(),
@@ -868,6 +893,7 @@ impl LayerTransport {
             volume_source,
             dt_over_depth,
             thin: thin_columns,
+            fallback,
             metric,
             neighbourhood,
             ..
@@ -875,15 +901,25 @@ impl LayerTransport {
         let metric = *metric;
         let thin = |flat: usize| state.eta.data[flat] - bathymetry.data[flat] < min_column_depth;
         // The subcell elements: those the pass moved on the subcells
-        // throughout (so the layers sum to its update node by node), or
-        // without a pass those with a thin column
+        // throughout (so the layers sum to its update node by node), and
+        // those with a thin column (their interfaces then carry the column
+        // transport's central value, none beside a thin column, and what
+        // the pass moved otherwise is a volume source, below). An element
+        // with a thin column whose layers moved by the DG pairs exchanged
+        // baroclinic transport within itself, which the pressure gradient
+        // does not balance there (it has no volume term in such an element,
+        // `crate::solver::rhs::baroclinic`), and moved its thin columns'
+        // tracers with a volume term that is not monotone (0.3 °C beyond
+        // the water around a film on a flat at a 0.1 m thin depth, 1.4 °C
+        // at 240 s steps)
         for k in elements.iter() {
-            subcell_elements[k] = match barotropic {
-                Some(b) => b.subcell[k * n_sub..(k + 1) * n_sub]
+            let pass = barotropic.is_some_and(|b| {
+                b.subcell[k * n_sub..(k + 1) * n_sub]
                     .iter()
-                    .all(|f| f.is_finite()),
-                None => (k * nn..(k + 1) * nn).any(thin),
-            };
+                    .all(|f| f.is_finite())
+            });
+            subcell_elements[k] = pass || (k * nn..(k + 1) * nn).any(thin);
+            fallback[k] = subcell_elements[k] && !pass;
         }
         let subcell_elements: &[bool] = subcell_elements;
         for k in elements.iter().filter(|&k| subcell_elements[k]) {
@@ -1189,8 +1225,11 @@ impl LayerTransport {
     /// it joins, so the source changes no concentration (constancy) and
     /// adds exactly what its volume holds (conservation).
     ///
-    /// `C` is the node's own value. In the elements of `pooled` the
-    /// barotropic pass kept only the element balance, and the nodal sources
+    /// `C` is the node's own value. In the elements of `pooled` (and the
+    /// subcell elements without the pass's interface fluxes,
+    /// [`Self::fallback`]) the barotropic pass kept only the element
+    /// balance, or the layers' divergence is not the pass's, and the nodal
+    /// sources
     /// hold its nodal residual besides the element's true source: water the
     /// pass moved from the nodes with a negative source to those with a
     /// positive one. There a node that loses water loses it at its own
@@ -1231,7 +1270,7 @@ impl LayerTransport {
                 // What the element's nodes lose and gain (m³/s per unit of
                 // the reference element's area)
                 let (mut lost, mut gained) = (0.0, 0.0);
-                if pooled.get(k).copied().unwrap_or(false) {
+                if pooled.get(k).copied().unwrap_or(false) || self.fallback[k] {
                     for (i, &s) in source.iter().enumerate() {
                         let rate = geom.node_mass(k, i) * s;
                         lost += (-rate).max(0.0);
@@ -1487,7 +1526,7 @@ pub(crate) fn dry_inventories(
 /// - A flushed element of `merged` takes its inventory over its volume at a
 ///   step's `end`, and before that the value that passes its inflow
 ///   through ([`MergedCells::pass_through`]), which is not its
-///   inventory's: do not set its inventory from it ([`inventory_of`]).
+///   inventory's: do not set its inventory from it (`inventory_of`).
 ///
 /// Converting back with [`to_inventory`] keeps each node's inventory, and
 /// each group's.
