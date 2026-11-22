@@ -250,9 +250,9 @@ fn a_sunlit_flat_warms_with_its_bed_and_no_faster() {
 /// fluxes would warm it) and at steps up to four minutes, where whole
 /// elements of film are flushed within a stage.
 ///
-/// Measured 7.3e-11 °C at 60 s and 9.3e-11 at 240 s (a 9 µm film: the
+/// Measured 8.7e-11 °C at 60 s and 8.4e-11 at 240 s (a 9 µm film: the
 /// round-off of the pass's balance of a node over its water; 1.4e-10 and
-/// 1.2e-10 before), 1.8e-13 and 2.4e-13 of the inventories.
+/// 1.2e-10 before), 1.9e-13 and 1.5e-13 of the inventories.
 #[test]
 fn a_uniform_tracer_stays_uniform_on_the_flat() {
     for (dt_max, cfl) in [(60.0, 4.0), (240.0, 16.0)] {
