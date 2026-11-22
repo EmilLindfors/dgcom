@@ -189,6 +189,63 @@ fn a_flats_tracers_are_bounded_and_conserved_without_the_weather() {
     }
 }
 
+/// The option that gives the thin columns the weather's fluxes
+/// (`Hydrostatic3D::with_thin_column_fluxes`, off by default), with a bed
+/// that holds heat as 0.1 m of water: the flat warms as a flat does, by
+/// several degrees over the water beside it at the sunny low water, and
+/// cools under it at night.
+///
+/// **The range the physics allows** then: no thin column beyond the
+/// temperatures at which the weather's flux turns (31.7 °C at noon,
+/// `Q_sw = Q_ns`, and 5.0 °C at night), or beyond what the other columns
+/// have had; and after every step each thin column within what the water
+/// within four elements held before it, widened by what the step's flux
+/// does to 0.1 m of water.
+///
+/// Measured: thin columns 8.5–17.5 °C beside 8.2–12.3 °C; no value outside
+/// the step's range.
+#[test]
+fn a_sunlit_flat_warms_with_its_bed_and_no_faster() {
+    let config = Config {
+        thin_bed: Some(0.1),
+        local_check: true,
+        ..Config::default()
+    };
+    let outcome = run(&config);
+    assert_regime(&outcome, 180, 4);
+    let range = |kind: usize| outcome.ranges.0[kind][0];
+    let (thin, shallow, deep) = (
+        range(tidal_flat::THIN),
+        range(tidal_flat::SHALLOW),
+        range(tidal_flat::DEEP),
+    );
+    let others = (shallow.low.min(deep.low), shallow.high.max(deep.high));
+    // Where the weather's flux turns: noon's shortwave against the loss,
+    // and the night's loss alone
+    let noon = 10.0 + (config.shortwave - config.cooling) / config.feedback;
+    let night = 10.0 - config.cooling / config.feedback;
+    assert!(
+        thin.high > others.1 + 3.0 && thin.low < others.0 + 1.0,
+        "test regime: the flat did not warm and cool: thin columns at {:.2}–{:.2} °C beside          {:.2}–{:.2} °C",
+        thin.low,
+        thin.high,
+        others.0,
+        others.1
+    );
+    assert!(
+        thin.high <= noon.max(others.1) && thin.low >= night.min(others.0),
+        "thin columns at {:.2}–{:.2} °C, beyond where the weather's flux turns ({night:.1} and          {noon:.1} °C)",
+        thin.low,
+        thin.high
+    );
+    let (local, count) = outcome.local_excess;
+    assert!(
+        count == 0,
+        "{count} values of thin columns outside what the water around them held before the          step and the step's flux, by up to {local:.3e} °C"
+    );
+    assert!(outcome.drift[0] < 1e-12, "volume drifted");
+}
+
 /// A uniform tracer stays uniform on the flat, with the weather off (its
 /// fluxes would warm it) and at steps up to four minutes, where whole
 /// elements of film are flushed within a stage.

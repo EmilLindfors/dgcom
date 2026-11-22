@@ -141,6 +141,10 @@ where
     /// The optical water type that absorbs the shortwave of
     /// `surface_fluxes` (see [`Self::with_shortwave_absorption`]).
     pub shortwave_absorption: JerlovWater,
+    /// The bed's share in the thin columns' heat and freshwater fluxes, as
+    /// a depth of water (m), if they take any (see
+    /// [`Self::with_thin_column_fluxes`]).
+    pub thin_column_bed: Option<f64>,
     pub g: f64,
     pub rho0: f64,
     /// Temperature of water flowing in through a physical boundary (walls
@@ -424,6 +428,7 @@ where
             surface_roughness: None,
             surface_fluxes: None,
             shortwave_absorption: JerlovWater::default(),
+            thin_column_bed: None,
             g,
             rho0,
             temp_bc: Arc::new(ExtrapolationTracerBC3D),
@@ -1006,6 +1011,32 @@ where
     /// water, as NorKyst v3).
     pub fn with_shortwave_absorption(mut self, water: JerlovWater) -> Self {
         self.shortwave_absorption = water;
+        self
+    }
+
+    /// Give the thin columns ([`Self::with_min_column_depth`]) the surface
+    /// heat and freshwater fluxes too (by default they take none: a tidal
+    /// flat under a metre of water neither warms nor cools). A thin column
+    /// with water takes them over its whole depth `D`, in one piece with
+    /// the bed under it, which holds heat and salt as `bed_depth` m of
+    /// water does: every level changes by the flux over `D + bed_depth`
+    /// (see [`crate::physics::apply_vertical_diffusion`]; about 0.1 m for
+    /// the sediment a day's heat reaches). So a sunlit flat warms as a flat
+    /// does, and a film no faster than `bed_depth` of water: 7 °C an hour
+    /// under 800 W/m² at 0.1 m. The bed's share of the fluxes leaves the
+    /// model.
+    ///
+    /// Where a thin column lies beside deep water (a cliff shore), its
+    /// levels hold the deep column's levels' water, which the tide takes
+    /// back level by level: the heat it took at the surface then reaches
+    /// the deep column's lower levels too, by the thin column's share of
+    /// their water in a tide.
+    pub fn with_thin_column_fluxes(mut self, bed_depth: f64) -> Self {
+        assert!(
+            bed_depth > 0.0,
+            "the bed's depth of water must be positive, got {bed_depth}"
+        );
+        self.thin_column_bed = Some(bed_depth);
         self
     }
 
@@ -2742,6 +2773,7 @@ where
                     stress: field,
                     roughness: self.surface_roughness.as_deref(),
                     tracers,
+                    thin_bed: self.thin_column_bed,
                 },
                 self.g,
                 self.rho0,

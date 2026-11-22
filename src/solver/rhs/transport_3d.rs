@@ -1361,7 +1361,7 @@ pub(crate) fn layer_volume_of(depth: f64, d_sigma: f64) -> f64 {
 
 /// Depth (m) below which a node's (or, as a mean, an element's) tracers are
 /// left as they were: it holds no water to define a concentration.
-const DRY_DEPTH: f64 = 1e-6;
+pub(crate) const DRY_DEPTH: f64 = 1e-6;
 
 /// Multiply a field by the thickness of its cells under `η`: concentration
 /// `C` → inventory `H_z C`, with `H_z = D·Δσ` for the σ-thicknesses

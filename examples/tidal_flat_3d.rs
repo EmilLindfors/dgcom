@@ -18,6 +18,10 @@
 //! volume is conserved, and without the weather (`heat=0`) the inventories
 //! of T and S are too.
 //!
+//! `thin_bed=0.1` gives the thin columns the weather's fluxes too
+//! (`Hydrostatic3D::with_thin_column_fluxes`); `trace=1` prints the steps
+//! in which a value leaves the range every column had before it.
+//!
 //! ```text
 //! cargo run --release --no-default-features --features parallel,simd --example tidal_flat_3d
 //! cargo run --release ... --example tidal_flat_3d -- heat=0 uniform=1 hours=6
@@ -76,6 +80,7 @@ fn main() {
         implicit_vertical: arg("implicit", 1) != 0,
         deep: arg("deep", d.deep),
         local_check: arg("local", 1) != 0,
+        thin_bed: Some(arg("thin_bed", 0.0)).filter(|&bed| bed > 0.0),
     };
     let _: JerlovWater = c.jerlov;
     let report = 60.0 * arg("report_minutes", 30.0);

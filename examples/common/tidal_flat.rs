@@ -28,6 +28,8 @@ use dgcom::vertical::{SigmaGrid, SongHaidvogelStretching};
 
 pub const G: f64 = 9.81;
 pub const RHO0: f64 = 1025.0;
+/// The specific heat of sea water (J kg⁻¹ K⁻¹), as the model's
+pub const HEAT_CAPACITY: f64 = dgcom::physics::air_sea::SEAWATER_HEAT_CAPACITY;
 
 /// The experiment's parameters (lengths in m, times in s unless named).
 #[derive(Clone, Debug)]
@@ -76,6 +78,10 @@ pub struct Config {
     /// Whether every step compares each thin column's values with those
     /// around it before the step (`Outcome::local_excess`)
     pub local_check: bool,
+    /// The thin columns take the weather's fluxes too, with a bed that
+    /// holds heat as this depth of water (m;
+    /// `Hydrostatic3D::with_thin_column_fluxes`)
+    pub thin_bed: Option<f64>,
 }
 
 impl Default for Config {
@@ -108,6 +114,7 @@ impl Default for Config {
             implicit_vertical: true,
             deep: 3.0,
             local_check: false,
+            thin_bed: None,
         }
     }
 }
@@ -283,6 +290,9 @@ pub fn build(c: &Config) -> (Physics, Solution3D) {
         physics = physics
             .with_surface_fluxes(Weather(c.clone()))
             .with_shortwave_absorption(c.jerlov);
+        if let Some(bed) = c.thin_bed {
+            physics = physics.with_thin_column_fluxes(bed);
+        }
     }
     if c.implicit_vertical {
         physics = physics.with_implicit_vertical_advection(ImplicitVerticalAdvection::default());
@@ -447,7 +457,11 @@ pub struct Outcome {
     /// before the step within four elements of it (the reach of four
     /// stages; on every level, since the columns that are not thin exchange
     /// between theirs), the largest over the steps, and how many values were
-    /// outside by more than 1e-9 °C; with `Config::local_check`
+    /// outside by more than 1e-9 °C; with `Config::local_check`. With
+    /// `Config::thin_bed` the range is widened by what the step's flux can
+    /// do to that much water: `Δt Q⁺/(ρ₀ c_p h_b)` above, with `Q` of the
+    /// coldest surface around, and `Δt Q⁻/(ρ₀ c_p h_b)` below, of the
+    /// warmest
     pub local_excess: (f64, usize),
     /// The largest change of T at a node that was dry before and after a
     /// step (a dry node keeps its value)
@@ -580,6 +594,18 @@ pub fn run(
                     for &x in &before.temp[e * nn * nl..(e + 1) * nn * nl] {
                         local.add(x);
                     }
+                }
+                // What the step's flux can add to a thin column and its
+                // bed: the flux at the step's middle over a surface that
+                // the transport left within the range
+                if let Some(bed) = c.thin_bed.filter(|_| c.heat) {
+                    let middle = 0.5 * (t + last);
+                    let net = |sst: f64| {
+                        let (sw, ns, _) = c.weather(middle, sst);
+                        (t - last) * (sw + ns) / (RHO0 * HEAT_CAPACITY * bed)
+                    };
+                    local.high += net(local.low).max(0.0);
+                    local.low += net(local.high).min(0.0);
                 }
                 for l in 0..nl {
                     let x = s.temp[idx * nl + l];
