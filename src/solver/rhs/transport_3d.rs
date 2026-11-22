@@ -727,6 +727,11 @@ pub struct LayerTransport {
     /// [`Self::compute`]; the vertical advection bounds the water an end layer
     /// sheds by it ([`VerticalAdvection::LimitedAkima`]).
     pub dt_over_depth: Vec<f64>,
+    /// The columns thinner than the minimum column depth at the last
+    /// [`Self::compute`] (`[element][node]`): the tracers cross a subcell
+    /// interface beside one at the donor's value
+    /// ([`apply_tracer_transport_3d`]).
+    pub thin: Vec<bool>,
     /// σ-thickness `Δσ_l` of the layers (uniform until the first
     /// [`Self::compute`]).
     pub d_sigma: Vec<f64>,
@@ -755,6 +760,7 @@ impl LayerTransport {
             omega: vec![0.0; n_elements * nn * (n_levels + 1)],
             volume_source: vec![0.0; n_elements * nn],
             dt_over_depth: vec![0.0; n_elements * nn],
+            thin: vec![false; n_elements * nn],
             d_sigma: vec![1.0 / n_levels as f64; n_levels],
             surface_residual: 0.0,
             metric: MetricForm::default(),
@@ -835,6 +841,7 @@ impl LayerTransport {
             omega: layer_omega,
             volume_source,
             dt_over_depth,
+            thin: thin_columns,
             metric,
             neighbourhood,
             ..
@@ -853,6 +860,11 @@ impl LayerTransport {
             };
         }
         let subcell_elements: &[bool] = subcell_elements;
+        for k in elements.iter() {
+            for flat in k * nn..(k + 1) * nn {
+                thin_columns[flat] = thin(flat);
+            }
+        }
 
         // 1. Nodal layer transports, corrected to DU_avg2, on the elements
         // and their face neighbours (whose transports the faces read)
@@ -1123,10 +1135,11 @@ impl LayerTransport {
     fn element(&self, k: usize) -> ElementTransport<'_> {
         // Every field is `[element][…]`
         let n_elements = self.subcell_elements.len();
-        let block = |values: &'_ [f64]| {
+        fn block_of<T>(values: &[T], k: usize, n_elements: usize) -> std::ops::Range<usize> {
             let len = values.len() / n_elements;
             k * len..(k + 1) * len
-        };
+        }
+        let block = |values: &'_ [f64]| block_of(values, k, n_elements);
         ElementTransport {
             n_levels: self.n_levels,
             hu: &self.hu[block(&self.hu)],
@@ -1136,6 +1149,7 @@ impl LayerTransport {
             subcell_element: self.subcell_elements[k],
             omega: &self.omega[block(&self.omega)],
             dt_over_depth: &self.dt_over_depth[block(&self.dt_over_depth)],
+            thin: &self.thin[block_of(&self.thin, k, n_elements)],
             d_sigma: &self.d_sigma,
             metric: self.metric,
         }
@@ -1785,8 +1799,10 @@ fn advect_fields<const N: usize>(
                             inflow(t, f, fi, node, tag, interior, flux, l)
                         };
                         let field = fields[t].0;
-                        let div =
-                            context.flux_divergence(transport, k, l, field, true, inflow, scratch);
+                        let interface = InterfaceValue::DonorBesideThin;
+                        let div = context.flux_divergence(
+                            transport, k, l, field, true, interface, inflow, scratch,
+                        );
                         for (i, &d) in div.iter().enumerate() {
                             rhs_k[i * nl + l] = -d;
                         }
@@ -2342,8 +2358,10 @@ pub fn apply_momentum_transport_3d(
                         let inflow = |f, fi, node, tag, interior, flux| {
                             inflow(t, f, fi, node, tag, interior, flux, l)
                         };
-                        let div =
-                            context.flux_divergence(transport, k, l, field, split, inflow, scratch);
+                        let interface = InterfaceValue::Central;
+                        let div = context.flux_divergence(
+                            transport, k, l, field, split, interface, inflow, scratch,
+                        );
                         for (i, &d) in div.iter().enumerate() {
                             rhs_k[i * nl + l] -= d;
                         }
@@ -2376,6 +2394,8 @@ struct ElementTransport<'a> {
     omega: &'a [f64],
     /// `[node]`
     dt_over_depth: &'a [f64],
+    /// `[node]`: the thin columns
+    thin: &'a [bool],
     d_sigma: &'a [f64],
     metric: MetricForm,
 }
@@ -2457,10 +2477,44 @@ impl WCellBlock {
             subcell_element: element.subcell_element,
             omega: &self.omega,
             dt_over_depth: &self.dt_over_depth,
+            thin: element.thin,
             d_sigma: &self.d_sigma,
             metric: element.metric,
         }
     }
+}
+
+/// The value a field crosses a subcell interface of a subcell element with
+/// ([`LayerContext::flux_divergence`]).
+///
+/// The central value is second order and moves no stratification along a
+/// σ-level that cuts through it, but it is not monotone: a node `a` that
+/// loses the share `c` of its water to a neighbour `b` in a forward-Euler
+/// step keeps
+///
+/// ```text
+///     C_a' = [V_a C_a − c V_a ½(C_a + C_b)] / [(1 − c) V_a]
+///          = C_a + c/(2(1 − c)) (C_a − C_b),
+/// ```
+///
+/// so its difference from the neighbour it drains into grows by
+/// `1 + c/(2(1 − c))` per step, `(V/V')^½` over a drain from `V` to `V'`,
+/// without bound as the node falls dry: 700× between half a metre and the
+/// micrometre below which a value is held (a draining film on a tidal flat
+/// at −2070 and 751 °C beside water at 8 to 11, TODO P4.5). A column that is
+/// not thin cannot drain that far. With the donor's value the water that
+/// leaves a node takes the node's own concentration and changes none, and
+/// the node's new value is the mean of its own and of what flowed in,
+/// weighted by their volumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterfaceValue {
+    /// `½(C_a + C_b)` on every interface (the momentum: thin columns are at
+    /// rest for it and take no tendency).
+    Central,
+    /// The donor's value on an interface beside a thin column, the central
+    /// one between two columns that are not thin (the tracers and the
+    /// turbulence).
+    DonorBesideThin,
 }
 
 /// Whether [`LayerContext::flux_divergence_levels`] takes the element of
@@ -2487,8 +2541,9 @@ impl LayerContext<'_> {
     /// ([`transport_divergence_element`] of `Q_l φ`); face flux `F_l φ↑`
     /// with `φ↑` upwind of `F_l`. On inflow through an open face `φ↑` is
     /// `inflow(face, face_node, node, tag, interior value, F_l)`, with `node`
-    /// the face node's `[element][node]` index. Written to (and returned
-    /// from) `scratch.div`.
+    /// the face node's `[element][node]` index. In a subcell element `φ`
+    /// crosses the subcell interfaces at `interface`'s value. Written to
+    /// (and returned from) `scratch.div`.
     #[allow(clippy::too_many_arguments)]
     fn flux_divergence<'s>(
         &self,
@@ -2497,6 +2552,7 @@ impl LayerContext<'_> {
         l: usize,
         field: &[f64],
         split: bool,
+        interface: InterfaceValue,
         inflow: impl Fn(usize, usize, usize, BoundaryTag, f64, f64) -> f64,
         scratch: &'s mut TransportScratch,
     ) -> &'s [f64] {
@@ -2539,10 +2595,13 @@ impl LayerContext<'_> {
         }
         if transport.subcell_element {
             // Through the subcell interfaces the 2D wet/dry kernel moves the
-            // water through, with the central value: no diffusion along
-            // σ-levels that cut steeply through the stratification (upwind
-            // moved a steep shore's stratification by 8e-3 °C)
+            // water through. Between two columns that are not thin, with the
+            // central value: no diffusion along σ-levels that cut steeply
+            // through the stratification (upwind moved a steep shore's
+            // stratification by 8e-3 °C). Beside a thin column a tracer
+            // takes the donor's value (see `InterfaceValue`)
             let n1 = ops.n_1d;
+            let donor = interface == InterfaceValue::DonorBesideThin;
             for dir in 0..2 {
                 for line in 0..n1 {
                     for a in 0..n1 - 1 {
@@ -2550,7 +2609,11 @@ impl LayerContext<'_> {
                         let flux = transport.subcell[slot * nl + l];
                         let (ia, ib) =
                             (line_node(n1, dir, line, a), line_node(n1, dir, line, a + 1));
-                        sub[slot] = flux * 0.5 * (phi[ia] + phi[ib]);
+                        sub[slot] = if donor && (transport.thin[ia] || transport.thin[ib]) {
+                            flux * if flux >= 0.0 { phi[ia] } else { phi[ib] }
+                        } else {
+                            flux * 0.5 * (phi[ia] + phi[ib])
+                        };
                     }
                 }
             }

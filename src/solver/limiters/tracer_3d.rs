@@ -546,6 +546,19 @@ enum TracerComponent {
 }
 
 /// Apply configured 3D tracer limiters to temperature and salinity.
+///
+/// Columns shallower than `thin_depth` (m; the model's thin columns and its
+/// dry nodes, [`crate::physics::Hydrostatic3D::with_min_column_depth`]) are
+/// left as they are, and count for nothing in their element layer's mean:
+/// their transport is monotone as it is
+/// ([`crate::solver::rhs::apply_tracer_transport_3d`]), a dry node holds
+/// its last wet value, and the limiters' scaling, which is about a mean
+/// over the element (and, for Kuzmin's, about a reference at each node's
+/// height), can take a node out of the range its water had (a film at the
+/// height of a flat, in an element whose other nodes are 0.1 °C over the
+/// reference at their depths, was raised 0.1 °C over every temperature in
+/// the basin, TODO P4.5). Zero limits every column.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_tracer_limiters_3d(
     state: &mut Solution3D,
     mesh: &Mesh2D,
@@ -554,6 +567,7 @@ pub fn apply_tracer_limiters_3d(
     bathymetry: &Bathymetry2D,
     sigma: &SigmaGrid,
     config: &TracerLimiter3DConfig,
+    thin_depth: f64,
     elements: Blocks,
 ) -> TracerLimiter3DStats {
     let mut stats = TracerLimiter3DStats::default();
@@ -588,6 +602,7 @@ pub fn apply_tracer_limiters_3d(
                 geom,
                 bathymetry,
                 sigma,
+                thin_depth,
             };
             let mut mean_heights = Pooled::take(
                 |a: &Vec<f64>| a.len() == state.n_elements * state.n_levels,
@@ -620,6 +635,7 @@ pub fn apply_tracer_limiters_3d(
         config.bounds.t_min,
         config.bounds.t_max,
         config.average_policy,
+        thin_depth,
         TracerComponent::Temperature,
         &mut stats,
     );
@@ -635,6 +651,7 @@ pub fn apply_tracer_limiters_3d(
         config.bounds.s_min,
         config.bounds.s_max,
         config.average_policy,
+        thin_depth,
         TracerComponent::Salinity,
         &mut stats,
     );
@@ -687,6 +704,7 @@ fn apply_horizontal_bounds_field(
     bound_min: f64,
     bound_max: f64,
     average_policy: TracerAveragePolicy3D,
+    thin_depth: f64,
     component: TracerComponent,
     stats: &mut TracerLimiter3DStats,
 ) {
@@ -701,6 +719,8 @@ fn apply_horizontal_bounds_field(
         |_, k, [field]| {
             let mut stats = TracerLimiter3DStats::default();
             let element = ElementIndex::new(k);
+            // The thin columns are left alone
+            let thin = |i: usize| bathymetry.water_depth(element, i, eta.get(k, i)) < thin_depth;
             for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
                 let mut weight_sum = 0.0;
                 let mut inventory = 0.0;
@@ -708,6 +728,9 @@ fn apply_horizontal_bounds_field(
                 let mut max_value = f64::NEG_INFINITY;
 
                 for i in 0..n_nodes {
+                    if thin(i) {
+                        continue;
+                    }
                     let value = field[index(i, level)];
                     let weight =
                         geom.node_mass(k, i) * layer_thickness(eta, bathymetry, element, i, ds);
@@ -730,7 +753,7 @@ fn apply_horizontal_bounds_field(
                         TracerAveragePolicy3D::EnforceBounds => avg.clamp(bound_min, bound_max),
                     };
 
-                    for i in 0..n_nodes {
+                    for i in (0..n_nodes).filter(|&i| !thin(i)) {
                         field[index(i, level)] = replacement;
                     }
 
@@ -748,7 +771,7 @@ fn apply_horizontal_bounds_field(
                     continue;
                 }
 
-                for i in 0..n_nodes {
+                for i in (0..n_nodes).filter(|&i| !thin(i)) {
                     let idx = index(i, level);
                     field[idx] = avg + theta * (field[idx] - avg);
                 }
@@ -864,6 +887,9 @@ struct LayerColumns<'a> {
     geom: &'a GeometricFactors2D,
     bathymetry: &'a Bathymetry2D,
     sigma: &'a SigmaGrid,
+    /// Columns shallower than this are left alone
+    /// ([`apply_tracer_limiters_3d`]).
+    thin_depth: f64,
 }
 
 /// Every node's layer-centre heights `z = η + D σ` into `centres`
@@ -952,6 +978,8 @@ impl LayerColumns<'_> {
 struct KuzminScratch {
     /// The union of the element's vertex patches.
     patches: Vec<usize>,
+    /// The element's thin columns, which are left alone.
+    thin: Vec<bool>,
     /// The node's height.
     height: Vec<f64>,
     /// Each tracer's values at the nodes.
@@ -1166,11 +1194,22 @@ fn apply_horizontal_kuzmin_fields(
         |scratch, k, fields| {
             let KuzminScratch {
                 patches,
+                thin,
                 height,
                 tracers: tracer_scratch,
             } = &mut **scratch;
             let mut stats = TracerLimiter3DStats::default();
             let element = ElementIndex::new(k);
+            thin.clear();
+            thin.extend((0..n_nodes).map(|i| {
+                columns
+                    .bathymetry
+                    .water_depth(element, i, columns.eta.get(k, i))
+                    < columns.thin_depth
+            }));
+            if thin.iter().all(|&t| t) {
+                return stats;
+            }
             let vertices = mesh.element_vertex_indices(element);
             // The union of the element's vertex patches
             patches.clear();
@@ -1213,8 +1252,13 @@ fn apply_horizontal_kuzmin_fields(
                     let z = columns.centre_height(element, i, level);
                     let bracket = bracket_at(k, z, level);
                     height.push(z);
-                    let node_weight = columns.geom.node_mass(k, i)
-                        * layer_thickness(columns.eta, columns.bathymetry, element, i, ds);
+                    // A thin column weighs nothing and is not limited
+                    let node_weight = if thin[i] {
+                        0.0
+                    } else {
+                        columns.geom.node_mass(k, i)
+                            * layer_thickness(columns.eta, columns.bathymetry, element, i, ds)
+                    };
                     for c in 0..2 {
                         if !present[c] {
                             continue;
@@ -1234,7 +1278,7 @@ fn apply_horizontal_kuzmin_fields(
                             relaxation,
                             node_scale,
                         );
-                        within_own[c] &= (lo..=hi).contains(&node_value);
+                        within_own[c] &= thin[i] || (lo..=hi).contains(&node_value);
                         weight_sum[c] += node_weight;
                         departure[c] += node_weight * (node_value - own);
                         scratch.reference.push(node_reference);
@@ -1345,6 +1389,7 @@ fn apply_horizontal_kuzmin_fields(
                     }
 
                     let alpha = (0..n_nodes)
+                        .filter(|&i| !thin[i])
                         .map(|i| {
                             let (lo, hi) = bounds[i];
                             compute_kuzmin_alpha(base[i], value[i], lo, hi)
@@ -1355,7 +1400,7 @@ fn apply_horizontal_kuzmin_fields(
                     }
 
                     let field = &mut *fields[c];
-                    for i in 0..n_nodes {
+                    for i in (0..n_nodes).filter(|&i| !thin[i]) {
                         field[local(i, level)] =
                             reference[i] + base[i] + alpha * (value[i] - base[i]);
                     }
@@ -1616,6 +1661,7 @@ mod tests {
             &bathymetry,
             &sigma,
             &config,
+            0.0,
             Blocks::All(mesh.n_elements),
         );
 
@@ -1648,6 +1694,7 @@ mod tests {
             &bathymetry,
             &sigma,
             &config,
+            0.0,
             Blocks::All(mesh.n_elements),
         );
 
@@ -1672,6 +1719,7 @@ mod tests {
             &bathymetry,
             &sigma,
             &config,
+            0.0,
             Blocks::All(mesh.n_elements),
         );
 
@@ -1712,6 +1760,7 @@ mod tests {
             &bathymetry,
             &sigma,
             &config,
+            0.0,
             Blocks::All(mesh.n_elements),
         );
         let after = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
@@ -1766,6 +1815,7 @@ mod tests {
             &bathymetry,
             &sigma,
             &config,
+            0.0,
             Blocks::All(mesh.n_elements),
         );
         let change = before
@@ -1808,6 +1858,7 @@ mod tests {
             &bathymetry,
             &sigma,
             &config,
+            0.0,
             Blocks::All(mesh.n_elements),
         );
 

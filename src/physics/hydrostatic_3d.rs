@@ -1326,6 +1326,7 @@ where
             &self.bathymetry,
             &self.sigma,
             &self.tracer_limiter,
+            self.min_column_depth,
             elements,
         );
         crate::profiling::stop("3d: tracer limiter", limiter);
