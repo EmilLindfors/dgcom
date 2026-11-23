@@ -1,11 +1,11 @@
-//! The 3D step's barotropic pass on the GPU, on global substeps (P2.7 Phase
-//! 4.4c2, `notes/gpu.md`): dgcom's `barotropic_pass`, the filtered pass of
-//! the depth-mean transport `(h, hu, hv)` through the step that the mode
-//! splitter runs between the slow forcing and the 3D stages, and what the 3D
-//! stages take from it.
+//! The 3D step's barotropic pass on the GPU (P2.7 Phase 4.4c2–c3,
+//! `notes/gpu.md`): dgcom's `barotropic_pass` and `barotropic_pass_local`,
+//! the filtered pass of the depth-mean transport `(h, hu, hv)` through the
+//! step that the mode splitter runs between the slow forcing and the 3D
+//! stages, and what the 3D stages take from it.
 //!
-//! - **Every stage** ([`BarotropicPass3D::run`], in the order of dgcom's own
-//!   stage table, `barotropic_stages`): the 2D module's RHS
+//! - **Every stage** on global substeps ([`BarotropicPass3D::run`], in the
+//!   order of dgcom's own stage table, `barotropic_stages`): the 2D module's RHS
 //!   ([`GpuSWE2D::rhs_pass_fluxes_into`], which also keeps the subcell
 //!   interfaces' mass fluxes and the nesting bands' volume sources), their
 //!   mean ([`kernels_pass::mean_source`]), the rivers' discharge
@@ -16,6 +16,15 @@
 //!   buffer, the subcell fluxes, NaN where the stage took the volume term)
 //!   and of the filter's average, then the 2D module's damping and wet/dry
 //!   correction (`barotropic_stage` with `finish_stage_element`).
+//! - **Every stage pass** on local time steps ([`BarotropicPass3D::run_local`]
+//!   with [`LocalPass3D`], dgcom's own `MultirateStepper` over the device's
+//!   state): the 2D module's RHS of the pass's elements at their levels'
+//!   stage times ([`GpuSWE2D::stage_pass_where`]), the rivers'
+//!   ([`kernels_pass::river_lts`]), then [`kernels_pass::pass_stage_lts`]:
+//!   each element's stage from `element_stage`, the same terms with the sums
+//!   weighted by the element's stage rate, and either the wet/dry correction
+//!   or the substep's sum (`coarse_step`); the substeps' ends are the 2D
+//!   module's `finish_where`.
 //! - **After it** ([`BarotropicPass3D::finish`]): the 2D module's wet/dry
 //!   correction of the average, the constant rates of `η`, `ū`, `v̄`, `Dū`,
 //!   `Dv̄` over the step (`barotropic_node_rates`), the divergence of
@@ -43,14 +52,15 @@ use dgcom::solver::rhs::{Boundaries3D, MetricForm};
 use dgcom::solver::{SWESolution2D, wet_dry_element};
 use dgcom::source::RiverSources;
 use dgcom::time::{
-    BarotropicFilter, Combination, Slot, SspScheme, barotropic_node_rates, barotropic_stages,
+    BarotropicFilter, Combination, LocalTimeStepping, MultiratePass, MultirateStepper,
+    ShuOsherStage, Slot, SspScheme, barotropic_node_rates, barotropic_stages, element_stage,
     pooled_element,
 };
 use dgcom::vertical::SigmaGrid;
 
 use crate::hooks::State3D;
 use crate::swe2d::{
-    Damping, DeviceState, Gpu, GpuSWE2D, N1, NF, NN, PassFluxes, is_subcell_element,
+    Damping, DeviceState, Gpu, GpuSWE2D, N1, NF, NN, PassFluxes, is_subcell_element, item, level_of,
 };
 use crate::three_d::{
     BarotropicDevice, COLUMN_BLOCK, LEVEL_BLOCK, NSUB, RiverTables, Statics3D, launch,
@@ -483,6 +493,270 @@ pub mod kernels_pass {
             *pooled.get_unchecked_mut(k) = u32::from(mark);
         }
     }
+
+    /// The rivers' discharge added to a stage pass's RHS on local time
+    /// steps, a thread per element of the pass (the first `n` of `list`,
+    /// every element where it is empty): each of its rivers in index order,
+    /// `h += Q·share`, `Q` the river's discharge at the element's stage time
+    /// (`discharge[first + i]`, the host's).
+    #[kernel]
+    pub fn river_lts(
+        n: u32,
+        list: &[u32],
+        first: u32,
+        offsets: &[u32],
+        by_element: &[u32],
+        discharge: &[f64],
+        share: &[f64],
+        mut h: DisjointSlice<f64>,
+    ) {
+        let Some(k) = item(thread::index_1d().get(), list, n) else {
+            return;
+        };
+        for j in offsets[k] as usize..offsets[k + 1] as usize {
+            let i = by_element[j] as usize;
+            let q = discharge[first as usize + i];
+            for node in 0..NN {
+                // SAFETY: thread k alone writes element k's rows (the
+                // pass's elements are distinct).
+                unsafe {
+                    *h.get_unchecked_mut(k * NN + node) += q * share[i * NN + node];
+                }
+            }
+        }
+    }
+
+    /// `coarse_step`'s stage of element k (the pass's barotropic stage on
+    /// local time steps), a thread per element of the pass: its stage from
+    /// `element_stage` (its level, this stage's rate), the value
+    /// `a·S + b·Y + c·(RHS + G)` from the rows' RHS, the drags' depth-mean
+    /// part over `c`, the sums of `DU_avg2` and of the 2D module's volume
+    /// sources (if `has_sources`) with weight `W_m b_s / (n_bt 2^r)`, `r`
+    /// the element's rate, then either its damping and wet/dry correction
+    /// (a stage the next reads) or its damping and the substep's sum into
+    /// `acc` (the last stage).
+    #[kernel]
+    pub fn pass_stage_lts(
+        n: u32,
+        list: &[u32],
+        t: f64,
+        dt: f64,
+        finest: u32,
+        substep: u32,
+        depth: u32,
+        last: u32,
+        start: f64,
+        input: f64,
+        beta: f64,
+        c_stage: f64,
+        level: &[u32],
+        rate: &[u32],
+        w_secondary: f64,
+        b_s: f64,
+        n_bt: f64,
+        subcell_depth: f64,
+        damping: Damping,
+        has_sources: u32,
+        base_h: &[f64],
+        base_hu: &[f64],
+        base_hv: &[f64],
+        x_h: &[f64],
+        x_hu: &[f64],
+        x_hv: &[f64],
+        g_h: &[f64],
+        g_hu: &[f64],
+        g_hv: &[f64],
+        bottom: &[f64],
+        column: &[f64],
+        faces: &[[[f64; 3]; NF]],
+        element_edges: &[[u32; 4]],
+        edges: &[[u32; 4]],
+        sub_mass: &[f64],
+        sources: &[f64],
+        mass: &[f64],
+        inv_area: &[f64],
+        mut out_h: DisjointSlice<f64>,
+        mut out_hu: DisjointSlice<f64>,
+        mut out_hv: DisjointSlice<f64>,
+        mut tr_hu: DisjointSlice<f64>,
+        mut tr_hv: DisjointSlice<f64>,
+        mut tr_face: DisjointSlice<f64>,
+        mut tr_sub: DisjointSlice<f64>,
+        mut tr_mass: DisjointSlice<f64>,
+        mut acc_h: DisjointSlice<f64>,
+        mut acc_hu: DisjointSlice<f64>,
+        mut acc_hv: DisjointSlice<f64>,
+        mut clips: DisjointSlice<u32>,
+    ) {
+        let Some(k) = item(thread::index_1d().get(), list, n) else {
+            return;
+        };
+        let r = level_of(rate, k);
+        let stage = element_stage(
+            (t, dt),
+            finest as usize,
+            substep as usize,
+            depth as usize,
+            ShuOsherStage {
+                start,
+                input,
+                beta,
+                c: c_stage,
+            },
+            last != 0,
+            level_of(level, k) as u8,
+            r as u8,
+        );
+        let c = w_secondary * b_s / (n_bt * (1u64 << r) as f64);
+        // The stage value, as `SSPRK3`/`SSPRK43` combine it, from the rate
+        // RHS + G in the rows
+        let combine = |s: f64, x: f64, f: f64| {
+            let mut v = if stage.a != 0.0 { stage.a * s } else { 0.0 };
+            if stage.b != 0.0 {
+                v += stage.b * x;
+            }
+            if stage.c != 0.0 {
+                v += stage.c * f;
+            }
+            v
+        };
+        let (mut eh, mut ehu, mut ehv) = ([0.0; NN], [0.0; NN], [0.0; NN]);
+        #[unroll]
+        for i in 0..NN {
+            let m = k * NN + i;
+            // SAFETY: thread k reads and writes only its own element's rows
+            // (the pass's elements are distinct).
+            let (fh, fhu, fhv) = unsafe {
+                (
+                    *out_h.get_unchecked_mut(m),
+                    *out_hu.get_unchecked_mut(m),
+                    *out_hv.get_unchecked_mut(m),
+                )
+            };
+            eh[i] = combine(base_h[m], x_h[m], fh + g_h[m]);
+            ehu[i] = combine(base_hu[m], x_hu[m], fhu + g_hu[m]);
+            ehv[i] = combine(base_hv[m], x_hv[m], fhv + g_hv[m]);
+        }
+        // The drags' depth-mean part, point-implicitly with the new depth
+        let (has_bottom, has_column) = (!bottom.is_empty(), !column.is_empty());
+        if has_bottom || has_column {
+            #[unroll]
+            for i in 0..NN {
+                let h = eh[i];
+                if h > 0.0 {
+                    let m = k * NN + i;
+                    let rate = (if has_bottom { bottom[m] / h } else { 0.0 })
+                        + (if has_column { column[m] } else { 0.0 });
+                    if rate > 0.0 {
+                        let factor = 1.0 / (1.0 + stage.c * rate);
+                        ehu[i] *= factor;
+                        ehv[i] *= factor;
+                    }
+                }
+            }
+        }
+        // The sums of DU_avg2 and of the volume sources
+        #[unroll]
+        for i in 0..NN {
+            let m = k * NN + i;
+            // SAFETY: as above, the element's rows of the sums.
+            unsafe {
+                *tr_hu.get_unchecked_mut(m) += c * x_hu[m];
+                *tr_hv.get_unchecked_mut(m) += c * x_hv[m];
+                if has_sources != 0 {
+                    *tr_mass.get_unchecked_mut(m) += c * sources[m];
+                }
+            }
+        }
+        #[unroll]
+        for f in 0..4 {
+            let e = element_edges[k][f] as usize;
+            let edge = edges[e];
+            // A wall's F* is in its left (own) side
+            let side = usize::from(edge[0] as usize != k || edge[1] as usize != f);
+            #[unroll]
+            for fi in 0..N1 {
+                // SAFETY: as above, the element's face nodes.
+                unsafe {
+                    *tr_face.get_unchecked_mut((k * 4 + f) * N1 + fi) +=
+                        c * faces[e][side * N1 + fi][0];
+                }
+            }
+        }
+        // NaN (a stage without subcells) stays NaN
+        let subcells = is_subcell_element(k, x_h, subcell_depth);
+        #[unroll]
+        for s in 0..NSUB {
+            let j = k * NSUB + s;
+            // SAFETY: as above, the element's interfaces.
+            unsafe {
+                let sum = tr_sub.get_unchecked_mut(j);
+                *sum = if subcells {
+                    *sum + c * sub_mass[j]
+                } else {
+                    f64::NAN
+                };
+            }
+        }
+        // The 2D module's damping from the stage's input
+        if damping.is_active() {
+            #[unroll]
+            for i in 0..NN {
+                let m = k * NN + i;
+                let from = SWEState2D::new(x_h[m], x_hu[m], x_hv[m]);
+                damping.node(m, eh[i], &mut ehu[i], &mut ehv[i], from, stage.c);
+            }
+        }
+        match stage.accumulate {
+            // The last stage: the substep's sum
+            Some((w, keep)) => {
+                #[unroll]
+                for i in 0..NN {
+                    let m = k * NN + i;
+                    // SAFETY: as above, the element's rows of the sum.
+                    unsafe {
+                        let sum = |s: &mut f64, v: f64| {
+                            *s = if keep != 0.0 {
+                                w * v + keep * *s
+                            } else {
+                                w * v
+                            };
+                        };
+                        sum(acc_h.get_unchecked_mut(m), eh[i]);
+                        sum(acc_hu.get_unchecked_mut(m), ehu[i]);
+                        sum(acc_hv.get_unchecked_mut(m), ehv[i]);
+                    }
+                }
+            }
+            // A stage the next reads: the wet/dry correction
+            None => {
+                if damping.wet_dry != 0 {
+                    let mut em = [0.0; NN];
+                    #[unroll]
+                    for i in 0..NN {
+                        em[i] = mass[k * NN + i];
+                    }
+                    let config = damping.wet_dry_config();
+                    if wet_dry_element(&mut eh, &mut ehu, &mut ehv, &em, inv_area[k], &config) {
+                        // SAFETY: thread k writes only its own element's count.
+                        unsafe {
+                            *clips.get_unchecked_mut(k) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        #[unroll]
+        for i in 0..NN {
+            let m = k * NN + i;
+            // SAFETY: as above.
+            unsafe {
+                *out_h.get_unchecked_mut(m) = eh[i];
+                *out_hu.get_unchecked_mut(m) = ehu[i];
+                *out_hv.get_unchecked_mut(m) = ehv[i];
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -509,6 +783,60 @@ pub struct DevicePass<'a> {
     pub column: Option<&'a DeviceBuffer<f64>>,
     /// The rivers (their discharge series; the tables are the pass's).
     pub rivers: Option<&'a RiverSources>,
+}
+
+/// The barotropic pass on local time steps on the device (dgcom's
+/// `LocalPass`): the levels and the stage buffers of dgcom's own
+/// `MultirateStepper::schedule`.
+pub struct LocalPass3D {
+    scheme: SspScheme,
+    stepper: MultirateStepper<DeviceState>,
+    element_dt: Vec<f64>,
+    values: Vec<DeviceState>,
+    last: DeviceState,
+    acc: DeviceState,
+}
+
+impl LocalPass3D {
+    /// Up to `max_levels` levels of `scheme`'s substeps, stage buffers like
+    /// `like`.
+    pub fn new(max_levels: usize, scheme: SspScheme, like: &DeviceState) -> Self {
+        Self {
+            scheme,
+            stepper: MultirateStepper::new(max_levels, scheme),
+            element_dt: Vec::new(),
+            values: (0..scheme.n_stages() - 1).map(|_| like.clone()).collect(),
+            last: like.clone(),
+            acc: like.clone(),
+        }
+    }
+
+    /// `LocalPass::assign_levels` from `q`'s element steps under `module`
+    /// (on the device) at the barotropic CFL number `cfl`; the coarse
+    /// substep, at most `dt_cap`.
+    pub fn assign_levels(
+        &mut self,
+        module: &GpuSWE2D,
+        q: &DeviceState,
+        cfl: f64,
+        dt_cap: f64,
+    ) -> f64 {
+        let mesh = module.mesh();
+        self.element_dt.resize(mesh.n_elements, 0.0);
+        module.element_dt(q, cfl, self.scheme, &mut self.element_dt);
+        self.stepper.assign_levels_from(
+            &self.element_dt,
+            mesh,
+            &[module.stencil()],
+            Some(dt_cap),
+            None,
+        )
+    }
+
+    /// The levels, the stage rates and the work counts.
+    pub fn stepper(&self) -> &MultirateStepper<DeviceState> {
+        &self.stepper
+    }
 }
 
 /// The barotropic pass of the 3D model on the GPU (see the module docs): its
@@ -689,6 +1017,259 @@ impl BarotropicPass3D {
         Ok(())
     }
 
+    /// The pass's sums from zero: the average, `DU_avg2`, the volume sources
+    /// and the rivers' discharge.
+    fn clear_sums(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let st = &self.gpu.stream;
+        for field in [&mut self.q_avg.h, &mut self.q_avg.hu, &mut self.q_avg.hv] {
+            field.zero_async(st)?;
+        }
+        let f = &mut self.flux;
+        for field in [&mut f.hu, &mut f.hv, &mut f.face, &mut f.subcell] {
+            field.zero_async(st)?;
+        }
+        self.mass_source.zero_async(st)?;
+        self.discharge.fill(0.0);
+        Ok(())
+    }
+
+    /// dgcom's `barotropic_pass_local` of `q` with `module` and `local`'s
+    /// levels ([`LocalPass3D::assign_levels`]): `q`, [`Self::q_avg`],
+    /// [`Self::flux`]'s `DU_avg2`, [`Self::mass_source`] and
+    /// [`Self::discharge`] end as [`Self::run`] leaves them.
+    pub fn run_local(
+        &mut self,
+        module: &GpuSWE2D,
+        pass: DevicePass<'_>,
+        local: &mut LocalPass3D,
+        q: &mut DeviceState,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let gpu = self.gpu.clone();
+        let (m, st) = (&gpu.module_pass, &gpu.stream);
+        let DevicePass {
+            filter,
+            scheme,
+            t,
+            dt_bt,
+            forcing,
+            bottom,
+            column,
+            rivers,
+        } = pass;
+        assert_eq!(scheme, local.scheme, "the levels are the pass's scheme's");
+        let n = self.statics.n_elements * NN;
+        let n_bt = filter.n_bt();
+        let stages = barotropic_stages(scheme);
+        let n_stages = stages.len();
+        self.clear_sums()?;
+        module.begin_coarse_step(local.stepper.levels(), local.stepper.stage_rates());
+        // The rivers' discharge at their elements' stage times in every
+        // pass, and their means, on the host in the CPU's order: a river's
+        // term where its element is in the pass (its stage's rate at least
+        // the pass's depth), else zero
+        let n_rivers = self.discharge.len();
+        let rivers = rivers.filter(|_| self.rivers.is_some());
+        if let Some(rivers) = rivers {
+            let mut all = Vec::new();
+            let means = &mut self.discharge;
+            for (mi, &w_secondary) in filter.secondary_weights().iter().enumerate() {
+                let t_m = t + mi as f64 * dt_bt;
+                local.stepper.schedule(t_m, dt_bt, |p| {
+                    let MultiratePass::Stage { stage: s, plan, .. } = p else {
+                        return;
+                    };
+                    let b_s = stages[s].weight;
+                    for (i, mean) in means.iter_mut().enumerate() {
+                        let k = rivers.element(i).as_usize();
+                        let discharge = rivers.discharge(i, plan.at(k).time);
+                        all.push(discharge);
+                        let r = plan.rate[k];
+                        let term = if r as usize >= plan.depth {
+                            let c = w_secondary * b_s / (n_bt as f64 * (1u64 << r) as f64);
+                            c * discharge
+                        } else {
+                            0.0
+                        };
+                        *mean += term;
+                    }
+                });
+            }
+            self.discharges = DeviceBuffer::from_host(st, &all)?;
+        }
+        if self.rivers.is_some() {
+            self.mean_discharge = DeviceBuffer::from_host(st, &self.discharge)?;
+        }
+        let has_sources = u32::from(module.has_mass_sources());
+        let tables = module.pass_tables();
+        let (subcell_depth, damping) = (tables.subcell_depth, tables.damping);
+        drop(tables);
+        let Self {
+            sub_mass,
+            sources,
+            rivers: river_tables,
+            discharges,
+            none,
+            flux,
+            mass_source,
+            q_avg,
+            ..
+        } = self;
+        let none: &DeviceBuffer<f64> = none;
+        let (bottom, column) = (bottom.unwrap_or(none), column.unwrap_or(none));
+        let discharges: &DeviceBuffer<f64> = discharges;
+        let river_tables = river_tables.as_ref().filter(|_| rivers.is_some());
+        let LocalPass3D {
+            stepper,
+            values,
+            last,
+            acc,
+            ..
+        } = local;
+        let mut pass_index = 0;
+        let mut failure: Option<Box<dyn std::error::Error>> = None;
+        for (mi, &w_secondary) in filter.secondary_weights().iter().enumerate() {
+            let t_m = t + mi as f64 * dt_bt;
+            stepper.schedule(t_m, dt_bt, |p| match p {
+                MultiratePass::Stage {
+                    stage: s,
+                    elements,
+                    plan,
+                } => {
+                    let (done, rest) = values.split_at_mut(s);
+                    let input: &DeviceState = if s == 0 { &*q } else { &done[s - 1] };
+                    let out: &mut DeviceState = if s + 1 < n_stages {
+                        &mut rest[0]
+                    } else {
+                        &mut *last
+                    };
+                    let first = (pass_index * n_rivers) as u32;
+                    pass_index += 1;
+                    let base: &DeviceState = q;
+                    let fluxes = PassFluxes {
+                        subcell: &mut *sub_mass,
+                        sources: &mut *sources,
+                    };
+                    let b_s = stages[s].weight;
+                    module.stage_pass_where(
+                        input,
+                        elements,
+                        plan,
+                        out,
+                        fluxes,
+                        |lists, out, fluxes| {
+                            let mut launch_all = || -> Result<(), Box<dyn std::error::Error>> {
+                                // SAFETY: every buffer is sized for this mesh (or
+                                // the rivers' passes); the pass's elements are
+                                // distinct; `out` and `acc` are neither `base`
+                                // nor `input` (the stepper's buffers).
+                                unsafe {
+                                    if let Some(r) = river_tables {
+                                        m.river_lts(
+                                            st,
+                                            launch(lists.n, COLUMN_BLOCK),
+                                            lists.n as u32,
+                                            lists.list,
+                                            first,
+                                            &r.offsets,
+                                            &r.by_element,
+                                            discharges,
+                                            &r.share,
+                                            &mut out.h,
+                                        )?;
+                                    }
+                                    let mut tables = module.pass_tables();
+                                    let w = plan.weights;
+                                    m.pass_stage_lts(
+                                        st,
+                                        launch(lists.n, COLUMN_BLOCK),
+                                        lists.n as u32,
+                                        lists.list,
+                                        plan.step.0,
+                                        plan.step.1,
+                                        plan.finest as u32,
+                                        plan.substep as u32,
+                                        plan.depth as u32,
+                                        u32::from(plan.last),
+                                        w.start,
+                                        w.input,
+                                        w.beta,
+                                        w.c,
+                                        lists.level,
+                                        lists.rate,
+                                        w_secondary,
+                                        b_s,
+                                        n_bt as f64,
+                                        subcell_depth,
+                                        damping,
+                                        has_sources,
+                                        &base.h,
+                                        &base.hu,
+                                        &base.hv,
+                                        &input.h,
+                                        &input.hu,
+                                        &input.hv,
+                                        &forcing.h,
+                                        &forcing.hu,
+                                        &forcing.hv,
+                                        bottom,
+                                        column,
+                                        &tables.faces,
+                                        tables.element_edges,
+                                        tables.edges,
+                                        fluxes.subcell,
+                                        &fluxes.sources.h,
+                                        tables.mass,
+                                        tables.inv_area,
+                                        &mut out.h,
+                                        &mut out.hu,
+                                        &mut out.hv,
+                                        &mut flux.hu,
+                                        &mut flux.hv,
+                                        &mut flux.face,
+                                        &mut flux.subcell,
+                                        &mut *mass_source,
+                                        &mut acc.h,
+                                        &mut acc.hu,
+                                        &mut acc.hv,
+                                        &mut tables.clips,
+                                    )?;
+                                }
+                                Ok(())
+                            };
+                            if let Err(e) = launch_all() {
+                                failure.get_or_insert(e);
+                            }
+                        },
+                    );
+                }
+                MultiratePass::Finish { elements, depth } => {
+                    module.finish_where(q, acc, elements, depth)
+                }
+            });
+            stepper.count_step(dt_bt);
+            if let Some(e) = failure.take() {
+                return Err(e);
+            }
+            let avg = &mut *q_avg;
+            // SAFETY: every buffer holds the mesh's nodes.
+            unsafe {
+                m.average_last(
+                    st,
+                    launch(n, COLUMN_BLOCK),
+                    n as u32,
+                    filter.weights()[mi],
+                    &q.h,
+                    &q.hu,
+                    &q.hv,
+                    &mut avg.h,
+                    &mut avg.hu,
+                    &mut avg.hv,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// dgcom's `barotropic_pass` of `q` with `module`: `q` ends as the last
     /// substep's state, [`Self::q_avg`] as the filtered average (without the
     /// 2D module's wet/dry correction, [`Self::finish`]'s), [`Self::flux`]'s
@@ -716,14 +1297,7 @@ impl BarotropicPass3D {
         let n = ne * NN;
         let n_bt = filter.n_bt();
         let stages = barotropic_stages(scheme);
-        for field in [&mut self.q_avg.h, &mut self.q_avg.hu, &mut self.q_avg.hv] {
-            field.zero_async(st)?;
-        }
-        let f = &mut self.flux;
-        for field in [&mut f.hu, &mut f.hv, &mut f.face, &mut f.subcell] {
-            field.zero_async(st)?;
-        }
-        self.mass_source.zero_async(st)?;
+        self.clear_sums()?;
         // The rivers' discharge at every stage time and their means, on the
         // host in the CPU's order; the stages' values uploaded at once (and
         // zero means for a pass without them)

@@ -299,7 +299,7 @@ impl Damping {
 /// Thread `i`'s item of a launch over `n` items: `list[i]`, or `i` itself
 /// where the list is empty (every item); `None` past the end.
 #[inline]
-fn item(i: usize, list: &[u32], n: u32) -> Option<usize> {
+pub fn item(i: usize, list: &[u32], n: u32) -> Option<usize> {
     if i >= n as usize {
         None
     } else if list.is_empty() {
@@ -329,7 +329,7 @@ const SHALLOW: usize = 1;
 
 /// The level of element `k` (`level` empty: global steps, level 0).
 #[inline]
-fn level_of(level: &[u32], k: usize) -> usize {
+pub fn level_of(level: &[u32], k: usize) -> usize {
     if level.is_empty() {
         0
     } else {
@@ -2683,6 +2683,29 @@ pub struct PassFluxes<'b> {
     pub sources: &'b mut DeviceState,
 }
 
+/// A stage pass's lists ([`GpuSWE2D::plan_lists`]).
+struct PlanLists<'s> {
+    times: [f64; LEVELS],
+    finest: usize,
+    list: &'s DeviceBuffer<u32>,
+    n: usize,
+    edges: [(&'s DeviceBuffer<u32>, usize); 2],
+    level: &'s DeviceBuffer<u32>,
+    last_rate: &'s DeviceBuffer<u32>,
+    rate: &'s DeviceBuffer<u32>,
+}
+
+/// A stage pass of the 3D model's barotropic pass on local time steps, as
+/// its stage kernel takes it ([`GpuSWE2D::stage_pass_where`]): the pass's
+/// elements (the first `n` of `list`, every element where it is empty),
+/// every element's level and this stage's rate (empty: level 0).
+pub struct PassLists<'b> {
+    pub list: &'b DeviceBuffer<u32>,
+    pub n: usize,
+    pub level: &'b DeviceBuffer<u32>,
+    pub rate: &'b DeviceBuffer<u32>,
+}
+
 /// What the 3D model's barotropic stage kernel reads of the 2D module
 /// ([`GpuSWE2D::pass_tables`]).
 pub struct PassTables<'b> {
@@ -2954,9 +2977,11 @@ struct Schedule {
     /// The levels and stage rates of the lists, as uploaded
     level_host: Vec<u8>,
     rates_host: Vec<Vec<u8>>,
-    /// Every element's level and last-stage rate
+    /// Every element's level and last-stage rate, and its every stage's
+    /// rate (the barotropic pass of the 3D model weighs its sums by them)
     level: DeviceBuffer<u32>,
     last_rate: DeviceBuffer<u32>,
+    rates: Vec<DeviceBuffer<u32>>,
     elements: Vec<DeviceBuffer<u32>>,
     element_counts: Vec<Vec<usize>>,
     /// Per stage, the interior edges (`[0]`) and the boundary edges (`[1]`)
@@ -2974,6 +2999,7 @@ impl Schedule {
             rates_host: Vec::new(),
             level: none()?,
             last_rate: none()?,
+            rates: Vec::new(),
             elements: Vec::new(),
             element_counts: Vec::new(),
             edges: Vec::new(),
@@ -3046,6 +3072,12 @@ impl Schedule {
         let widen = |keys: &[u8]| keys.iter().map(|&k| u32::from(k)).collect::<Vec<_>>();
         upload(&mut self.level, &widen(level))?;
         upload(&mut self.last_rate, &widen(rates.last().expect("a stage")))?;
+        self.rates.resize_with(rates.len(), || {
+            DeviceBuffer::zeroed(stream, 0).expect("allocation")
+        });
+        for (device, rate) in self.rates.iter_mut().zip(rates) {
+            upload(device, &widen(rate))?;
+        }
         let keys: Vec<&[u8]> = rates.iter().map(Vec::as_slice).chain([level]).collect();
         self.elements.resize_with(keys.len(), || {
             DeviceBuffer::zeroed(stream, 0).expect("allocation")
@@ -3669,6 +3701,117 @@ impl<'a> GpuSWE2D<'a> {
         );
     }
 
+    /// A stage pass's lists in the coarse step's schedule (`schedule`, from
+    /// [`LocalTimeStepping::begin_coarse_step`]): every level's stage time,
+    /// the pass's elements and edges, every element's level, last-stage rate
+    /// and this stage's rate.
+    fn plan_lists<'s>(
+        &'s self,
+        schedule: &'s Schedule,
+        elements: &[u32],
+        plan: &StagePlan<'_>,
+    ) -> PlanLists<'s> {
+        let finest = schedule.finest;
+        assert_eq!(plan.finest, finest, "the plan is the coarse step's");
+        // Every level's stage time
+        let mut times = [0.0; LEVELS];
+        for (l, time) in times.iter_mut().enumerate().take(finest + 1) {
+            *time = element_stage(
+                plan.step,
+                plan.finest,
+                plan.substep,
+                plan.depth,
+                plan.weights,
+                false,
+                l as u8,
+                l as u8,
+            )
+            .time;
+        }
+        let (s, d) = (plan.stage, plan.depth);
+        let all = finest == 0;
+        let n = if all {
+            self.mesh.n_elements
+        } else {
+            schedule.element_counts[s][d]
+        };
+        assert_eq!(elements.len(), n, "the pass's elements are the schedule's");
+        let st = &self.statics;
+        // The first n of the schedule's orders (every element, and the
+        // static edge lists, with one level)
+        let (list, edges, level, last_rate, rate) = if all {
+            let static_edges = [
+                (&st.interior_edges, st.interior_edges.len()),
+                (&st.boundary_edges, st.boundary_edges.len()),
+            ];
+            let none = &self.no_list;
+            (none, static_edges, none, none, none)
+        } else {
+            (
+                &schedule.elements[s],
+                [0, 1].map(|kind| (&schedule.edges[s][kind], schedule.edge_counts[s][kind][d])),
+                &schedule.level,
+                &schedule.last_rate,
+                &schedule.rates[s],
+            )
+        };
+        PlanLists {
+            times,
+            finest,
+            list,
+            n,
+            edges,
+            level,
+            last_rate,
+            rate,
+        }
+    }
+
+    /// A stage pass of the 3D model's barotropic pass on local time steps
+    /// (`BarotropicPhysics::stage_subset_then`): the RHS of the pass's
+    /// elements of `input` at their levels' stage times into their rows of
+    /// `out`, with the pass's `fluxes` ([`Self::rhs_pass_fluxes_into`]),
+    /// then `then` with the pass's lists, the rows and the fluxes, which
+    /// turns the rows into the stage's values.
+    pub fn stage_pass_where<'f>(
+        &self,
+        input: &DeviceState,
+        elements: &[u32],
+        plan: &StagePlan<'_>,
+        out: &mut DeviceState,
+        fluxes: PassFluxes<'f>,
+        then: impl FnOnce(PassLists<'_>, &mut DeviceState, PassFluxes<'f>),
+    ) {
+        if elements.is_empty() {
+            return;
+        }
+        let schedule = self.schedule.lock().expect("schedule");
+        let lists = self.plan_lists(&schedule, elements, plan);
+        let PassFluxes { subcell, sources } = fluxes;
+        self.rhs_where(
+            input,
+            &lists.times[..=lists.finest],
+            lists.level,
+            lists.edges,
+            (lists.list, lists.n),
+            out,
+            Some(PassFluxes {
+                subcell: &mut *subcell,
+                sources: &mut *sources,
+            }),
+        );
+        then(
+            PassLists {
+                list: lists.list,
+                n: lists.n,
+                level: lists.level,
+                rate: lists.rate,
+            },
+            out,
+            PassFluxes { subcell, sources },
+        );
+    }
+
     /// What the 3D model's barotropic stage kernel reads of the module
     /// ([`PassTables`]), the face buffer locked.
     pub fn pass_tables(&self) -> PassTables<'_> {
@@ -4035,57 +4178,16 @@ impl LocalTimeStepping<DeviceState> for GpuSWE2D<'_> {
             return;
         }
         let schedule = self.schedule.lock().expect("schedule");
-        let finest = schedule.finest;
-        assert_eq!(plan.finest, finest, "the plan is the coarse step's");
-        // Every level's stage time
-        let mut times = [0.0; LEVELS];
-        for (l, time) in times.iter_mut().enumerate().take(finest + 1) {
-            *time = element_stage(
-                plan.step,
-                plan.finest,
-                plan.substep,
-                plan.depth,
-                plan.weights,
-                false,
-                l as u8,
-                l as u8,
-            )
-            .time;
-        }
-        let (s, d) = (plan.stage, plan.depth);
-        let all = finest == 0;
-        let n_elements = if all {
-            self.mesh.n_elements
-        } else {
-            schedule.element_counts[s][d]
-        };
-        assert_eq!(
-            elements.len(),
-            n_elements,
-            "the pass's elements are the schedule's"
-        );
-        // The first n of the schedule's orders (every element, and the
-        // static edge lists, with one level)
-        let element_list = if all {
-            &self.no_list
-        } else {
-            &schedule.elements[s]
-        };
-        let st = &self.statics;
-        let edges = if all {
-            [
-                (&st.interior_edges, st.interior_edges.len()),
-                (&st.boundary_edges, st.boundary_edges.len()),
-            ]
-        } else {
-            [0, 1].map(|kind| (&schedule.edges[s][kind], schedule.edge_counts[s][kind][d]))
-        };
-        let level = if all { &self.no_list } else { &schedule.level };
-        let last_rate = if all {
-            &self.no_list
-        } else {
-            &schedule.last_rate
-        };
+        let PlanLists {
+            times,
+            finest,
+            list: element_list,
+            n: n_elements,
+            edges,
+            level,
+            last_rate,
+            ..
+        } = self.plan_lists(&schedule, elements, plan);
         self.rhs_where(
             input,
             &times[..=finest],
@@ -4095,6 +4197,7 @@ impl LocalTimeStepping<DeviceState> for GpuSWE2D<'_> {
             out,
             None,
         );
+        let st = &self.statics;
 
         let gpu = &self.gpu;
         let line_local = self.line_local.lock().expect("line-local flags");
