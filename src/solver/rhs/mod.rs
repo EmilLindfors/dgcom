@@ -64,8 +64,8 @@ pub use boundary_3d::{Boundaries3D, Exterior3D, ExteriorField, FaceExterior};
 
 pub mod advection_3d;
 pub use advection_3d::{
-    ExtrapolationTracerBC3D, FixedTracerBC3D, TracerBCContext3D, TracerBoundaryCondition3D,
-    UpwindTracerBC3D,
+    DeviceTracerBC3D, ExtrapolationTracerBC3D, FixedTracerBC3D, TracerBCContext3D,
+    TracerBoundaryCondition3D, UpwindTracerBC3D,
 };
 
 pub mod merged_cells;

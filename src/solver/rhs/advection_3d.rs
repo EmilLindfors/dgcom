@@ -32,6 +32,40 @@ pub struct TracerBCContext3D {
 /// [`crate::solver::rhs::boundary_3d`]).
 pub trait TracerBoundaryCondition3D: Send + Sync {
     fn exterior_value(&self, ctx: &TracerBCContext3D) -> f64;
+
+    /// The condition as a device runs it, if it has a form there (`None`:
+    /// a run on a device refuses it).
+    fn device_form(&self) -> Option<DeviceTracerBC3D> {
+        None
+    }
+}
+
+/// A [`TracerBoundaryCondition3D`] as a device (`gpu/`) evaluates it: plain
+/// data, the same values as [`TracerBoundaryCondition3D::exterior_value`]
+/// ([`Self::exterior_value`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DeviceTracerBC3D {
+    /// The interior's value ([`ExtrapolationTracerBC3D`]).
+    Extrapolation,
+    /// A fixed value ([`FixedTracerBC3D`]).
+    Fixed(f64),
+    /// A fixed value on inflow, the interior's otherwise
+    /// ([`UpwindTracerBC3D`]).
+    Upwind(f64),
+}
+
+impl DeviceTracerBC3D {
+    /// The exterior value beside `interior` with the outward volume flux
+    /// `normal_velocity`.
+    #[inline]
+    pub fn exterior_value(self, interior: f64, normal_velocity: f64) -> f64 {
+        match self {
+            Self::Extrapolation => interior,
+            Self::Fixed(value) => value,
+            Self::Upwind(value) if normal_velocity < 0.0 => value,
+            Self::Upwind(_) => interior,
+        }
+    }
 }
 
 /// Zero-gradient tracer boundary condition.
@@ -40,6 +74,10 @@ pub struct ExtrapolationTracerBC3D;
 impl TracerBoundaryCondition3D for ExtrapolationTracerBC3D {
     fn exterior_value(&self, ctx: &TracerBCContext3D) -> f64 {
         ctx.interior_value
+    }
+
+    fn device_form(&self) -> Option<DeviceTracerBC3D> {
+        Some(DeviceTracerBC3D::Extrapolation)
     }
 }
 
@@ -57,6 +95,10 @@ impl FixedTracerBC3D {
 impl TracerBoundaryCondition3D for FixedTracerBC3D {
     fn exterior_value(&self, _ctx: &TracerBCContext3D) -> f64 {
         self.value
+    }
+
+    fn device_form(&self) -> Option<DeviceTracerBC3D> {
+        Some(DeviceTracerBC3D::Fixed(self.value))
     }
 }
 
@@ -78,6 +120,10 @@ impl TracerBoundaryCondition3D for UpwindTracerBC3D {
         } else {
             ctx.interior_value
         }
+    }
+
+    fn device_form(&self) -> Option<DeviceTracerBC3D> {
+        Some(DeviceTracerBC3D::Upwind(self.inflow_value))
     }
 }
 
@@ -110,5 +156,35 @@ mod tests {
 
         ctx.normal_velocity = 0.2;
         assert_close(bc.exterior_value(&ctx), 8.0);
+    }
+
+    /// A device form gives its condition's values to the bit, on inflow,
+    /// outflow and a flux of zero.
+    #[test]
+    fn device_forms_give_the_conditions_values() {
+        let conditions: [&dyn TracerBoundaryCondition3D; 3] = [
+            &ExtrapolationTracerBC3D,
+            &FixedTracerBC3D::new(4.25),
+            &UpwindTracerBC3D::new(3.5),
+        ];
+        for bc in conditions {
+            let form = bc.device_form().expect("a device form");
+            for normal_velocity in [-0.2, -0.0, 0.0, 0.3] {
+                let ctx = TracerBCContext3D {
+                    element: 2,
+                    face: 1,
+                    level: 3,
+                    face_node: 0,
+                    boundary_tag: Some(BoundaryTag::Open),
+                    interior_value: 8.125,
+                    normal_velocity,
+                };
+                assert_eq!(
+                    form.exterior_value(ctx.interior_value, normal_velocity)
+                        .to_bits(),
+                    bc.exterior_value(&ctx).to_bits()
+                );
+            }
+        }
     }
 }
