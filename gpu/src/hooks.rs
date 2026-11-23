@@ -1,7 +1,7 @@
 //! The mode splitter's 3D stage values on the GPU (P2.7 Phase 4.3a,
 //! `notes/gpu.md`): what `ModeSplitIntegrator::step` does to a stage's
 //! inventories to make the values the next stage's RHS reads, and the hooks
-//! of `Hydrostatic3D` it calls there, but the tracer limiter (4.3b):
+//! of `Hydrostatic3D` it calls there:
 //!
 //! - inventories ↔ values: dgcom's `to_inventory`, `from_inventory_after`
 //!   (the last values where a node has no water, the stash's velocities in
@@ -15,8 +15,9 @@
 //!   (`Hydrostatic3D::mask_stage` with `StageStash::mask`, `forget`,
 //!   `restore_into`), their momentum tendencies zeroed
 //!   (`zero_thin_momentum`);
-//! - the density of the linear equation of state (`update_density_on`:
-//!   `post_stage` without a limiter, `end_density`);
+//! - the tracer limiter of `post_stage` (Phase 4.3b, `limiter.rs`), then
+//!   the density of the linear equation of state (`update_density_on`;
+//!   `end_density` alone at the step's end);
 //! - the nesting band's relaxation of the shear and the tracers to the
 //!   parent's columns (`NestingColumns::relax_shear`, `relax_tracers`,
 //!   Phase 4.3c): the band's slots static ([`Band3D`]), the parent's columns
@@ -49,6 +50,7 @@ use dgcom::solver::rhs::transport_3d::{DRY_DEPTH, layer_thickness_of, layer_volu
 use dgcom::solver::state::Solution3D;
 use dgcom::vertical::depth_average;
 
+use crate::limiter::Limiter3D;
 use crate::swe2d::{Gpu, NN};
 use crate::three_d::{LEVEL_BLOCK, Statics3D, launch};
 
@@ -1033,20 +1035,22 @@ impl Band3D {
 }
 
 /// The mode splitter's stage values and `Hydrostatic3D`'s hooks there on the
-/// device (but the tracer limiter, 4.3b).
+/// device.
 pub struct StageHooks3D {
     gpu: Arc<Gpu>,
     /// Columns shallower than this are thin
     min_column_depth: f64,
     /// The linear equation of state: ρ₀, T₀, S₀, α, β
     eos: DeviceBuffer<f64>,
+    /// The tracer limiter of `post_stage`, if any
+    limiter: Option<Limiter3D>,
     none: DeviceBuffer<f64>,
     none_u32: DeviceBuffer<u32>,
 }
 
 impl StageHooks3D {
-    /// The hooks with the linear equation of state `eos`; columns shallower
-    /// than `min_column_depth` are thin.
+    /// The hooks with the linear equation of state `eos` and no tracer
+    /// limiter; columns shallower than `min_column_depth` are thin.
     pub fn new(
         gpu: &Arc<Gpu>,
         eos: LinearEOS,
@@ -1057,9 +1061,17 @@ impl StageHooks3D {
             gpu: gpu.clone(),
             min_column_depth,
             eos: DeviceBuffer::from_host(st, &[eos.rho0, eos.t0, eos.s0, eos.alpha, eos.beta])?,
+            limiter: None,
             none: DeviceBuffer::zeroed(st, 0)?,
             none_u32: DeviceBuffer::zeroed(st, 0)?,
         })
+    }
+
+    /// The hooks with `limiter` limiting every stage's tracers
+    /// (`Hydrostatic3D::post_stage`; its thin depth should be the hooks').
+    pub fn with_limiter(mut self, limiter: Limiter3D) -> Self {
+        self.limiter = Some(limiter);
+        self
     }
 
     /// A stage buffer for `statics`' mesh: values like `like`'s (sized as
@@ -1522,12 +1534,12 @@ impl StageHooks3D {
 
     /// A stage's values from its inventories `inv` and its RHS argument's
     /// values `from` (the splitter's `stage_values`): [`Self::values_of`],
-    /// the density (`end_density` at the step's `end`; `post_stage`, which
-    /// limits the tracers first, 4.3b), the limited T and S back into
-    /// `inv`, the dry nodes' inventories of u, v, k, ψ from their last
-    /// values, and the thin columns masked for the next RHS.
+    /// the tracer limiter (`post_stage`, but at the step's `end`: then
+    /// `end_density`), the density, the limited T and S back into `inv`,
+    /// the dry nodes' inventories of u, v, k, ψ from their last values, and
+    /// the thin columns masked for the next RHS.
     pub fn stage_values(
-        &self,
+        &mut self,
         s: &Statics3D,
         merged: &Merged3D,
         inv: &mut State3D,
@@ -1536,8 +1548,9 @@ impl StageHooks3D {
         end: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.values_of(s, merged, inv, out, from)?;
-        // `post_stage` limits the tracers before (4.3b); `end_density` not
-        let _ = end;
+        if let (false, Some(limiter)) = (end, &mut self.limiter) {
+            limiter.apply(s, &mut out.values)?;
+        }
         self.density(s, &mut out.values, None)?;
         self.inventories_of(s, merged, &out.values, inv, false)?;
         self.dry_inventories(s, merged, &out.values, inv)?;

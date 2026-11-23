@@ -11,7 +11,7 @@
 mod limiters_1d;
 mod standard;
 mod swe_2d;
-mod tracer_3d;
+pub mod tracer_3d;
 mod traits;
 
 // Traits

@@ -1,7 +1,7 @@
 //! The 3D stage-values gate (P2.7 Phase 4.3a, `notes/gpu.md`): what the mode
 //! splitter does to a stage's inventories to make the values the next
-//! stage's RHS reads, with `Hydrostatic3D`'s hooks there but the tracer
-//! limiter ([`StageHooks3D`]), on the GPU against dgcom on the CPU composed in
+//! stage's RHS reads, with `Hydrostatic3D`'s hooks there ([`StageHooks3D`]),
+//! on the GPU against dgcom on the CPU composed in
 //! `ModeSplitIntegrator::step`'s order, value for value:
 //!
 //! - the step's start: the merged cells' groups to their means
@@ -10,8 +10,10 @@
 //!   flushed elements' values passed through (`MergedCells::pass_through`);
 //! - a stage from another buffer's values (the slots of local time
 //!   stepping: `from_inventory_after` with the last values and their
-//!   stash's velocities, the groups, the flushed elements), the density,
-//!   T and S back to inventories (`inventory_of`), the dry nodes'
+//!   stash's velocities, the groups, the flushed elements), the case
+//!   runner's tracer limiter and the density (`post_stage`; Phase 4.3b,
+//!   whose own gate is `limiter3d`), T and S back to inventories
+//!   (`inventory_of`), the dry nodes'
 //!   inventories (`dry_inventories`), the mask;
 //! - a stage in place (global steps), the step's last (`end_density`);
 //! - the step's end: the mask undone (`restore_into`), the values of its
@@ -37,23 +39,25 @@ use dgcom::boundary::{
 };
 use dgcom::mesh::BoundaryTag;
 use dgcom::physics::{EquationOfState, LinearEOS, zero_thin_momentum};
-use dgcom::solver::Blocks;
 use dgcom::solver::rhs::transport_3d::{dry_inventories, from_inventory_after, inventory_of};
 use dgcom::solver::rhs::{
     MergedCells, MergedTables, StepWater, from_inventory, to_inventory, w_cell_thicknesses,
 };
 use dgcom::solver::state::Solution3D;
+use dgcom::solver::{Blocks, TracerLimiter3DConfig, apply_tracer_limiters_3d};
 use dgcom::source::SpongeProfile;
 use dgcom::time::{StageStash, StageTime};
 use dgcom::vertical::{SigmaGrid, depth_average};
 
 use crate::hooks::{Band3D, Merged3D, N_FIELDS, StageHooks3D, StageValues3D, State3D};
+use crate::limiter::{Limiter3D, VertexPatches};
+use crate::limiter3d::case_runner_config;
 use crate::swe2d::{Gpu, NN, ORDER};
 use crate::three_d::Statics3D;
 use crate::transport3d::{DT, Fixture, LEVELS, Shape, agreement};
 
 /// What the gate compares, by name, at every point of the pipeline.
-type Snapshots = Vec<(String, Vec<f64>)>;
+pub(crate) type Snapshots = Vec<(String, Vec<f64>)>;
 
 /// The inventory fields' names, in the splitter's order.
 const NAMES: [&str; N_FIELDS] = ["u", "v", "T", "S", "k", "psi"];
@@ -161,6 +165,8 @@ struct Cpu<'a> {
     fx: &'a Fixture,
     merged: &'a MergedCells,
     eos: LinearEOS,
+    /// `post_stage`'s tracer limiter
+    limiter: TracerLimiter3DConfig,
     d_sigma_w: Vec<f64>,
 }
 
@@ -258,17 +264,32 @@ impl Cpu<'_> {
         to.vbar.data.copy_from_slice(&from.vbar.data);
     }
 
-    /// The splitter's `stage_values` with `Hydrostatic3D`'s hooks (no
-    /// tracer limiter: `post_stage` and `end_density` are the density).
+    /// The splitter's `stage_values` with `Hydrostatic3D`'s hooks: its
+    /// `post_stage` (the tracer limiter, then the density), or at the
+    /// step's `end` its `end_density`.
     fn stage_values(
         &self,
         inv: &mut Solution3D,
         out: &mut Solution3D,
         stash: &mut StageStash,
         from: Option<(&Solution3D, &StageStash)>,
+        end: bool,
     ) {
         let (fx, all) = (self.fx, self.all());
         self.values_of(inv, out, stash, from);
+        if !end {
+            apply_tracer_limiters_3d(
+                out,
+                &fx.mesh,
+                &fx.ops,
+                &fx.geom,
+                &fx.bathymetry,
+                &fx.sigma,
+                &self.limiter,
+                fx.min_column_depth,
+                all,
+            );
+        }
         self.eos.update_density_on(out, all);
         let d_sigma = fx.sigma.d_sigma();
         for (q, c) in [(&mut inv.temp, &out.temp), (&mut inv.salt, &out.salt)] {
@@ -365,14 +386,14 @@ impl Cpu<'_> {
         combine(&mut inv, &fx.eta_rate, 1.0);
         let mut v1 = start.clone();
         let mut stash1 = StageStash::default();
-        self.stage_values(&mut inv, &mut v1, &mut stash1, Some((&v0, &stash0)));
+        self.stage_values(&mut inv, &mut v1, &mut stash1, Some((&v0, &stash0)), false);
         take(&mut out, "stage values", &v1, 0..N_FIELDS, true);
         out.push(("stage values masked".into(), masked(&stash1, fx)));
         take(&mut out, "stage inventories", &inv, 0..N_FIELDS, false);
         // A stage in place, the step's last
         combine(&mut inv, &fx.eta_rate, 2.0);
         let mut stash = std::mem::take(&mut stash1);
-        self.stage_values(&mut inv, &mut v1, &mut stash, None);
+        self.stage_values(&mut inv, &mut v1, &mut stash, None, true);
         take(&mut out, "in place values", &v1, 0..N_FIELDS, true);
         out.push(("in place values masked".into(), masked(&stash, fx)));
         take(&mut out, "in place inventories", &inv, 0..N_FIELDS, false);
@@ -412,7 +433,6 @@ struct Device<'a> {
     gpu: &'a Arc<Gpu>,
     fx: &'a Fixture,
     statics: &'a Statics3D,
-    hooks: &'a StageHooks3D,
 }
 
 impl Device<'_> {
@@ -431,14 +451,15 @@ impl Device<'_> {
         Ok(flags.into_iter().map(f64::from).collect())
     }
 
-    /// The whole pipeline from `start` with the groups `merged`.
+    /// The whole pipeline from `start` with `hooks` and the groups `merged`.
     fn run(
         &self,
+        hooks: &mut StageHooks3D,
         merged: &Merged3D,
         start: &Solution3D,
         mutations: Mutations,
     ) -> Result<Snapshots, Box<dyn std::error::Error>> {
-        let (gpu, s, hooks, fx) = (self.gpu, self.statics, self.hooks, self.fx);
+        let (gpu, s, fx) = (self.gpu, self.statics, self.fx);
         let mut out = Snapshots::new();
         let mut state = State3D::upload(gpu, start)?;
         hooks.start(s, merged, &mut state)?;
@@ -538,7 +559,7 @@ impl Device<'_> {
 
 /// `device`'s snapshots against `cpu`'s, a line per stage of the pipeline
 /// (and per value that differs); whether all are the same to the bit.
-fn report(cpu: &Snapshots, device: &Snapshots) -> bool {
+pub(crate) fn report(cpu: &Snapshots, device: &Snapshots) -> bool {
     assert_eq!(cpu.len(), device.len(), "the snapshots");
     let mut same = true;
     let mut group: Option<(String, usize, usize, usize)> = None;
@@ -586,7 +607,7 @@ fn report(cpu: &Snapshots, device: &Snapshots) -> bool {
 
 /// How many of `cpu`'s values `device`'s differ from, and where most; prints
 /// the mutant's line. Whether the gate catches it.
-fn report_mutant(what: &str, cpu: &Snapshots, device: &Snapshots) -> bool {
+pub(crate) fn report_mutant(what: &str, cpu: &Snapshots, device: &Snapshots) -> bool {
     let (mut total, mut worst) = (0, (0, ""));
     for ((name, c), (_, g)) in cpu.iter().zip(device) {
         let a = agreement(c, g);
@@ -671,22 +692,29 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
     );
     let mut d_sigma_w = vec![0.0; LEVELS + 1];
     w_cell_thicknesses(fx.sigma.d_sigma(), &mut d_sigma_w);
+    let config = case_runner_config(&fx);
     let cpu = Cpu {
         fx: &fx,
         merged: &merged,
         eos: LinearEOS::default(),
+        limiter: config.clone(),
         d_sigma_w,
     }
     .run(&start);
     let statics = fx.statics(gpu)?;
-    let hooks = StageHooks3D::new(gpu, LinearEOS::default(), fx.min_column_depth)?;
+    let unlimited = || StageHooks3D::new(gpu, LinearEOS::default(), fx.min_column_depth);
+    let patches = VertexPatches::of(&fx.mesh);
+    let limiter = || Limiter3D::new(gpu, &statics, &patches, &config, fx.min_column_depth);
+    let mut hooks = unlimited()?.with_limiter(limiter()?);
     let device = Device {
         gpu,
         fx: &fx,
         statics: &statics,
-        hooks: &hooks,
     };
-    let mut same = report(&cpu, &device.run(&groups, &start, Mutations::default())?);
+    let mut same = report(
+        &cpu,
+        &device.run(&mut hooks, &groups, &start, Mutations::default())?,
+    );
     // Every part of the pipeline must act: the groups, the flushed elements,
     // the mask
     let mut needed = tables.elements.is_empty() || tables.flushed_elements.is_empty();
@@ -740,8 +768,22 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
         ),
     ];
     for (what, groups, mutations) in runs {
-        same &= report_mutant(what, &cpu, &device.run(&groups, &start, mutations)?);
+        same &= report_mutant(
+            what,
+            &cpu,
+            &device.run(&mut hooks, &groups, &start, mutations)?,
+        );
     }
+    same &= report_mutant(
+        "the tracers not limited",
+        &cpu,
+        &device.run(
+            &mut unlimited()?,
+            &Merged3D::upload(gpu, tables)?,
+            &start,
+            Mutations::default(),
+        )?,
+    );
     println!(
         "  {}",
         if same {
@@ -768,10 +810,12 @@ fn time(
     let merged = find_groups(&fx, &start);
     let mut d_sigma_w = vec![0.0; LEVELS + 1];
     w_cell_thicknesses(fx.sigma.d_sigma(), &mut d_sigma_w);
+    let config = case_runner_config(&fx);
     let cpu = Cpu {
         fx: &fx,
         merged: &merged,
         eos: LinearEOS::default(),
+        limiter: config.clone(),
         d_sigma_w,
     };
     let all = Blocks::All(ne);
@@ -792,14 +836,17 @@ fn time(
     let mut cpu_time = 0.0;
     for it in 0..iterations + 1 {
         let t0 = Instant::now();
-        cpu.stage_values(&mut inv, &mut v1, &mut stash1, Some((&v0, &stash0)));
+        cpu.stage_values(&mut inv, &mut v1, &mut stash1, Some((&v0, &stash0)), false);
         if it >= 1 {
             cpu_time += t0.elapsed().as_secs_f64();
         }
     }
     drop(v1);
     let statics = fx.statics(gpu)?;
-    let hooks = StageHooks3D::new(gpu, LinearEOS::default(), fx.min_column_depth)?;
+    let patches = VertexPatches::of(&fx.mesh);
+    let limiter = Limiter3D::new(gpu, &statics, &patches, &config, fx.min_column_depth)?;
+    let mut hooks =
+        StageHooks3D::new(gpu, LinearEOS::default(), fx.min_column_depth)?.with_limiter(limiter);
     let groups = Merged3D::upload(gpu, merged.tables())?;
     println!(
         "timing, {label}: {ne} P{ORDER} elements × {LEVELS} levels ({:.1} M points), {} elements \

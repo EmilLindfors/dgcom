@@ -7,8 +7,8 @@
 //! cargo oxide run --no-fmad --features simd   # ... against the SIMD batch
 //! cargo oxide run --features simd             # multiply–adds fused: the timing
 //! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, beach,
-//!                                             # transport3d, momentum3d, stage3d; all by
-//!                                             # default)
+//!                                             # transport3d, momentum3d, stage3d,
+//!                                             # limiter3d; all by default)
 //! target\release\dgcom-gpu.exe case <case.toml> [--set key.path=value]...
 //!                                             # a case on the CPU and the GPU, compared
 //! target\release\dgcom-gpu.exe run <case.toml> [--set ...]
@@ -26,8 +26,9 @@
 //!   u, v, T and S with the reference's (`transport3d`); the reference at
 //!   the levels, the baroclinic pressure gradient, Coriolis and the shear's
 //!   viscosity (`momentum3d`); the stage values the mode splitter makes of
-//!   a stage's inventories, with the merged cells, the thin columns' mask
-//!   and the density, and the nesting band's relaxation (`stage3d`); value
+//!   a stage's inventories, with the merged cells, the thin columns' mask,
+//!   the tracer limiter and the density, and the nesting band's relaxation
+//!   (`stage3d`); the tracer limiter's configurations (`limiter3d`); value
 //!   for value.
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
@@ -39,6 +40,8 @@ use std::process::ExitCode;
 mod baroclinic;
 mod case;
 mod hooks;
+mod limiter;
+mod limiter3d;
 mod momentum3d;
 mod nest;
 mod phase0;
@@ -103,6 +106,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if which == "all" || which == "stage3d" {
         stage3d::run(&gpu)?;
+    }
+    if which == "all" || which == "limiter3d" {
+        limiter3d::run(&gpu)?;
     }
     Ok(())
 }
