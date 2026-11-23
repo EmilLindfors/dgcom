@@ -71,7 +71,7 @@
 //! 38–69.
 
 use crate::mesh::data::Bathymetry2D;
-use crate::solver::core::blocks::{Blocks, Pooled, for_each_block};
+use crate::solver::core::blocks::{Blocks, Pooled, for_each_block, reduce_blocks};
 use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
@@ -118,10 +118,46 @@ impl ImplicitVerticalAdvection {
     pub fn implicit_fraction(&self, courant: f64) -> f64 {
         let (a, b) = (self.courant_min, self.courant_max);
         if courant > a {
-            (courant - a).powi(2) / (courant * (courant + b - 2.0 * a))
+            let excess = courant - a;
+            excess * excess / (courant * (courant + b - 2.0 * a))
         } else {
             0.0
         }
+    }
+
+    /// [`Self::split_column`] of a column of water of depth `depth` (m) on
+    /// layers of σ-thickness `d_sigma`, its explicit part left in `omega`:
+    /// nothing in a column shallower than `thin_depth` (its `Ω` stays
+    /// explicit, `implicit` zero). `thickness`: scratch of a value per layer.
+    /// Whether any of it is implicit, and the largest outflow Courant number
+    /// (zero in a thin column). `Hydrostatic3D`'s split of a stage's `Ω`, and
+    /// the GPU's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_water_column(
+        &self,
+        depth: f64,
+        thin_depth: f64,
+        d_sigma: &[f64],
+        dt: f64,
+        omega: &mut [f64],
+        implicit: &mut [f64],
+        thickness: &mut [f64],
+    ) -> (bool, f64) {
+        if depth < thin_depth {
+            implicit.fill(0.0);
+            return (false, 0.0);
+        }
+        for (h, &ds) in thickness.iter_mut().zip(d_sigma) {
+            *h = layer_thickness_of(depth, ds);
+        }
+        let largest = self.split_column(omega, thickness, dt, implicit);
+        let any = implicit.iter().any(|&w| w != 0.0);
+        if any {
+            for (w, &w_i) in omega.iter_mut().zip(implicit.iter()) {
+                *w -= w_i;
+            }
+        }
+        (any, largest)
     }
 
     /// Write the implicit part `Ω_i` of a column's `omega` (`n + 1`
@@ -156,6 +192,54 @@ impl ImplicitVerticalAdvection {
     }
 }
 
+/// Split the vertical volume fluxes `omega` (`Ω` at the σ-surfaces,
+/// `[element][node][n_levels + 1]`) of the columns of `elements` under
+/// `[η, bed]` (`[element][node]`, `n_nodes` per element) into their explicit
+/// part, left in `omega`, and their implicit part, into `implicit`, each
+/// element at its forward-Euler step `euler_dt[k]`
+/// ([`ImplicitVerticalAdvection::split_water_column`]; layers of σ-thickness
+/// `d_sigma`; the columns shallower than `thin_depth` explicit). The columns
+/// with an implicit part, and the largest outflow Courant number.
+#[allow(clippy::too_many_arguments)]
+pub fn split_vertical_velocity(
+    split: &ImplicitVerticalAdvection,
+    [eta, bed]: [&[f64]; 2],
+    thin_depth: f64,
+    d_sigma: &[f64],
+    euler_dt: &[f64],
+    n_nodes: usize,
+    [omega, implicit]: [&mut [f64]; 2],
+    elements: Blocks,
+) -> (usize, f64) {
+    let (nn, nl) = (n_nodes, d_sigma.len());
+    reduce_blocks(
+        elements,
+        [omega, implicit],
+        || Pooled::take(|t: &Vec<f64>| t.len() == nl, || vec![0.0; nl]),
+        |thickness, k, [omega_k, implicit_k]| {
+            let (mut count, mut largest) = (0, 0.0_f64);
+            for i in 0..nn {
+                let idx = k * nn + i;
+                let column = i * (nl + 1)..(i + 1) * (nl + 1);
+                let (any, courant) = split.split_water_column(
+                    eta[idx] - bed[idx],
+                    thin_depth,
+                    d_sigma,
+                    euler_dt[k],
+                    &mut omega_k[column.clone()],
+                    &mut implicit_k[column],
+                    thickness,
+                );
+                largest = largest.max(courant);
+                count += usize::from(any);
+            }
+            (count, largest)
+        },
+        || (0, 0.0),
+        |a, b| (a.0 + b.0, a.1.max(b.1)),
+    )
+}
+
 /// Relax the inventory fields of the stage value `stage` (`H_z u`, `H_z v`,
 /// `H_z T`, `H_z S` and the turbulence's `H_w k`, `H_w ψ`) with the implicit
 /// vertical fluxes `omega_implicit` (`Ω_i` at the σ-surfaces,
@@ -169,7 +253,7 @@ impl ImplicitVerticalAdvection {
 /// The turbulence's bed and surface w-points hold the closure's boundary
 /// values: the solve takes them as their interior neighbours' (as the
 /// explicit advection does) and leaves their inventories alone.
-pub(crate) fn apply_implicit_vertical_advection(
+pub fn apply_implicit_vertical_advection(
     stage: &mut Solution3D,
     omega_implicit: &[f64],
     d_sigma: &[f64],
@@ -244,24 +328,6 @@ impl ElementColumns<'_> {
         &self.omega[i * nw..(i + 1) * nw]
     }
 
-    /// Add `weight` times the upward and downward fluxes through the
-    /// surfaces of node `i`'s `n_cells` cells to `up` and `down`: the layers'
-    /// `Ω_i`, or for the w-cells (one more) the mean of each layer's two, as
-    /// [`crate::solver::rhs::apply_w_point_transport_3d`] has it.
-    fn add_fluxes(&self, i: usize, n_cells: usize, weight: f64, up: &mut [f64], down: &mut [f64]) {
-        let omega = self.omega_at(i);
-        let staggered = n_cells > self.n_levels;
-        for j in 1..n_cells {
-            let w = if staggered {
-                0.5 * (omega[j - 1] + omega[j])
-            } else {
-                omega[j]
-            };
-            up[j] += weight * w.max(0.0);
-            down[j] += weight * (-w).max(0.0);
-        }
-    }
-
     /// Relax the inventory `field` (`[node][cell]`, cells of σ-thickness
     /// `cells`) over `dt`; `w_points`: the end cells hold the closure's
     /// boundary values (see [`apply_implicit_vertical_advection`]).
@@ -286,30 +352,73 @@ impl ElementColumns<'_> {
         } = scratch;
         let solve = if w_points { w_cells } else { layers };
         debug_assert_eq!(solve.len(), nc);
-        let depth = |i: usize| (self.eta[i] - self.bed[i]).max(0.0);
-        // The end w-points carry their neighbours' values, as the explicit
-        // advection does
-        let starting_values = |solve: &mut ColumnSolve, start: &mut [f64]| {
-            start[..nc].copy_from_slice(&solve.values);
-        };
         for i in 0..nn {
-            if self.omega_at(i).iter().all(|&w| w == 0.0) {
-                continue;
-            }
-            solve.up.fill(0.0);
-            solve.down.fill(0.0);
-            self.add_fluxes(i, nc, 1.0, &mut solve.up, &mut solve.down);
-            let column = &mut field[i * nc..(i + 1) * nc];
-            for l in 0..nc {
-                solve.volume[l] = layer_thickness_of(depth(i), cells[l]);
-                solve.values[l] = column[l] / solve.volume[l];
-            }
-            starting_values(solve, start);
-            solve.solve(dt, w_points);
-            for (l, q) in column.iter_mut().enumerate() {
-                *q += solve.volume[l] * (solve.values[l] - start[l]);
-            }
+            let ColumnSolve {
+                up,
+                down,
+                volume,
+                values,
+                c_prime,
+            } = solve;
+            relax_column(
+                &mut field[i * nc..(i + 1) * nc],
+                cells,
+                self.omega_at(i),
+                self.eta[i] - self.bed[i],
+                w_points,
+                dt,
+                [up, down, volume, values, c_prime, &mut start[..nc]],
+            );
         }
+    }
+}
+
+/// [`apply_implicit_vertical_advection`] of one column of `depth` (m, `η −
+/// B`) with the implicit fluxes `omega` (`Ω_i` at its `n_levels + 1`
+/// σ-surfaces): its inventory `column` (`n_cells` cells of σ-thickness
+/// `cells`; with `w_points`, the w-cells, whose end cells hold the
+/// closure's boundary values) relaxed over `dt`. Nothing if `omega` is zero.
+/// `[up, down]` (`n_cells + 1`), `[volume, values, c_prime, start]`
+/// (`n_cells`): scratch. The GPU's kernel calls it too.
+pub fn relax_column(
+    column: &mut [f64],
+    cells: &[f64],
+    omega: &[f64],
+    depth: f64,
+    w_points: bool,
+    dt: f64,
+    [up, down, volume, values, c_prime, start]: [&mut [f64]; 6],
+) {
+    if omega.iter().all(|&w| w == 0.0) {
+        return;
+    }
+    let nc = cells.len();
+    let depth = depth.max(0.0);
+    // The fluxes through the cells' surfaces: the layers' `Ω_i`, or for
+    // the w-cells (one more) the mean of each layer's two, as
+    // `apply_w_point_transport_3d` has it
+    up.fill(0.0);
+    down.fill(0.0);
+    let staggered = nc == omega.len();
+    for j in 1..nc {
+        let w = if staggered {
+            0.5 * (omega[j - 1] + omega[j])
+        } else {
+            omega[j]
+        };
+        up[j] += w.max(0.0);
+        down[j] += (-w).max(0.0);
+    }
+    for l in 0..nc {
+        volume[l] = layer_thickness_of(depth, cells[l]);
+        values[l] = column[l] / volume[l];
+    }
+    // The end w-points carry their neighbours' values, as the explicit
+    // advection does
+    start[..nc].copy_from_slice(&values[..nc]);
+    solve_column(up, down, volume, values, c_prime, dt, w_points);
+    for (l, q) in column.iter_mut().enumerate() {
+        *q += volume[l] * (values[l] - start[l]);
     }
 }
 
@@ -365,25 +474,9 @@ impl ColumnSolve {
         self.volume.len()
     }
 
-    /// Solve
-    /// `V_l x_l + dt [up_{l+1} x_l − down_{l+1} x_{l+1} − up_l x_{l−1} + down_l x_l] = V_l c_l`
-    /// for `x`, with `c` and then `x` in `self.values` (the volumes, the
-    /// fluxes through the σ-surfaces and the values set). An M-matrix,
-    /// diagonally dominant by columns: the Thomas algorithm needs no pivoting
-    /// and every pivot is positive.
-    ///
-    /// With `zero_gradient_ends` (at least three cells) the two end cells are
-    /// not unknowns: what flows out of them carries their neighbour's new
-    /// value, as for the turbulence's bed and surface w-points, whose own
-    /// values are the closure's boundary values. Their neighbours' rows then
-    /// have that inflow on the diagonal; where it would take the diagonal
-    /// below half the cell's volume (an inflow far beyond the outflow) it is
-    /// taken at the neighbour's starting value instead, keeping the M-matrix
-    /// at the cost of constancy there. The end cells' values then change by
-    /// the flux through their one interior surface, so the column's inventory
-    /// is kept.
-    pub(crate) fn solve(&mut self, dt: f64, zero_gradient_ends: bool) {
-        let n = self.len();
+    /// [`solve_column`] on these buffers.
+    #[cfg(test)]
+    fn solve(&mut self, dt: f64, zero_gradient_ends: bool) {
         let Self {
             up,
             down,
@@ -391,78 +484,108 @@ impl ColumnSolve {
             values,
             c_prime,
         } = self;
-        if n == 0 || (zero_gradient_ends && n < 3) {
-            return;
-        }
-        let (lo, hi) = if zero_gradient_ends {
-            (1, n - 2)
+        solve_column(up, down, volume, values, c_prime, dt, zero_gradient_ends);
+    }
+}
+
+/// Solve
+/// `V_l x_l + dt [up_{l+1} x_l − down_{l+1} x_{l+1} − up_l x_{l−1} + down_l x_l] = V_l c_l`
+/// for `x`, with `c` and then `x` in `values` (the volumes `volume`, the
+/// fluxes `up`, `down` through the `n + 1` σ-surfaces set; `c_prime`:
+/// scratch of `n`). An M-matrix, diagonally dominant by columns: the Thomas
+/// algorithm needs no pivoting and every pivot is positive.
+///
+/// With `zero_gradient_ends` (at least three cells) the two end cells are
+/// not unknowns: what flows out of them carries their neighbour's new
+/// value, as for the turbulence's bed and surface w-points, whose own
+/// values are the closure's boundary values. Their neighbours' rows then
+/// have that inflow on the diagonal; where it would take the diagonal
+/// below half the cell's volume (an inflow far beyond the outflow) it is
+/// taken at the neighbour's starting value instead, keeping the M-matrix
+/// at the cost of constancy there. The end cells' values then change by
+/// the flux through their one interior surface, so the column's inventory
+/// is kept.
+pub fn solve_column(
+    up: &[f64],
+    down: &[f64],
+    volume: &[f64],
+    values: &mut [f64],
+    c_prime: &mut [f64],
+    dt: f64,
+    zero_gradient_ends: bool,
+) {
+    let n = volume.len();
+    if n == 0 || (zero_gradient_ends && n < 3) {
+        return;
+    }
+    let (lo, hi) = if zero_gradient_ends {
+        (1, n - 2)
+    } else {
+        (0, n - 1)
+    };
+    let (start_lo, start_hi) = (values[lo], values[hi]);
+    let diagonal = |l: usize| volume[l] + dt * (up[l + 1] + down[l]);
+    // The rows next to zero-gradient ends: the inflow from the end on
+    // the diagonal (`implicit_*`), or lagged on the right-hand side
+    let (mut b_lo, mut extra_lo) = (diagonal(lo), 0.0);
+    let (mut implicit_below, mut implicit_above) = (true, true);
+    if zero_gradient_ends {
+        if b_lo - dt * up[lo] >= 0.5 * volume[lo] {
+            b_lo -= dt * up[lo];
         } else {
-            (0, n - 1)
-        };
-        let (start_lo, start_hi) = (values[lo], values[hi]);
-        let diagonal = |l: usize| volume[l] + dt * (up[l + 1] + down[l]);
-        // The rows next to zero-gradient ends: the inflow from the end on
-        // the diagonal (`implicit_*`), or lagged on the right-hand side
-        let (mut b_lo, mut extra_lo) = (diagonal(lo), 0.0);
-        let (mut implicit_below, mut implicit_above) = (true, true);
-        if zero_gradient_ends {
-            if b_lo - dt * up[lo] >= 0.5 * volume[lo] {
-                b_lo -= dt * up[lo];
-            } else {
-                implicit_below = false;
-                extra_lo += dt * up[lo] * start_lo;
-            }
+            implicit_below = false;
+            extra_lo += dt * up[lo] * start_lo;
         }
-        let (mut b_hi, mut extra_hi) = if hi == lo {
-            (b_lo, extra_lo)
+    }
+    let (mut b_hi, mut extra_hi) = if hi == lo {
+        (b_lo, extra_lo)
+    } else {
+        (diagonal(hi), 0.0)
+    };
+    if zero_gradient_ends {
+        if b_hi - dt * down[hi + 1] >= 0.5 * volume[hi] {
+            b_hi -= dt * down[hi + 1];
         } else {
-            (diagonal(hi), 0.0)
+            implicit_above = false;
+            extra_hi += dt * down[hi + 1] * start_hi;
+        }
+    }
+    // Row l: a_l x_{l−1} + b_l x_l + c_l x_{l+1} = V_l c_l (+ extra)
+    let a = |l: usize| if l > lo { -dt * up[l] } else { 0.0 };
+    let c = |l: usize| if l < hi { -dt * down[l + 1] } else { 0.0 };
+    let row = |l: usize, value: f64| {
+        if l == hi {
+            (b_hi, volume[l] * value + extra_hi)
+        } else if l == lo {
+            (b_lo, volume[l] * value + extra_lo)
+        } else {
+            (diagonal(l), volume[l] * value)
+        }
+    };
+    let (b, rhs) = row(lo, values[lo]);
+    c_prime[lo] = c(lo) / b;
+    values[lo] = rhs / b;
+    for l in lo + 1..=hi {
+        let (b, rhs) = row(l, values[l]);
+        let pivot = b - a(l) * c_prime[l - 1];
+        c_prime[l] = c(l) / pivot;
+        values[l] = (rhs - a(l) * values[l - 1]) / pivot;
+    }
+    for l in (lo..hi).rev() {
+        values[l] -= c_prime[l] * values[l + 1];
+    }
+    if zero_gradient_ends {
+        // The bed end loses what flows up through surface 1 and gains
+        // what flows down; the surface end the reverse through n − 1
+        let carried_up = if implicit_below { values[1] } else { start_lo };
+        values[0] += dt * (down[1] * values[1] - up[1] * carried_up) / volume[0];
+        let carried_down = if implicit_above {
+            values[n - 2]
+        } else {
+            start_hi
         };
-        if zero_gradient_ends {
-            if b_hi - dt * down[hi + 1] >= 0.5 * volume[hi] {
-                b_hi -= dt * down[hi + 1];
-            } else {
-                implicit_above = false;
-                extra_hi += dt * down[hi + 1] * start_hi;
-            }
-        }
-        // Row l: a_l x_{l−1} + b_l x_l + c_l x_{l+1} = V_l c_l (+ extra)
-        let a = |l: usize| if l > lo { -dt * up[l] } else { 0.0 };
-        let c = |l: usize| if l < hi { -dt * down[l + 1] } else { 0.0 };
-        let row = |l: usize, value: f64| {
-            if l == hi {
-                (b_hi, volume[l] * value + extra_hi)
-            } else if l == lo {
-                (b_lo, volume[l] * value + extra_lo)
-            } else {
-                (diagonal(l), volume[l] * value)
-            }
-        };
-        let (b, rhs) = row(lo, values[lo]);
-        c_prime[lo] = c(lo) / b;
-        values[lo] = rhs / b;
-        for l in lo + 1..=hi {
-            let (b, rhs) = row(l, values[l]);
-            let pivot = b - a(l) * c_prime[l - 1];
-            c_prime[l] = c(l) / pivot;
-            values[l] = (rhs - a(l) * values[l - 1]) / pivot;
-        }
-        for l in (lo..hi).rev() {
-            values[l] -= c_prime[l] * values[l + 1];
-        }
-        if zero_gradient_ends {
-            // The bed end loses what flows up through surface 1 and gains
-            // what flows down; the surface end the reverse through n − 1
-            let carried_up = if implicit_below { values[1] } else { start_lo };
-            values[0] += dt * (down[1] * values[1] - up[1] * carried_up) / volume[0];
-            let carried_down = if implicit_above {
-                values[n - 2]
-            } else {
-                start_hi
-            };
-            values[n - 1] +=
-                dt * (up[n - 1] * values[n - 2] - down[n - 1] * carried_down) / volume[n - 1];
-        }
+        values[n - 1] +=
+            dt * (up[n - 1] * values[n - 2] - down[n - 1] * carried_down) / volume[n - 1];
     }
 }
 

@@ -29,20 +29,22 @@
 use std::sync::Arc;
 
 use cuda_core::{DeviceBuffer, DeviceCopy};
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+use cuda_device::{DisjointSlice, kernel, thread, warp};
 use cuda_host::cuda_module;
 use dgcom::physics::cage_drag::cage_rates;
+use dgcom::physics::implicit_advection::relax_column;
 use dgcom::physics::vertical_diffusion::{
     ColumnBuffers, ColumnForcing, diffuse_column, thin_column_fluxes,
 };
 use dgcom::physics::vertical_mixing::Forcing;
-use dgcom::physics::{BottomDrag3D, GlsMixing, JerlovWater};
+use dgcom::physics::{BottomDrag3D, GlsMixing, ImplicitVerticalAdvection, JerlovWater};
 use dgcom::solver::rhs::transport_3d::DRY_DEPTH;
 use dgcom::source::CageDrag2D;
 use dgcom::vertical::SigmaGrid;
 
 use crate::hooks::State3D;
-use crate::swe2d::Gpu;
+use crate::swe2d::{Gpu, NN};
 use crate::three_d::{COLUMN_BLOCK, MAX_LEVELS, Statics3D, launch};
 
 /// A GLS closure on the device: dgcom's own, copied as it is.
@@ -87,6 +89,143 @@ pub mod kernels_vertical {
                 *out.get_unchecked_mut(t * 4 + j) = value;
             }
         }
+    }
+
+    /// `Hydrostatic3D::split_vertical_velocity`, a thread per column: the
+    /// column's `Ω` (`omega`, `nl + 1` σ-surfaces) split by dgcom's
+    /// `ImplicitVerticalAdvection::split_water_column` (`courant_min`,
+    /// `courant_max`) for its element's forward-Euler step `euler_dt`, the
+    /// explicit part left in `omega`, the implicit one into `implicit`. The
+    /// columns with an implicit part are appended to `active`, their number
+    /// counted in `counts[0]` (zeroed before): one atomic per warp, the
+    /// list's order the atomics' (no result depends on it).
+    #[kernel]
+    pub fn split_omega(
+        nl: u32,
+        n: u32,
+        courant_min: f64,
+        courant_max: f64,
+        thin_depth: f64,
+        eta: &[f64],
+        bed: &[f64],
+        d_sigma: &[f64],
+        euler_dt: &[f64],
+        counts: *mut u32,
+        mut omega: DisjointSlice<f64>,
+        mut implicit: DisjointSlice<f64>,
+        mut active: DisjointSlice<u32>,
+    ) {
+        // Every lane reaches the vote: no early return
+        let col = thread::index_1d().get();
+        let (nl, nw) = (nl as usize, nl as usize + 1);
+        let mut any = false;
+        if col < n as usize {
+            let split = ImplicitVerticalAdvection {
+                courant_min,
+                courant_max,
+            };
+            let mut thickness = [0.0; MAX_LEVELS];
+            // SAFETY: thread col alone touches column col.
+            unsafe {
+                let column = |p: *mut f64| core::slice::from_raw_parts_mut(p.add(col * nw), nw);
+                any = split
+                    .split_water_column(
+                        eta[col] - bed[col],
+                        thin_depth,
+                        &d_sigma[..nl],
+                        euler_dt[col / NN],
+                        column(omega.as_mut_ptr()),
+                        column(implicit.as_mut_ptr()),
+                        &mut thickness[..nl],
+                    )
+                    .0;
+            }
+        }
+        let mask = warp::ballot(any);
+        let lane = warp::lane_id();
+        let mut base = 0u32;
+        if mask != 0 && lane == mask.trailing_zeros() {
+            // SAFETY: `counts` holds a u32 that only atomics touch here.
+            let count = unsafe { DeviceAtomicU32::from_ptr(counts) };
+            base = count.fetch_add(mask.count_ones(), AtomicOrdering::Relaxed);
+        }
+        let base = warp::shuffle(base, mask.trailing_zeros() & 31);
+        if any {
+            // SAFETY: each active lane writes the slot its warp reserved plus
+            // its rank among the warp's active lanes: distinct slots, fewer
+            // than the columns.
+            unsafe {
+                *active.get_unchecked_mut(
+                    (base + (mask & warp::lanemask_lt()).count_ones()) as usize,
+                ) = col as u32;
+            }
+        }
+    }
+
+    /// `apply_implicit_vertical_advection` of the columns of `active` (the
+    /// first `counts[0]`), a thread per column and field: the column's
+    /// inventory of u, v, T or S (or k, ψ on the w-cells, if not empty)
+    /// relaxed with its implicit fluxes `implicit` over its element's `dt`,
+    /// by dgcom's `relax_column`. Launched for up to six threads per column.
+    #[kernel]
+    pub fn relax_implicit(
+        nl: u32,
+        counts: &[u32],
+        active: &[u32],
+        eta: &[f64],
+        bed: &[f64],
+        d_sigma: &[f64],
+        d_sigma_w: &[f64],
+        implicit: &[f64],
+        dt: &[f64],
+        mut u: DisjointSlice<f64>,
+        mut v: DisjointSlice<f64>,
+        mut temp: DisjointSlice<f64>,
+        mut salt: DisjointSlice<f64>,
+        mut tke: DisjointSlice<f64>,
+        mut gls: DisjointSlice<f64>,
+    ) {
+        let t = thread::index_1d().get();
+        let (j, field) = (t / 6, t % 6);
+        if j >= counts[0] as usize || (field >= 4 && tke.is_empty()) {
+            return;
+        }
+        let col = active[j] as usize;
+        let (nl, nw) = (nl as usize, nl as usize + 1);
+        let omega = &implicit[col * nw..(col + 1) * nw];
+        let (pointer, nc, cells, w_points) = match field {
+            0 => (u.as_mut_ptr(), nl, d_sigma, false),
+            1 => (v.as_mut_ptr(), nl, d_sigma, false),
+            2 => (temp.as_mut_ptr(), nl, d_sigma, false),
+            3 => (salt.as_mut_ptr(), nl, d_sigma, false),
+            4 => (tke.as_mut_ptr(), nw, d_sigma_w, true),
+            _ => (gls.as_mut_ptr(), nw, d_sigma_w, true),
+        };
+        let mut up = [0.0; MAX_LEVELS + 2];
+        let mut down = [0.0; MAX_LEVELS + 2];
+        let mut volume = [0.0; MAX_LEVELS + 1];
+        let mut values = [0.0; MAX_LEVELS + 1];
+        let mut c_prime = [0.0; MAX_LEVELS + 1];
+        let mut start = [0.0; MAX_LEVELS + 1];
+        // SAFETY: the listed columns are distinct: thread (j, field) alone
+        // touches column col of its field.
+        let column = unsafe { core::slice::from_raw_parts_mut(pointer.add(col * nc), nc) };
+        relax_column(
+            column,
+            &cells[..nc],
+            omega,
+            eta[col] - bed[col],
+            w_points,
+            dt[col / NN],
+            [
+                &mut up[..nc + 1],
+                &mut down[..nc + 1],
+                &mut volume[..nc],
+                &mut values[..nc],
+                &mut c_prime[..nc],
+                &mut start[..nc],
+            ],
+        );
     }
 
     /// `Hydrostatic3D::bottom_drag_into`, a thread per column: the drag
@@ -378,6 +517,131 @@ pub struct SurfaceDevice<'a> {
     pub roughness: Option<&'a DeviceBuffer<f64>>,
     /// `[non-solar, shortwave, fresh water]` (`SurfaceTracerFluxes`)
     pub tracers: Option<[&'a DeviceBuffer<f64>; 3]>,
+}
+
+/// Implicit vertical advection on the device (`ImplicitVerticalAdvection`,
+/// Phase 4.4b): a stage's `Ω` split into its explicit and implicit parts,
+/// and the stage's inventories relaxed with the implicit part.
+pub struct Implicit3D {
+    gpu: Arc<Gpu>,
+    split: ImplicitVerticalAdvection,
+    min_column_depth: f64,
+    /// `Ω_i` of the last [`Self::split`], `[column][σ-surface]`
+    pub implicit: DeviceBuffer<f64>,
+    /// The columns with an implicit part (the first `counts[0]` of
+    /// `active`, in no particular order)
+    counts: DeviceBuffer<u32>,
+    active: DeviceBuffer<u32>,
+}
+
+impl Implicit3D {
+    pub fn new(
+        gpu: &Arc<Gpu>,
+        statics: &Statics3D,
+        split: ImplicitVerticalAdvection,
+        min_column_depth: f64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let st = &gpu.stream;
+        let n = statics.n_columns();
+        Ok(Self {
+            gpu: gpu.clone(),
+            split,
+            min_column_depth,
+            implicit: DeviceBuffer::zeroed(st, n * (statics.n_levels + 1))?,
+            counts: DeviceBuffer::zeroed(st, 1)?,
+            active: DeviceBuffer::zeroed(st, n)?,
+        })
+    }
+
+    /// The columns with an implicit part at the last [`Self::split`] (waits
+    /// for the device).
+    pub fn columns(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        Ok(self.counts.to_host_vec(&self.gpu.stream)?[0] as usize)
+    }
+
+    /// `Hydrostatic3D::split_vertical_velocity` of a stage's `omega` (the
+    /// layer transport's, under `eta`), every element at its forward-Euler
+    /// step `euler_dt`: its explicit part left in `omega`, the implicit one
+    /// kept.
+    pub fn split(
+        &mut self,
+        s: &Statics3D,
+        eta: &DeviceBuffer<f64>,
+        euler_dt: &DeviceBuffer<f64>,
+        omega: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let n = s.n_columns();
+        let st = &self.gpu.stream;
+        self.counts.zero_async(st)?;
+        // SAFETY: the buffers are sized for this mesh and these levels;
+        // `counts` holds the one u32 the kernel's atomics touch.
+        unsafe {
+            self.gpu.module_vertical.split_omega(
+                st,
+                launch(n, COLUMN_BLOCK),
+                s.n_levels as u32,
+                n as u32,
+                self.split.courant_min,
+                self.split.courant_max,
+                self.min_column_depth,
+                eta,
+                &s.bed,
+                &s.d_sigma,
+                euler_dt,
+                self.counts.cu_deviceptr() as *mut u32,
+                omega,
+                &mut self.implicit,
+                &mut self.active,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `implicit_vertical_advection` of the inventories `stage` with the
+    /// implicit part of the last [`Self::split`], each element over its
+    /// `dt`.
+    pub fn relax(
+        &self,
+        s: &Statics3D,
+        stage: &mut State3D,
+        dt: &DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let n = s.n_columns();
+        let State3D {
+            eta,
+            u,
+            v,
+            temp,
+            salt,
+            tke,
+            gls,
+            ..
+        } = stage;
+        // SAFETY: the buffers are sized for this mesh and these levels; the
+        // listed columns are the last split's.
+        unsafe {
+            self.gpu.module_vertical.relax_implicit(
+                &self.gpu.stream,
+                launch(6 * n, COLUMN_BLOCK),
+                s.n_levels as u32,
+                &self.counts,
+                &self.active,
+                eta,
+                &s.bed,
+                &s.d_sigma,
+                &s.d_sigma_w,
+                &self.implicit,
+                dt,
+                u,
+                v,
+                temp,
+                salt,
+                tke,
+                gls,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// `dgcom::math`'s `[pow(x, y), exp(y), ln(x), hypot(x, y)]` of every pair
