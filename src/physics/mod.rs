@@ -48,7 +48,7 @@ pub use eos::{EquationOfState, LinearEOS, UnescoEOS};
 pub use gls::{GlsMixing, GlsParameters, StabilityFunctions, WaveBreaking};
 pub use hydrostatic_3d::{
     ElementStep, Hydrostatic3D, ImplicitAdvectionStats, TimeStepLimit, TimeStepLimits,
-    TracerRanges, zero_thin_momentum,
+    TracerRanges, thin_columns_to_depth_mean, zero_thin_momentum,
 };
 pub use implicit_advection::ImplicitVerticalAdvection;
 pub use surface_fluxes::{SeaSurface, SurfaceFluxFields, SurfaceFluxes3D};

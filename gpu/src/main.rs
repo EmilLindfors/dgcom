@@ -8,7 +8,7 @@
 //! cargo oxide run --features simd             # multiply–adds fused: the timing
 //! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, beach,
 //!                                             # transport3d, momentum3d, stage3d,
-//!                                             # limiter3d; all by default)
+//!                                             # limiter3d, vertical3d; all by default)
 //! target\release\dgcom-gpu.exe case <case.toml> [--set key.path=value]...
 //!                                             # a case on the CPU and the GPU, compared
 //! target\release\dgcom-gpu.exe run <case.toml> [--set ...]
@@ -28,7 +28,9 @@
 //!   viscosity (`momentum3d`); the stage values the mode splitter makes of
 //!   a stage's inventories, with the merged cells, the thin columns' mask,
 //!   the tracer limiter and the density, and the nesting band's relaxation
-//!   (`stage3d`); the tracer limiter's configurations (`limiter3d`); value
+//!   (`stage3d`); the tracer limiter's configurations (`limiter3d`); the
+//!   step's vertical terms, GLS and the implicit diffusion with the drags
+//!   and the surface fluxes, and `dgcom::math` itself (`vertical3d`); value
 //!   for value.
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
@@ -50,6 +52,8 @@ mod stage3d;
 mod swe2d;
 mod three_d;
 mod transport3d;
+mod vertical;
+mod vertical3d;
 mod viscosity;
 
 fn main() -> ExitCode {
@@ -109,6 +113,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if which == "all" || which == "limiter3d" {
         limiter3d::run(&gpu)?;
+    }
+    if which == "all" || which == "vertical3d" {
+        vertical3d::run(&gpu)?;
     }
     Ok(())
 }

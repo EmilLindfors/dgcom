@@ -9,6 +9,7 @@
 //! (ϕ_k^{n+1} - ϕ_k^n) / Δt = 1/Δz_k [ K_{k+1/2} (ϕ_{k+1}^{n+1} - ϕ_k^{n+1}) / Δz_{k+1/2}
 //!                                   - K_{k-1/2} (ϕ_k^{n+1} - ϕ_{k-1}^{n+1}) / Δz_{k-1/2} ]
 
+use crate::math::hypot;
 use crate::mesh::data::Bathymetry2D;
 use crate::physics::air_sea::{FRESH_WATER_DENSITY, JerlovWater, SEAWATER_HEAT_CAPACITY};
 use crate::physics::vertical_mixing::{Column, Forcing, Turbulence, VerticalMixing};
@@ -141,7 +142,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     } = state;
     let (eta, rho): (&[f64], &[f64]) = (&eta.data, rho);
     let n = state.n_elements * nn * nl;
-    let [tau_bx, tau_by] = forcing.bottom_stress;
+    let levels = [sigma.sigma_rho(), sigma.sigma_w(), sigma.d_sigma()];
     for_each_block(
         elements,
         [
@@ -183,142 +184,298 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 // column as eta + h, so eta + h = eta - B = water_depth,
                 // matching the PGF/advection paths.
                 let h = -bathymetry.get(ElementIndex::new(k), i);
+                let (local, column) = (i * nl..(i + 1) * nl, idx * nl..(idx + 1) * nl);
+                let tracer_fluxes = surface.tracers.map(|fluxes| {
+                    [
+                        fluxes.nonsolar[idx],
+                        fluxes.shortwave[idx],
+                        fluxes.freshwater[idx],
+                    ]
+                });
                 if eta[idx] + h < min_column_depth {
                     // A thin column: its fluxes over the whole of it and
                     // the bed, if asked for
                     let depth = eta[idx] + h;
                     if let Some(bed) = surface.thin_bed.filter(|_| depth >= DRY_DEPTH) {
-                        let mut heat = forcing.surface_heat_flux;
-                        let mut fresh = 0.0;
-                        if let Some(fluxes) = &surface.tracers {
-                            heat += fluxes.nonsolar[idx] + fluxes.shortwave[idx];
-                            fresh = fluxes.freshwater[idx];
-                        }
-                        let warming = dt * heat / (rho0 * SEAWATER_HEAT_CAPACITY * (depth + bed));
-                        let salting = dt * fresh / (FRESH_WATER_DENSITY * (depth + bed));
-                        for l in 0..nl {
-                            temp[i * nl + l] += warming;
-                            salt[i * nl + l] *= 1.0 + salting;
-                        }
+                        thin_column_fluxes(
+                            [&mut temp[local.clone()], &mut salt[local]],
+                            depth,
+                            bed,
+                            forcing.surface_heat_flux,
+                            tracer_fluxes,
+                            rho0,
+                            dt,
+                        );
                     }
                     continue;
                 }
-                let (local, column) = (i * nl..(i + 1) * nl, idx * nl..(idx + 1) * nl);
-
-                // 1. Prepare Column data
-                sigma.z_at_levels_into(eta[idx], h, z_r);
-                sigma.z_at_faces_into(eta[idx], h, z_w);
-                sigma.layer_thicknesses_into(eta[idx], h, dz);
-
-                // 2. Step the turbulence, if any, and compute the mixing
-                // coefficients. The surface stress: the uniform one plus the
-                // column's; the bottom stress: the prescribed one plus the
-                // drag of the bottom-layer velocity
+                // The surface stress: the uniform one plus the column's
                 let [mut tau_sx, mut tau_sy] = forcing.surface_stress;
                 if let Some([field_x, field_y]) = surface.stress {
                     tau_sx += field_x[idx];
                     tau_sy += field_y[idx];
                 }
-                let forcing = Forcing {
-                    surface_stress: [tau_sx, tau_sy],
-                    ..*forcing
-                };
-                let surface_friction_velocity = (tau_sx.hypot(tau_sy) / rho0).sqrt();
-                let bottom_drag = drag.bottom.map_or(0.0, |rate| rate[idx]);
-                let layer_drag = drag.layers.map(|rate| &rate[column.clone()]);
-                let bottom_friction_velocity = ((tau_bx / rho0 + bottom_drag * u[i * nl])
-                    .hypot(tau_by / rho0 + bottom_drag * v[i * nl]))
-                .sqrt();
                 let turbulence_column = if tke.is_empty() {
                     0..0
                 } else {
                     i * (nl + 1)..(i + 1) * (nl + 1)
                 };
-                mixing.step_mixing_into(
-                    &Column {
+                let (tke, gls) = (
+                    &mut tke[turbulence_column.clone()],
+                    &mut gls[turbulence_column],
+                );
+                let [u, v, temp, salt] = [&mut *u, &mut *v, &mut *temp, &mut *salt]
+                    .map(|field| &mut field[local.clone()]);
+                diffuse_column(
+                    levels,
+                    eta[idx],
+                    h,
+                    [u, v, temp, salt],
+                    &rho[column.clone()],
+                    &ColumnForcing {
+                        forcing: Forcing {
+                            surface_stress: [tau_sx, tau_sy],
+                            ..*forcing
+                        },
+                        roughness: surface.roughness.map(|z0| z0[idx]),
+                        tracers: tracer_fluxes.zip(surface.tracers.map(|fluxes| fluxes.water)),
+                        bottom_drag: drag.bottom.map_or(0.0, |rate| rate[idx]),
+                    },
+                    drag.layers.map(|rate| &rate[column]),
+                    [g, rho0, dt],
+                    ColumnBuffers {
+                        a,
+                        b,
+                        c,
+                        d,
+                        x,
+                        c_prime,
+                        d_prime,
                         z_r,
                         z_w,
-                        u: &u[local.clone()],
-                        v: &v[local.clone()],
-                        rho: &rho[column],
-                        g,
-                        rho0,
-                        surface_friction_velocity,
-                        bottom_friction_velocity,
-                        surface_roughness: surface.roughness.map(|z0| z0[idx]),
+                        dz,
+                        av,
+                        kt,
                     },
-                    &forcing,
-                    dt,
-                    Turbulence {
-                        tke: &mut tke[turbulence_column.clone()],
-                        gls: &mut gls[turbulence_column],
-                        scratch: work,
+                    |column, forcing, av, kt| {
+                        mixing.step_mixing_into(
+                            column,
+                            forcing,
+                            dt,
+                            Turbulence {
+                                tke,
+                                gls,
+                                scratch: work,
+                            },
+                            av,
+                            kt,
+                        );
                     },
-                    av,
-                    kt,
                 );
-
                 // Store diagnostics, at the w-points
                 let w_points = i * (nl + 1)..(i + 1) * (nl + 1);
                 eddy_viscosity[w_points.clone()].copy_from_slice(av);
                 eddy_diffusivity[w_points].copy_from_slice(kt);
-
-                // 3. The surface fluxes of heat and salt (kinematic), the
-                // shortwave absorbed through the column as a source of the
-                // implicit step (`T + dt·source` on the right-hand side)
-                let heat_capacity = rho0 * SEAWATER_HEAT_CAPACITY;
-                let mut heat_flux = forcing.surface_heat_flux;
-                let mut salt_flux = 0.0;
-                if let Some(fluxes) = &surface.tracers {
-                    heat_flux += fluxes.nonsolar[idx];
-                    salt_flux = salt[local.end - 1] * fluxes.freshwater[idx] / FRESH_WATER_DENSITY;
-                    let shortwave = fluxes.shortwave[idx];
-                    if shortwave != 0.0 {
-                        let eta = z_w[nl];
-                        let mut above = 1.0;
-                        for l in (0..nl).rev() {
-                            let below = if l == 0 {
-                                0.0
-                            } else {
-                                fluxes.water.transmitted(eta - z_w[l])
-                            };
-                            temp[i * nl + l] +=
-                                dt * shortwave * (above - below) / (heat_capacity * dz[l]);
-                            above = below;
-                        }
-                    }
-                }
-
-                // 4. Solve diffusion: u, v with the stresses (kinematic) and
-                // the drags, T and S with their surface fluxes; each pair has
-                // one matrix
-                let (u, v) = (&mut u[local.clone()], &mut v[local.clone()]);
-                solve_diffusion_pair(
-                    [u, v],
-                    av,
-                    dz,
-                    dt,
-                    [tau_sx / rho0, tau_sy / rho0],
-                    [tau_bx / rho0, tau_by / rho0],
-                    bottom_drag,
-                    layer_drag,
-                    [a, b, c, d, x, c_prime, d_prime],
-                );
-                let (temp, salt) = (&mut temp[local.clone()], &mut salt[local]);
-                solve_diffusion_pair(
-                    [temp, salt],
-                    kt,
-                    dz,
-                    dt,
-                    [heat_flux / heat_capacity, salt_flux],
-                    [0.0, 0.0],
-                    0.0,
-                    None,
-                    [a, b, c, d, x, c_prime, d_prime],
-                );
             }
         },
     );
+}
+
+/// What one column of [`diffuse_column`] is forced with.
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnForcing {
+    /// The column's surface stress (the uniform one plus its own), the
+    /// prescribed bottom stress and the uniform surface heat flux
+    pub forcing: Forcing,
+    /// Its surface roughness (m), if any ([`Column::surface_roughness`])
+    pub roughness: Option<f64>,
+    /// Its non-solar heat, shortwave and fresh-water fluxes
+    /// ([`SurfaceTracerFluxes`]) and the water's optical type, if any
+    pub tracers: Option<([f64; 3], JerlovWater)>,
+    /// Its bottom drag rate `r` (m/s; zero without)
+    pub bottom_drag: f64,
+}
+
+/// One column's buffers of [`diffuse_column`]: the tridiagonal system and
+/// the solver's (`N` values each), the levels' heights `z_r` (`N`), `z_w`
+/// (`N + 1`) and thicknesses `dz` (`N`), and the mixing's viscosity `av` and
+/// diffusivity `kt` at the w-points (`N + 1`), which it leaves there.
+pub struct ColumnBuffers<'a> {
+    pub a: &'a mut [f64],
+    pub b: &'a mut [f64],
+    pub c: &'a mut [f64],
+    pub d: &'a mut [f64],
+    pub x: &'a mut [f64],
+    pub c_prime: &'a mut [f64],
+    pub d_prime: &'a mut [f64],
+    pub z_r: &'a mut [f64],
+    pub z_w: &'a mut [f64],
+    pub dz: &'a mut [f64],
+    pub av: &'a mut [f64],
+    pub kt: &'a mut [f64],
+}
+
+/// [`apply_vertical_diffusion`] in one column of water (not thin) of
+/// surface `eta` over still-water depth `h` (`-B`) on the σ-levels
+/// `[σ_ρ, σ_w, Δσ]`: the mixing stepped by `step_mixing(column, forcing,
+/// av, kt)` (the closure's, with the column's turbulence), the shortwave
+/// absorbed through the column, then `u`, `v` with the stresses and drags
+/// (`bottom_drag` at the bed, `layer_drag` on the layers, both implicit),
+/// and `T`, `S` with their surface fluxes, each pair by one backward-Euler
+/// solve. `[g, ρ₀, Δt]`. The GPU's vertical kernel calls it too.
+#[allow(clippy::too_many_arguments)]
+pub fn diffuse_column(
+    [sigma_rho, sigma_w, d_sigma]: [&[f64]; 3],
+    eta: f64,
+    h: f64,
+    [u, v, temp, salt]: [&mut [f64]; 4],
+    rho: &[f64],
+    column: &ColumnForcing,
+    layer_drag: Option<&[f64]>,
+    [g, rho0, dt]: [f64; 3],
+    buffers: ColumnBuffers<'_>,
+    step_mixing: impl FnOnce(&Column, &Forcing, &mut [f64], &mut [f64]),
+) {
+    let ColumnBuffers {
+        a,
+        b,
+        c,
+        d,
+        x,
+        c_prime,
+        d_prime,
+        z_r,
+        z_w,
+        dz,
+        av,
+        kt,
+    } = buffers;
+    let nl = d_sigma.len();
+    let ColumnForcing {
+        forcing,
+        roughness,
+        tracers,
+        bottom_drag,
+    } = *column;
+
+    // 1. The levels (as `SigmaGrid::z_at_levels_into` and its siblings)
+    let depth = eta + h;
+    for (z, &s) in z_r.iter_mut().zip(sigma_rho) {
+        *z = eta + depth * s;
+    }
+    for (z, &s) in z_w.iter_mut().zip(sigma_w) {
+        *z = eta + depth * s;
+    }
+    for (dz, &ds) in dz.iter_mut().zip(d_sigma) {
+        *dz = depth * ds;
+    }
+
+    // 2. Step the turbulence, if any, and compute the mixing coefficients.
+    // The bottom stress: the prescribed one plus the drag of the
+    // bottom-layer velocity
+    let [tau_sx, tau_sy] = forcing.surface_stress;
+    let [tau_bx, tau_by] = forcing.bottom_stress;
+    let surface_friction_velocity = (hypot(tau_sx, tau_sy) / rho0).sqrt();
+    let bottom_friction_velocity = hypot(
+        tau_bx / rho0 + bottom_drag * u[0],
+        tau_by / rho0 + bottom_drag * v[0],
+    )
+    .sqrt();
+    step_mixing(
+        &Column {
+            z_r,
+            z_w,
+            u,
+            v,
+            rho,
+            g,
+            rho0,
+            surface_friction_velocity,
+            bottom_friction_velocity,
+            surface_roughness: roughness,
+        },
+        &forcing,
+        av,
+        kt,
+    );
+
+    // 3. The surface fluxes of heat and salt (kinematic), the shortwave
+    // absorbed through the column as a source of the implicit step
+    // (`T + dt·source` on the right-hand side)
+    let heat_capacity = rho0 * SEAWATER_HEAT_CAPACITY;
+    let mut heat_flux = forcing.surface_heat_flux;
+    let mut salt_flux = 0.0;
+    if let Some(([nonsolar, shortwave, freshwater], water)) = tracers {
+        heat_flux += nonsolar;
+        salt_flux = salt[nl - 1] * freshwater / FRESH_WATER_DENSITY;
+        if shortwave != 0.0 {
+            let eta = z_w[nl];
+            let mut above = 1.0;
+            for l in (0..nl).rev() {
+                let below = if l == 0 {
+                    0.0
+                } else {
+                    water.transmitted(eta - z_w[l])
+                };
+                temp[l] += dt * shortwave * (above - below) / (heat_capacity * dz[l]);
+                above = below;
+            }
+        }
+    }
+
+    // 4. Solve diffusion: u, v with the stresses (kinematic) and the drags,
+    // T and S with their surface fluxes; each pair has one matrix
+    solve_diffusion_pair(
+        [u, v],
+        av,
+        dz,
+        dt,
+        [tau_sx / rho0, tau_sy / rho0],
+        [tau_bx / rho0, tau_by / rho0],
+        bottom_drag,
+        layer_drag,
+        [a, b, c, d, x, c_prime, d_prime],
+    );
+    solve_diffusion_pair(
+        [temp, salt],
+        kt,
+        dz,
+        dt,
+        [heat_flux / heat_capacity, salt_flux],
+        [0.0, 0.0],
+        0.0,
+        None,
+        [a, b, c, d, x, c_prime, d_prime],
+    );
+}
+
+/// The heat and fresh-water fluxes of a thin column of depth `depth` (m)
+/// with water over `bed` m of water's heat capacity under it (see
+/// [`apply_vertical_diffusion`]): `[T, S]` of its levels warmed and salted
+/// by the uniform `surface_heat_flux` plus the column's `[non-solar,
+/// shortwave, fresh water]`, if any.
+#[allow(clippy::too_many_arguments)]
+pub fn thin_column_fluxes(
+    [temp, salt]: [&mut [f64]; 2],
+    depth: f64,
+    bed: f64,
+    surface_heat_flux: f64,
+    fluxes: Option<[f64; 3]>,
+    rho0: f64,
+    dt: f64,
+) {
+    let mut heat = surface_heat_flux;
+    let mut fresh = 0.0;
+    if let Some([nonsolar, shortwave, freshwater]) = fluxes {
+        heat += nonsolar + shortwave;
+        fresh = freshwater;
+    }
+    let warming = dt * heat / (rho0 * SEAWATER_HEAT_CAPACITY * (depth + bed));
+    let salting = dt * fresh / (FRESH_WATER_DENSITY * (depth + bed));
+    for (t, s) in temp.iter_mut().zip(salt.iter_mut()) {
+        *t += warming;
+        *s *= 1.0 + salting;
+    }
 }
 
 /// One column's buffers of [`apply_vertical_diffusion`].
@@ -1109,7 +1266,6 @@ mod gls_gates {
             let k_log = u_star * u_star / gls.cm0().powi(2);
             let (log, log_spin_up) = run(&gls);
             let (waves, spin_up) = run(&gls
-                .clone()
                 .with_roughness(0.5, GlsMixing::DEFAULT_ROUGHNESS)
                 .with_wave_breaking(GlsMixing::DEFAULT_WAVE_BREAKING));
             assert!(
@@ -1135,7 +1291,6 @@ mod gls_gates {
             );
 
             let (charnock, _) = run(&gls
-                .clone()
                 .with_charnock_roughness(GlsMixing::DEFAULT_CHARNOCK)
                 .with_wave_breaking(GlsMixing::DEFAULT_WAVE_BREAKING));
             for j in 1..n_levels {

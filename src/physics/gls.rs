@@ -105,6 +105,10 @@
 //! turbulence (both at their minima). With the advection off the model is
 //! local to each column, as in GOTM.
 //!
+//! The powers and logarithms are [`crate::math`]'s (plain arithmetic) or
+//! products, so the column step ([`GlsMixing::step_column`]) gives the same
+//! bits on every platform and in the GPU's vertical kernel.
+//!
 //! # Verification
 //!
 //! - Wind entrainment into linear stratification (Kato & Phillips 1969):
@@ -127,8 +131,21 @@
 //!   leave mid-depth and the Kato–Phillips entrainment as they were, and
 //!   with Charnock's roughness change nothing at 0.5 m layers.
 
+use crate::math::{ln, pow};
 use crate::physics::vertical_mixing::{Column, Forcing, Turbulence, VerticalMixing};
 use crate::solver::algorithms::tridiagonal::solve_tridiagonal;
+
+/// `x²` and `x³`, as products (the closure's powers are `dgcom::math`'s
+/// or products, the same bits on every platform and the GPU).
+#[inline]
+fn square(x: f64) -> f64 {
+    x * x
+}
+
+#[inline]
+fn cube(x: f64) -> f64 {
+    x * (x * x)
+}
 
 /// Exponents and constants of a GLS model (see the module docs). The
 /// presets are ROMS's (`ocean.in`), except for `c₃`: `c₃⁻` is computed
@@ -209,6 +226,8 @@ struct Stability {
     n: [f64; 3],
     nt: [f64; 3],
     cm0: f64,
+    /// `(c_μ⁰)³`
+    cm3: f64,
     an_min: f64,
 }
 
@@ -237,35 +256,39 @@ impl Stability {
         let nn = 0.5 * cc1;
         let nt = ct1;
 
-        let d0 = 36.0 * nn.powi(3) * nt.powi(2);
-        let d1 = 84.0 * a5 * at3 * nn.powi(2) * nt + 36.0 * at5 * nn.powi(3) * nt;
-        let d2 = 9.0 * (at2.powi(2) - at1.powi(2)) * nn.powi(3)
-            - 12.0 * (a2.powi(2) - 3.0 * a3.powi(2)) * nn * nt.powi(2);
+        let (sq, cb) = (square, cube);
+        let d0 = 36.0 * cb(nn) * sq(nt);
+        let d1 = 84.0 * a5 * at3 * sq(nn) * nt + 36.0 * at5 * cb(nn) * nt;
+        let d2 = 9.0 * (sq(at2) - sq(at1)) * cb(nn) - 12.0 * (sq(a2) - 3.0 * sq(a3)) * nn * sq(nt);
         let d3 = 12.0 * a5 * at3 * (a2 * at1 - 3.0 * a3 * at2) * nn
-            + 12.0 * a5 * at3 * (a3.powi(2) - a2.powi(2)) * nt
-            + 12.0 * at5 * (3.0 * a3.powi(2) - a2.powi(2)) * nn * nt;
-        let d4 = 48.0 * a5.powi(2) * at3.powi(2) * nn + 36.0 * a5 * at3 * at5 * nn.powi(2);
-        let d5 = 3.0 * (a2.powi(2) - 3.0 * a3.powi(2)) * (at1.powi(2) - at2.powi(2)) * nn;
-        let n0 = 36.0 * a1 * nn.powi(2) * nt.powi(2);
-        let n1 = -12.0 * a5 * at3 * (at1 + at2) * nn.powi(2)
+            + 12.0 * a5 * at3 * (sq(a3) - sq(a2)) * nt
+            + 12.0 * at5 * (3.0 * sq(a3) - sq(a2)) * nn * nt;
+        let d4 = 48.0 * sq(a5) * sq(at3) * nn + 36.0 * a5 * at3 * at5 * sq(nn);
+        let d5 = 3.0 * (sq(a2) - 3.0 * sq(a3)) * (sq(at1) - sq(at2)) * nn;
+        let n0 = 36.0 * a1 * sq(nn) * sq(nt);
+        let n1 = -12.0 * a5 * at3 * (at1 + at2) * sq(nn)
             + 8.0 * a5 * at3 * (6.0 * a1 - a2 - 3.0 * a3) * nn * nt
-            + 36.0 * a1 * at5 * nn.powi(2) * nt;
-        let n2 = 9.0 * a1 * (at2.powi(2) - at1.powi(2)) * nn.powi(2);
-        let nt0 = 12.0 * at3 * nn.powi(3) * nt;
-        let nt1 = 12.0 * a5 * at3.powi(2) * nn.powi(2);
-        let nt2 = 9.0 * a1 * at3 * (at1 - at2) * nn.powi(2)
-            + (6.0 * a1 * (a2 - 3.0 * a3) - 4.0 * (a2.powi(2) - 3.0 * a3.powi(2))) * at3 * nn * nt;
+            + 36.0 * a1 * at5 * sq(nn) * nt;
+        let n2 = 9.0 * a1 * (sq(at2) - sq(at1)) * sq(nn);
+        let nt0 = 12.0 * at3 * cb(nn) * nt;
+        let nt1 = 12.0 * a5 * sq(at3) * sq(nn);
+        let nt2 = 9.0 * a1 * at3 * (at1 - at2) * sq(nn)
+            + (6.0 * a1 * (a2 - 3.0 * a3) - 4.0 * (sq(a2) - 3.0 * sq(a3))) * at3 * nn * nt;
 
         // The neutral value (GOTM `compute_cm0`), and the convective limit
         // of α_N where the denominator vanishes
-        let cm0 = ((a2.powi(2) - 3.0 * a3.powi(2) + 3.0 * a1 * nn) / (3.0 * nn.powi(2))).powf(0.25);
-        let an_min = (-(d1 + nt0) + ((d1 + nt0).powi(2) - 4.0 * d0 * (d4 + nt1)).sqrt())
-            / (2.0 * (d4 + nt1));
+        let cm0 = pow(
+            (sq(a2) - 3.0 * sq(a3) + 3.0 * a1 * nn) / (3.0 * sq(nn)),
+            0.25,
+        );
+        let an_min =
+            (-(d1 + nt0) + (sq(d1 + nt0) - 4.0 * d0 * (d4 + nt1)).sqrt()) / (2.0 * (d4 + nt1));
         Self {
             d: [d0, d1, d2, d3, d4, d5],
             n: [n0, n1, n2],
             nt: [nt0, nt1, nt2],
             cm0,
+            cm3: cb(cm0),
             an_min,
         }
     }
@@ -288,7 +311,7 @@ impl Stability {
         let dcm = d0 + d1 * an + d2 * a_s + d3 * an * a_s + d4 * an * an + d5 * a_s * a_s;
         let ncm = n0 + n1 * an + n2 * a_s;
         let ncmp = nt0 + nt1 * an + nt2 * a_s;
-        let cm3_inv = 1.0 / self.cm0.powi(3);
+        let cm3_inv = 1.0 / self.cm3;
         (cm3_inv * ncm / dcm, cm3_inv * ncmp / dcm)
     }
 
@@ -298,7 +321,7 @@ impl Stability {
     fn c3_for(&self, c1: f64, c2: f64, ri: f64) -> f64 {
         let residual = |an: f64| {
             let (cm, cmp) = self.eval(an);
-            cm * an / ri - cmp * an - self.cm0.powi(-3)
+            cm * an / ri - cmp * an - 1.0 / self.cm3
         };
         let (mut an, e) = (5.0, 1e-8);
         for _ in 0..200 {
@@ -342,14 +365,14 @@ impl WaveBreaking {
         if self.extent <= 1.0 {
             return 0.0;
         }
-        (1.0 - s_over_z0.ln() / self.extent.ln()).clamp(0.0, 1.0)
+        (1.0 - ln(s_over_z0) / ln(self.extent)).clamp(0.0, 1.0)
     }
 }
 
 /// GLS vertical mixing (see the module docs). The turbulence is stored in
 /// `Solution3D::tke`, `Solution3D::gls` and stepped by the vertical
 /// diffusion ([`crate::physics::apply_vertical_diffusion`]).
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct GlsMixing {
     params: GlsParameters,
     stability: Stability,
@@ -371,6 +394,10 @@ pub struct GlsMixing {
     charnock: Option<f64>,
     /// The surface's TKE injection; a log layer without.
     wave_breaking: Option<WaveBreaking>,
+    /// `(c_μ⁰)^(3+p/n)`, `(c_μ⁰)^p`, `(c_μ⁰)^(p+1)` and `κ^(n+1)`: the
+    /// column step's constant powers, taken once (the same bits as taken
+    /// at every w-point)
+    powers: [f64; 4],
 }
 
 impl GlsMixing {
@@ -408,16 +435,25 @@ impl GlsMixing {
             "GLS exponent n must be negative, got {}",
             params.n
         );
-        let radicand = params.sigma_psi * (params.c2 - params.c1) / params.n.powi(2);
+        let radicand = params.sigma_psi * (params.c2 - params.c1) / square(params.n);
         assert!(
             radicand > 0.0,
             "GLS constants have no log layer: σ_ψ(c₂ − c₁)/n² = {radicand}"
         );
+        let kappa = stability.cm0 * radicand.sqrt();
+        let GlsParameters { p, n, .. } = params;
+        let cm0 = stability.cm0;
         Self {
             params,
             stability,
             c3_minus: stability.c3_for(params.c1, params.c2, Self::DEFAULT_RI_ST),
-            kappa: stability.cm0 * radicand.sqrt(),
+            kappa,
+            powers: [
+                pow(cm0, 3.0 + p / n),
+                pow(cm0, p),
+                pow(cm0, p + 1.0),
+                pow(kappa, n + 1.0),
+            ],
             k_min: Self::DEFAULT_K_MIN,
             eps_min: Self::DEFAULT_EPS_MIN,
             length_limit: Some(Self::DEFAULT_LENGTH_LIMIT),
@@ -503,12 +539,12 @@ impl GlsMixing {
         // k at the surface over the log layer's, (σ_k c_w/(a c_μ⁰ L))^(2/3) (c_μ⁰)²
         let cm0 = self.stability.cm0;
         let surface_ratio =
-            (self.params.sigma_k * c_w / (decay * cm0 * slope)).powf(2.0 / 3.0) * cm0 * cm0;
+            pow(self.params.sigma_k * c_w / (decay * cm0 * slope), 2.0 / 3.0) * cm0 * cm0;
         self.wave_breaking = Some(WaveBreaking {
             c_w,
             decay,
             slope,
-            extent: surface_ratio.powf(1.0 / decay),
+            extent: pow(surface_ratio, 1.0 / decay),
         });
         self
     }
@@ -626,17 +662,19 @@ impl GlsMixing {
     /// `ε` of `k` and `ψ`.
     #[inline]
     pub fn dissipation(&self, k: f64, psi: f64) -> f64 {
-        let GlsParameters { p, m, n, .. } = self.params;
-        self.stability.cm0.powf(3.0 + p / n) * k.powf(1.5 + m / n) * psi.powf(-1.0 / n)
+        let GlsParameters { m, n, .. } = self.params;
+        self.powers[0] * pow(k, 1.5 + m / n) * pow(psi, -1.0 / n)
     }
 
     /// `ψ` of `k` and `ε`.
     #[inline]
     pub fn psi(&self, k: f64, eps: f64) -> f64 {
-        let GlsParameters { p, m, n, .. } = self.params;
-        let cm0 = self.stability.cm0;
-        let length = cm0.powi(3) * k.powf(1.5) / eps;
-        cm0.powf(p) * k.powf(m) * length.powf(n)
+        let GlsParameters { m, n, .. } = self.params;
+        let k_15 = pow(k, 1.5);
+        let length = self.stability.cm3 * k_15 / eps;
+        // k-ε's `m` is 3/2: the same power, taken once
+        let k_m = if m == 1.5 { k_15 } else { pow(k, m) };
+        self.powers[1] * k_m * pow(length, n)
     }
 
     /// Turbulent viscosity and diffusivity `(c_μ, c_μ′)·√k l` of `k`, `ε`
@@ -645,7 +683,7 @@ impl GlsMixing {
     fn coefficients(&self, k: f64, eps: f64, n2: f64) -> (f64, f64) {
         let tau = k / eps;
         let (cm, cmp) = self.stability.eval(tau * tau * n2);
-        let x = self.stability.cm0.powi(3) * k * k / eps;
+        let x = self.stability.cm3 * k * k / eps;
         (cm * x, cmp * x)
     }
 
@@ -655,8 +693,8 @@ impl GlsMixing {
         let eps = eps.max(self.eps_min);
         match self.length_limit {
             Some(c_lim) if n2 > 0.0 => {
-                let cm0 = self.stability.cm0;
-                eps.max(cm0.powi(3) / (std::f64::consts::SQRT_2 * c_lim) * k * n2.sqrt())
+                let cm3 = self.stability.cm3;
+                eps.max(cm3 / (std::f64::consts::SQRT_2 * c_lim) * k * n2.sqrt())
             }
             _ => eps,
         }
@@ -665,8 +703,8 @@ impl GlsMixing {
     /// `ψ` at a wall with friction-velocity `k` and roughness `z0`.
     #[inline]
     fn wall_psi(&self, k: f64, z0: f64) -> f64 {
-        let GlsParameters { p, m, n, .. } = self.params;
-        self.stability.cm0.powf(p) * k.powf(m) * (self.kappa * z0).powf(n)
+        let GlsParameters { m, n, .. } = self.params;
+        self.powers[1] * pow(k, m) * pow(self.kappa * z0, n)
     }
 
     /// Flux of `ψ` into the water of a log layer at `z′ + z₀` from a wall,
@@ -674,11 +712,9 @@ impl GlsMixing {
     #[inline]
     fn wall_psi_flux(&self, k: f64, height: f64) -> f64 {
         let GlsParameters {
-            p, m, n, sigma_psi, ..
+            m, n, sigma_psi, ..
         } = self.params;
-        -n * self.stability.cm0.powf(p + 1.0) * self.kappa.powf(n + 1.0) / sigma_psi
-            * k.powf(m + 0.5)
-            * height.powf(n)
+        -n * self.powers[2] * self.powers[3] / sigma_psi * pow(k, m + 0.5) * pow(height, n)
     }
 
     /// Flux of `ψ` into the water at a distance `s` from the surface (plus
@@ -688,12 +724,11 @@ impl GlsMixing {
     #[inline]
     fn shear_free_psi_flux(&self, wave: &WaveBreaking, k: f64, s: f64) -> f64 {
         let GlsParameters {
-            p, m, n, sigma_psi, ..
+            m, n, sigma_psi, ..
         } = self.params;
-        -(n - wave.decay * m) * self.stability.cm0.powf(p + 1.0) * wave.slope.powf(n + 1.0)
-            / sigma_psi
-            * k.powf(m + 0.5)
-            * s.powf(n)
+        -(n - wave.decay * m) * self.powers[2] * pow(wave.slope, n + 1.0) / sigma_psi
+            * pow(k, m + 0.5)
+            * pow(s, n)
     }
 
     /// `k` and `ψ` at the surface itself of the shear-free layer under the
@@ -701,15 +736,20 @@ impl GlsMixing {
     /// `l = L z₀`.
     #[inline]
     fn wave_surface(&self, wave: &WaveBreaking, u_star: f64, z0: f64) -> (f64, f64) {
-        let GlsParameters {
-            p, m, n, sigma_k, ..
-        } = self.params;
+        let GlsParameters { m, n, sigma_k, .. } = self.params;
         let cm0 = self.stability.cm0;
-        let k = ((sigma_k * wave.c_w / (wave.decay * cm0 * wave.slope)).powf(2.0 / 3.0)
-            * u_star
+        let k = (pow(
+            sigma_k * wave.c_w / (wave.decay * cm0 * wave.slope),
+            2.0 / 3.0,
+        ) * u_star
             * u_star)
             .max(self.k_min);
-        (k, cm0.powf(p) * k.powf(m) * (wave.slope * z0).powf(n))
+        (k, self.powers[1] * pow(k, m) * pow(wave.slope * z0, n))
+    }
+
+    /// The work space [`Self::step_column`] takes for `n_levels` levels.
+    pub const fn work_len(n_levels: usize) -> usize {
+        (N_FIELDS + N_SOLVER) * (n_levels + 1)
     }
 }
 
@@ -739,14 +779,14 @@ struct Solver<'a> {
     d_prime: &'a mut [f64],
 }
 
-/// `scratch` split into [`Fields`] and [`Solver`] for `nw` w-points.
-fn work(scratch: &mut Vec<f64>, nw: usize) -> (Fields<'_>, Solver<'_>) {
-    const N_FIELDS: usize = 9;
-    const N_SOLVER: usize = 7;
+/// Per-w-point buffers in [`Fields`] and in [`Solver`].
+const N_FIELDS: usize = 9;
+const N_SOLVER: usize = 7;
+
+/// `scratch` (at least [`GlsMixing::work_len`]) split into [`Fields`] and
+/// [`Solver`] for `nw` w-points.
+fn work(scratch: &mut [f64], nw: usize) -> (Fields<'_>, Solver<'_>) {
     let len = (N_FIELDS + N_SOLVER) * nw;
-    if scratch.len() < len {
-        scratch.resize(len, 0.0);
-    }
     let mut chunks = scratch[..len].chunks_exact_mut(nw);
     let mut next = || chunks.next().expect("sized above");
     (
@@ -882,7 +922,33 @@ impl VerticalMixing for GlsMixing {
             tke.len(),
             psi.len()
         );
-        let (f, mut solver) = work(scratch, nw);
+        let len = Self::work_len(nl);
+        if scratch.len() < len {
+            scratch.resize(len, 0.0);
+        }
+        self.step_column(column, dt, tke, psi, scratch, av, kt);
+    }
+}
+
+impl GlsMixing {
+    /// [`VerticalMixing::step_mixing_into`] of one column: `tke` and `psi`
+    /// at its `N + 1` w-points stepped over `dt`, then `av` and `kt` from
+    /// them, with `work` (at least [`Self::work_len`] values) as scratch.
+    /// The GPU's vertical kernel calls it too.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_column(
+        &self,
+        column: &Column,
+        dt: f64,
+        tke: &mut [f64],
+        psi: &mut [f64],
+        work: &mut [f64],
+        av: &mut [f64],
+        kt: &mut [f64],
+    ) {
+        let nl = column.u.len();
+        let nw = nl + 1;
+        let (f, mut solver) = self::work(work, nw);
         let GlsParameters {
             sigma_k,
             sigma_psi,
@@ -958,7 +1024,7 @@ impl VerticalMixing for GlsMixing {
             // layer's flux at the top layer's centre under breaking waves
             let top_centre = 0.5 * h[nl - 1] + z0_surface;
             let k_flux_top = self.wave_breaking.map_or(0.0, |wave| {
-                wave.c_w * u_surface.powi(3) * (z0_surface / top_centre).powf(1.5 * wave.decay)
+                wave.c_w * cube(u_surface) * pow(z0_surface / top_centre, 1.5 * wave.decay)
             });
             solve_interior(
                 tke,
@@ -986,7 +1052,7 @@ impl VerticalMixing for GlsMixing {
                 Some(wave) => {
                     let w = wave.share_above(top_centre / z0_surface);
                     let k_centre =
-                        tke[nl - 1] * ((h[nl - 1] + z0_surface) / top_centre).powf(wave.decay);
+                        tke[nl - 1] * pow((h[nl - 1] + z0_surface) / top_centre, wave.decay);
                     w * self.shear_free_psi_flux(wave, k_centre, top_centre)
                         + (1.0 - w) * log_flux_top
                 }
@@ -1023,7 +1089,7 @@ impl VerticalMixing for GlsMixing {
         }
 
         // The boundary layers at the boundary w-points
-        tke[0] = (column.bottom_friction_velocity.powi(2) / (cm0 * cm0)).max(self.k_min);
+        tke[0] = (square(column.bottom_friction_velocity) / (cm0 * cm0)).max(self.k_min);
         psi[0] = self.wall_psi(tke[0], self.z0_bottom);
         match &self.wave_breaking {
             None => {

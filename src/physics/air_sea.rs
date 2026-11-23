@@ -388,6 +388,9 @@ pub enum JerlovWater {
 }
 
 impl JerlovWater {
+    /// Every type, in order (a device kernel takes one by its index here).
+    pub const ALL: [Self; 5] = [Self::I, Self::IA, Self::IB, Self::II, Self::III];
+
     /// `(R, ζ₁, ζ₂)`.
     pub fn parameters(self) -> (f64, f64, f64) {
         match self {
@@ -400,11 +403,12 @@ impl JerlovWater {
     }
 
     /// The fraction of the net shortwave that reaches `depth` (m) below the
-    /// surface.
+    /// surface (with [`crate::math::exp`]: the same bits on the GPU).
     pub fn transmitted(self, depth: f64) -> f64 {
+        use crate::math::exp;
         let (r, zeta_1, zeta_2) = self.parameters();
         let depth = depth.max(0.0);
-        r * (-depth / zeta_1).exp() + (1.0 - r) * (-depth / zeta_2).exp()
+        r * exp(-depth / zeta_1) + (1.0 - r) * exp(-depth / zeta_2)
     }
 }
 

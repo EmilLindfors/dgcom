@@ -43,10 +43,21 @@ use crate::vertical::SigmaGrid;
 /// `net_depth` (m) below the surface, in a column of depth `depth > 0`.
 #[inline]
 pub fn net_fraction(sigma: &SigmaGrid, level: usize, net_depth: f64, depth: f64) -> f64 {
-    let sigma_w = sigma.sigma_w();
+    net_fraction_on([sigma.sigma_w(), sigma.d_sigma()], level, net_depth, depth)
+}
+
+/// [`net_fraction`] on the σ-surfaces and layer thicknesses
+/// `[σ_w, Δσ]`.
+#[inline]
+pub fn net_fraction_on(
+    [sigma_w, d_sigma]: [&[f64]; 2],
+    level: usize,
+    net_depth: f64,
+    depth: f64,
+) -> f64 {
     let net_bottom = (-net_depth / depth).max(-1.0);
     let (bottom, top) = (sigma_w[level].max(net_bottom), sigma_w[level + 1]);
-    ((top - bottom) / sigma.d_sigma()[level]).max(0.0)
+    ((top - bottom) / d_sigma[level]).max(0.0)
 }
 
 /// `Σ φ ½ C_d a χ_l` (1/m) of the cage entries of one node on σ-layer
@@ -54,10 +65,59 @@ pub fn net_fraction(sigma: &SigmaGrid, level: usize, net_depth: f64, depth: f64)
 /// unit speed, `λ_l = c_l |u_l|`.
 #[inline]
 pub fn layer_coefficient(entries: &[CageNode], sigma: &SigmaGrid, level: usize, depth: f64) -> f64 {
-    entries
-        .iter()
-        .map(|e| e.coefficient * net_fraction(sigma, level, e.net_depth, depth))
+    layer_coefficient_on(
+        entries.len(),
+        |e| (entries[e].coefficient, entries[e].net_depth),
+        [sigma.sigma_w(), sigma.d_sigma()],
+        level,
+        depth,
+    )
+}
+
+/// [`layer_coefficient`] of `n` entries, `entry(e) = (coefficient, net
+/// depth)`, on `[σ_w, Δσ]`.
+#[inline]
+pub fn layer_coefficient_on(
+    n: usize,
+    entry: impl Fn(usize) -> (f64, f64),
+    levels: [&[f64]; 2],
+    level: usize,
+    depth: f64,
+) -> f64 {
+    (0..n)
+        .map(|e| {
+            let (coefficient, net_depth) = entry(e);
+            coefficient * net_fraction_on(levels, level, net_depth, depth)
+        })
         .sum()
+}
+
+/// The cage-drag rates `λ_l = c_l |u_l|` (1/s) of every layer of a column of
+/// depth `depth` (m) under `n` cage entries (`entry(e) = (coefficient, net
+/// depth)`) into `rate`, on `[σ_w, Δσ]`: with the layers' velocities
+/// `[u, v]`, or the depth mean's `mean` in a column shallower than
+/// `thin_depth`; zero where it is dry. The speeds are
+/// [`crate::math::hypot`]'s (the GPU's bits).
+#[allow(clippy::too_many_arguments)]
+pub fn cage_rates(
+    n: usize,
+    entry: impl Fn(usize) -> (f64, f64),
+    levels: [&[f64]; 2],
+    depth: f64,
+    thin_depth: f64,
+    [u, v]: [&[f64]; 2],
+    mean: [f64; 2],
+    rate: &mut [f64],
+) {
+    if depth <= 0.0 {
+        rate.fill(0.0);
+        return;
+    }
+    let thin = depth < thin_depth;
+    for (l, r) in rate.iter_mut().enumerate() {
+        let [u, v] = if thin { mean } else { [u[l], v[l]] };
+        *r = layer_coefficient_on(n, &entry, levels, l, depth) * crate::math::hypot(u, v);
+    }
 }
 
 /// The cage entries of every node of element `k` (`n_nodes` nodes), in

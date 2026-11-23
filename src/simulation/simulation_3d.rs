@@ -8321,7 +8321,7 @@ mod tests {
                 bathymetry,
                 Arc::new(CoriolisSource2D::f_plane(0.0)),
                 LinearEOS::default(),
-                gls.clone(),
+                gls,
                 swe,
                 no_stress(),
                 G,

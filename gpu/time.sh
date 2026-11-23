@@ -15,8 +15,8 @@
 #    On any card each must be the CPU's bit for bit.
 # 2. The timing, built with FMA: the refined tidal channel at each size, on
 #    the CPU and on the GPU, REPEATS times; and the 3D transport, momentum
-#    terms and stage hooks (`transport3d`, `momentum3d`, `stage3d`,
-#    `limiter3d`) at 96,000 P2 elements × 20 levels.
+#    terms, stage hooks and vertical step (`transport3d`, `momentum3d`,
+#    `stage3d`, `limiter3d`, `vertical3d`) at 96,000 P2 elements × 20 levels.
 # 3. Nsight Systems' kernel times on the first size, if nsys is found.
 #
 # Everything goes to output/gpu_timing/<gpu>_<date>/, which git ignores:
@@ -178,7 +178,7 @@ say ""
 
 # 2b. The 3D stages' transport, momentum terms and hooks (Phase 4), with FMA:
 # per element and level at 96,000 P2 elements × 20 levels.
-parts="transport3d momentum3d stage3d limiter3d"
+parts="transport3d momentum3d stage3d limiter3d vertical3d"
 for part in $parts; do
     run_logged "time_$part" "$exe" "$part"
 done

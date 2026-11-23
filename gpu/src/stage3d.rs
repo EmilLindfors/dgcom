@@ -101,7 +101,7 @@ fn take(out: &mut Snapshots, at: &str, s: &Solution3D, which: std::ops::Range<us
 /// The step's start of `fx`: its state, the thin columns carrying their
 /// depth means (made up there, the layers' means elsewhere), and the density
 /// of an earlier step's end (not of its T and S).
-fn start_state(fx: &Fixture) -> Solution3D {
+pub(crate) fn start_state(fx: &Fixture) -> Solution3D {
     let mut state = fx.state.clone();
     let (nl, d_sigma) = (LEVELS, fx.sigma.d_sigma());
     for idx in 0..state.eta.data.len() {

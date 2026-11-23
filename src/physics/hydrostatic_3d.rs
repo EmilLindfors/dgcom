@@ -70,7 +70,7 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::SWEPhysics2D;
 use crate::physics::air_sea::JerlovWater;
 use crate::physics::bottom_drag::BottomDrag3D;
-use crate::physics::cage_drag::{for_each_caged_node, layer_coefficient};
+use crate::physics::cage_drag::{cage_rates, for_each_caged_node, layer_coefficient};
 use crate::physics::eos::EquationOfState;
 use crate::physics::implicit_advection::{
     ImplicitVerticalAdvection, apply_implicit_vertical_advection,
@@ -1206,18 +1206,14 @@ where
     /// above the bed; zero where the column is dry.
     #[inline]
     fn drag_rate(&self, drag: &BottomDrag3D, state: &Solution3D, idx: usize) -> f64 {
-        let depth = state.eta.data[idx] - self.bathymetry.data[idx];
-        if depth <= 0.0 {
-            return 0.0;
-        }
         let bottom = idx * state.n_levels;
-        let (u, v) = if depth < self.min_column_depth {
-            (state.ubar.data[idx], state.vbar.data[idx])
-        } else {
-            (state.u[bottom], state.v[bottom])
-        };
-        let z_b = (1.0 + self.sigma.sigma_rho()[0]) * depth;
-        drag.rate(z_b, (u * u + v * v).sqrt())
+        drag.column_rate(
+            state.eta.data[idx] - self.bathymetry.data[idx],
+            self.min_column_depth,
+            self.sigma.sigma_rho()[0],
+            [state.u[bottom], state.v[bottom]],
+            [state.ubar.data[idx], state.vbar.data[idx]],
+        )
     }
 
     /// Cage-drag rate `λ_l = c_l·|u_l|` (1/s) of every layer of the column at
@@ -1230,21 +1226,17 @@ where
         idx: usize,
         rate: &mut [f64],
     ) {
-        let depth = state.eta.data[idx] - self.bathymetry.data[idx];
-        if depth <= 0.0 {
-            rate.fill(0.0);
-            return;
-        }
-        let nl = state.n_levels;
-        let thin = depth < self.min_column_depth;
-        for (l, r) in rate.iter_mut().enumerate() {
-            let (u, v) = if thin {
-                (state.ubar.data[idx], state.vbar.data[idx])
-            } else {
-                (state.u[idx * nl + l], state.v[idx * nl + l])
-            };
-            *r = layer_coefficient(entries, &self.sigma, l, depth) * u.hypot(v);
-        }
+        let column = idx * state.n_levels..(idx + 1) * state.n_levels;
+        cage_rates(
+            entries.len(),
+            |e| (entries[e].coefficient, entries[e].net_depth),
+            [self.sigma.sigma_w(), self.sigma.d_sigma()],
+            state.eta.data[idx] - self.bathymetry.data[idx],
+            self.min_column_depth,
+            [&state.u[column.clone()], &state.v[column]],
+            [state.ubar.data[idx], state.vbar.data[idx]],
+            rate,
+        );
     }
 
     /// The range of `state`'s temperature and salinity in the columns that
@@ -2669,8 +2661,8 @@ where
                             let (mut drag_x, mut drag_y) = (0.0, 0.0);
                             for (l, &ds) in self.sigma.d_sigma().iter().enumerate() {
                                 let (u, v) = (state.u[idx * nl + l], state.v[idx * nl + l]);
-                                let rate =
-                                    layer_coefficient(entries, &self.sigma, l, depth) * u.hypot(v);
+                                let rate = layer_coefficient(entries, &self.sigma, l, depth)
+                                    * crate::math::hypot(u, v);
                                 drag_x += ds * rate * (u - ubar);
                                 drag_y += ds * rate * (v - vbar);
                             }
@@ -2785,14 +2777,8 @@ where
                 elements,
             )
         });
-        // Thin columns carry the depth mean only
-        let (nn, nl) = (state.n_nodes, state.n_levels);
-        for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
-            if self.is_thin(state, idx) {
-                state.u[idx * nl..(idx + 1) * nl].fill(state.ubar.data[idx]);
-                state.v[idx * nl..(idx + 1) * nl].fill(state.vbar.data[idx]);
-            }
-        }
+        let bed = &self.bathymetry.data;
+        thin_columns_to_depth_mean(state, bed, self.min_column_depth, elements);
     }
 
     fn end_density(&self, state: &mut Solution3D, elements: Blocks) {
@@ -2846,6 +2832,24 @@ pub fn zero_thin_momentum(
         if eta[idx] - bed[idx] < min_column_depth {
             rhs.u[idx * nl..(idx + 1) * nl].fill(0.0);
             rhs.v[idx * nl..(idx + 1) * nl].fill(0.0);
+        }
+    }
+}
+
+/// Every layer of the thin columns of `elements` (as in
+/// [`zero_thin_momentum`]) to the depth mean `ū`, `v̄`: a thin column
+/// carries no shear (the end of [`Hydrostatic3D`]'s vertical step).
+pub fn thin_columns_to_depth_mean(
+    state: &mut Solution3D,
+    bed: &[f64],
+    min_column_depth: f64,
+    elements: Blocks,
+) {
+    let (nn, nl) = (state.n_nodes, state.n_levels);
+    for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
+        if state.eta.data[idx] - bed[idx] < min_column_depth {
+            state.u[idx * nl..(idx + 1) * nl].fill(state.ubar.data[idx]);
+            state.v[idx * nl..(idx + 1) * nl].fill(state.vbar.data[idx]);
         }
     }
 }
