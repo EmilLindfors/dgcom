@@ -72,10 +72,11 @@ pub mod merged_cells;
 pub mod transport_3d;
 pub use merged_cells::{MergedCells, StepWater};
 pub use transport_3d::{
-    AdvectedTracer, BarotropicFlux, LayerTransport, MetricForm, MomentumAdvectionForm, UNBOUNDED,
-    VerticalAdvection, advective_divergence_element, apply_momentum_transport_3d,
-    apply_tracer_transport_3d, apply_w_point_transport_3d, from_inventory,
-    subcell_divergence_element, to_inventory, transport_divergence_element, w_cell_thicknesses,
+    AdvectedTracer, BarotropicFlux, ColumnScratch, EndLayerShed, LayerTransport, MetricForm,
+    MomentumAdvectionForm, UNBOUNDED, VerticalAdvection, advective_divergence_element,
+    apply_momentum_transport_3d, apply_tracer_transport_3d, apply_w_point_transport_3d,
+    column_vertical_flux, from_inventory, subcell_divergence_element, to_inventory,
+    transport_divergence_element, w_cell_thicknesses,
 };
 
 pub mod viscosity_3d;

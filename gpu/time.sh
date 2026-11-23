@@ -14,7 +14,8 @@
 #    time stepping (`case_lts`) and forced by a tidal atlas (`case_atlas`).
 #    On any card each must be the CPU's bit for bit.
 # 2. The timing, built with FMA: the refined tidal channel at each size, on
-#    the CPU and on the GPU, REPEATS times.
+#    the CPU and on the GPU, REPEATS times; and the 3D transport
+#    (`transport3d`) at 96,000 P2 elements × 20 levels.
 # 3. Nsight Systems' kernel times on the first size, if nsys is found.
 #
 # Everything goes to output/gpu_timing/<gpu>_<date>/, which git ignores:
@@ -125,6 +126,8 @@ if ((SKIP_GATES == 0)); then
         result="bit for bit"
         if ((code != 0 || partial > 0)); then result="**differs** (gate_$gate.log)"; fi
         if [[ $gate == case* ]] && ! grep -q 'bit for bit' "$log"; then result="**differs** (gate_$gate.log)"; fi
+        # The 3D transport's fixtures (in `all`) print their own verdict
+        if grep -q 'NOT bit for bit\|NOT CAUGHT' "$log"; then result="**differs** (gate_$gate.log)"; fi
         if [[ $gate == case ]]; then
             what="steps, volume, clips and station records"
         elif [[ $gate == case_lts ]]; then
@@ -170,6 +173,16 @@ say "|---|---|---|---|---|---|---|"
 for row in "${rows[@]}"; do say "$row"; done
 say ""
 say "A build's first GPU run also compiles its PTX for $arch (the driver caches it): judge by the later runs."
+say ""
+
+# 2b. The 3D stages' transport (Phase 4), with FMA: per element and level at
+# 96,000 P2 elements × 20 levels.
+run_logged "time_transport3d" "$exe" transport3d
+say "## The 3D transport (FMA build; 96,000 P2 elements × 20 levels, per element and level)"
+say ""
+say '```'
+grep -E 'timing:|per element and level|ns \|' "$out/time_transport3d.log" >>"$summary" || say "(no timing lines: time_transport3d.log)"
+say '```'
 say ""
 
 # 3. The kernels, from Nsight Systems.

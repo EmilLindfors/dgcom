@@ -1932,7 +1932,6 @@ fn subtract_vertical_flux(
     } = scratch;
     for i in 0..nn {
         let idx = k * nn + i;
-        let omega = &transport.omega[i * (nl + 1)..(i + 1) * (nl + 1)];
         let mut column = &field[idx * nl..(idx + 1) * nl];
         if ends_from_neighbours {
             own.copy_from_slice(column);
@@ -1940,45 +1939,94 @@ fn subtract_vertical_flux(
             own[nl - 1] = own[nl - 2];
             column = own;
         }
-        let shed = EndLayerShed {
-            range,
-            dt_over_depth: transport.dt_over_depth[i],
-        };
-        scheme.surface_values(column, omega, transport.d_sigma, shed, slope, flux);
-        if let Some(reference) = reference {
-            let reference = &reference[idx * nl..(idx + 1) * nl];
-            let unbounded = EndLayerShed {
-                range: UNBOUNDED,
-                ..shed
-            };
-            scheme.surface_values(
-                reference,
-                omega,
-                transport.d_sigma,
-                unbounded,
+        column_vertical_flux(
+            &mut rhs_k[i * nl..(i + 1) * nl],
+            column,
+            reference.map(|reference| &reference[idx * nl..(idx + 1) * nl]),
+            &transport.omega[i * (nl + 1)..(i + 1) * (nl + 1)],
+            transport.d_sigma,
+            EndLayerShed::new(range, transport.dt_over_depth[i]),
+            scheme,
+            ColumnScratch {
                 slope,
+                surface: flux,
                 reference_surface,
-            );
-            for l in 1..nl {
-                let jump = reference[l] - reference[l - 1];
-                if jump == 0.0 {
-                    continue;
-                }
-                let share = ((column[l] - column[l - 1]) / jump).clamp(0.0, 1.0);
-                let correction =
-                    -share * (reference_surface[l] - 0.5 * (reference[l - 1] + reference[l]));
-                // Only ever towards the column's centred value, not past it:
-                // a limited value stays bounded
-                let to_centred = 0.5 * (column[l - 1] + column[l]) - flux[l];
-                flux[l] += correction.clamp(to_centred.min(0.0), to_centred.max(0.0));
+            },
+        );
+    }
+}
+
+/// Scratch of [`column_vertical_flux`] for a column of `nl` cells: `nl`
+/// slopes and two sets of `nl + 1` surface values.
+pub struct ColumnScratch<'a> {
+    pub slope: &'a mut [f64],
+    pub surface: &'a mut [f64],
+    pub reference_surface: &'a mut [f64],
+}
+
+/// Subtract `δ(Ω φ)` of one column from its tendencies `rhs` (`nl` cells,
+/// bed first, `nl` the length of `column`): `φ` at the `nl + 1` σ-surfaces
+/// reconstructed from `column` by `scheme` for the volume fluxes `omega`
+/// through cells of σ-thickness `d_sigma`, the water leaving an end layer
+/// kept by `shed`; with a `reference` (the column's reference
+/// stratification) each surface value is moved towards the column's centred
+/// value by the share of the reference's own departure from it (see
+/// [`apply_tracer_transport_3d`]).
+///
+/// The column kernel of the vertical advection, pointwise and core-only: the
+/// CPU's kernels call it column by column, the GPU's (`gpu/src/three_d.rs`)
+/// one column per thread, so both take the same steps.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn column_vertical_flux(
+    rhs: &mut [f64],
+    column: &[f64],
+    reference: Option<&[f64]>,
+    omega: &[f64],
+    d_sigma: &[f64],
+    shed: EndLayerShed,
+    scheme: VerticalAdvection,
+    scratch: ColumnScratch,
+) {
+    let nl = column.len();
+    let ColumnScratch {
+        slope,
+        surface: flux,
+        reference_surface,
+    } = scratch;
+    scheme.surface_values(column, omega, d_sigma, shed, slope, flux);
+    if let Some(reference) = reference {
+        let unbounded = EndLayerShed {
+            range: UNBOUNDED,
+            ..shed
+        };
+        scheme.surface_values(
+            reference,
+            omega,
+            d_sigma,
+            unbounded,
+            slope,
+            reference_surface,
+        );
+        for l in 1..nl {
+            let jump = reference[l] - reference[l - 1];
+            if jump == 0.0 {
+                continue;
             }
+            let share = ((column[l] - column[l - 1]) / jump).clamp(0.0, 1.0);
+            let correction =
+                -share * (reference_surface[l] - 0.5 * (reference[l - 1] + reference[l]));
+            // Only ever towards the column's centred value, not past it: a
+            // limited value stays bounded
+            let to_centred = 0.5 * (column[l - 1] + column[l]) - flux[l];
+            flux[l] += correction.clamp(to_centred.min(0.0), to_centred.max(0.0));
         }
-        for l in 0..=nl {
-            flux[l] *= omega[l];
-        }
-        for (l, r) in rhs_k[i * nl..(i + 1) * nl].iter_mut().enumerate() {
-            *r -= flux[l + 1] - flux[l];
-        }
+    }
+    for l in 0..=nl {
+        flux[l] *= omega[l];
+    }
+    for (l, r) in rhs[..nl].iter_mut().enumerate() {
+        *r -= flux[l + 1] - flux[l];
     }
 }
 
@@ -2221,7 +2269,7 @@ fn tvd_limited(increment: f64, behind: f64, ahead: f64) -> f64 {
 /// What keeps the water an end layer sheds within the tracer's physical
 /// range: the range itself and the stage's Courant scale at the column.
 #[derive(Clone, Copy, Debug)]
-struct EndLayerShed {
+pub struct EndLayerShed {
     /// The tracer's physical range `(min, max)` ([`UNBOUNDED`] for none).
     range: (f64, f64),
     /// `Δt_E/D` of the column ([`LayerTransport::dt_over_depth`]), zero for
@@ -2230,6 +2278,16 @@ struct EndLayerShed {
 }
 
 impl EndLayerShed {
+    /// The tracer's physical `range` (`(min, max)`, [`UNBOUNDED`] for none)
+    /// and the column's `Δt_E/D` (`dt_over_depth`, zero for none).
+    #[inline]
+    pub fn new(range: (f64, f64), dt_over_depth: f64) -> Self {
+        Self {
+            range,
+            dt_over_depth,
+        }
+    }
+
     /// No range, so nothing to keep.
     #[cfg(test)]
     const NONE: Self = Self {
@@ -2342,14 +2400,18 @@ fn akima_surface_values(column: &[f64], d_sigma: &[f64], slope: &mut [f64], surf
         let l = l.clamp(1, nl - 1);
         2.0 * (column[l] - column[l - 1]) / (d_sigma[l - 1] + d_sigma[l])
     };
+    // Each gradient once: the one above a layer is the one below the next (a
+    // division per layer less, which a GPU's few FP64 units feel)
+    let mut below = gradient(0);
     for (l, d) in slope.iter_mut().enumerate() {
-        let (below, above) = (gradient(l), gradient(l + 1));
+        let above = gradient(l + 1);
         let product = below * above;
         *d = if product > 0.0 {
             2.0 * product / (below + above)
         } else {
             0.0
         };
+        below = above;
     }
     for l in 1..nl {
         let (a, b) = (d_sigma[l - 1], d_sigma[l]);

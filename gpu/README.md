@@ -7,6 +7,8 @@ dgcom's GPU kernels, in Rust on NVIDIA's [cuda-oxide](https://github.com/NVIDIA/
 - `src/phase0.rs`: the RHS against `compute_rhs_swe_2d_parallel_into`, node for node, on periodic P2 meshes (parallelograms and jittered quadrilaterals) and walled drying beaches, and timed.
 - `src/phase1.rs`: `Simulation` with SSP-RK(4,3) on the GPU against the same run on the CPU (`SWEPhysics2D`), the final states node for node, and the time per step.
 - `src/nest.rs`: a run nested in a made-up parent held in memory (no NetCDF), its boundary and relaxation band, on the CPU and the GPU with global steps and local time stepping, the final states node for node (`nest`, also in `all`).
+- `src/three_d.rs`: the 3D stages' transport (Phase 4): the layer transports and Ω (dgcom's `LayerTransport`, fully wet), the advection of u, v, T and S by them, and the water no transport carried (`Transport3D`), with dgcom's own column kernel (`column_vertical_flux`).
+- `src/transport3d.rs`: those against dgcom's `LayerTransport::compute`, `apply_momentum_transport_3d`, `apply_tracer_transport_3d` and `add_volume_sources`, value for value, on periodic and walled P2 meshes under 20 σ-levels, and timed at 96,000 elements (`transport3d`, also in `all`).
 - `time.sh`: the gates and the timing of a card in one go ([Timing a card](#timing-a-card)).
 
 It is a workspace of its own, as `viz/`: it builds with cuda-oxide's pinned toolchain (`rust-toolchain.toml`, Rust 1.99.1), dgcom included (without its NetCDF feature unless built with `--features netcdf`, so no HDF5 or netCDF-C by default). CI does not build it (no GPU or CUDA toolkit on the runners).
@@ -70,7 +72,8 @@ In `gpu/` (on Windows the binary is `target\release\dgcom-gpu.exe`):
 cargo oxide run --no-fmad                   # the gates against the scalar CPU kernel
 cargo oxide run --no-fmad --features simd   # ... and against the 8-wide SIMD batch
 cargo oxide run --features simd             # multiply–adds fused: within ~1e-11; the timing
-target/release/dgcom-gpu phase1             # one gate (phase0, phase1, nest, beach; all by default)
+target/release/dgcom-gpu phase1             # one gate (phase0, phase1, nest, beach, transport3d;
+                                            # all by default)
 target/release/dgcom-gpu case ../cases/tidal_channel/case.toml
                                             # the case on the CPU and the GPU, compared
 target/release/dgcom-gpu run ../cases/tidal_channel/case.toml --set compute.device=cuda
@@ -89,8 +92,8 @@ SIZES="800x80 1600x160 3200x320" REPEATS=5 gpu/time.sh
 ```
 
 1. Refuses a GPU that is more than 10 % busy (the cards are shared; `FORCE=1` overrides).
-2. Builds with `--no-fmad` and runs the gates against the SIMD batch: `all` (the RHS and `Simulation` runs, and the nested runs), `beach`, and `case` on `cases/tidal_channel` (25 h, every station record), global steps and local time stepping at 3 levels, and `case_atlas` on `cases/tidal_channel/atlas.toml` (the same channel forced by a tidal atlas node by node). On any card each must be bit for bit (`SKIP_GATES=1` skips them).
-3. Builds with FMA and runs `dgcom-gpu case` on the tidal channel refined to each of `SIZES` (`<nx>x<ny>` elements: 64,000 and 256,000 by default, about 1,150 steps each), on the CPU (the SIMD batch on all threads) and on the GPU, `REPEATS` times (3).
+2. Builds with `--no-fmad` and runs the gates against the SIMD batch: `all` (the RHS and `Simulation` runs, the nested runs and the 3D transport), `beach`, and `case` on `cases/tidal_channel` (25 h, every station record), global steps and local time stepping at 3 levels, and `case_atlas` on `cases/tidal_channel/atlas.toml` (the same channel forced by a tidal atlas node by node). On any card each must be bit for bit (`SKIP_GATES=1` skips them).
+3. Builds with FMA and runs `dgcom-gpu case` on the tidal channel refined to each of `SIZES` (`<nx>x<ny>` elements: 64,000 and 256,000 by default, about 1,150 steps each), on the CPU (the SIMD batch on all threads) and on the GPU, `REPEATS` times (3); then `dgcom-gpu transport3d`, the 3D transport per element and level at 96,000 P2 elements × 20 levels.
 4. Profiles the first size with Nsight Systems, if `nsys` is found (`SKIP_PROFILE=1` skips it): each kernel's time per step.
 
 Everything goes to `output/gpu_timing/<gpu>_<date>/` (git-ignored): each command's log and `summary.md`. The time per step is the run's wall time over its steps, start-up included; a build's first GPU run also compiles the PTX for the card, so judge by the later runs.

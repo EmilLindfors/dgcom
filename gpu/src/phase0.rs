@@ -25,10 +25,10 @@ use crate::swe2d::{DeviceState, Formulation, Gpu, GpuSWE2D, NN, ORDER};
 const G: f64 = 9.81;
 
 /// Deterministic pseudo-random numbers in [0, 1) (64-bit LCG).
-struct Lcg(u64);
+pub(crate) struct Lcg(pub(crate) u64);
 
 impl Lcg {
-    fn next(&mut self) -> f64 {
+    pub(crate) fn next(&mut self) -> f64 {
         self.0 = self
             .0
             .wrapping_mul(6364136223846793005)
@@ -38,13 +38,13 @@ impl Lcg {
 }
 
 /// Element size (m).
-const DX: f64 = 100.0;
+pub(crate) const DX: f64 = 100.0;
 
 /// An `nx × ny` mesh of 100 m quadrilaterals, doubly periodic or walled,
 /// its interior vertices moved by up to `jitter · DX` (0: parallelograms
 /// throughout).
-fn quad_mesh(nx: usize, ny: usize, jitter: f64, periodic: bool) -> Mesh2D {
-    let mut rng = Lcg(2026_11_15);
+pub(crate) fn quad_mesh(nx: usize, ny: usize, jitter: f64, periodic: bool) -> Mesh2D {
+    let mut rng = Lcg(20_261_115);
     let mut vertices = Vec::with_capacity((nx + 1) * (ny + 1));
     for j in 0..=ny {
         for i in 0..=nx {
@@ -279,7 +279,7 @@ pub fn cpu_kernel() -> &'static str {
 }
 
 /// Distance in units in the last place between two finite f64.
-fn ulps(a: f64, b: f64) -> u64 {
+pub(crate) fn ulps(a: f64, b: f64) -> u64 {
     let key = |x: f64| {
         let bits = x.to_bits() as i64;
         if bits < 0 { i64::MIN - bits } else { bits }
