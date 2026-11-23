@@ -54,7 +54,7 @@ use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
 use dgcom::physics::builder::LINE_LOCAL_HEADROOM;
 use dgcom::physics::{PhysicsModule, PhysicsModuleInfo, SWEDeviceForm2D};
-use dgcom::solver::rhs::subcells::telescoped_interfaces;
+use dgcom::solver::rhs::subcells::{subcell_slot, telescoped_interfaces};
 use dgcom::solver::{
     PositivityBound, SUBCELL_CAP_DEPTH_FACTOR, SWEFormulation2D, SWESide2D, SWESolution2D,
     WetDryConfig, damp_node, dt_from_reference_rate, hydrostatic_hll, node_reference_rate,
@@ -67,6 +67,8 @@ use dgcom::time::{
     Integrable, LocalTimeStepping, NodeLines, ShuOsherStage, SspScheme, StagePlan, element_stage,
 };
 use dgcom::types::{Depth, ElementIndex};
+
+use crate::three_d::NSUB;
 
 /// Polynomial order of the kernels (P2).
 pub const ORDER: usize = 2;
@@ -250,12 +252,12 @@ pub struct Damping {
 impl Damping {
     /// Whether it damps at all (`ImplicitDamping2D::is_active`).
     #[inline]
-    fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         self.friction != 0 || self.wet_dry != 0
     }
 
     #[inline]
-    fn wet_dry_config(&self) -> WetDryConfig {
+    pub fn wet_dry_config(&self) -> WetDryConfig {
         WetDryConfig {
             h_dry: Depth::new(self.h_dry),
             relaxation_time: self.relaxation_time,
@@ -267,7 +269,7 @@ impl Damping {
     /// `damp_node` of mesh node `n` with depth `h`, from `from`, over `dt`.
     #[inline]
     #[allow(clippy::too_many_arguments)]
-    fn node(&self, n: usize, h: f64, u: &mut f64, v: &mut f64, from: SWEState2D, dt: f64) {
+    pub fn node(&self, n: usize, h: f64, u: &mut f64, v: &mut f64, from: SWEState2D, dt: f64) {
         let law = ManningFriction2D {
             g: self.g,
             manning_n: self.manning_n,
@@ -468,9 +470,10 @@ pub const LINE_TERMS: usize = 3;
 /// it adds to each node, in the CPU's order: node `a` gets `terms[a][0]`,
 /// then `[1]`, then `[2]` (the end flux or an interface's HLL flux, an
 /// interface's HLL flux, the bed and metric balance). A subtraction on the
-/// CPU is the negated term's sum here, the same bits. Not generic, so that
-/// it inlines (a generic `#[device]` function stays a call), and the GLL
-/// data are arrays, so that its loops have constant trip counts.
+/// CPU is the negated term's sum here, the same bits. Also each interface's
+/// mass flux (`line_subcells`' `mass`). Not generic, so that it inlines (a
+/// generic `#[device]` function stays a call), and the GLL data are arrays,
+/// so that its loops have constant trip counts.
 #[allow(clippy::too_many_arguments)]
 #[device]
 // The device backend makes this alwaysinline (no call in the PTX); the host
@@ -488,8 +491,9 @@ fn line_terms(
     g: f64,
     h_min: f64,
     h_dry: f64,
-) -> [[SWEState2D; LINE_TERMS]; N1] {
+) -> ([[SWEState2D; LINE_TERMS]; N1], [f64; N1 - 1]) {
     let mut terms = [[SWEState2D::zero(); LINE_TERMS]; N1];
+    let mut mass = [0.0; N1 - 1];
     // Interface metrics (the telescoping sum of the flux-differencing term)
     let mut interfaces = [(0.0, 0.0); N1 + 1];
     telescoped_interfaces(w, d1, metric, affine, &mut interfaces);
@@ -535,6 +539,7 @@ fn line_terms(
     for a in 0..N1 - 1 {
         let m = interfaces[a + 1];
         let (f_a, f_b) = hydrostatic_hll(&faces[a].1, &faces[a + 1].0, m, g, h_min);
+        mass[a] = f_a.h;
         terms[a][1] = -((1.0 / w[a]) * f_a);
         terms[a + 1][if a + 1 == N1 - 1 { 1 } else { 0 }] = (1.0 / w[a + 1]) * f_b;
     }
@@ -562,7 +567,7 @@ fn line_terms(
         };
         terms[a][2] = SWEState2D::new(0.0, force_x, force_y);
     }
-    terms
+    (terms, mass)
 }
 
 /// `SplitFormSWE2D::outer_node`: of face node `fi` of `face` of element `k`,
@@ -852,7 +857,7 @@ fn boundary_node(
 // compiler, which sees an exported symbol, ignores it.
 #[allow(unused_attributes)]
 #[inline(always)]
-fn is_subcell_element(k: usize, h: &[f64], depth: f64) -> bool {
+pub fn is_subcell_element(k: usize, h: &[f64], depth: f64) -> bool {
     let mut shallow = false;
     #[unroll]
     for i in 0..NN {
@@ -1347,9 +1352,12 @@ pub mod kernels {
     /// element and GLL line (`2·N1` per element, line `l` of direction `d`
     /// the element's `2l + d`), `line_terms` of the line into `terms`
     /// (`LINE_TERMS` per node, at `((k·2N1 + 2l + d)·N1 + a)·LINE_TERMS`),
-    /// which `element_rhs_subcells` sums. A line is a sixth of an element's
-    /// subcell work: the chain each thread runs, which bounds a short pass
-    /// of local time stepping, is a sixth as long.
+    /// which `element_rhs_subcells` sums, and, unless `mass` is empty, the
+    /// mass flux through each of the line's subcell interfaces into `mass`
+    /// (`k·NSUB + subcell_slot(N1, d, l, a)`, as the CPU's `subcell_mass`;
+    /// the barotropic pass of the 3D model sums them). A line is a sixth of
+    /// an element's subcell work: the chain each thread runs, which bounds a
+    /// short pass of local time stepping, is a sixth as long.
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn subcell_terms(
@@ -1372,6 +1380,7 @@ pub mod kernels {
         element_edges: &[[u32; 4]],
         edges: &[[u32; 4]],
         mut terms: DisjointSlice<[f64; 3]>,
+        mut mass: DisjointSlice<f64>,
     ) {
         let t = thread::index_1d().get();
         let (i, j) = (t / (2 * N1), t % (2 * N1));
@@ -1440,7 +1449,20 @@ pub mod kernels {
         } else {
             [outer(0, fwd), outer(2, rev)]
         };
-        let line_t = line_terms(&q, &metric, ends, aff, &w_a, &xi_a, &d1_a, g, h_min, h_dry);
+        let (line_t, line_mass) =
+            line_terms(&q, &metric, ends, aff, &w_a, &xi_a, &d1_a, g, h_min, h_dry);
+        if !mass.is_empty() {
+            #[unroll]
+            for a in 0..N1 - 1 {
+                // SAFETY: thread (k, j) writes only its own line's interfaces
+                // (the listed elements are distinct), within the buffer's
+                // n_elements · NSUB.
+                unsafe {
+                    *mass.get_unchecked_mut(k * NSUB + subcell_slot(N1, direction, line, a)) =
+                        line_mass[a];
+                }
+            }
+        }
         let first = (k * 2 * N1 + j) * N1 * LINE_TERMS;
         #[unroll]
         for a in 0..N1 {
@@ -2118,6 +2140,8 @@ pub struct Gpu {
     pub(crate) module_vertical: crate::vertical::kernels_vertical::LoadedModule,
     /// The 3D step's slow forcing (`forcing.rs`)
     pub(crate) module_forcing: crate::forcing::kernels_forcing::LoadedModule,
+    /// The 3D step's barotropic pass (`pass.rs`)
+    pub(crate) module_pass: crate::pass::kernels_pass::LoadedModule,
     /// The device's name and compute capability
     pub name: String,
     /// Its streaming multiprocessors
@@ -2139,6 +2163,7 @@ impl Gpu {
         let module_limiter = crate::limiter::kernels_limiter::load(&ctx)?;
         let module_vertical = crate::vertical::kernels_vertical::load(&ctx)?;
         let module_forcing = crate::forcing::kernels_forcing::load(&ctx)?;
+        let module_pass = crate::pass::kernels_pass::load(&ctx)?;
         let sms = ctx.multiprocessor_count()?;
         Ok(Arc::new(Self {
             stream,
@@ -2150,6 +2175,7 @@ impl Gpu {
             module_limiter,
             module_vertical,
             module_forcing,
+            module_pass,
             name,
             sms,
         }))
@@ -2637,9 +2663,42 @@ pub struct GpuSWE2D<'a> {
     /// The stage's boundary data on the device
     boundary: Mutex<BoundaryUploads>,
     /// An empty list (every element or edge) and empty rows (the sum of a
-    /// stage that does not accumulate)
+    /// stage that does not accumulate, the subcell fluxes of a RHS that
+    /// keeps none)
     no_list: DeviceBuffer<u32>,
     no_rows: Mutex<[DeviceBuffer<f64>; 3]>,
+    no_mass: Mutex<DeviceBuffer<f64>>,
+}
+
+/// What the 3D model's barotropic pass takes from a stage's RHS besides the
+/// rates ([`GpuSWE2D::rhs_pass_fluxes_into`]).
+pub struct PassFluxes<'b> {
+    /// The mass flux through every subcell interface of the elements that
+    /// took the subcells, `k·NSUB + slot` (the other elements' left as they
+    /// are)
+    pub subcell: &'b mut DeviceBuffer<f64>,
+    /// The relaxation bands' volume sources into its `h`, from zero (`hu`
+    /// and `hv` scratch), if the module has any
+    /// ([`GpuSWE2D::has_mass_sources`])
+    pub sources: &'b mut DeviceState,
+}
+
+/// What the 3D model's barotropic stage kernel reads of the 2D module
+/// ([`GpuSWE2D::pass_tables`]).
+pub struct PassTables<'b> {
+    /// Both sides' F* of every edge, of the last RHS
+    pub faces: std::sync::MutexGuard<'b, DeviceBuffer<[[f64; 3]; NF]>>,
+    pub element_edges: &'b DeviceBuffer<[u32; 4]>,
+    pub edges: &'b DeviceBuffer<[u32; 4]>,
+    /// Nodal masses and every element's 1/area (the wet/dry correction)
+    pub mass: &'b DeviceBuffer<f64>,
+    pub inv_area: &'b DeviceBuffer<f64>,
+    /// The depth below which an element takes the subcells
+    pub subcell_depth: f64,
+    /// A stage's damping and wet/dry correction
+    pub damping: Damping,
+    /// Every element's count of the wet/dry correction's clips
+    pub clips: std::sync::MutexGuard<'b, DeviceBuffer<u32>>,
 }
 
 /// The open boundaries' external data and the parents on the device
@@ -3174,6 +3233,7 @@ impl<'a> GpuSWE2D<'a> {
             ),
             no_list: DeviceBuffer::zeroed(stream, 0).map_err(|e| e.to_string())?,
             no_rows: Mutex::new([zeroed(0)?, zeroed(0)?, zeroed(0)?]),
+            no_mass: Mutex::new(zeroed(0)?),
             boundary: Mutex::new(BoundaryUploads::new(gpu, forcing.width)?),
             parents,
             relaxations,
@@ -3259,7 +3319,9 @@ impl<'a> GpuSWE2D<'a> {
     /// list is empty): the F* of the listed edges, then the element
     /// kernels. The boundary data of level `l` are at its stage time
     /// `times[l]`; `level` gives a boundary edge its element's level (empty:
-    /// level 0).
+    /// level 0). With `fluxes`, also what the 3D model's barotropic pass
+    /// takes ([`PassFluxes`]).
+    #[allow(clippy::too_many_arguments)]
     fn rhs_where(
         &self,
         state: &DeviceState,
@@ -3268,6 +3330,7 @@ impl<'a> GpuSWE2D<'a> {
         [(interior, n_interior), (boundary_list, n_boundary)]: [(&DeviceBuffer<u32>, usize); 2],
         (element_list, n_elements): (&DeviceBuffer<u32>, usize),
         out: &mut DeviceState,
+        mut fluxes: Option<PassFluxes<'_>>,
     ) {
         let (gpu, s) = (&self.gpu, &self.statics);
         // The element kernels split at the subcell depth (none for the
@@ -3280,6 +3343,7 @@ impl<'a> GpuSWE2D<'a> {
             } => (true, subcell_depth, h_dry),
         };
         let mut faces = self.faces.lock().expect("face buffer");
+        let mut no_mass = self.no_mass.lock().expect("empty rows");
         let mut uploads = self.boundary.lock().expect("boundary data");
         let width = self.forcing.width;
         let (boundary, moments) = uploads.upload(&gpu.stream, |levels, moments| {
@@ -3455,6 +3519,10 @@ impl<'a> GpuSWE2D<'a> {
                         &s.element_edges,
                         &s.edges,
                         &mut terms,
+                        match fluxes.as_mut() {
+                            Some(fluxes) => fluxes.subcell,
+                            None => &mut no_mass,
+                        },
                     )
                     .expect("subcell terms");
                 let [out_h, out_hu, out_hv] = out.fields_mut();
@@ -3522,6 +3590,110 @@ impl<'a> GpuSWE2D<'a> {
                     )
                     .expect("nesting relaxation");
             }
+            // The bands' volume sources alone, from zero, as
+            // `mass_sources_into` adds them: the bands that relax the level
+            let Some(PassFluxes { sources, .. }) = fluxes else {
+                return;
+            };
+            if !self.has_mass_sources() {
+                return;
+            }
+            for field in sources.fields_mut() {
+                field.zero_async(&gpu.stream).expect("clear the sources");
+            }
+            for &(p, relaxation) in self.relaxations.iter().filter(|(_, r)| !r.momentum_only()) {
+                let [out_h, out_hu, out_hv] = sources.fields_mut();
+                gpu.module
+                    .nesting_relaxation(
+                        &gpu.stream,
+                        gpu.spread(n_pass, 256),
+                        p as u32,
+                        relaxation.rate(),
+                        relaxation.wet_depth(),
+                        0,
+                        &f.parents,
+                        &f.series,
+                        &f.slots,
+                        &f.slot_of_node,
+                        &f.band,
+                        self.mesh.n_elements as u32,
+                        moments,
+                        width as u32,
+                        level,
+                        element_list,
+                        n_elements,
+                        &state.h,
+                        &state.hu,
+                        &state.hv,
+                        &s.bed,
+                        out_h,
+                        out_hu,
+                        out_hv,
+                    )
+                    .expect("nesting relaxation's volume source");
+            }
+        }
+    }
+
+    /// Whether the 2D module has volume sources of its own
+    /// (`BarotropicPhysics::mass_sources_into`): a relaxation band that
+    /// relaxes the level.
+    pub fn has_mass_sources(&self) -> bool {
+        self.relaxations.iter().any(|(_, r)| !r.momentum_only())
+    }
+
+    /// `BarotropicPhysics::compute_rhs_mass_fluxes_into` at `time` with
+    /// global steps: the RHS of `state` into `out`, the subcell interfaces'
+    /// mass fluxes and the 2D module's volume sources into `fluxes`. The
+    /// face nodes' F* stay in [`Self::pass_tables`]' face buffer until the
+    /// next RHS.
+    pub fn rhs_pass_fluxes_into(
+        &self,
+        state: &DeviceState,
+        time: f64,
+        out: &mut DeviceState,
+        fluxes: PassFluxes<'_>,
+    ) {
+        let s = &self.statics;
+        self.rhs_where(
+            state,
+            &[time],
+            &self.no_list,
+            [
+                (&s.interior_edges, s.interior_edges.len()),
+                (&s.boundary_edges, s.boundary_edges.len()),
+            ],
+            (&self.no_list, self.mesh.n_elements),
+            out,
+            Some(fluxes),
+        );
+    }
+
+    /// What the 3D model's barotropic stage kernel reads of the module
+    /// ([`PassTables`]), the face buffer locked.
+    pub fn pass_tables(&self) -> PassTables<'_> {
+        let (subcell_depth, _) = self.subcell_split();
+        PassTables {
+            faces: self.faces.lock().expect("face buffer"),
+            element_edges: &self.statics.element_edges,
+            edges: &self.statics.edges,
+            mass: &self.statics.mass,
+            inv_area: &self.statics.inv_area,
+            subcell_depth,
+            damping: self.damping(),
+            clips: self.clips.lock().expect("clip counts"),
+        }
+    }
+
+    /// The subcell depth (`−∞` for the entropy-stable form, which has no
+    /// subcells) and `h_dry` of the subcells' reconstruction.
+    fn subcell_split(&self) -> (f64, f64) {
+        match self.formulation {
+            Formulation::EntropyStable => (f64::NEG_INFINITY, 0.0),
+            Formulation::WetDry {
+                subcell_depth,
+                h_dry,
+            } => (subcell_depth, h_dry),
         }
     }
 
@@ -3585,6 +3757,7 @@ impl PhysicsModule<DeviceState> for GpuSWE2D<'_> {
             ],
             (&self.no_list, self.mesh.n_elements),
             out,
+            None,
         );
     }
 
@@ -3920,6 +4093,7 @@ impl LocalTimeStepping<DeviceState> for GpuSWE2D<'_> {
             edges,
             (element_list, n_elements),
             out,
+            None,
         );
 
         let gpu = &self.gpu;

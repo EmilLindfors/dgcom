@@ -9,7 +9,7 @@
 //! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, beach,
 //!                                             # transport3d, momentum3d, stage3d,
 //!                                             # limiter3d, vertical3d, implicit3d,
-//!                                             # forcing3d; all by default)
+//!                                             # forcing3d, pass3d; all by default)
 //! target\release\dgcom-gpu.exe case <case.toml> [--set key.path=value]...
 //!                                             # a case on the CPU and the GPU, compared
 //! target\release\dgcom-gpu.exe run <case.toml> [--set ...]
@@ -34,7 +34,9 @@
 //!   and the surface fluxes, and `dgcom::math` itself (`vertical3d`); the
 //!   implicit vertical advection, the split of Ω and the relaxation
 //!   (`implicit3d`); the slow forcing `G` of the barotropic pass
-//!   (`forcing3d`); value for value.
+//!   (`forcing3d`); the barotropic pass on global substeps with its
+//!   `DU_avg2`, filter, rivers and the 2D module's volume sources, and the
+//!   step's rates and balance (`pass3d`); value for value.
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
 //! must be the CPU's bit for bit; that is the gate.
@@ -52,6 +54,8 @@ mod limiter;
 mod limiter3d;
 mod momentum3d;
 mod nest;
+mod pass;
+mod pass3d;
 mod phase0;
 mod phase1;
 mod stage3d;
@@ -128,6 +132,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if which == "all" || which == "forcing3d" {
         forcing3d::run(&gpu)?;
+    }
+    if which == "all" || which == "pass3d" {
+        pass3d::run(&gpu)?;
     }
     Ok(())
 }

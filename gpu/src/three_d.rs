@@ -1236,7 +1236,7 @@ pub struct Statics3D {
     pub(crate) sub_metric: DeviceBuffer<[f64; 2]>,
     /// Per GLL line (`(k·2 + dir)·N1 + line`): `line_metric` at its first
     /// and last node
-    line_ends: DeviceBuffer<[f64; 2]>,
+    pub(crate) line_ends: DeviceBuffer<[f64; 2]>,
     pub(crate) d_sigma: DeviceBuffer<f64>,
     pub(crate) sigma_w: DeviceBuffer<f64>,
     /// The layer centres' σ
@@ -1427,18 +1427,58 @@ impl ExteriorDevice {
     }
 }
 
+/// Where dgcom's `RiverSources` put the rivers, on the device: the rivers
+/// of every element in index order (`in_element`, `offsets[k]..offsets[k +
+/// 1]` of `by_element`), the elements with rivers, each once, and each
+/// river's share of its discharge at its element's nodes (`share`, `i·NN +
+/// node`).
+pub struct RiverTables {
+    pub(crate) n_rivers: usize,
+    pub(crate) offsets: DeviceBuffer<u32>,
+    pub(crate) by_element: DeviceBuffer<u32>,
+    pub(crate) elements: DeviceBuffer<u32>,
+    pub(crate) n_elements_with: usize,
+    pub(crate) share: DeviceBuffer<f64>,
+}
+
+impl RiverTables {
+    /// `rivers`' tables over `n_elements` elements.
+    pub fn new(
+        gpu: &Gpu,
+        n_elements: usize,
+        rivers: &RiverSources,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let stream = &gpu.stream;
+        let mut offsets = vec![0u32; n_elements + 1];
+        let mut by_element = Vec::with_capacity(rivers.len());
+        let mut elements = Vec::new();
+        for k in 0..n_elements {
+            let here = rivers.in_element(k);
+            by_element.extend(here.iter().map(|&i| i as u32));
+            offsets[k + 1] = by_element.len() as u32;
+            if !here.is_empty() {
+                elements.push(k as u32);
+            }
+        }
+        let share: Vec<f64> = (0..rivers.len())
+            .flat_map(|i| rivers.share(i).to_vec())
+            .collect();
+        Ok(Self {
+            n_rivers: rivers.len(),
+            offsets: DeviceBuffer::from_host(stream, &offsets)?,
+            by_element: DeviceBuffer::from_host(stream, &by_element)?,
+            n_elements_with: elements.len(),
+            elements: DeviceBuffer::from_host(stream, &elements)?,
+            share: DeviceBuffer::from_host(stream, &share)?,
+        })
+    }
+}
+
 /// The rivers on the device (dgcom's `RiverSources` with its levels set):
-/// the rivers of every element in index order, each river's shares and
-/// level weights (static), and its step-mean discharge (`RiverInflow`,
-/// [`Self::set_discharge`]).
+/// their [`RiverTables`], each river's level weights (static), and its
+/// step-mean discharge (`RiverInflow`, [`Self::set_discharge`]).
 pub struct RiversDevice {
-    n_rivers: usize,
-    offsets: DeviceBuffer<u32>,
-    by_element: DeviceBuffer<u32>,
-    /// The elements with rivers, each once
-    elements: DeviceBuffer<u32>,
-    n_elements_with: usize,
-    share: DeviceBuffer<f64>,
+    tables: RiverTables,
     weights: DeviceBuffer<f64>,
     q: DeviceBuffer<f64>,
 }
@@ -1450,32 +1490,16 @@ impl RiversDevice {
         rivers: &RiverSources,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = &gpu.stream;
-        let (ne, nl) = (statics.n_elements, statics.n_levels);
-        assert_eq!(rivers.n_levels(), nl, "the rivers' levels are the grid's");
-        let mut offsets = vec![0u32; ne + 1];
-        let mut by_element = Vec::with_capacity(rivers.len());
-        let mut elements = Vec::new();
-        for k in 0..ne {
-            let here = rivers.in_element(k);
-            by_element.extend(here.iter().map(|&i| i as u32));
-            offsets[k + 1] = by_element.len() as u32;
-            if !here.is_empty() {
-                elements.push(k as u32);
-            }
-        }
-        let share: Vec<f64> = (0..rivers.len())
-            .flat_map(|i| rivers.share(i).to_vec())
-            .collect();
+        assert_eq!(
+            rivers.n_levels(),
+            statics.n_levels,
+            "the rivers' levels are the grid's"
+        );
         let weights: Vec<f64> = (0..rivers.len())
             .flat_map(|i| (0..NN).flat_map(move |node| rivers.level_weights(i, node).to_vec()))
             .collect();
         Ok(Self {
-            n_rivers: rivers.len(),
-            offsets: DeviceBuffer::from_host(stream, &offsets)?,
-            by_element: DeviceBuffer::from_host(stream, &by_element)?,
-            n_elements_with: elements.len(),
-            elements: DeviceBuffer::from_host(stream, &elements)?,
-            share: DeviceBuffer::from_host(stream, &share)?,
+            tables: RiverTables::new(gpu, statics.n_elements, rivers)?,
             weights: DeviceBuffer::from_host(stream, &weights)?,
             q: DeviceBuffer::zeroed(stream, rivers.len())?,
         })
@@ -1487,7 +1511,7 @@ impl RiversDevice {
         gpu: &Gpu,
         q: &[f64],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(q.len(), self.n_rivers, "a discharge per river");
+        assert_eq!(q.len(), self.tables.n_rivers, "a discharge per river");
         self.q = DeviceBuffer::from_host(&gpu.stream, q)?;
         Ok(())
     }
@@ -1609,14 +1633,14 @@ impl Transport3D {
     /// The rivers' tables, or empty buffers for none.
     fn river_tables(&self) -> [&DeviceBuffer<u32>; 2] {
         match &self.rivers {
-            Some(r) => [&r.offsets, &r.by_element],
+            Some(r) => [&r.tables.offsets, &r.tables.by_element],
             None => [&self.none_u32, &self.none_u32],
         }
     }
 
     fn river_values(&self) -> [&DeviceBuffer<f64>; 3] {
         match &self.rivers {
-            Some(r) => [&r.q, &r.share, &r.weights],
+            Some(r) => [&r.q, &r.tables.share, &r.weights],
             None => [&self.none, &self.none, &self.none],
         }
     }
@@ -1655,7 +1679,13 @@ impl Transport3D {
         // Field by field, so that the outputs below can be borrowed apart
         let rivers = self.rivers.as_ref().filter(|_| barotropic.is_some());
         let (offsets, by_element, q, share, weights) = match rivers {
-            Some(r) => (&r.offsets, &r.by_element, &r.q, &r.share, &r.weights),
+            Some(r) => (
+                &r.tables.offsets,
+                &r.tables.by_element,
+                &r.q,
+                &r.tables.share,
+                &r.weights,
+            ),
             None => (
                 &self.none_u32,
                 &self.none_u32,
@@ -2036,7 +2066,8 @@ impl Transport3D {
         };
         let gpu = self.gpu.clone();
         let nl = self.statics.n_levels;
-        let n = rivers.n_elements_with * NN * nl;
+        let t = &rivers.tables;
+        let n = t.n_elements_with * NN * nl;
         if n == 0 {
             return Ok(());
         }
@@ -2047,11 +2078,11 @@ impl Transport3D {
                 launch(n, LEVEL_BLOCK),
                 nl as u32,
                 n as u32,
-                &rivers.elements,
-                &rivers.offsets,
-                &rivers.by_element,
+                &t.elements,
+                &t.offsets,
+                &t.by_element,
                 &rivers.q,
-                &rivers.share,
+                &t.share,
                 &rivers.weights,
                 conc,
                 rhs,

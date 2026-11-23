@@ -179,7 +179,7 @@ say ""
 
 # 2b. The 3D stages' transport, momentum terms and hooks (Phase 4), with FMA:
 # per element and level at 96,000 P2 elements × 20 levels.
-parts="transport3d momentum3d stage3d limiter3d vertical3d implicit3d forcing3d"
+parts="transport3d momentum3d stage3d limiter3d vertical3d implicit3d forcing3d pass3d"
 for part in $parts; do
     run_logged "time_$part" "$exe" "$part"
 done

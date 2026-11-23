@@ -27,9 +27,11 @@ mod ssp_rk3_swe_2d;
 
 pub use clock::ModelClock;
 pub use mode_split::{
-    BarotropicFilter, BarotropicPhysics, BarotropicTransport, MIN_BAROTROPIC_SUBSTEPS,
-    ModeSplitIntegrator, ModeSplitPhysics, SlowForcingRecord, SplitMethod, StageElements,
-    StageStash, StageTime, StepDrag, step_average_weights,
+    BarotropicFilter, BarotropicPhysics, BarotropicTransport, Combination, GlobalPass,
+    MIN_BAROTROPIC_SUBSTEPS, ModeSplitIntegrator, ModeSplitPhysics, PassDrag, PassWork, RkStage,
+    Slot, SlowForcingRecord, SplitMethod, StageElements, StageStash, StageTime, StepDrag,
+    barotropic_node_rates, barotropic_pass, barotropic_rates, barotropic_stages, column_drag_rates,
+    filtered_state, pooled_element, pooled_elements, step_average_weights, to_transport,
 };
 pub use multirate::{
     ElementStage, LocalTimeStepping, Multirate, MultiratePass, MultirateSSPRK3, MultirateSSPRK43,

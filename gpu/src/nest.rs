@@ -90,27 +90,43 @@ fn parent_reader(projection: &LocalProjection) -> Arc<OceanModelReader> {
 }
 
 /// One nested configuration.
-struct Nest {
-    label: &'static str,
-    options: NestingOptions,
+pub(crate) struct Nest {
+    pub(crate) label: &'static str,
+    pub(crate) options: NestingOptions,
     /// The band's timescale at the boundary (s), and whether it relaxes the
     /// momentum alone
-    timescale: f64,
-    momentum_only: bool,
+    pub(crate) timescale: f64,
+    pub(crate) momentum_only: bool,
+}
+
+impl Nest {
+    /// The first of the gate's nests: a cubic, transport-scaled parent whose
+    /// band relaxes the level too.
+    pub(crate) fn cubic() -> Self {
+        Self {
+            label: "nested, cubic, transport-scaled",
+            options: NestingOptions::default()
+                .with_band(3000.0)
+                .with_datum(ParentDatum::Shift(-0.04))
+                .with_ramp_up(3600.0),
+            timescale: 1800.0,
+            momentum_only: false,
+        }
+    }
 }
 
 /// The channel nested as `nest` says: its mesh, operators, bed (blended)
 /// and parent.
-struct Domain {
-    mesh: Arc<Mesh2D>,
-    ops: Arc<DGOperators2D>,
-    geom: Arc<GeometricFactors2D>,
-    bed: Arc<Bathymetry2D>,
-    parent: OceanModelState,
+pub(crate) struct Domain {
+    pub(crate) mesh: Arc<Mesh2D>,
+    pub(crate) ops: Arc<DGOperators2D>,
+    pub(crate) geom: Arc<GeometricFactors2D>,
+    pub(crate) bed: Arc<Bathymetry2D>,
+    pub(crate) parent: OceanModelState,
 }
 
 impl Domain {
-    fn new(nest: &Nest) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new(nest: &Nest) -> Result<Self, Box<dyn Error>> {
         let projection = LocalProjection::new(63.5, 8.0);
         let mesh = Mesh2D::uniform_rectangle_with_sides(
             0.0,
@@ -164,7 +180,7 @@ impl Domain {
     }
 
     /// The physics as the case runner builds a nested case, on `bc`.
-    fn physics<'a>(
+    pub(crate) fn physics<'a>(
         &self,
         nest: &Nest,
         bc: MultiBoundaryCondition2D<'a>,
@@ -260,15 +276,7 @@ fn gate(gpu: &Arc<Gpu>, nest: &Nest, levels: usize) -> Result<bool, Box<dyn Erro
 pub fn run_gates(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
     println!("== Phase 2: a run nested in a parent model ==");
     let nests = [
-        Nest {
-            label: "nested, cubic, transport-scaled",
-            options: NestingOptions::default()
-                .with_band(3000.0)
-                .with_datum(ParentDatum::Shift(-0.04))
-                .with_ramp_up(3600.0),
-            timescale: 1800.0,
-            momentum_only: false,
-        },
+        Nest::cubic(),
         Nest {
             label: "nested, linear, unscaled, momentum relaxed",
             options: NestingOptions::default()
