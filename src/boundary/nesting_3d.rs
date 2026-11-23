@@ -343,6 +343,17 @@ impl Nesting3D {
         self.nodes.len()
     }
 
+    /// The band's slots as flat tables: what a device relaxes with, the
+    /// parent's columns of [`NestingColumns::values`] uploaded.
+    pub fn slots(&self) -> NestingSlots<'_> {
+        NestingSlots {
+            nodes: &self.nodes,
+            velocity_rate: &self.velocity_rate,
+            tracer_rate: &self.tracer_rate,
+            supplied: self.supplied,
+        }
+    }
+
     /// The parent's columns for `state` at the band nodes of `elements`,
     /// each at its element's stage time in `time`; a column is evaluated
     /// unless its last evaluation was for the same time and free surface.
@@ -473,6 +484,19 @@ type BandColumn<'a> = (
     ),
 );
 
+/// A [`Nesting3D`]'s slots ([`Nesting3D::slots`]): the boundary and band
+/// nodes the parent's columns are sampled at, and their relaxation rates.
+#[derive(Clone, Copy, Debug)]
+pub struct NestingSlots<'a> {
+    /// `[element][node]` of every slot
+    pub nodes: &'a [usize],
+    /// The shear's and the tracers' relaxation rates of every slot (1/s)
+    pub velocity_rate: &'a [f64],
+    pub tracer_rate: &'a [f64],
+    /// What the parent supplies (what is relaxed)
+    pub supplied: Supplied,
+}
+
 /// The parent's columns of a [`Nesting3D`] for one child state.
 pub struct NestingColumns<'a> {
     nesting: &'a Nesting3D,
@@ -492,6 +516,14 @@ impl NestingColumns<'_> {
             n_levels: self.nesting.n_levels,
             values,
         }
+    }
+
+    /// The parent's u, v, T and S at every slot (`[slot][level]`, in
+    /// [`Nesting3D::slots`]'s order): the child's own columns where the
+    /// parent does not cover a node.
+    pub fn values(&self) -> [&[f64]; 4] {
+        let c = &self.columns;
+        [&c.u, &c.v, &c.temp, &c.salt]
     }
 
     /// The exterior values of the 3D kernels at the nested open faces.

@@ -20,13 +20,22 @@
 //!
 //! on walled beaches whose stages are long enough that thin cells merge
 //! with their neighbours and films are flushed (`MergedCells::find` on the
-//! host, its groups uploaded). Mutants it must catch, and timed at Chiloé's
-//! size (96,000 P2 elements × 20 levels).
+//! host, its groups uploaded). Then the nesting band's relaxation of the
+//! shear and the tracers (`NestingColumns::relax_shear`, `relax_tracers`,
+//! Phase 4.3c) on the channel open at both ends, nested in a parent model
+//! that covers part of the band and in a state at rest
+//! (`ReferenceColumns`). Mutants it must catch, and timed at Chiloé's size
+//! (96,000 P2 elements × 20 levels).
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use cuda_core::DeviceBuffer;
+use dgcom::boundary::{
+    ColumnContext3D, Nesting3D, NestingBand3D, NestingSlots, ParentColumn, ParentColumns3D,
+    ReferenceColumns, Supplied,
+};
+use dgcom::mesh::BoundaryTag;
 use dgcom::physics::{EquationOfState, LinearEOS, zero_thin_momentum};
 use dgcom::solver::Blocks;
 use dgcom::solver::rhs::transport_3d::{dry_inventories, from_inventory_after, inventory_of};
@@ -34,10 +43,11 @@ use dgcom::solver::rhs::{
     MergedCells, MergedTables, StepWater, from_inventory, to_inventory, w_cell_thicknesses,
 };
 use dgcom::solver::state::Solution3D;
-use dgcom::time::StageStash;
-use dgcom::vertical::depth_average;
+use dgcom::source::SpongeProfile;
+use dgcom::time::{StageStash, StageTime};
+use dgcom::vertical::{SigmaGrid, depth_average};
 
-use crate::hooks::{Merged3D, N_FIELDS, StageHooks3D, StageValues3D, State3D};
+use crate::hooks::{Band3D, Merged3D, N_FIELDS, StageHooks3D, StageValues3D, State3D};
 use crate::swe2d::{Gpu, NN, ORDER};
 use crate::three_d::Statics3D;
 use crate::transport3d::{DT, Fixture, LEVELS, Shape, agreement};
@@ -829,6 +839,186 @@ fn time(
     Ok(())
 }
 
+/// A parent with a sheared, stratified flow that moves in time, covering
+/// the columns south of `cover` (m): the others keep their own.
+struct Profile {
+    cover: f64,
+}
+
+impl ParentColumns3D for Profile {
+    fn supplies(&self) -> Supplied {
+        Supplied {
+            velocity: true,
+            tracers: true,
+        }
+    }
+
+    fn column(&self, ctx: &ColumnContext3D, sigma: &SigmaGrid, out: ParentColumn<'_>) -> bool {
+        let (x, y) = ctx.position;
+        for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+            out.u[l] = 0.2 + 0.15 * s + 1e-4 * ctx.time + 0.01 * (1e-3 * y).sin();
+            out.v[l] = -0.08 * s + 0.1 * ctx.eta + 0.02 * (1e-3 * x).cos();
+            out.temp[l] = 9.0 + 3.0 * (s + 0.5) + 0.1 * (2e-3 * y).sin();
+            out.salt[l] = 33.5 - 1.2 * s;
+        }
+        y < self.cover
+    }
+}
+
+/// The nesting band's relaxation (Phase 4.3c) on the open channel nested at
+/// both ends in `parent`, as `Hydrostatic3D`'s RHS adds it: the shear's
+/// after the momentum terms, then `zero_thin_momentum`; the tracers' after
+/// the transport. Columns shallower than 20 m count as thin, so that the
+/// band has thin columns. Mutants it must catch. Whether all are the same
+/// to the bit (and every mutant caught).
+fn band_gate(
+    gpu: &Arc<Gpu>,
+    label: &str,
+    parent: Arc<dyn ParentColumns3D>,
+    moves: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    const THIN: f64 = 20.0;
+    const TIME: f64 = 5400.0;
+    let fx = Fixture::new(Shape::CHANNEL);
+    let ne = fx.n_elements();
+    let all = Blocks::All(ne);
+    let band = NestingBand3D {
+        width: 600.0,
+        profile: SpongeProfile::default(),
+        velocity_timescale: Some(1800.0),
+        tracer_timescale: Some(3600.0),
+    };
+    let nesting = Nesting3D::new(
+        parent,
+        &fx.mesh,
+        &fx.ops,
+        LEVELS,
+        &[BoundaryTag::Open],
+        &band,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let state = &fx.state;
+    let bed = &fx.bathymetry.data;
+    let is_thin = |idx: usize| state.eta.data[idx] - bed[idx] < THIN;
+    // The tendencies before the relaxation
+    let mut rhs0 = tendencies(state);
+    for (t, (temp, salt)) in rhs0.temp.iter_mut().zip(rhs0.salt.iter_mut()).enumerate() {
+        *temp = 1e-4 * (0.11 * t as f64).cos();
+        *salt = 1e-4 * (0.07 * t as f64).sin();
+    }
+    let columns_at = |time: f64| {
+        let columns = nesting.columns(
+            state,
+            &fx.bathymetry,
+            &fx.sigma,
+            StageTime::Uniform(time),
+            all,
+            THIN,
+        );
+        columns.values().map(<[f64]>::to_vec)
+    };
+    // The CPU
+    let mut rhs = rhs0.clone();
+    {
+        let columns = nesting.columns(
+            state,
+            &fx.bathymetry,
+            &fx.sigma,
+            StageTime::Uniform(TIME),
+            all,
+            THIN,
+        );
+        columns.relax_shear(state, &fx.sigma, &mut rhs, is_thin);
+        zero_thin_momentum(&mut rhs, &state.eta.data, bed, THIN, all);
+        columns.relax_tracers(state, &fx.bathymetry, &fx.sigma, &mut rhs, is_thin);
+    }
+    let names = ["u", "v", "T", "S"];
+    let cpu: Snapshots = names
+        .iter()
+        .zip([&rhs.u, &rhs.v, &rhs.temp, &rhs.salt])
+        .map(|(name, v)| (format!("relaxed {name}"), v.clone()))
+        .collect();
+    let slots = nesting.slots();
+    let thin_slots = slots.nodes.iter().filter(|&&n| is_thin(n)).count();
+    let relaxed = agreement(&rhs0.temp, &rhs.temp);
+    println!(
+        "{label}: the channel's {ne} P{ORDER} elements × {LEVELS} levels, a {} m band at both \
+         ends: {} slots ({thin_slots} thin), {} of {} T tendencies relaxed",
+        band.width,
+        slots.nodes.len(),
+        relaxed.len - relaxed.identical,
+        relaxed.len
+    );
+    // The device
+    let statics = fx.statics(gpu)?;
+    let hooks = StageHooks3D::new(gpu, LinearEOS::default(), THIN)?;
+    let values = State3D::upload(gpu, state)?;
+    let upload = |slots, columns: &[Vec<f64>; 4]| -> Result<Band3D, Box<dyn std::error::Error>> {
+        let mut band = Band3D::new(gpu, &statics, slots)?;
+        band.set_columns(gpu, columns.each_ref().map(|c| &c[..]))?;
+        Ok(band)
+    };
+    let run =
+        |relaxing: &StageHooks3D, band: &Band3D| -> Result<Snapshots, Box<dyn std::error::Error>> {
+            let up = |v: &[f64]| DeviceBuffer::from_host(&gpu.stream, v);
+            let (mut ru, mut rv) = (up(&rhs0.u)?, up(&rhs0.v)?);
+            let (mut rt, mut rs) = (up(&rhs0.temp)?, up(&rhs0.salt)?);
+            let s = &statics;
+            relaxing.relax_shear(s, band, &values.eta, &values.u, &values.v, &mut ru, &mut rv)?;
+            hooks.zero_thin_momentum(s, &values.eta, &mut ru, &mut rv)?;
+            relaxing.relax_tracers(
+                s,
+                band,
+                &values.eta,
+                &values.temp,
+                &values.salt,
+                &mut rt,
+                &mut rs,
+            )?;
+            let mut out = Snapshots::new();
+            for (name, buffer) in names.iter().zip([&ru, &rv, &rt, &rs]) {
+                out.push((format!("relaxed {name}"), buffer.to_host_vec(&gpu.stream)?));
+            }
+            Ok(out)
+        };
+    let columns = columns_at(TIME);
+    let mut same = report(&cpu, &run(&hooks, &upload(slots, &columns)?)?);
+    // The mutants: the gate must catch each
+    let unthinned = StageHooks3D::new(gpu, LinearEOS::default(), 0.0)?;
+    same &= report_mutant(
+        "the thin columns relaxed",
+        &cpu,
+        &run(&unthinned, &upload(slots, &columns)?)?,
+    );
+    let swapped = NestingSlots {
+        velocity_rate: slots.tracer_rate,
+        tracer_rate: slots.velocity_rate,
+        ..slots
+    };
+    same &= report_mutant(
+        "the shear's and the tracers' rates swapped",
+        &cpu,
+        &run(&hooks, &upload(swapped, &columns)?)?,
+    );
+    if moves {
+        let later = columns_at(TIME + 600.0);
+        same &= report_mutant(
+            "the parent's columns 10 min later",
+            &cpu,
+            &run(&hooks, &upload(slots, &later)?)?,
+        );
+    }
+    println!(
+        "  {}",
+        if same {
+            "bit for bit"
+        } else {
+            "NOT bit for bit"
+        }
+    );
+    Ok(same)
+}
+
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "== The 3D stage values: conversions, merged cells, the mask, the density (Phase 4.3a) =="
@@ -851,6 +1041,29 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     let mut failed = Vec::new();
     for (label, shape) in cases {
         if !gate(gpu, label, shape)? {
+            failed.push(label);
+        }
+    }
+    println!("== The nesting band's relaxation of the shear and the tracers (Phase 4.3c) ==");
+    // A parent model's columns, and the case runner's state at rest
+    // without one (`ReferenceColumns`), here a perturbed start
+    let model: Arc<dyn ParentColumns3D> = Arc::new(Profile { cover: 700.0 });
+    let mut rest = Fixture::new(Shape::CHANNEL).state;
+    for (t, (u, temp)) in rest.u.iter_mut().zip(rest.temp.iter_mut()).enumerate() {
+        *u = 0.5 * *u + 0.05;
+        *temp += 0.4 * (0.013 * t as f64).sin();
+    }
+    rest.salt.iter_mut().for_each(|s| *s -= 0.2);
+    let bands = [
+        ("a parent model, covering part of the band", model, true),
+        (
+            "the state at rest (ReferenceColumns)",
+            Arc::new(ReferenceColumns::from_state(&rest)) as Arc<dyn ParentColumns3D>,
+            false,
+        ),
+    ];
+    for (label, parent, moves) in bands {
+        if !band_gate(gpu, label, parent, moves)? {
             failed.push(label);
         }
     }
