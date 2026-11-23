@@ -42,6 +42,7 @@ pub mod case;
 pub mod equations;
 pub mod flux;
 pub mod io;
+pub mod math;
 pub mod mesh;
 pub mod operators;
 pub mod particles;

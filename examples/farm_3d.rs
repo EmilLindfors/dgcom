@@ -385,7 +385,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let closure: Box<dyn VerticalMixing + Send + Sync> = if no_diffusion {
             Box::new(ConstantMixing::new(1e-2, 0.0))
         } else {
-            Box::new(mixing.clone())
+            Box::new(mixing)
         };
         let physics = Hydrostatic3D::new(
             mesh.clone(),

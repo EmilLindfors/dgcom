@@ -57,6 +57,8 @@ that set the direction is `notes/review-2026-09-25.md`).
 ```
 src/
 ├── types/          # Newtypes (indices, Depth, Sigma, bounds)
+├── math.rs         # exp/ln/pow/hypot in plain arithmetic: the same bits on
+│                   # every CPU and the GPU (the 3D column physics uses them)
 ├── polynomial/     # Legendre polynomials, GLL nodes/weights (1D + 2D)
 ├── basis/          # Vandermonde matrices for nodal-modal transforms
 ├── operators/      # Dr/Ds, Mass, LIFT, geometric factors (reference element)

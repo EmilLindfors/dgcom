@@ -106,10 +106,12 @@ impl BottomDrag3D {
         match *self {
             Self::Quadratic { cd } => cd,
             Self::LogLayer { z0, cd_min, cd_max } => {
-                let log = (z_b / z0).ln();
+                // `crate::math`'s logarithm: the same bits on the GPU
+                let log = crate::math::ln(z_b / z0);
                 // At or below z₀ the log layer has no positive coefficient
                 if log > 0.0 {
-                    (VON_KARMAN / log).powi(2).clamp(cd_min, cd_max)
+                    let ratio = VON_KARMAN / log;
+                    (ratio * ratio).clamp(cd_min, cd_max)
                 } else {
                     cd_max
                 }
@@ -121,6 +123,28 @@ impl BottomDrag3D {
     #[inline]
     pub fn rate(&self, z_b: f64, speed: f64) -> f64 {
         self.drag_coefficient(z_b) * speed
+    }
+
+    /// The rate of a column of depth `depth` (m) whose bottom layer's
+    /// centre is at `σ = sigma_bottom`: [`Self::rate`] at `z_b = (1 + σ) D`
+    /// with the speed of the bottom layer's velocity `bottom`, or of the
+    /// depth mean `mean` in a column shallower than `thin_depth`; zero where
+    /// it is dry.
+    #[inline]
+    pub fn column_rate(
+        &self,
+        depth: f64,
+        thin_depth: f64,
+        sigma_bottom: f64,
+        bottom: [f64; 2],
+        mean: [f64; 2],
+    ) -> f64 {
+        if depth <= 0.0 {
+            return 0.0;
+        }
+        let [u, v] = if depth < thin_depth { mean } else { bottom };
+        let z_b = (1.0 + sigma_bottom) * depth;
+        self.rate(z_b, (u * u + v * v).sqrt())
     }
 }
 

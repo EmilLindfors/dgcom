@@ -31,6 +31,9 @@ This document describes what exists and how it fits together. Open work is in
 src/
 ├── lib.rs            # Public API, re-exports (oversized — TODO P6)
 ├── types/            # Newtypes: indices, bounds, physical (Depth, Sigma), sides
+├── math.rs           # exp, ln, pow, hypot in plain IEEE arithmetic (fdlibm's):
+│                     # the same bits on every platform and in the GPU kernels;
+│                     # the 3D column physics (GLS, drags, shortwave) uses them
 │
 │  # ---- DG core (dimension/equation-agnostic) ----
 ├── polynomial/       # Legendre P_n, GLL nodes/weights (1D + tensor-product 2D)

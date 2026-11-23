@@ -2114,6 +2114,8 @@ pub struct Gpu {
     pub(crate) module_hooks: crate::hooks::kernels_hooks::LoadedModule,
     /// The 3D tracer limiter (`limiter.rs`)
     pub(crate) module_limiter: crate::limiter::kernels_limiter::LoadedModule,
+    /// The 3D step's vertical terms (`vertical.rs`)
+    pub(crate) module_vertical: crate::vertical::kernels_vertical::LoadedModule,
     /// The device's name and compute capability
     pub name: String,
     /// Its streaming multiprocessors
@@ -2133,6 +2135,7 @@ impl Gpu {
         let module_viscosity = crate::viscosity::kernels_viscosity::load(&ctx)?;
         let module_hooks = crate::hooks::kernels_hooks::load(&ctx)?;
         let module_limiter = crate::limiter::kernels_limiter::load(&ctx)?;
+        let module_vertical = crate::vertical::kernels_vertical::load(&ctx)?;
         let sms = ctx.multiprocessor_count()?;
         Ok(Arc::new(Self {
             stream,
@@ -2142,6 +2145,7 @@ impl Gpu {
             module_viscosity,
             module_hooks,
             module_limiter,
+            module_vertical,
             name,
             sms,
         }))
