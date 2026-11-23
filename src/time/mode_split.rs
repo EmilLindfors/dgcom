@@ -662,7 +662,7 @@ impl StageStash {
     /// Element `k`'s block `out` of inventory field `field` (0: `u`,
     /// 1: `v`) with its masked columns restored, as [`Self::restore_into`]
     /// does; nothing for the fields that are never masked.
-    fn restore_velocity(&self, field: usize, k: usize, nn: usize, out: &mut [f64]) {
+    pub fn restore_velocity(&self, field: usize, k: usize, nn: usize, out: &mut [f64]) {
         if self.masked.is_empty() {
             return;
         }

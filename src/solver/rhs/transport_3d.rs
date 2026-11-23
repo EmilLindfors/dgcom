@@ -1383,7 +1383,7 @@ enum Across<'a> {
 /// Layer thickness `H_z = D·Δσ` (m), floored at the same small positive value
 /// as the 3D advection kernels, so that dividing an inventory by it is safe.
 #[inline]
-pub(crate) fn layer_thickness_of(depth: f64, d_sigma: f64) -> f64 {
+pub fn layer_thickness_of(depth: f64, d_sigma: f64) -> f64 {
     (depth * d_sigma).max(crate::solver::rhs::advection_3d::MIN_LAYER_THICKNESS)
 }
 
@@ -1394,13 +1394,13 @@ pub(crate) fn layer_thickness_of(depth: f64, d_sigma: f64) -> f64 {
 /// concentration of the floor's phantom water (1e-12 m; 2.3e-7 of a 4 μm
 /// film's tracers at a beach's wetting front, TODO P1.3).
 #[inline]
-pub(crate) fn layer_volume_of(depth: f64, d_sigma: f64) -> f64 {
+pub fn layer_volume_of(depth: f64, d_sigma: f64) -> f64 {
     (depth * d_sigma).max(0.0)
 }
 
 /// Depth (m) below which a node's (or, as a mean, an element's) tracers are
 /// left as they were: it holds no water to define a concentration.
-pub(crate) const DRY_DEPTH: f64 = 1e-6;
+pub const DRY_DEPTH: f64 = 1e-6;
 
 /// Multiply a field by the thickness of its cells under `η`: concentration
 /// `C` → inventory `H_z C`, with `H_z = D·Δσ` for the σ-thicknesses
@@ -1439,7 +1439,7 @@ pub fn to_inventory(
 /// the bits of copying them there first, in one pass. Not in the flushed
 /// elements of `merged`, whose inventories are not their nodes' values
 /// times their volumes within a step ([`MergedCells::pass_through`]).
-pub(crate) fn inventory_of(
+pub fn inventory_of(
     q: &mut [f64],
     values: &[f64],
     eta: &[f64],
@@ -1479,7 +1479,7 @@ pub(crate) fn inventory_of(
 /// value: their inventories become that value's, the rest are left alone
 /// (on `elements`; not in the flushed elements of `merged`, as
 /// [`inventory_of`]).
-pub(crate) fn dry_inventories(
+pub fn dry_inventories(
     q: &mut [f64],
     values: &[f64],
     eta: &[f64],
@@ -1564,7 +1564,7 @@ pub fn from_inventory(
 /// say): the bits of writing them to `out` before the call, in one pass
 /// over the field.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn from_inventory_after(
+pub fn from_inventory_after(
     q: &[f64],
     eta: &[f64],
     d_sigma: &[f64],

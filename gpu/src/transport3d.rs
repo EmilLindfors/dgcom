@@ -68,7 +68,7 @@ pub(crate) const LEVELS: usize = 20;
 const T_RANGE: (f64, f64) = (5.5, 11.0);
 const S_RANGE: (f64, f64) = (31.6, 34.4);
 /// The baroclinic step of the barotropic flux (s).
-const DT: f64 = 30.0;
+pub(crate) const DT: f64 = 30.0;
 /// The tracers' conditions at the channel's open faces without a parent.
 const T_BC: f64 = 9.25;
 const S_BC: f64 = 33.4;
@@ -214,12 +214,15 @@ pub(crate) struct Fixture {
     pub(crate) fields: Option<ReferenceFields>,
     bar_hu: Vec<f64>,
     bar_hv: Vec<f64>,
-    bar_face: Vec<f64>,
-    eta_rate: Vec<f64>,
-    euler_dt: Vec<f64>,
+    /// The pass's mass flux out of every face node
+    pub(crate) bar_face: Vec<f64>,
+    /// `∂η/∂t` over the step
+    pub(crate) eta_rate: Vec<f64>,
+    /// Every element's forward-Euler step
+    pub(crate) euler_dt: Vec<f64>,
     /// The pass's subcell interface fluxes: NaN in the elements it did not
     /// move on the subcells throughout
-    subcell: Vec<f64>,
+    pub(crate) subcell: Vec<f64>,
     /// The elements the pass balanced only as a whole (empty: none)
     pooled: Vec<bool>,
     parent: Option<Parent>,
@@ -612,7 +615,7 @@ impl Fixture {
         ]
     }
 
-    fn statics(&self, gpu: &Gpu) -> Result<Statics3D, Box<dyn std::error::Error>> {
+    pub(crate) fn statics(&self, gpu: &Gpu) -> Result<Statics3D, Box<dyn std::error::Error>> {
         self.statics_in(gpu, MetricForm::Averaged)
     }
 
@@ -1017,7 +1020,8 @@ pub(crate) struct Agreement {
     pub(crate) identical: usize,
     pub(crate) len: usize,
     worst_ulps: u64,
-    worst_rel: f64,
+    /// The largest difference over the field's largest value
+    pub(crate) worst_rel: f64,
     first_difference: Option<usize>,
 }
 

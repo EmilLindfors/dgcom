@@ -1340,13 +1340,13 @@ where
     /// Zero the momentum tendency of thin columns: they carry no shear, and
     /// the splitter adds the depth-mean rate.
     fn zero_thin_momentum(&self, state: &Solution3D, rhs: &mut Solution3D, elements: Blocks) {
-        let (nn, nl) = (state.n_nodes, state.n_levels);
-        for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
-            if self.is_thin(state, idx) {
-                rhs.u[idx * nl..(idx + 1) * nl].fill(0.0);
-                rhs.v[idx * nl..(idx + 1) * nl].fill(0.0);
-            }
-        }
+        zero_thin_momentum(
+            rhs,
+            &state.eta.data,
+            &self.bathymetry.data,
+            self.min_column_depth,
+            elements,
+        );
     }
 
     /// Override the boundary tags that are walls for the 3D kernels (untagged
@@ -2827,6 +2827,26 @@ where
         let (bed, thin) = (&self.bathymetry.data, self.min_column_depth);
         // As `Self::is_thin`
         stash.mask(state, elements, |idx, eta| eta - bed[idx] < thin);
+    }
+}
+
+/// Zero the momentum tendencies `rhs.u`, `rhs.v` in the thin columns of
+/// `elements`, those shallower than `min_column_depth` under `eta` over
+/// `bed` (`[element][node]`): a thin column carries no shear, and the
+/// splitter adds the depth-mean rate ([`Hydrostatic3D::with_min_column_depth`]).
+pub fn zero_thin_momentum(
+    rhs: &mut Solution3D,
+    eta: &[f64],
+    bed: &[f64],
+    min_column_depth: f64,
+    elements: Blocks,
+) {
+    let (nn, nl) = (rhs.n_nodes, rhs.n_levels);
+    for idx in elements.iter().flat_map(|k| k * nn..(k + 1) * nn) {
+        if eta[idx] - bed[idx] < min_column_depth {
+            rhs.u[idx * nl..(idx + 1) * nl].fill(0.0);
+            rhs.v[idx * nl..(idx + 1) * nl].fill(0.0);
+        }
     }
 }
 
