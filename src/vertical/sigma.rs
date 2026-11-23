@@ -42,6 +42,18 @@
 use super::stretching::Stretching;
 use crate::types::{Depth, Elevation, PhysicalZ, Sigma};
 
+/// The depth mean `Σ_k q_k Δσ_k` of a column `column` of layers of
+/// σ-thickness `d_sigma` ([`SigmaGrid::depth_average`], which a kernel
+/// holding the thicknesses in its own buffer calls as this).
+#[inline]
+pub fn depth_average(column: &[f64], d_sigma: &[f64]) -> f64 {
+    let mut sum = 0.0;
+    for (q, ds) in column.iter().zip(d_sigma) {
+        sum += q * ds;
+    }
+    sum
+}
+
 /// Sigma coordinate grid for terrain-following vertical discretization.
 ///
 /// σ ∈ [-1, 0] where:
@@ -668,12 +680,7 @@ impl SigmaGrid {
     #[inline]
     pub fn depth_average(&self, column: &[f64]) -> f64 {
         debug_assert_eq!(column.len(), self.n_levels);
-        let mut sum = 0.0;
-        // Auto-vectorizable loop
-        for k in 0..self.n_levels {
-            sum += column[k] * self.d_sigma[k];
-        }
-        sum
+        depth_average(column, &self.d_sigma)
     }
 
     /// Compute the depth-weighted average of a vertical column (SIMD optimized).

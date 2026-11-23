@@ -66,7 +66,7 @@ A cuda-oxide kernel calling `dgcom::flux::wintermeyer_flux_2d` and `entropy_stab
   - **4.1a** The wet/dry transport: subcell elements and thin columns (`LayerTransport::compute`'s subcell interfaces, `InterfaceValue::DonorBesideThin`, `fallback`), the pooled volume sources (done 2026-11-23, below).
   - **4.1b** Open faces with device forms for `TracerBoundaryCondition3D` and the nesting's `Exterior3D`; the rivers' layer and tracer sources; the turbulence's w-cells (done 2026-11-23, below). The transport is then complete but for what the mode splitter wraps around it (4.3: the thin columns' mask, `zero_thin_momentum`) and implicit vertical advection's split of Ω (4.4).
   - **4.2a** The reference at a stage's levels (`ReferenceFields::fill` with the profile and the linear EOS, `set_displacements`), the σ-pairs pressure gradient over it with Coriolis (`compute_momentum_rhs_3d`), the reference's advection (`add_reference_advection`) (done 2026-11-23, below).
-  - **4.2b** The horizontal and Smagorinsky viscosity of the shear (`apply_horizontal_viscosity_3d`: BR1 per layer; every case-runner 3D run has it, `shear_smagorinsky` 0.1 by default).
+  - **4.2b** The horizontal and Smagorinsky viscosity of the shear (`apply_horizontal_viscosity_3d`: BR1 per layer; every case-runner 3D run has it, `shear_smagorinsky` 0.1 by default) (done 2026-11-23, below; `with_viscosity_once_per_step`, which the case runner does not set, is the driver's, 4.5).
   - **4.3** The stage hooks: the inventory and value conversions (`to_inventory`, `from_inventory` with `MergedCells`, the stash of thin columns and their velocities at rest, `Hydrostatic3D::zero_thin_momentum`), the EOS (`post_stage`, `end_density`), the tracer limiter; the nesting band's relaxation of the shear and the tracers (`NestingColumns::relax_shear`, `relax_tracers`: the parent's columns at the band's nodes uploaded per stage, as 4.1b's exterior values).
   - **4.4** The columns and the pass: the vertical implicit solves (a thread per column, tridiagonal), the GLS closure, implicit vertical advection; the barotropic pass on the 2D kernels with the `DU_avg2` sums and the slow forcing.
   - **4.5** The driver: `ModeSplitIntegrator` over a device state. Recommended: the mode splitter generic over a state trait, as `Simulation` is over `Integrable`, so the orchestration stays one source (against a second mode splitter in `gpu/`); decided once 4.1–4.4 show what a step asks of the state. Judge: the 3D gates and a 3D case through the case runner, CPU against GPU, bit for bit.
@@ -301,6 +301,33 @@ Measured on the RTX 3090 with Nsight Systems' per-launch durations against each 
     - `column_pressures`: a 2 kB stack, its four local columns;
     - the rest: 54–64 registers, nothing spilled.
 
+## Phase 4.2b: the shear's viscosity on the device (2026-11-23)
+
+- **What runs** (`gpu/src/viscosity.rs`, a fourth module `kernels_viscosity`; `Viscosity3D`): `apply_horizontal_viscosity_3d`'s passes.
+  - `viscosity_columns`, a thread per column: the depth (zero in a thin column) and the depth means of u and v.
+  - `viscosity_mean_gradients`, a thread per element, with Smagorinsky only: the means' BR1 gradients.
+  - `viscosity_layer_gradients`, a thread per element and level: the shear's BR1 gradients; `ν = ν₀ + (C_s Δ)²|S|` with the strain rate of the shear's and the mean's gradients; the fluxes `ν D ∇u′`, `ν D ∇v′` stored, four per node and level (553 MB at 96,000 × 20).
+  - `viscosity_diffusion`, a thread per element and level: their BR1 divergence, the central face flux, the normal stress alone at a wall, none at an open face; then `d/D` added to the tendencies.
+
+  The CPU computes a block of five levels as lanes, each lane with the operations it would have alone, so a thread per element and level has their bits. The BR1 loops of `diffusion_2d.rs` are mirrored over `Statics3D`'s tables, with the metric `(r_x, r_y, s_x, s_y)` and Smagorinsky's `(C_s Δ)²` tabled.
+- **One source.** These are public functions now, called by the CPU's kernels and the GPU's: `mirrored_velocity` (the gradients' wall state), `wall_stress` (the matching flux), `smagorinsky_areas`, and `vertical::depth_average`. The CPU's bits are unchanged: the hashes of `apply_horizontal_viscosity_3d` and `largest_horizontal_viscosity_3d` (constant ν and Smagorinsky; walls, open faces and thin columns) are the same before and after. `dgcom::source::swe_2d::viscosity::strain_rate_magnitude` was already shared.
+- **The gate** (`momentum3d`): seven of the nine fixtures now carry a viscosity: constant 5 and 2 m²/s; Smagorinsky 0.1, the case runner's default; 0.1 with a 0.1 m²/s background, Kattholmen's. The viscosity alone, and the whole momentum RHS (the force, Coriolis, then the viscosity, as `Hydrostatic3D::momentum_rhs` adds it), are **bit for bit** (`--no-fmad`). Mutants caught:
+  - the viscosity of u, not of the shear: all values, or 92,540–92,640 of 129,600 on the beaches (the thin columns get none);
+  - Smagorinsky's strain without the mean's gradient: the same counts;
+  - walls as open faces: 3,460–15,120, the walls' elements.
+
+  The FMA build is within 7e-15 of each field's largest value for the viscosity, 4.7e-12 for the whole.
+- **Time** (FMA, RTX 4060 Laptop, 96,000 P2 elements × 20 levels, Smagorinsky 0.1, two runs):
+
+  | per stage | CPU, 24 threads | GPU | |
+  |---|---|---|---|
+  | the shear's viscosity | 162–164 ms | 40.5 ms | 4.0× |
+  | the momentum terms (reference, force, Coriolis, viscosity) | 310–316 ms | 115 ms | 2.7× |
+
+  - On the CPU the viscosity is half of the momentum terms; on the GPU it is a third.
+  - Per kernel (Nsight Systems): `viscosity_layer_gradients` 21.5 ms, `viscosity_diffusion` 16.4, `viscosity_columns` 1.3, `viscosity_mean_gradients` 0.8.
+  - SASS: 254–255 registers in the three BR1 kernels; stacks of 1.6–1.8 kB (the gradients' local arrays) with 76 B spilled in `viscosity_layer_gradients`, 40 B in `viscosity_diffusion`.
+
 ## One source for the physics (2026-11-15)
 
 - **Shared:** `wintermeyer_flux_2d` (the two-point flux of the volume and surface terms), `hll_flux_face_aligned` with `einfeldt_speeds_2d` and `rotate_from_normal`, the split form's `hydrostatic_hll` (now a free function, with `wall_ram_pressure`), `limited_slope` and `reconstruct_subcell`, all generic over `Lane`. `SWEState2D<T = f64>` and `SWENodeState2D<T = f64>` carry a lane type (`f64` unless written); the HLL and the reconstruction take the split form's `Side<T>` (depth, velocity, bed: what they read), the two-point flux `SWENodeState2D<T>` (it reads the momenta). The batch's copies are gone: its `Star`, `Flux`, `hydrostatic_hll`, `limited_slope`, `signed_min`, `reconstruct_subcell`, `reconstructed`, `max`, `min` and the two-point flux of `Nodes` (≈ 330 lines); it calls the shared functions on `Side<f64x8>` and `SWENodeState2D<f64x8>`.
@@ -334,4 +361,5 @@ Measured on the RTX 3090 with Nsight Systems' per-launch durations against each 
   - each σ-surface's edge is computed by both its levels' threads (18 of the ≈ 110): a thread per element for the columns' surfaces, the totals fused in;
   - `reference_edge`'s share `θ = clamp(ΔC/ΔC̄, 0, 1)` needs no division where it clamps (1 where `|ΔC| ≥ |ΔC̄|` with the same sign, 0 where the signs differ; keep the zero's sign, `clamp(−0) = −0`). The CPU's vectorised `edges_over_levels` would gain too (selects). Count the clamped edges of a stratified run first.
 - **P2.7** (3D) `pressure_gradient` spills 6.2 kB per thread (255 registers: the nine pair ends at five values each, and 36 pairs' coefficients formed from the contravariant vectors). The coefficients are static: a table per element (36 pairs × 4 at P2, 110 MB at 96,000 elements), or the ends re-read per pair. Nsight Compute's stall reasons first. 43 ms of the momentum terms' 76 ms a stage on the RTX 4060.
+- **P2.7** (3D) The shear's viscosity stores every layer's fluxes (`ν D ∇u′`, four per node and level: 553 MB at 96,000 × 20) between its two BR1 passes, and its gradient kernels keep 1.6–1.8 kB stacks (2026-11-23, above). The CPU spends 162 ms a stage on it at that size, half of its momentum terms: the 24 threads run its BR1 lanes, five levels a pass, over `ElementScratch` vectors. A thread per element doing both passes, with the neighbours' gradients recomputed, would drop the buffer and pay the gradients ≈ 5×. Measure the CPU's own profile first (`profile_3d`): it is the larger cost.
 - **P2.7** (3D) The CPU's pressure gradient lifts each face jump into all nn nodes (`pressure_gradient_element`), though the GLL LIFT is zero but at the face node (`diffusion_2d` applies just that entry, and the GPU now does too, 2026-11-23): the same bits, the face loop's work over 9 at P2.
