@@ -901,14 +901,39 @@ pub mod kernels_baroclinic {
 
 /// A reference profile's samples on the device (`ReferenceProfileView`'s
 /// slices).
-struct ProfileDevice {
-    heights: DeviceBuffer<f64>,
-    temp: DeviceBuffer<f64>,
-    salt: DeviceBuffer<f64>,
+pub(crate) struct ProfileDevice {
+    pub(crate) heights: DeviceBuffer<f64>,
+    pub(crate) temp: DeviceBuffer<f64>,
+    pub(crate) salt: DeviceBuffer<f64>,
     /// `[dT/dz, dS/dz]` if cubic, else empty
-    slopes: [DeviceBuffer<f64>; 2],
-    inverse_spacing: Option<f64>,
-    inverse_widths: DeviceBuffer<f64>,
+    pub(crate) slopes: [DeviceBuffer<f64>; 2],
+    pub(crate) inverse_spacing: Option<f64>,
+    pub(crate) inverse_widths: DeviceBuffer<f64>,
+}
+
+impl ProfileDevice {
+    pub(crate) fn upload(
+        gpu: &Gpu,
+        profile: &TracerReferenceProfile,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let stream = &gpu.stream;
+        let up = |v: &[f64]| DeviceBuffer::from_host(stream, v);
+        let view = profile.view();
+        Ok(Self {
+            heights: up(view.heights)?,
+            temp: up(view.temp)?,
+            salt: up(view.salt)?,
+            slopes: match view.slopes {
+                Some([t, s]) => [up(t)?, up(s)?],
+                None => [
+                    DeviceBuffer::zeroed(stream, 0)?,
+                    DeviceBuffer::zeroed(stream, 0)?,
+                ],
+            },
+            inverse_spacing: view.inverse_spacing,
+            inverse_widths: up(view.inverse_widths)?,
+        })
+    }
 }
 
 /// The reference stratification at a stage's levels on the device (dgcom's
@@ -988,20 +1013,7 @@ impl Baroclinic3D {
         let zeros = |n: usize| DeviceBuffer::<f64>::zeroed(stream, n);
         let eos = setup.eos;
         let profile = match setup.profile {
-            Some(profile) => {
-                let view = profile.view();
-                Some(ProfileDevice {
-                    heights: up(view.heights)?,
-                    temp: up(view.temp)?,
-                    salt: up(view.salt)?,
-                    slopes: match view.slopes {
-                        Some([t, s]) => [up(t)?, up(s)?],
-                        None => [zeros(0)?, zeros(0)?],
-                    },
-                    inverse_spacing: view.inverse_spacing,
-                    inverse_widths: up(view.inverse_widths)?,
-                })
-            }
+            Some(profile) => Some(ProfileDevice::upload(gpu, profile)?),
             None => None,
         };
         let fields = match setup.profile {

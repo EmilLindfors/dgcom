@@ -2112,6 +2112,8 @@ pub struct Gpu {
     pub(crate) module_viscosity: crate::viscosity::kernels_viscosity::LoadedModule,
     /// The 3D stages' values and hooks (`hooks.rs`)
     pub(crate) module_hooks: crate::hooks::kernels_hooks::LoadedModule,
+    /// The 3D tracer limiter (`limiter.rs`)
+    pub(crate) module_limiter: crate::limiter::kernels_limiter::LoadedModule,
     /// The device's name and compute capability
     pub name: String,
     /// Its streaming multiprocessors
@@ -2130,6 +2132,7 @@ impl Gpu {
         let module_baroclinic = crate::baroclinic::kernels_baroclinic::load(&ctx)?;
         let module_viscosity = crate::viscosity::kernels_viscosity::load(&ctx)?;
         let module_hooks = crate::hooks::kernels_hooks::load(&ctx)?;
+        let module_limiter = crate::limiter::kernels_limiter::load(&ctx)?;
         let sms = ctx.multiprocessor_count()?;
         Ok(Arc::new(Self {
             stream,
@@ -2138,6 +2141,7 @@ impl Gpu {
             module_baroclinic,
             module_viscosity,
             module_hooks,
+            module_limiter,
             name,
             sms,
         }))

@@ -12,6 +12,7 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::DGSolution2D;
 use crate::solver::core::blocks::{Blocks, Neighbourhood, Pooled, for_each_block, reduce_blocks};
 use crate::solver::rhs::UNBOUNDED;
+use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -54,9 +55,12 @@ impl TracerBounds {
     }
 }
 
-const MIN_LAYER_THICKNESS: f64 = 1.0e-12;
-const MIN_INTEGRAL_WEIGHT: f64 = 1.0e-14;
-const LIMITER_EPS: f64 = 1.0e-12;
+/// The least inventory weight (m³) of an element layer the limiters take a
+/// mean over.
+pub const MIN_INTEGRAL_WEIGHT: f64 = 1.0e-14;
+/// A limiting factor this close to 1, or a deviation this small, leaves a
+/// layer as it is.
+pub const LIMITER_EPS: f64 = 1.0e-12;
 /// The relative round-off margin of the Kuzmin bounds.
 const ROUND_OFF: f64 = 256.0 * f64::EPSILON;
 
@@ -1402,53 +1406,15 @@ fn apply_horizontal_kuzmin_fields(
                         bounds,
                         ..
                     } = &mut tracer_scratch[c];
-                    let weight_sum = weight_sum[c];
-                    // The limited state at `α = 0`: `T̂` shifted by the
-                    // departure's mean `m` to keep the inventory. The shift
-                    // goes into each node's room within its bounds (`T̂_i` is
-                    // one of its candidates) in proportion to it, then into the
-                    // room within the element's widest bounds, then (if not
-                    // even those hold the layer's mean) uniformly. A shift as a
-                    // factor on the column's structure, or a fallback to the
-                    // layer's mean, would be ill-conditioned: that structure
-                    // vanishes at nodes near the layer's mean height, where a
-                    // round-off violation would set the factor, and flattening
-                    // it over a slope drives a flow.
-                    let m = departure[c] / weight_sum;
-                    let mut need = m.abs() * weight_sum;
-                    let widest = bounds
-                        .iter()
-                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(lo, hi)| {
-                            (a.min(lo), b.max(hi))
-                        });
-                    let room_of = |own: f64, (lo, hi): (f64, f64)| {
-                        if m > 0.0 { hi - own } else { own - lo }.max(0.0)
-                    };
-                    for tier in 0..2 {
-                        let node_bounds = |i: usize| if tier == 0 { bounds[i] } else { widest };
-                        let room: f64 = (0..n_nodes)
-                            .map(|i| weight[i] * room_of(base[i], node_bounds(i)))
-                            .sum();
-                        if need <= 0.0 || !room.is_finite() || room <= 0.0 {
-                            continue;
-                        }
-                        let fraction = (need / room).min(1.0);
-                        for (i, own) in base.iter_mut().enumerate() {
-                            *own += m.signum() * fraction * room_of(*own, node_bounds(i));
-                        }
-                        need -= need.min(room);
-                    }
-                    for own in base.iter_mut() {
-                        *own += m.signum() * need / weight_sum;
-                    }
-
-                    let alpha = (0..n_nodes)
-                        .filter(|&i| !thin(i))
-                        .map(|i| {
-                            let (lo, hi) = bounds[i];
-                            compute_kuzmin_alpha(base[i], value[i], lo, hi)
-                        })
-                        .fold(1.0_f64, f64::min);
+                    let alpha = kuzmin_layer_alpha(
+                        departure[c],
+                        weight_sum[c],
+                        base,
+                        value,
+                        weight,
+                        bounds,
+                        thin,
+                    );
                     if alpha >= 1.0 - LIMITER_EPS {
                         continue;
                     }
@@ -1496,7 +1462,7 @@ fn apply_horizontal_kuzmin_fields(
 /// about half as many. On a flat bed a node's own layer is one of the pair: a
 /// sharp interface between layers is bounded by both water masses' means
 /// (the lock exchanges stay in range to 5e-12 °C).
-struct HeightBracket {
+pub struct HeightBracket {
     /// The lower layer of the pair.
     lo: usize,
     /// `(z − z_lo)/(z_hi − z_lo)`, or `None` for coincident heights.
@@ -1509,8 +1475,10 @@ struct HeightBracket {
 }
 
 impl HeightBracket {
+    /// Where the layer-mean `heights` of a column bracket `z`, searching
+    /// from `level`'s pair (a node's own layer: the search is short).
     #[inline]
-    fn find(heights: &[f64], z: f64, level: usize) -> Self {
+    pub fn find(heights: &[f64], z: f64, level: usize) -> Self {
         let n = heights.len();
         if n == 1 {
             return Self {
@@ -1542,9 +1510,11 @@ impl HeightBracket {
         }
     }
 
-    /// The column's `(value, lower, upper)` from its layer `means`.
+    /// The column's `(value, lower, upper)` from its layer `means` and the
+    /// range of its end layers' nodal values (`[bottom min, bottom max, top
+    /// min, top max]`).
     #[inline]
-    fn column_value(&self, means: &[f64], end_ranges: [f64; 4]) -> (f64, f64, f64) {
+    pub fn column_value(&self, means: &[f64], end_ranges: [f64; 4]) -> (f64, f64, f64) {
         if self.single {
             return (means[0], means[0], means[0]);
         }
@@ -1566,7 +1536,7 @@ impl HeightBracket {
 /// and by a round-off margin relative to its values and the tracer's
 /// `scale` (bounds interpolated at a node's height close on its value in a
 /// smooth stratification); unbounded for no data.
-fn relaxed_bounds(bound_min: f64, bound_max: f64, relaxation: f64, scale: f64) -> (f64, f64) {
+pub fn relaxed_bounds(bound_min: f64, bound_max: f64, relaxation: f64, scale: f64) -> (f64, f64) {
     if !bound_min.is_finite() || !bound_max.is_finite() {
         return (f64::NEG_INFINITY, f64::INFINITY);
     }
@@ -1577,9 +1547,82 @@ fn relaxed_bounds(bound_min: f64, bound_max: f64, relaxation: f64, scale: f64) -
     (bound_min - expand, bound_max + expand)
 }
 
-/// `values` at `heights` (increasing) interpolated linearly to `z`, constant
-/// beyond the ends.
-fn compute_theta(avg: f64, min_value: f64, max_value: f64, bound_min: f64, bound_max: f64) -> f64 {
+/// One tracer's Kuzmin limiting of an element layer
+/// ([`apply_tracer_limiters_3d`]'s horizontal pass): its limited state at
+/// `α = 0` into `base` (on entry the element's own column at each node's
+/// height, `T̂_i`), and the largest `α` that keeps every node but the `thin`
+/// ones within its `bounds`; the limited departures are then
+/// `base_i + α (value_i − base_i)`. `departure` is `Σ w_i (value_i − T̂_i)`
+/// over the nodes' inventory weights `weight`, and `weight_sum` is `Σ w_i`.
+///
+/// The state at `α = 0` is `T̂` shifted by the departure's mean `m` to keep
+/// the inventory. The shift goes into each node's room within its bounds
+/// (`T̂_i` is one of its candidates) in proportion to it, then into the room
+/// within the element's widest bounds, then (if not even those hold the
+/// layer's mean) uniformly. A shift as a factor on the column's structure,
+/// or a fallback to the layer's mean, would be ill-conditioned: that
+/// structure vanishes at nodes near the layer's mean height, where a
+/// round-off violation would set the factor, and flattening it over a slope
+/// drives a flow.
+///
+/// The slices are the layer's nodes'; the GPU's limiter calls it on its own
+/// arrays.
+pub fn kuzmin_layer_alpha(
+    departure: f64,
+    weight_sum: f64,
+    base: &mut [f64],
+    value: &[f64],
+    weight: &[f64],
+    bounds: &[(f64, f64)],
+    thin: impl Fn(usize) -> bool,
+) -> f64 {
+    let n_nodes = base.len();
+    let m = departure / weight_sum;
+    let mut need = m.abs() * weight_sum;
+    let widest = bounds
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(lo, hi)| {
+            (a.min(lo), b.max(hi))
+        });
+    let room_of =
+        |own: f64, (lo, hi): (f64, f64)| if m > 0.0 { hi - own } else { own - lo }.max(0.0);
+    for tier in 0..2 {
+        let node_bounds = |i: usize| if tier == 0 { bounds[i] } else { widest };
+        let room: f64 = (0..n_nodes)
+            .map(|i| weight[i] * room_of(base[i], node_bounds(i)))
+            .sum();
+        if need <= 0.0 || !room.is_finite() || room <= 0.0 {
+            continue;
+        }
+        let fraction = (need / room).min(1.0);
+        for (i, own) in base.iter_mut().enumerate() {
+            *own += m.signum() * fraction * room_of(*own, node_bounds(i));
+        }
+        need -= need.min(room);
+    }
+    for own in base.iter_mut() {
+        *own += m.signum() * need / weight_sum;
+    }
+
+    (0..n_nodes)
+        .filter(|&i| !thin(i))
+        .map(|i| {
+            let (lo, hi) = bounds[i];
+            compute_kuzmin_alpha(base[i], value[i], lo, hi)
+        })
+        .fold(1.0_f64, f64::min)
+}
+
+/// The Zhang–Shu factor `θ ∈ [0, 1]` on a layer's deviations from its mean
+/// `avg` that brings its values, from `min_value` to `max_value`, within
+/// `[bound_min, bound_max]`.
+pub fn compute_theta(
+    avg: f64,
+    min_value: f64,
+    max_value: f64,
+    bound_min: f64,
+    bound_max: f64,
+) -> f64 {
     let mut theta: f64 = 1.0;
 
     if min_value < bound_min && (avg - min_value).abs() > LIMITER_EPS {
@@ -1593,7 +1636,9 @@ fn compute_theta(avg: f64, min_value: f64, max_value: f64, bound_min: f64, bound
     theta.clamp(0.0, 1.0)
 }
 
-fn compute_kuzmin_alpha(avg: f64, value: f64, bound_min: f64, bound_max: f64) -> f64 {
+/// The largest `α ∈ [0, 1]` that keeps `avg + α (value − avg)` within
+/// `[bound_min, bound_max]` (1 for a deviation under [`LIMITER_EPS`]).
+pub fn compute_kuzmin_alpha(avg: f64, value: f64, bound_min: f64, bound_max: f64) -> f64 {
     let deviation = value - avg;
     if deviation.abs() < LIMITER_EPS {
         return 1.0;
@@ -1613,7 +1658,7 @@ fn compute_kuzmin_alpha(avg: f64, value: f64, bound_min: f64, bound_max: f64) ->
 }
 
 /// The local vertex at `node`, if it is one.
-fn node_to_vertex(node: usize, n_1d: usize) -> Option<usize> {
+pub fn node_to_vertex(node: usize, n_1d: usize) -> Option<usize> {
     (0..4).find(|&local_vertex| vertex_to_node_index(local_vertex, n_1d) == node)
 }
 
@@ -1635,7 +1680,7 @@ fn layer_thickness(
     d_sigma: f64,
 ) -> f64 {
     let eta_value = eta.get(element.as_usize(), node);
-    (bathymetry.water_depth(element, node, eta_value) * d_sigma).max(MIN_LAYER_THICKNESS)
+    layer_thickness_of(bathymetry.water_depth(element, node, eta_value), d_sigma)
 }
 
 #[inline]
