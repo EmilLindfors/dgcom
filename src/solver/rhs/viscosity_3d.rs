@@ -90,6 +90,38 @@ impl HorizontalViscosity3D {
     }
 }
 
+/// The velocity `[u, v]` mirrored in a wall of outward normal `(nx, ny)`:
+/// the exterior state of the gradients at a wall (free slip, no normal
+/// velocity at the wall).
+#[inline]
+pub fn mirrored_velocity([u, v]: [f64; 2], (nx, ny): (f64, f64)) -> [f64; 2] {
+    let normal = u * nx + v * ny;
+    [u - 2.0 * normal * nx, v - 2.0 * normal * ny]
+}
+
+/// The viscous flux through a wall that matches [`mirrored_velocity`]: of
+/// the interior's normal fluxes `[F_u·n, F_v·n]`, the normal stress alone
+/// (see `diffusion_2d::br1_diffusion_element`).
+#[inline]
+pub fn wall_stress(f: [f64; 2], (nx, ny): (f64, f64)) -> [f64; 2] {
+    let normal = nx * f[0] + ny * f[1];
+    [nx * normal, ny * normal]
+}
+
+/// `(C_s Δ)²` of every element into `out`, `Δ = √(area)/N` the node
+/// spacing: what Smagorinsky's viscosity multiplies the strain rate by.
+pub fn smagorinsky_areas(
+    viscosity: HorizontalViscosity3D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    out: &mut [f64],
+) {
+    let width = 1.0 / ops.order.max(1) as f64;
+    for (k, area) in out.iter_mut().enumerate() {
+        *area = (viscosity.smagorinsky * width * geom.element_size(k)).powi(2);
+    }
+}
+
 /// Buffers of [`apply_horizontal_viscosity_3d`], reused between calls.
 pub struct ViscosityScratch3D {
     /// `D` of every column, zero in thin ones, `[element][node]`.
@@ -197,11 +229,9 @@ impl Columns<'_> {
             |k, face, fi, _node, mut exterior| {
                 // Mirrored: no normal velocity at the wall
                 if let FaceExterior::Wall = self.boundaries.exterior(mesh, k, face) {
-                    let (nx, ny) = geom.normal(k.as_usize(), face, fi);
+                    let normal = geom.normal(k.as_usize(), face, fi);
                     for pair in exterior.as_chunks_mut::<2>().0 {
-                        let [u, v] = *pair;
-                        let normal = u * nx + v * ny;
-                        *pair = [u - 2.0 * normal * nx, v - 2.0 * normal * ny];
+                        *pair = mirrored_velocity(*pair, normal);
                     }
                 }
                 exterior
@@ -269,12 +299,8 @@ impl Columns<'_> {
                 }
             },
         );
-        let cs = self.viscosity.smagorinsky;
-        if cs > 0.0 {
-            let width = 1.0 / self.ops.order.max(1) as f64;
-            for (k, area) in smagorinsky_area.iter_mut().enumerate() {
-                *area = (cs * width * self.geom.element_size(k)).powi(2);
-            }
+        if self.viscosity.smagorinsky > 0.0 {
+            smagorinsky_areas(self.viscosity, self.ops, self.geom, smagorinsky_area);
             let (mean, nn): (&[[f64; 2]], _) = (mean, self.ops.n_nodes);
             for_each_block(
                 gradients,
@@ -439,7 +465,7 @@ pub fn apply_horizontal_viscosity_3d(
                     // The fluxes that match the gradients' exterior states:
                     // at a wall (mirrored velocity) the normal stress only,
                     // at an open face (extrapolated) none
-                    |k, face, _fi, (nx, ny), interior| match boundaries.exterior(mesh, k, face) {
+                    |k, face, _fi, normal, interior| match boundaries.exterior(mesh, k, face) {
                         FaceExterior::Wall => {
                             let mut stress = [0.0; LANES];
                             for (pair, f) in stress
@@ -448,8 +474,7 @@ pub fn apply_horizontal_viscosity_3d(
                                 .iter_mut()
                                 .zip(interior.as_chunks::<2>().0)
                             {
-                                let normal = nx * f[0] + ny * f[1];
-                                *pair = [nx * normal, ny * normal];
+                                *pair = wall_stress(*f, normal);
                             }
                             stress
                         }

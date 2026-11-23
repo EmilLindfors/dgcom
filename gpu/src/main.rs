@@ -23,8 +23,8 @@
 //!   relaxation band, with global steps and local time stepping (`nest`).
 //! - **Phase 4:** the 3D stages' layer transports, Ω and the advection of
 //!   u, v, T and S with the reference's (`transport3d`); the reference at
-//!   the levels, the baroclinic pressure gradient and Coriolis
-//!   (`momentum3d`); value for value.
+//!   the levels, the baroclinic pressure gradient, Coriolis and the shear's
+//!   viscosity (`momentum3d`); value for value.
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
 //! must be the CPU's bit for bit; that is the gate.
@@ -41,6 +41,7 @@ mod phase1;
 mod swe2d;
 mod three_d;
 mod transport3d;
+mod viscosity;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

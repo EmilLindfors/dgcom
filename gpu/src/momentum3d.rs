@@ -1,16 +1,18 @@
 //! The 3D momentum gate (P2.7 Phase 4.2, `notes/gpu.md`): the reference
 //! stratification at the columns' levels and the elements' displacements
 //! about it, then the baroclinic pressure gradient in the σ-pairs form with
-//! Coriolis ([`Baroclinic3D::reference`], [`Baroclinic3D::momentum`]) on the
-//! GPU, against dgcom's `ReferenceFields::fill`, `set_displacements` and
-//! `compute_momentum_rhs_3d` on the CPU, value for value, on the transport
-//! gate's fixtures: periodic and walled, a walled beach with flats, films
-//! and dry columns (the subcell interfaces' depth-mean force), a channel
-//! open at both ends; about a reference profile (evenly spaced and linear,
-//! cubic, unevenly spaced), without one (the anomaly about ρ₀ as a monotone
+//! Coriolis ([`Baroclinic3D::reference`], [`Baroclinic3D::momentum`]) and
+//! the horizontal viscosity of the shear ([`Viscosity3D::apply`]) on the
+//! GPU, against dgcom's `ReferenceFields::fill`, `set_displacements`,
+//! `compute_momentum_rhs_3d` and `apply_horizontal_viscosity_3d` on the CPU,
+//! value for value, on the transport gate's fixtures: periodic and walled, a
+//! walled beach with flats, films and dry columns (the subcell interfaces'
+//! depth-mean force, thin columns without shear), a channel open at both
+//! ends; about a reference profile (evenly spaced and linear, cubic,
+//! unevenly spaced), without one (the anomaly about ρ₀ as a monotone
 //! Hermite cubic), with a balanced reference state; in both metric forms;
-//! f- and β-planes. Mutants it must catch, and timed at Chiloé's size
-//! (96,000 P2 elements × 20 levels).
+//! f- and β-planes; a constant viscosity and Smagorinsky's. Mutants it must
+//! catch, and timed at Chiloé's size (96,000 P2 elements × 20 levels).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,8 +21,9 @@ use cuda_core::DeviceBuffer;
 use dgcom::physics::{EquationOfState, LinearEOS};
 use dgcom::solver::Blocks;
 use dgcom::solver::rhs::{
-    BalancedReference, Exterior3D, ExtrapolationTracerBC3D, MetricForm, MomentumAdvectionForm,
-    PressureGradientForm, ReferenceFields, Rhs3DConfig, UNBOUNDED, VerticalAdvection,
+    BalancedReference, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D, HorizontalViscosity3D,
+    MetricForm, MomentumAdvectionForm, PressureGradientForm, ReferenceFields, Rhs3DConfig,
+    UNBOUNDED, VerticalAdvection, ViscosityScratch3D, apply_horizontal_viscosity_3d,
     compute_momentum_rhs_3d,
 };
 use dgcom::solver::state::Solution3D;
@@ -30,9 +33,17 @@ use crate::baroclinic::Baroclinic3D;
 use crate::swe2d::{Gpu, NN, ORDER};
 use crate::three_d::Statics3D;
 use crate::transport3d::{Fixture, G, LEVELS, RHO0, Shape, agreement, report, report_reference};
+use crate::viscosity::Viscosity3D;
+
+/// No viscosity.
+const INVISCID: HorizontalViscosity3D = HorizontalViscosity3D {
+    background: 0.0,
+    smagorinsky: 0.0,
+};
 
 /// One fixture of the gate: its shape, the volume terms' metric form, the
-/// Coriolis parameter, and whether a balanced reference state is set.
+/// Coriolis parameter, whether a balanced reference state is set, and the
+/// viscosity of the shear.
 #[derive(Clone, Copy)]
 struct Case {
     label: &'static str,
@@ -41,6 +52,7 @@ struct Case {
     /// β (1/(m s)) about f₀ = 1.3e-4 at y = 0: zero for an f-plane
     beta: f64,
     balanced: bool,
+    viscosity: HorizontalViscosity3D,
 }
 
 impl Case {
@@ -110,6 +122,33 @@ fn cpu_momentum(
     compute_momentum_rhs_3d(rhs, state, &config);
 }
 
+/// The CPU's `apply_horizontal_viscosity_3d` of `state` added to `rhs_u`,
+/// `rhs_v`, on `fx`'s boundaries.
+fn cpu_viscosity(
+    fx: &Fixture,
+    state: &Solution3D,
+    viscosity: HorizontalViscosity3D,
+    scratch: &mut ViscosityScratch3D,
+    rhs_u: &mut [f64],
+    rhs_v: &mut [f64],
+) {
+    apply_horizontal_viscosity_3d(
+        rhs_u,
+        rhs_v,
+        state,
+        viscosity,
+        &fx.mesh,
+        &fx.ops,
+        &fx.geom,
+        &fx.bathymetry,
+        &fx.sigma,
+        &fx.boundaries,
+        fx.min_column_depth,
+        scratch,
+        Blocks::All(fx.n_elements()),
+    );
+}
+
 /// The state's fields on the device.
 struct Device {
     eta: DeviceBuffer<f64>,
@@ -151,10 +190,36 @@ impl Device {
             &mut self.rhs_v,
         )
     }
+
+    /// The viscosity's tendencies alone by `viscosity` (on zero tendencies),
+    /// into `rhs_u`, `rhs_v`.
+    fn viscosity(
+        &mut self,
+        gpu: &Gpu,
+        viscosity: &mut Viscosity3D,
+        statics: &Statics3D,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.zero(gpu)?;
+        viscosity.apply(
+            statics,
+            &self.eta,
+            &self.u,
+            &self.v,
+            &mut self.rhs_u,
+            &mut self.rhs_v,
+        )
+    }
+
+    fn zero(&mut self, gpu: &Gpu) -> Result<(), Box<dyn std::error::Error>> {
+        let n = self.u.len();
+        self.rhs_u = DeviceBuffer::zeroed(&gpu.stream, n)?;
+        self.rhs_v = DeviceBuffer::zeroed(&gpu.stream, n)?;
+        Ok(())
+    }
 }
 
-/// How many of `cpu`'s u values `device`'s differ from; prints the mutant's
-/// line. Whether the gate catches it.
+/// How many of `cpu`'s u values the device's `values` differ from; prints
+/// the mutant's line. Whether the gate catches it.
 fn report_mutant(
     gpu: &Gpu,
     what: &str,
@@ -187,13 +252,20 @@ fn gate(gpu: &Arc<Gpu>, case: Case) -> Result<bool, Box<dyn std::error::Error>> 
         .count();
     println!(
         "{}: {ne} P{ORDER} elements ({thin} with a thin column) × {LEVELS} levels, {:?} metric, \
-         {}",
+         {}{}",
         case.label,
         case.metric,
         match (&fx.profile, case.balanced) {
             (Some(_), _) => "about a reference profile",
             (None, true) => "about ρ₀, with a balanced reference state",
             (None, false) => "about ρ₀",
+        },
+        match case.viscosity {
+            v if v.is_zero() => String::new(),
+            v => format!(
+                ", the shear's viscosity ν₀ {} m²/s, C_s {}",
+                v.background, v.smagorinsky
+            ),
         }
     );
     let balanced = case.balanced.then(|| balanced(&fx, case.metric));
@@ -274,6 +346,105 @@ fn gate(gpu: &Arc<Gpu>, case: Case) -> Result<bool, Box<dyn std::error::Error>> 
         device.momentum(&mut without, &statics)?;
         same &= report_mutant(gpu, "no balanced reference state", &rhs.u, &device)?;
     }
+
+    // The viscosity of the shear: alone, then after the force, as
+    // `Hydrostatic3D::momentum_rhs` adds it
+    let viscosity = case.viscosity;
+    if !viscosity.is_zero() {
+        let n = ne * NN * LEVELS;
+        let mut scratch = ViscosityScratch3D::new(ne, &fx.ops);
+        let (mut alone_u, mut alone_v) = (vec![0.0; n], vec![0.0; n]);
+        cpu_viscosity(
+            &fx,
+            &fx.state,
+            viscosity,
+            &mut scratch,
+            &mut alone_u,
+            &mut alone_v,
+        );
+        let mut full = Solution3D::new(ne, NN, LEVELS);
+        cpu_momentum(
+            &fx,
+            &fx.state,
+            fx.fields.as_ref(),
+            case.metric,
+            &coriolis,
+            balanced.as_ref(),
+            &mut full,
+        );
+        cpu_viscosity(
+            &fx,
+            &fx.state,
+            viscosity,
+            &mut scratch,
+            &mut full.u,
+            &mut full.v,
+        );
+        let new = |statics: &Statics3D| {
+            Viscosity3D::new(
+                gpu,
+                statics,
+                &fx.ops,
+                &fx.geom,
+                viscosity,
+                fx.min_column_depth,
+            )
+        };
+        let mut device_viscosity = new(&statics)?;
+        device.viscosity(gpu, &mut device_viscosity, &statics)?;
+        same &= report(gpu, "viscosity u", &alone_u, &device.rhs_u)?;
+        same &= report(gpu, "viscosity v", &alone_v, &device.rhs_v)?;
+        device.momentum(&mut baroclinic, &statics)?;
+        device_viscosity.apply(
+            &statics,
+            &device.eta,
+            &device.u,
+            &device.v,
+            &mut device.rhs_u,
+            &mut device.rhs_v,
+        )?;
+        same &= report(gpu, "momentum u", &full.u, &device.rhs_u)?;
+        same &= report(gpu, "momentum v", &full.v, &device.rhs_v)?;
+
+        // Its mutants, on the viscosity alone
+        let layers = |device: &mut Device, v: &mut Viscosity3D| {
+            v.layers(
+                &statics,
+                &device.u,
+                &device.v,
+                &mut device.rhs_u,
+                &mut device.rhs_v,
+            )
+        };
+        device.zero(gpu)?;
+        device_viscosity.means(&statics, &device.eta, &device.u, &device.v)?;
+        device_viscosity.mean = DeviceBuffer::zeroed(&gpu.stream, ne * NN)?;
+        layers(&mut device, &mut device_viscosity)?;
+        same &= report_mutant(gpu, "viscosity of u, not of the shear", &alone_u, &device)?;
+        if viscosity.smagorinsky > 0.0 {
+            device.zero(gpu)?;
+            device_viscosity.means(&statics, &device.eta, &device.u, &device.v)?;
+            device_viscosity.mean_gradient = DeviceBuffer::zeroed(&gpu.stream, ne * NN)?;
+            layers(&mut device, &mut device_viscosity)?;
+            same &= report_mutant(gpu, "the strain without the mean's", &alone_u, &device)?;
+        }
+        if !case.shape.periodic {
+            // The walls as open faces: copied, not mirrored, and no stress
+            let open = Statics3D::upload(
+                gpu,
+                &fx.mesh,
+                &fx.ops,
+                &fx.geom,
+                &fx.bathymetry,
+                &fx.sigma,
+                &Boundaries3D::with_walls([]),
+                case.metric,
+            )?;
+            let mut through = new(&open)?;
+            device.viscosity(gpu, &mut through, &open)?;
+            same &= report_mutant(gpu, "walls as open faces", &alone_u, &device)?;
+        }
+    }
     // The metric form acts on the jittered fixtures (on the CPU alone)
     if case.shape.jitter > 0.0 {
         let other = match case.metric {
@@ -309,10 +480,11 @@ fn gate(gpu: &Arc<Gpu>, case: Case) -> Result<bool, Box<dyn std::error::Error>> 
 }
 
 /// Time the CPU and the GPU on `shape` (a reference, a β-plane, the averaged
-/// metric), per element and level, by part: the reference at a stage's
-/// levels with the displacements, and the force with Coriolis. Every
-/// evaluation is at another free surface (two alternating), so that the
-/// reference is filled every time, as at every stage.
+/// metric, the case runner's Smagorinsky viscosity of the shear), per
+/// element and level, by part: the reference at a stage's levels with the
+/// displacements, the force with Coriolis, the viscosity. Every evaluation
+/// is at another free surface (two alternating), so that the reference is
+/// filled every time, as at every stage.
 fn time(
     gpu: &Arc<Gpu>,
     label: &str,
@@ -331,9 +503,11 @@ fn time(
     raised.eta.data.iter_mut().for_each(|e| *e += 1e-3);
     let states = [&fx.state, &raised];
     let all = Blocks::All(ne);
+    let viscosity = HorizontalViscosity3D::smagorinsky(0.1);
+    let mut scratch = ViscosityScratch3D::new(ne, &fx.ops);
     let mut fields = ReferenceFields::default();
     let mut rhs = Solution3D::new(ne, NN, LEVELS);
-    let mut cpu_parts = [0.0; 2];
+    let mut cpu_parts = [0.0; 3];
     for it in 0..iterations + 2 {
         let state = states[it % 2];
         let t0 = Instant::now();
@@ -357,9 +531,12 @@ fn time(
         let t1 = Instant::now();
         cpu_momentum(&fx, state, Some(&fields), metric, &coriolis, None, &mut rhs);
         let t2 = Instant::now();
+        cpu_viscosity(&fx, state, viscosity, &mut scratch, &mut rhs.u, &mut rhs.v);
+        let t3 = Instant::now();
         if it >= 2 {
             cpu_parts[0] += (t1 - t0).as_secs_f64();
             cpu_parts[1] += (t2 - t1).as_secs_f64();
+            cpu_parts[2] += (t3 - t2).as_secs_f64();
         }
     }
     println!(
@@ -369,12 +546,20 @@ fn time(
     );
     let statics = fx.statics_in(gpu, metric)?;
     let mut baroclinic = fx.baroclinic(gpu, &statics, &coriolis, None)?;
+    let mut device_viscosity = Viscosity3D::new(
+        gpu,
+        &statics,
+        &fx.ops,
+        &fx.geom,
+        viscosity,
+        fx.min_column_depth,
+    )?;
     let mut devices = [
         Device::upload(gpu, &fx.state)?,
         Device::upload(gpu, &raised)?,
     ];
     let gpu_iterations = 5 * iterations;
-    let mut gpu_parts = [0.0; 2];
+    let mut gpu_parts = [0.0; 3];
     for it in 0..gpu_iterations + 2 {
         let d = &mut devices[it % 2];
         gpu.stream.synchronize()?;
@@ -393,9 +578,13 @@ fn time(
         )?;
         gpu.stream.synchronize()?;
         let t2 = Instant::now();
+        device_viscosity.apply(&statics, &d.eta, &d.u, &d.v, &mut d.rhs_u, &mut d.rhs_v)?;
+        gpu.stream.synchronize()?;
+        let t3 = Instant::now();
         if it >= 2 {
             gpu_parts[0] += (t1 - t0).as_secs_f64();
             gpu_parts[1] += (t2 - t1).as_secs_f64();
+            gpu_parts[2] += (t3 - t2).as_secs_f64();
         }
     }
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -404,6 +593,7 @@ fn time(
     let names = [
         "reference at the levels, displacements",
         "pressure gradient, Coriolis",
+        "viscosity of the shear (Smagorinsky 0.1)",
     ];
     let (mut cpu_all, mut gpu_all) = (0.0, 0.0);
     for ((name, c), g) in names.iter().zip(cpu_parts).zip(gpu_parts) {
@@ -424,7 +614,7 @@ fn time(
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "== The 3D momentum terms: the reference, the pressure gradient, Coriolis (Phase 4.2) =="
+        "== The 3D momentum terms: the reference, the pressure gradient, Coriolis, the viscosity (Phase 4.2) =="
     );
     let wet = Shape::WET;
     let cases = [
@@ -437,6 +627,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             metric: MetricForm::Averaged,
             beta: 0.0,
             balanced: false,
+            viscosity: INVISCID,
         },
         Case {
             label: "periodic, jittered, stretched, reference",
@@ -449,6 +640,10 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             metric: MetricForm::Averaged,
             beta: 2e-11,
             balanced: false,
+            viscosity: HorizontalViscosity3D {
+                background: 0.1,
+                smagorinsky: 0.1,
+            },
         },
         Case {
             label: "walled, jittered, reference, conservative metric",
@@ -461,6 +656,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             metric: MetricForm::Conservative,
             beta: 2e-11,
             balanced: false,
+            viscosity: HorizontalViscosity3D::constant(5.0),
         },
         Case {
             label: "walled, jittered, stretched, no reference",
@@ -473,6 +669,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             metric: MetricForm::Averaged,
             beta: 0.0,
             balanced: false,
+            viscosity: HorizontalViscosity3D::smagorinsky(0.1),
         },
         Case {
             label: "walled, jittered, no reference, balanced reference state",
@@ -484,6 +681,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             metric: MetricForm::Conservative,
             beta: 2e-11,
             balanced: true,
+            viscosity: INVISCID,
         },
         Case {
             label: "beach, parallelograms, reference",
@@ -491,6 +689,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             metric: MetricForm::Averaged,
             beta: 0.0,
             balanced: false,
+            viscosity: HorizontalViscosity3D::smagorinsky(0.1),
         },
         Case {
             label: "beach, jittered, stretched, reference",
@@ -502,6 +701,10 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             metric: MetricForm::Averaged,
             beta: 2e-11,
             balanced: false,
+            viscosity: HorizontalViscosity3D {
+                background: 0.1,
+                smagorinsky: 0.1,
+            },
         },
         Case {
             label: "beach, jittered, no reference",
@@ -513,6 +716,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             metric: MetricForm::Averaged,
             beta: 0.0,
             balanced: false,
+            viscosity: HorizontalViscosity3D::constant(2.0),
         },
         Case {
             label: "channel, open ends, jittered, stretched, reference",
@@ -520,6 +724,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             metric: MetricForm::Averaged,
             beta: 2e-11,
             balanced: false,
+            viscosity: HorizontalViscosity3D::smagorinsky(0.1),
         },
     ];
     let mut failed = Vec::new();
