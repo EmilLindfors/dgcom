@@ -1,11 +1,14 @@
-//! The 3D transport gate (P2.7 Phase 4.0, `notes/gpu.md`): the layer
+//! The 3D transport gate (P2.7 Phase 4, `notes/gpu.md`): the layer
 //! transports and Ω ([`Transport3D::compute`]), the advection of u and v
 //! (split form, centred in the vertical) and of T and S (LimitedAkima within
 //! their ranges, about a reference stratification or not), and the water no
 //! transport carried, on the GPU against dgcom's `LayerTransport::compute`,
 //! `apply_momentum_transport_3d`, `apply_tracer_transport_3d` and
-//! `LayerTransport::add_volume_sources` on the CPU, value for value; then
-//! timed at Chiloé's size (96,000 P2 elements × 20 levels).
+//! `LayerTransport::add_volume_sources` on the CPU, value for value: fully
+//! wet (Phase 4.0) and on a walled beach with flats, films and dry columns,
+//! where subcell elements, thin columns, fallback and pooled elements meet
+//! (Phase 4.1); then timed at Chiloé's size (96,000 P2 elements × 20
+//! levels).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,7 +17,9 @@ use cuda_core::DeviceBuffer;
 use dgcom::mesh::{Bathymetry2D, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
 use dgcom::solver::Blocks;
-use dgcom::solver::rhs::subcells::subcell_interfaces;
+use dgcom::solver::rhs::subcells::{
+    line_metric, line_node, subcell_interfaces, subcell_slot, telescoped_interfaces,
+};
 use dgcom::solver::rhs::{
     AdvectedTracer, BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D,
     FaceExterior, LayerTransport, MetricForm, MomentumAdvectionForm, UNBOUNDED, VerticalAdvection,
@@ -26,12 +31,10 @@ use dgcom::vertical::{ROMSVstretching4, SigmaGrid};
 
 use crate::phase0::{DX, Lcg, quad_mesh, ulps};
 use crate::swe2d::{Gpu, N1, NN, ORDER};
-use crate::three_d::{Advected, BarotropicDevice, Statics3D, Transport3D};
+use crate::three_d::{Advected, BarotropicDevice, Interface, Statics3D, Transport3D};
 
 /// σ-levels of the fixtures (Chiloé's 3D case has 20).
 const LEVELS: usize = 20;
-/// Columns thinner than this exchange no baroclinic transport (none is).
-const MIN_COLUMN_DEPTH: f64 = 1.0;
 /// The tracers' ranges, narrower than the water's in places so that the end
 /// layers' bound (`in_range`) acts.
 const T_RANGE: (f64, f64) = (5.5, 11.0);
@@ -48,6 +51,10 @@ struct Shape {
     jitter: f64,
     /// Doubly periodic, else walled
     periodic: bool,
+    /// A walled beach with flats, films and dry columns (else a bed
+    /// 12–28 m deep): subcell elements, thin columns, the pass's subcell
+    /// fluxes in some, fallback and pooled elements
+    beach: bool,
     /// ROMS's Vstretching 4 (θ_s 5, θ_b 0.4), else uniform levels
     stretched: bool,
     /// T and S advected about a reference stratification
@@ -66,6 +73,9 @@ struct Fixture {
     bathymetry: Bathymetry2D,
     sigma: SigmaGrid,
     boundaries: Boundaries3D,
+    /// Columns thinner than this exchange no baroclinic transport
+    min_column_depth: f64,
+    /// The thin columns at rest, as the mode splitter's stage values are
     state: Solution3D,
     /// The reference stratification of T and S at each column's levels
     reference: Option<[Vec<f64>; 2]>,
@@ -74,8 +84,11 @@ struct Fixture {
     bar_face: Vec<f64>,
     eta_rate: Vec<f64>,
     euler_dt: Vec<f64>,
-    /// NaN: the pass moved no element's mass on the subcells
+    /// The pass's subcell interface fluxes: NaN in the elements it did not
+    /// move on the subcells throughout
     subcell: Vec<f64>,
+    /// The elements the pass balanced only as a whole (empty: none)
+    pooled: Vec<bool>,
     /// The momentum's tendencies before the advection adds to them
     rhs_u0: Vec<f64>,
     rhs_v0: Vec<f64>,
@@ -88,20 +101,25 @@ impl Fixture {
             ny,
             jitter,
             periodic,
+            beach,
             stretched,
             reference,
             euler_dt,
         } = shape;
-        let mesh = quad_mesh(nx, ny, jitter, periodic);
+        let mesh = quad_mesh(nx, ny, jitter, periodic && !beach);
         let ops = DGOperators2D::new(ORDER);
         let geom = GeometricFactors2D::compute(&mesh, &ops);
-        let (kx, ky) = (
-            std::f64::consts::TAU / (nx as f64 * DX),
-            std::f64::consts::TAU / (ny as f64 * DX),
-        );
+        let (lx, ly) = (nx as f64 * DX, ny as f64 * DX);
+        let (kx, ky) = (std::f64::consts::TAU / lx, std::f64::consts::TAU / ly);
         let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
-            -20.0 - 8.0 * (kx * x).sin() * (ky * y).cos()
+            if beach {
+                // −8 m to +2 m along x, with bumps
+                -8.0 + 10.0 * x / lx + 0.6 * (0.01 * y).sin() * (0.004 * x).cos()
+            } else {
+                -20.0 - 8.0 * (kx * x).sin() * (ky * y).cos()
+            }
         });
+        let min_column_depth = if beach { 0.5 } else { 1.0 };
         let sigma = if stretched {
             SigmaGrid::new(LEVELS, ROMSVstretching4::default())
         } else {
@@ -113,7 +131,6 @@ impl Fixture {
         let mut state = Solution3D::new(ne, NN, nl);
         let mut references = [vec![0.0; ne * NN * nl], vec![0.0; ne * NN * nl]];
         let mut rng = Lcg(20_261_123);
-        let mut noise = |a: f64| a * (rng.next() - 0.5);
         let mut bar_hu = vec![0.0; ne * NN];
         let mut bar_hv = vec![0.0; ne * NN];
         let mut eta_rate = vec![0.0; ne * NN];
@@ -125,26 +142,50 @@ impl Fixture {
             for i in 0..NN {
                 let idx = k * NN + i;
                 let [x, y] = mesh.reference_to_physical(ki, ops.nodes_r[i], ops.nodes_s[i]);
-                let eta = 0.3 * (2.0 * kx * x).cos() * (ky * y).sin();
+                let b = bathymetry.data[idx];
+                let depth = if beach {
+                    // A shoreline band, and films and dry columns anywhere
+                    let r = rng.next();
+                    let wet = (0.1 + 0.25 * (0.003 * x + 0.002 * y).sin() - b).max(0.0);
+                    if r < 0.02 {
+                        0.0
+                    } else if r < 0.04 {
+                        0.3 * rng.next()
+                    } else {
+                        wet
+                    }
+                } else {
+                    0.3 * (2.0 * kx * x).cos() * (ky * y).sin() - b
+                };
+                let eta = b + depth;
                 state.eta.data[idx] = eta;
-                let depth = eta - bathymetry.data[idx];
-                // A pycnocline about 10 m deep, tilted by a front along x
-                let front = 2.0 * (kx * x).sin();
+                let at_rest = depth < min_column_depth;
+                // A pycnocline about 3 m (beach) or 10 m deep, tilted by a
+                // front along x
+                let (z0, front) = if beach {
+                    (3.0, 0.8 * (0.004 * y).sin())
+                } else {
+                    (10.0, 2.0 * (kx * x).sin())
+                };
                 for (l, &s) in sigma_rho.iter().enumerate() {
                     let at = idx * nl + l;
                     let z = eta + s * depth;
-                    state.u[at] =
-                        0.6 * (ky * y).sin() + 0.25 * (s + 0.5) * (kx * x).cos() + noise(0.02);
-                    state.v[at] =
-                        0.4 * (kx * x).cos() - 0.2 * (s + 0.5) * (ky * y).sin() + noise(0.02);
-                    let interface = ((z + 10.0 + front) / 1.5).tanh();
-                    state.temp[at] = 8.0 + 3.0 * interface + noise(0.05);
-                    state.salt[at] = 33.0 - 1.5 * interface + noise(0.02);
-                    let smooth = ((z + 10.0) / 3.0).tanh();
+                    let (u, v) = (
+                        0.6 * (ky * y).sin() + 0.25 * (s + 0.5) * (kx * x).cos(),
+                        0.4 * (kx * x).cos() - 0.2 * (s + 0.5) * (ky * y).sin(),
+                    );
+                    let (du, dv) = (0.02 * (rng.next() - 0.5), 0.02 * (rng.next() - 0.5));
+                    // The thin columns at rest: the stage values' mask
+                    state.u[at] = if at_rest { 0.0 } else { u + du };
+                    state.v[at] = if at_rest { 0.0 } else { v + dv };
+                    let interface = ((z + z0 + front) / 1.5).tanh();
+                    state.temp[at] = 8.0 + 3.0 * interface + 0.05 * (rng.next() - 0.5);
+                    state.salt[at] = 33.0 - 1.5 * interface + 0.02 * (rng.next() - 0.5);
+                    let smooth = ((z + z0) / 3.0).tanh();
                     references[0][at] = 8.0 + 3.0 * smooth;
                     references[1][at] = 33.0 - 1.5 * smooth;
-                    rhs_u0[at] = noise(1e-3);
-                    rhs_v0[at] = noise(1e-3);
+                    rhs_u0[at] = 1e-3 * (rng.next() - 0.5);
+                    rhs_v0[at] = 1e-3 * (rng.next() - 0.5);
                 }
                 bar_hu[idx] = depth * (0.62 * (ky * y).sin() + 0.01 * (kx * x).cos());
                 bar_hv[idx] = depth * (0.38 * (kx * x).cos() - 0.01 * (ky * y).sin());
@@ -171,8 +212,54 @@ impl Fixture {
                 }
             }
         }
+        // The pass's subcell fluxes (the beach): in 70 % of the elements
+        // with a thin column and 5 % of the others, the central DU_avg2
+        // along each interface, perturbed, none beside a dry column; NaN in
+        // the rest
+        let n_sub = subcell_interfaces(ops.n_1d);
+        let mut subcell = vec![f64::NAN; ne * n_sub];
+        let mut pooled = Vec::new();
+        if beach {
+            let depth = |flat: usize| state.eta.data[flat] - bathymetry.data[flat];
+            let mut metric = [(0.0, 0.0); N1];
+            let mut interfaces = [(0.0, 0.0); N1 + 1];
+            for k in 0..ne {
+                let thin = (k * NN..(k + 1) * NN).any(|flat| depth(flat) < min_column_depth);
+                if rng.next() >= if thin { 0.7 } else { 0.05 } {
+                    continue;
+                }
+                for dir in 0..2 {
+                    for line in 0..N1 {
+                        let affine = line_metric(&ops, &geom, k, dir, line, &mut metric);
+                        telescoped_interfaces(
+                            &ops.weights_1d,
+                            &ops.dr_1d_row_major,
+                            &metric,
+                            affine,
+                            &mut interfaces,
+                        );
+                        for a in 0..N1 - 1 {
+                            let m = interfaces[a + 1];
+                            let (ia, ib) = (
+                                k * NN + line_node(N1, dir, line, a),
+                                k * NN + line_node(N1, dir, line, a + 1),
+                            );
+                            let q = |n: usize| m.0 * bar_hu[n] + m.1 * bar_hv[n];
+                            subcell[k * n_sub + subcell_slot(N1, dir, line, a)] =
+                                if depth(ia) == 0.0 || depth(ib) == 0.0 {
+                                    0.0
+                                } else {
+                                    0.5 * (q(ia) + q(ib)) * (1.0 + 0.2 * (rng.next() - 0.5))
+                                };
+                        }
+                    }
+                }
+            }
+            pooled = (0..ne).map(|_| rng.next() < 0.06).collect();
+        }
         Self {
-            subcell: vec![f64::NAN; ne * subcell_interfaces(ops.n_1d)],
+            subcell,
+            pooled,
             euler_dt: vec![euler_dt; ne],
             mesh,
             ops,
@@ -180,6 +267,7 @@ impl Fixture {
             bathymetry,
             sigma,
             boundaries,
+            min_column_depth,
             state,
             reference: reference.then_some(references),
             bar_hu,
@@ -201,12 +289,25 @@ impl Fixture {
             subcell: &self.subcell,
             eta_rate: &self.eta_rate,
             rivers: None,
-            pooled: &[],
+            pooled: &self.pooled,
         }
     }
 
     fn n_elements(&self) -> usize {
         self.mesh.n_elements
+    }
+
+    fn statics(&self, gpu: &Gpu) -> Result<Statics3D, Box<dyn std::error::Error>> {
+        Statics3D::upload(
+            gpu,
+            &self.mesh,
+            &self.ops,
+            &self.geom,
+            &self.bathymetry,
+            &self.sigma,
+            &self.boundaries,
+            MetricForm::Averaged,
+        )
     }
 }
 
@@ -230,7 +331,7 @@ fn cpu_layers(fx: &Fixture, layers: &mut LayerTransport) {
         &fx.bathymetry,
         &fx.boundaries,
         &Exterior3D::default(),
-        MIN_COLUMN_DEPTH,
+        fx.min_column_depth,
         Blocks::All(fx.n_elements()),
     );
 }
@@ -300,7 +401,7 @@ fn cpu_sources(fx: &Fixture, layers: &LayerTransport, rhs: &mut [Vec<f64>; 4]) {
             field,
             fx.sigma.d_sigma(),
             &fx.geom,
-            &[],
+            &fx.pooled,
             Blocks::All(fx.n_elements()),
         );
     }
@@ -310,10 +411,6 @@ fn cpu(fx: &Fixture) -> Cpu {
     let ne = fx.n_elements();
     let mut layers = LayerTransport::new(ne, &fx.ops, LEVELS).with_metric(MetricForm::Averaged);
     cpu_layers(fx, &mut layers);
-    assert!(
-        layers.subcell_elements.iter().all(|&s| !s),
-        "the fixture is fully wet"
-    );
     let n = ne * NN * LEVELS;
     let mut rhs = [
         vec![0.0; n],
@@ -345,6 +442,7 @@ impl Device {
     fn upload(gpu: &Gpu, fx: &Fixture) -> Result<Self, Box<dyn std::error::Error>> {
         let up = |v: &[f64]| DeviceBuffer::from_host(&gpu.stream, v);
         let s = &fx.state;
+        let pooled: Vec<u32> = fx.pooled.iter().map(|&p| u32::from(p)).collect();
         Ok(Self {
             eta: up(&s.eta.data)?,
             fields: [up(&s.temp)?, up(&s.salt)?, up(&s.u)?, up(&s.v)?],
@@ -356,8 +454,10 @@ impl Device {
                 hu: up(&fx.bar_hu)?,
                 hv: up(&fx.bar_hv)?,
                 face: up(&fx.bar_face)?,
+                subcell: up(&fx.subcell)?,
                 eta_rate: up(&fx.eta_rate)?,
                 euler_dt: up(&fx.euler_dt)?,
+                pooled: DeviceBuffer::from_host(&gpu.stream, &pooled)?,
             },
             rhs_u0: fx.rhs_u0.clone(),
             rhs_v0: fx.rhs_v0.clone(),
@@ -378,13 +478,13 @@ impl Device {
     }
 
     /// The advection of u, v and T, S on the device, as [`cpu_advect`], and
-    /// with `sources` the volume sources, as [`cpu_sources`]; `reference`
-    /// false drops T's and S's reference (the mutant).
+    /// with `sources` the volume sources, as [`cpu_sources`]; or a
+    /// `mutant` of it.
     fn advect(
         &self,
         transport: &Transport3D,
         rhs: &mut [DeviceBuffer<f64>; 4],
-        reference: bool,
+        mutant: Mutant,
         sources: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let [t, s, u, v] = &self.fields;
@@ -398,10 +498,16 @@ impl Device {
             [&unbounded(u), &unbounded(v)],
             [rhs_u, rhs_v],
             VerticalAdvection::Centred,
+            Interface::Central,
             false,
             sources,
         )?;
-        let reference = |i: usize| self.reference.as_ref().filter(|_| reference).map(|r| &r[i]);
+        let reference = |i: usize| {
+            self.reference
+                .as_ref()
+                .filter(|_| mutant != Mutant::NoReference)
+                .map(|r| &r[i])
+        };
         transport.advect(
             [
                 &Advected {
@@ -417,10 +523,25 @@ impl Device {
             ],
             [rhs_t, rhs_s],
             VerticalAdvection::LimitedAkima,
+            if mutant == Mutant::CentralTracers {
+                Interface::Central
+            } else {
+                Interface::DonorBesideThin
+            },
             true,
             sources,
         )
     }
+}
+
+/// What the device gets wrong on purpose, for the gate to catch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mutant {
+    None,
+    /// T and S without their reference
+    NoReference,
+    /// T and S at the central value beside thin columns, not the donor's
+    CentralTracers,
 }
 
 /// Agreement of one field: its values identical to the bit, the largest
@@ -466,7 +587,11 @@ fn report(
     device: &DeviceBuffer<f64>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let values = device.to_host_vec(&gpu.stream)?;
-    let a = agreement(cpu, &values);
+    Ok(report_values(name, cpu, &values))
+}
+
+fn report_values(name: &str, cpu: &[f64], values: &[f64]) -> bool {
+    let a = agreement(cpu, values);
     let same = a.identical == a.len;
     if same {
         println!("    {name:<16} {} of {} bit-identical", a.identical, a.len);
@@ -478,7 +603,54 @@ fn report(
             a.identical, a.len, a.worst_ulps, a.worst_rel, cpu[at], values[at]
         );
     }
-    Ok(same)
+    same
+}
+
+/// The device's element kinds and thin columns against the CPU's
+/// (`subcell_elements`, `fallback`, `thin` in the subcell elements, where
+/// the CPU sets it); prints the counts. Whether they agree.
+fn report_kinds(
+    gpu: &Gpu,
+    fx: &Fixture,
+    layers: &LayerTransport,
+    transport: &Transport3D,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let kinds = transport.kinds.to_host_vec(&gpu.stream)?;
+    let thin = transport.thin.to_host_vec(&gpu.stream)?;
+    let ne = fx.n_elements();
+    let mut wrong = 0;
+    for (k, &kind) in kinds.iter().enumerate() {
+        let subcell = layers.subcell_elements[k];
+        let fallback = layers.fallback[k];
+        let pooling = fallback || fx.pooled.get(k).copied().unwrap_or(false);
+        let device = (kind & 1 != 0, kind & 2 != 0, kind & 4 != 0);
+        if device != (subcell, fallback, pooling) {
+            wrong += 1;
+        }
+        if subcell {
+            wrong += (k * NN..(k + 1) * NN)
+                .filter(|&flat| (thin[flat] != 0) != layers.thin[flat])
+                .count();
+        }
+    }
+    let count = |f: &dyn Fn(usize) -> bool| (0..ne).filter(|&k| f(k)).count();
+    let thin_columns = (0..ne * NN)
+        .filter(|&flat| fx.state.eta.data[flat] - fx.bathymetry.data[flat] < fx.min_column_depth)
+        .count();
+    println!(
+        "    {:<16} subcell {}, fallback {}, pooled {}, thin columns {}: {}",
+        "elements",
+        count(&|k| layers.subcell_elements[k]),
+        count(&|k| layers.fallback[k]),
+        count(&|k| fx.pooled.get(k).copied().unwrap_or(false)),
+        thin_columns,
+        if wrong == 0 {
+            "the device's kinds and thin columns agree".to_string()
+        } else {
+            format!("{wrong} kinds or thin columns DIFFER")
+        }
+    );
+    Ok(wrong == 0)
 }
 
 /// One fixture on both: every output compared. Whether all are the same to
@@ -501,26 +673,24 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
         }
     );
     let cpu = cpu(&fx);
-    let statics = Statics3D::upload(
-        gpu,
-        &fx.mesh,
-        &fx.ops,
-        &fx.geom,
-        &fx.bathymetry,
-        &fx.sigma,
-        &fx.boundaries,
-        MetricForm::Averaged,
-    )?;
-    let mut transport = Transport3D::new(gpu, statics, MIN_COLUMN_DEPTH)?;
+    let mut transport = Transport3D::new(gpu, fx.statics(gpu)?, fx.min_column_depth)?;
     let device = Device::upload(gpu, &fx)?;
     let [_, _, u, v] = &device.fields;
     transport.compute(&device.eta, u, v, &device.barotropic)?;
     let layers = &cpu.layers;
-    let mut same = true;
+    let mut same = report_kinds(gpu, &fx, layers, &transport)?;
+    if !shape.beach {
+        let any = layers.subcell_elements.iter().any(|&s| s);
+        same &= !any;
+        if any {
+            println!("    a wet fixture has subcell elements");
+        }
+    }
     for (name, cpu, gpu_values) in [
         ("layer hu", &layers.hu, &transport.hu),
         ("layer hv", &layers.hv, &transport.hv),
         ("layer face", &layers.face, &transport.face),
+        ("layer subcell", &layers.subcell, &transport.subcell),
         ("omega", &layers.omega, &transport.omega),
         (
             "volume source",
@@ -551,20 +721,35 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
         (true, &cpu.sourced, "+ sources"),
     ] {
         let mut rhs = device.rhs(gpu)?;
-        device.advect(&transport, &mut rhs, true, sources)?;
+        device.advect(&transport, &mut rhs, Mutant::None, sources)?;
         for ((name, cpu), gpu_values) in names.iter().zip(results).zip(&rhs) {
             same &= report(gpu, &format!("{prefix} {name}"), cpu, gpu_values)?;
         }
     }
 
-    // The mutant: the device drops the reference; the gate must see it
-    if shape.reference {
+    // The mutants: the gate must see each
+    let mutants = [
+        (
+            shape.reference,
+            Mutant::NoReference,
+            "no reference on the device",
+        ),
+        (
+            shape.beach,
+            Mutant::CentralTracers,
+            "T at the central value beside thin columns",
+        ),
+    ];
+    for (applies, mutant, what) in mutants {
+        if !applies {
+            continue;
+        }
         let mut rhs = device.rhs(gpu)?;
-        device.advect(&transport, &mut rhs, false, false)?;
+        device.advect(&transport, &mut rhs, mutant, false)?;
         let t = rhs[0].to_host_vec(&gpu.stream)?;
         let a = agreement(&cpu.advected[0], &t);
         println!(
-            "    mutant (no reference on the device): T {} of {} differ{}",
+            "    mutant ({what}): T {} of {} differ{}",
             a.len - a.identical,
             a.len,
             if a.identical < a.len {
@@ -574,6 +759,33 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
             }
         );
         same &= a.identical < a.len;
+    }
+    // That the fixture reaches the pooled sources: without the pass's pooled
+    // elements (the fallback ones still pool) the sources differ (on the
+    // CPU alone)
+    if !fx.pooled.is_empty() {
+        let mut unpooled = cpu.advected.clone();
+        let fields = [&fx.state.temp, &fx.state.salt, &fx.state.u, &fx.state.v];
+        for (out, field) in unpooled.iter_mut().zip(fields) {
+            layers.add_volume_sources(
+                out,
+                field,
+                fx.sigma.d_sigma(),
+                &fx.geom,
+                &[],
+                Blocks::All(ne),
+            );
+        }
+        let differ = |t: usize| {
+            let a = agreement(&cpu.sourced[t], &unpooled[t]);
+            a.len - a.identical
+        };
+        println!(
+            "    the pooled elements act (CPU, none pooled): T {} and u {} of {} values differ",
+            differ(0),
+            differ(2),
+            ne * NN * LEVELS
+        );
     }
     // That the fixture reaches the end layers' bound: unbounded ranges give
     // other tendencies (on the CPU alone)
@@ -606,15 +818,15 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
 }
 
 /// Time the CPU and the GPU on `shape`, per element and level, by part.
-fn time(gpu: &Arc<Gpu>, shape: Shape, iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn time(
+    gpu: &Arc<Gpu>,
+    label: &str,
+    shape: Shape,
+    iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let fx = Fixture::new(shape);
     let ne = fx.n_elements();
     let points = (ne * LEVELS) as f64;
-    println!(
-        "timing: {ne} P{ORDER} elements × {LEVELS} levels ({:.1} M points), {iterations} \
-         evaluations",
-        (ne * NN * LEVELS) as f64 / 1e6
-    );
     let n = ne * NN * LEVELS;
     let mut layers = LayerTransport::new(ne, &fx.ops, LEVELS).with_metric(MetricForm::Averaged);
     let mut rhs = [
@@ -637,17 +849,14 @@ fn time(gpu: &Arc<Gpu>, shape: Shape, iterations: usize) -> Result<(), Box<dyn s
             cpu_parts[1] += (t2 - t1).as_secs_f64();
         }
     }
-    let statics = Statics3D::upload(
-        gpu,
-        &fx.mesh,
-        &fx.ops,
-        &fx.geom,
-        &fx.bathymetry,
-        &fx.sigma,
-        &fx.boundaries,
-        MetricForm::Averaged,
-    )?;
-    let mut transport = Transport3D::new(gpu, statics, MIN_COLUMN_DEPTH)?;
+    let subcell = layers.subcell_elements.iter().filter(|&&s| s).count();
+    println!(
+        "timing, {label}: {ne} P{ORDER} elements × {LEVELS} levels ({:.1} M points; {subcell} \
+         subcell elements, {:.1} %), {iterations} evaluations",
+        (ne * NN * LEVELS) as f64 / 1e6,
+        100.0 * subcell as f64 / ne as f64
+    );
+    let mut transport = Transport3D::new(gpu, fx.statics(gpu)?, fx.min_column_depth)?;
     let device = Device::upload(gpu, &fx)?;
     let mut rhs = device.rhs(gpu)?;
     let [_, _, u, v] = &device.fields;
@@ -659,7 +868,7 @@ fn time(gpu: &Arc<Gpu>, shape: Shape, iterations: usize) -> Result<(), Box<dyn s
         transport.compute(&device.eta, u, v, &device.barotropic)?;
         gpu.stream.synchronize()?;
         let t1 = Instant::now();
-        device.advect(&transport, &mut rhs, true, true)?;
+        device.advect(&transport, &mut rhs, Mutant::None, true)?;
         gpu.stream.synchronize()?;
         let t2 = Instant::now();
         if it >= 2 {
@@ -689,24 +898,35 @@ fn time(gpu: &Arc<Gpu>, shape: Shape, iterations: usize) -> Result<(), Box<dyn s
 }
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
-    println!("== The 3D transport: layer transports, Ω, advection (Phase 4.0) ==");
-    let base = Shape {
+    println!("== The 3D transport: layer transports, Ω, advection (Phase 4) ==");
+    let wet = Shape {
         nx: 24,
         ny: 20,
         jitter: 0.0,
         periodic: true,
+        beach: false,
         stretched: false,
         reference: false,
         euler_dt: 0.05,
     };
+    let beach = Shape {
+        nx: 36,
+        ny: 20,
+        jitter: 0.0,
+        periodic: false,
+        beach: true,
+        stretched: false,
+        reference: true,
+        euler_dt: 0.05,
+    };
     let fixtures = [
-        ("periodic, parallelograms", base),
+        ("periodic, parallelograms", wet),
         (
             "periodic, jittered, stretched",
             Shape {
                 jitter: 0.15,
                 stretched: true,
-                ..base
+                ..wet
             },
         ),
         (
@@ -715,7 +935,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
                 jitter: 0.15,
                 stretched: true,
                 reference: true,
-                ..base
+                ..wet
             },
         ),
         (
@@ -725,7 +945,17 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
                 periodic: false,
                 reference: true,
                 euler_dt: 40.0,
-                ..base
+                ..wet
+            },
+        ),
+        ("beach, parallelograms, reference", beach),
+        (
+            "beach, jittered, stretched, reference, long Euler step",
+            Shape {
+                jitter: 0.2,
+                stretched: true,
+                euler_dt: 40.0,
+                ..beach
             },
         ),
     ];
@@ -735,15 +965,23 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             failed.push(label);
         }
     }
+    let large = Shape {
+        nx: 320,
+        ny: 300,
+        jitter: 0.15,
+        stretched: true,
+        reference: true,
+        ..wet
+    };
+    time(gpu, "wet", large, 10)?;
     time(
         gpu,
+        "beach",
         Shape {
-            nx: 320,
-            ny: 300,
-            jitter: 0.15,
-            stretched: true,
-            reference: true,
-            ..base
+            beach: true,
+            periodic: false,
+            jitter: 0.2,
+            ..large
         },
         10,
     )?;
