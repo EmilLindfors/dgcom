@@ -174,6 +174,29 @@ pub struct MergedCells {
     counts: [usize; 2],
 }
 
+/// The groups of a step as flat tables ([`MergedCells::tables`]): what a
+/// kernel holding them in its own buffers (the GPU's) converts with.
+#[derive(Clone, Copy, Debug)]
+pub struct MergedTables<'a> {
+    /// `[element][node]`: the first node of the node's group (its own: the
+    /// node is on its own)
+    pub group: &'a [u8],
+    /// `[element][node]`: in a group of two or more
+    pub joined: &'a [bool],
+    /// `[element]`: the element is flushed
+    pub flushed: &'a [bool],
+    /// The elements with a group, in order
+    pub elements: &'a [u32],
+    /// The flushed elements, in order, with the water entering and leaving
+    /// each through its faces (m³/s per unit of the reference element's
+    /// area)
+    pub flushed_elements: &'a [(u32, f64, f64)],
+    /// What flows into them from other elements, element by element in
+    /// their order: the element, the neighbour's node the water comes from
+    /// (`[element][node]`) and its rate
+    pub inflows: &'a [(u32, u32, f64)],
+}
+
 /// Most nodes of an element the groups are found for (order 8).
 const MAX_NODES: usize = 81;
 
@@ -218,6 +241,18 @@ impl MergedCells {
     /// The elements with a group.
     pub fn elements(&self) -> &[u32] {
         &self.elements
+    }
+
+    /// The step's groups as flat tables.
+    pub fn tables(&self) -> MergedTables<'_> {
+        MergedTables {
+            group: &self.group,
+            joined: &self.joined,
+            flushed: &self.flushed,
+            elements: &self.elements,
+            flushed_elements: &self.flushed_elements,
+            inflows: &self.inflows,
+        }
     }
 
     fn clear(&mut self) {
@@ -607,6 +642,13 @@ impl MergedCells {
 /// keeping the value lost (5e-11 of the tidal flat's heat in 6 h).
 fn dry_volume(geom: &GeometricFactors2D, k: usize, members: &[usize], d_sigma: f64) -> f64 {
     let area: f64 = members.iter().map(|&i| geom.node_mass(k, i)).sum();
+    dry_volume_of(area, d_sigma)
+}
+
+/// [`dry_volume`] of members whose nodal masses sum to `area` (summed in
+/// node order, from −0.0 as `Iterator::sum`).
+#[inline]
+pub fn dry_volume_of(area: f64, d_sigma: f64) -> f64 {
     area * d_sigma * MIN_LAYER_THICKNESS
 }
 

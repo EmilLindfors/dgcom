@@ -70,7 +70,7 @@ pub use advection_3d::{
 
 pub mod merged_cells;
 pub mod transport_3d;
-pub use merged_cells::{MergedCells, StepWater};
+pub use merged_cells::{MergedCells, MergedTables, StepWater};
 pub use transport_3d::{
     AdvectedTracer, BarotropicFlux, ColumnScratch, EndLayerShed, LayerTransport, MetricForm,
     MomentumAdvectionForm, UNBOUNDED, VerticalAdvection, advective_divergence_element,

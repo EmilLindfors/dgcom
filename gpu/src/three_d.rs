@@ -1224,7 +1224,7 @@ pub struct Statics3D {
     /// The layer centres' σ
     pub(crate) sigma_rho: DeviceBuffer<f64>,
     /// The w-cells' σ-thicknesses (`w_cell_thicknesses`)
-    d_sigma_w: DeviceBuffer<f64>,
+    pub(crate) d_sigma_w: DeviceBuffer<f64>,
     /// Each face node's open boundary tag (`None` but at open faces), for
     /// [`ExteriorDevice::new`]
     open_tags: Vec<Option<dgcom::mesh::BoundaryTag>>,

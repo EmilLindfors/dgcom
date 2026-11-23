@@ -2110,6 +2110,8 @@ pub struct Gpu {
     pub(crate) module_baroclinic: crate::baroclinic::kernels_baroclinic::LoadedModule,
     /// The 3D shear's viscosity (`viscosity.rs`)
     pub(crate) module_viscosity: crate::viscosity::kernels_viscosity::LoadedModule,
+    /// The 3D stages' values and hooks (`hooks.rs`)
+    pub(crate) module_hooks: crate::hooks::kernels_hooks::LoadedModule,
     /// The device's name and compute capability
     pub name: String,
     /// Its streaming multiprocessors
@@ -2127,6 +2129,7 @@ impl Gpu {
         let module3d = crate::three_d::kernels3d::load(&ctx)?;
         let module_baroclinic = crate::baroclinic::kernels_baroclinic::load(&ctx)?;
         let module_viscosity = crate::viscosity::kernels_viscosity::load(&ctx)?;
+        let module_hooks = crate::hooks::kernels_hooks::load(&ctx)?;
         let sms = ctx.multiprocessor_count()?;
         Ok(Arc::new(Self {
             stream,
@@ -2134,6 +2137,7 @@ impl Gpu {
             module3d,
             module_baroclinic,
             module_viscosity,
+            module_hooks,
             name,
             sms,
         }))
