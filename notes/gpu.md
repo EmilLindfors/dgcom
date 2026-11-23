@@ -65,8 +65,9 @@ A cuda-oxide kernel calling `dgcom::flux::wintermeyer_flux_2d` and `entropy_stab
   - **4.0** The fully wet transport: the layer transports and Ω, the advection of u, v, T and S, the volume sources (done 2026-11-23, below; PR #262).
   - **4.1a** The wet/dry transport: subcell elements and thin columns (`LayerTransport::compute`'s subcell interfaces, `InterfaceValue::DonorBesideThin`, `fallback`), the pooled volume sources (done 2026-11-23, below).
   - **4.1b** Open faces with device forms for `TracerBoundaryCondition3D` and the nesting's `Exterior3D`; the rivers' layer and tracer sources; the turbulence's w-cells (done 2026-11-23, below). The transport is then complete but for what the mode splitter wraps around it (4.3: the thin columns' mask, `zero_thin_momentum`) and implicit vertical advection's split of Ω (4.4).
-  - **4.2** The momentum RHS: the pressure gradient (`SigmaPairs` over `ReferenceFields`, the reference's displacements), Coriolis, the horizontal and Smagorinsky viscosity, the reference's advection (`add_reference_advection`).
-  - **4.3** The stage hooks: the inventory and value conversions (`to_inventory`, `from_inventory` with `MergedCells`, the stash of thin columns and their velocities at rest, `Hydrostatic3D::zero_thin_momentum`), the EOS (`post_stage`, `end_density`), the tracer limiter.
+  - **4.2a** The reference at a stage's levels (`ReferenceFields::fill` with the profile and the linear EOS, `set_displacements`), the σ-pairs pressure gradient over it with Coriolis (`compute_momentum_rhs_3d`), the reference's advection (`add_reference_advection`) (done 2026-11-23, below).
+  - **4.2b** The horizontal and Smagorinsky viscosity of the shear (`apply_horizontal_viscosity_3d`: BR1 per layer; every case-runner 3D run has it, `shear_smagorinsky` 0.1 by default).
+  - **4.3** The stage hooks: the inventory and value conversions (`to_inventory`, `from_inventory` with `MergedCells`, the stash of thin columns and their velocities at rest, `Hydrostatic3D::zero_thin_momentum`), the EOS (`post_stage`, `end_density`), the tracer limiter; the nesting band's relaxation of the shear and the tracers (`NestingColumns::relax_shear`, `relax_tracers`: the parent's columns at the band's nodes uploaded per stage, as 4.1b's exterior values).
   - **4.4** The columns and the pass: the vertical implicit solves (a thread per column, tridiagonal), the GLS closure, implicit vertical advection; the barotropic pass on the 2D kernels with the `DU_avg2` sums and the slow forcing.
   - **4.5** The driver: `ModeSplitIntegrator` over a device state. Recommended: the mode splitter generic over a state trait, as `Simulation` is over `Integrable`, so the orchestration stays one source (against a second mode splitter in `gpu/`); decided once 4.1–4.4 show what a step asks of the state. Judge: the 3D gates and a 3D case through the case runner, CPU against GPU, bit for bit.
   - Particles (F.2) ride along once velocities live on the device.
@@ -249,6 +250,57 @@ Measured on the RTX 3090 with Nsight Systems' per-launch durations against each 
 - **The gate** (`transport3d`): every fixture now carries k and ψ, compared after the advection and after the sources (the beaches' subcell w-cells too); a new channel of 360 P2 elements × 20 stretched levels, jittered, open at both ends, a parent's u, v, T and S outside x = L (inflow and outflow along it), T fixed and S upwind at x = 0, three rivers (two in one element, three profiles): bit for bit. Mutants caught: T's open boundary extrapolated (393 of 64,800 T values), no river water in T (312), no parent's T (325), no parent's velocity (720 of 86,400 layer face fluxes); and those of 4.0–4.1a.
 - **Time** (FMA, RTX 4060 Laptop, 96,000 P2 elements × 20 levels, the turbulence advected too; two runs): wet 211–212 ms per stage against 343–346 on the laptop's 24 threads (1.6×), the beach 253–255 against 403–420 (1.6×). The w-points cost the GPU ≈ 60 ms a stage: `advect_vertical_w` 16 ms a field, the w-cells' horizontal pass ≈ 30 ms (21 levels, the transports averaged as read).
 
+## Phase 4.2a: the reference and the pressure gradient on the device (2026-11-23)
+
+- **What runs** (`gpu/src/baroclinic.rs`, a third cuda-oxide module `kernels_baroclinic`; `Baroclinic3D`):
+  - `reference_fields`, a thread per column: `ReferenceFields::fill` from the profile's samples with the linear EOS; a column whose η is the one it was last filled at is skipped, as the CPU skips an element.
+  - `displacements`, a thread per element.
+  - `column_pressures`, a thread per column: the anomaly's pressure about the reference, or about ρ₀ as the monotone Hermite cubic.
+  - `subcell_means`, a thread per subcell interface of the elements with a thin column: the column sums of the depth-mean force.
+  - `pressure_gradient`, a thread per element and level: the volume term over all 36 node pairs, the subcell interfaces' term, the faces, ×(−g/ρ₀), a balanced reference state's correction, Coriolis (f per node, tabled from `f_at`). It overwrites the velocity tendencies as `compute_momentum_rhs_3d` does.
+  - `reference_edges`, `reference_totals`, `reference_correction`: `add_reference_advection` of T and S, then the water no transport carried. On the CPU that comes after the reference's advection, so with a reference `Transport3D::advect` runs without its sources, and the correction kernel and `pooled_sources` add them.
+  - Device forms: the σ-pairs force (the constant-depth one is for diagnostics) and `LinearEOS` (the case runner's).
+- **One source.** dgcom's per-column and pointwise pieces became public functions that `baroclinic.rs` on the CPU now calls too:
+  - `reference_column` (with the profile's lookup `ReferenceProfileView::at`, its `ceil` and binary search compiled for the device), `element_displacement`, `taken_back_weight`, `column_pressure`;
+  - `sigma_pair_difference`, `pair_coefficients`, `reference_edge`.
+
+  The loops over an element's pairs, interfaces, faces and σ-surfaces are mirrored over `Statics3D`'s tables (now with `σ_ρ`). The CPU's bits are unchanged: 80 hashes of the reference fields, displacements, forces (σ-pairs with and without a reference, constant depth) and the reference advection, over linear, cubic and unevenly spaced profiles and both metric forms, before and after.
+- **Two shortcuts with the same bits.**
+  - The face jump is lifted into its own face node alone. The LIFT's other entries are zero (`Statics3D::upload` asserts it), and a sum that starts at +0 is never −0, so the CPU's ±0 terms change nothing.
+  - `reference_edges` takes the nodes' `1/m` once, not per pair.
+- **P2's `D_r`, `D_s` are not exactly zero off the GLL lines.** The Vandermonde construction leaves round-off of up to 4.4e-16 in 34 of the 36 off-line entries (the LIFT matrices are exact). Each of the 18 pairs of nodes on no common line has such an entry one way or the other. So the CPU's pressure gradient takes all 36 pairs, and `add_reference_advection`'s test for pairs apart (`dr == 0 && ds == 0`, both ways) removes none. The device mirrors both. A structural skip of those pairs failed the upload's check (parked below).
+- **The gates.**
+  - `dgcom-gpu momentum3d` (new, in `all`), nine fixtures from the transport gate's meshes:
+    - periodic parallelograms; periodic jittered and stretched; walled jittered with the conservative metric;
+    - walled without a reference, also with a balanced reference state;
+    - the two beaches with a reference (≈ 367 of 720 elements with a thin column), and one without;
+    - the open channel;
+    - f- and β-planes; profiles evenly spaced and linear, cubic on the beaches, unevenly spaced in the channel.
+
+    Every reference field, displacement and velocity tendency is **bit for bit** (`--no-fmad`). Mutants caught:
+    - no displacement term: 92,280–92,640 of 129,600 u values on the beaches, all elsewhere;
+    - no depth-mean force along the subcell interfaces: 26,020–28,800;
+    - an f-plane for the β-plane;
+    - no balanced reference state.
+  - `transport3d`: the reference is now a profile's, filled on the device and compared field by field, and T and S get its advection on both sides. Bit for bit on all seven fixtures. The new mutant "no advection of the reference" changes 92,540–92,640 of 129,600 T values on the beaches and all elsewhere. The 4.0–4.1b mutants are unchanged.
+  - The FMA build is within 1.7e-11 of the largest value for the momentum, 1e-13 for the transport.
+- **Time** (FMA, RTX 4060 Laptop, 96,000 P2 elements × 20 levels, a new η every evaluation so that the reference is refilled as at every stage, two runs):
+
+  | per stage | CPU, 24 threads | GPU | |
+  |---|---|---|---|
+  | reference at the levels, displacements | 53.6–54.3 ms | 21.2 ms | 2.5× |
+  | pressure gradient, Coriolis | 88.1–97.6 ms | 55.0–55.8 ms | 1.6–1.7× |
+  | the momentum terms | 142–152 ms | 76.2–77.0 ms | 1.9–2.0× |
+  | the transport, with the reference's advection (wet) | 383–400 ms | 284 ms | 1.3–1.4× |
+
+  Per kernel (Nsight Systems): `pressure_gradient` 43 ms, `column_pressures` 17, `reference_fields` 17, `displacements` 5; `reference_edges` 52 ms, `reference_correction` 4, `reference_totals` 2.
+  - The reference's advection costs the GPU ≈ 58 ms a stage, against ≈ 40–55 ms on the CPU. `reference_edges` is bound by FP64 divisions: one per edge, level and tracer in `reference_edge`, 36 pairs and 2 × 9 σ-surfaces (each computed by both of its levels' threads), ≈ 110 per element and level.
+  - SASS (sm_89, static):
+    - `pressure_gradient`: 255 registers, a 4.4 kB stack, 6.2 kB spilled (the nine pair ends and 36 pairs);
+    - `reference_edges`: 255 registers, 100 B spilled;
+    - `column_pressures`: a 2 kB stack, its four local columns;
+    - the rest: 54–64 registers, nothing spilled.
+
 ## One source for the physics (2026-11-15)
 
 - **Shared:** `wintermeyer_flux_2d` (the two-point flux of the volume and surface terms), `hll_flux_face_aligned` with `einfeldt_speeds_2d` and `rotate_from_normal`, the split form's `hydrostatic_hll` (now a free function, with `wall_ram_pressure`), `limited_slope` and `reconstruct_subcell`, all generic over `Lane`. `SWEState2D<T = f64>` and `SWENodeState2D<T = f64>` carry a lane type (`f64` unless written); the HLL and the reconstruction take the split form's `Side<T>` (depth, velocity, bed: what they read), the two-point flux `SWENodeState2D<T>` (it reads the momenta). The batch's copies are gone: its `Star`, `Flux`, `hydrostatic_hll`, `limited_slope`, `signed_min`, `reconstruct_subcell`, `reconstructed`, `max`, `min` and the two-point flux of `Nodes` (≈ 330 lines); it calls the shared functions on `Side<f64x8>` and `SWENodeState2D<f64x8>`.
@@ -277,3 +329,9 @@ Measured on the RTX 3090 with Nsight Systems' per-launch durations against each 
 - **P2.7** (3D) The horizontal advection of u, v, T and S in one launch: the pair flux `½(D_r {{J∇r}}·{{q}} + D_s …)` is the same for all four, and `advect_horizontal` computes it once per pair of fields (as the CPU's two calls do), ≈ 25 ms per pair and stage at 96,000 × 20 on the RTX 4060. The same bits; its 255 registers already spill 32 B, so four fields may need the faces in a second pass.
 - **P2.7** (3D) The node pairs' `{{J∇r}}`, `{{J∇s}}` are static, but each of an element's 20 threads (one per level) forms them again (4 additions per pair, 81 pairs, in `layer_divergence` and `advect_horizontal`): a table of the 45 distinct pairs per element (138 MB at 96,000 elements) or shared memory per element. The same bits.
 - **P2.7** (3D) `advect_vertical`'s scratch is three local arrays of `MAX_LEVELS` (64: a 1.5 kB stack per thread); u's and v's centred columns take 6.4 ms a field at 96,000 × 20, which is memory. Nsight Compute's local-memory traffic first, then a bound from the grid's levels (a const generic per level count) or the column in registers for a fixed count.
+- **P2.7** (3D, numerics) `DGOperators2D`'s `D_r`, `D_s` from the Vandermonde matrices carry round-off of up to 4.4e-16 at nodes on no common GLL line, at every one of P2's 18 such pairs (2026-11-23, above). Built as the tensor product of the 1D D (exact zeros there), half of the 36 pairs would drop out of every dense pair sum: the pressure gradient's volume term and the reference's advection (now all 36 pairs on the CPU and the GPU; `add_reference_advection`'s apart test, meant for this, removes none), and the 3D transport's split-form divergence and advection. On the GPU the pairs could then be chosen at compile time (`i % N1 == j % N1 || i / N1 == j / N1`; tried, and refused by the upload's check of D). It would halve those volume terms on both. It changes the bits of every run that reads `dr_row_major`, `ds_row_major` or `ops.dr`: a numerics change with the gates (summation by parts becomes exact to the 1D D's rounding) and a scored rerun.
+- **P2.7** (3D) `reference_edges` (52 ms a stage at 96,000 × 20 on the RTX 4060; the CPU's whole `add_reference_advection` ≈ 40–55 ms) is bound by divisions, ≈ 110 per element and level. Two cuts with the same bits:
+  - each σ-surface's edge is computed by both its levels' threads (18 of the ≈ 110): a thread per element for the columns' surfaces, the totals fused in;
+  - `reference_edge`'s share `θ = clamp(ΔC/ΔC̄, 0, 1)` needs no division where it clamps (1 where `|ΔC| ≥ |ΔC̄|` with the same sign, 0 where the signs differ; keep the zero's sign, `clamp(−0) = −0`). The CPU's vectorised `edges_over_levels` would gain too (selects). Count the clamped edges of a stratified run first.
+- **P2.7** (3D) `pressure_gradient` spills 6.2 kB per thread (255 registers: the nine pair ends at five values each, and 36 pairs' coefficients formed from the contravariant vectors). The coefficients are static: a table per element (36 pairs × 4 at P2, 110 MB at 96,000 elements), or the ends re-read per pair. Nsight Compute's stall reasons first. 43 ms of the momentum terms' 76 ms a stage on the RTX 4060.
+- **P2.7** (3D) The CPU's pressure gradient lifts each face jump into all nn nodes (`pressure_gradient_element`), though the GLL LIFT is zero but at the face node (`diffusion_2d` applies just that entry, and the GPU now does too, 2026-11-23): the same bits, the face loop's work over 9 at P2.

@@ -43,6 +43,6 @@ pub use swe_2d::{
 
 // 3D Tracer limiters
 pub use tracer_3d::{
-    TracerAveragePolicy3D, TracerBounds, TracerLimiter3DConfig, TracerLimiter3DStats,
-    TracerLimiterType3D, TracerReferenceProfile, apply_tracer_limiters_3d,
+    ReferenceProfileView, TracerAveragePolicy3D, TracerBounds, TracerLimiter3DConfig,
+    TracerLimiter3DStats, TracerLimiterType3D, TracerReferenceProfile, apply_tracer_limiters_3d,
 };

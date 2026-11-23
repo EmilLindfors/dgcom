@@ -1,12 +1,14 @@
 //! The 3D transport gate (P2.7 Phase 4, `notes/gpu.md`): the layer
 //! transports and Ω ([`Transport3D::compute`]), the advection of u and v
 //! (split form, centred in the vertical), of T and S (LimitedAkima within
-//! their ranges, about a reference stratification or not) and of the
-//! turbulence's k and ψ at the w-points, the water no transport carried and
-//! the rivers', on the GPU against dgcom on the CPU, in the order
+//! their ranges, about a reference stratification or not, and then the
+//! reference's own advection) and of the turbulence's k and ψ at the
+//! w-points, the water no transport carried and the rivers', on the GPU
+//! against dgcom on the CPU, in the order
 //! `Hydrostatic3D::compute_transport_rhs_into` takes them
-//! (`LayerTransport::compute`, `apply_momentum_transport_3d`,
-//! `apply_tracer_transport_3d`, `LayerTransport::add_volume_sources`,
+//! (`LayerTransport::compute`, `ReferenceFields::fill`,
+//! `apply_momentum_transport_3d`, `apply_tracer_transport_3d`,
+//! `add_reference_advection`, `LayerTransport::add_volume_sources`,
 //! `apply_w_point_transport_3d`, the rivers' `RiverInflow`), value for
 //! value:
 //!
@@ -16,39 +18,51 @@
 //! - a channel open at both ends, nested in a parent at one (its velocity,
 //!   T and S outside), with fixed and upwind tracer conditions at the other,
 //!   and rivers, two in one element (Phase 4.1b);
+//! - the reference stratification from a profile (evenly spaced and linear,
+//!   cubic, unevenly spaced) at the columns' levels, and its advection
+//!   (Phase 4.2);
 //!
 //! then timed at Chiloé's size (96,000 P2 elements × 20 levels).
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
 
 use cuda_core::DeviceBuffer;
 use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
-use dgcom::solver::Blocks;
+use dgcom::physics::{EquationOfState, LinearEOS};
 use dgcom::solver::rhs::subcells::{
     line_metric, line_node, subcell_interfaces, subcell_slot, telescoped_interfaces,
 };
 use dgcom::solver::rhs::{
     AdvectedTracer, BarotropicFlux, Boundaries3D, DeviceTracerBC3D, Exterior3D, ExteriorField,
     ExtrapolationTracerBC3D, FaceExterior, FixedTracerBC3D, LayerTransport, MetricForm,
-    MomentumAdvectionForm, TracerBoundaryCondition3D, UNBOUNDED, UpwindTracerBC3D,
-    VerticalAdvection, apply_momentum_transport_3d, apply_tracer_transport_3d,
-    apply_w_point_transport_3d, w_cell_thicknesses,
+    MomentumAdvectionForm, ReferenceFields, TracerBoundaryCondition3D, UNBOUNDED, UpwindTracerBC3D,
+    VerticalAdvection, add_reference_advection, apply_momentum_transport_3d,
+    apply_tracer_transport_3d, apply_w_point_transport_3d, w_cell_thicknesses,
 };
 use dgcom::solver::state::Solution3D;
-use dgcom::source::{River, RiverInflow, RiverProfile, RiverSeries, RiverSources};
+use dgcom::solver::{Blocks, TracerReferenceProfile};
+use dgcom::source::{
+    CoriolisSource2D, River, RiverInflow, RiverProfile, RiverSeries, RiverSources,
+};
 use dgcom::types::ElementIndex;
 use dgcom::vertical::{ROMSVstretching4, SigmaGrid};
 
+use crate::baroclinic::{Baroclinic3D, BaroclinicSetup};
 use crate::phase0::{DX, Lcg, quad_mesh, ulps};
 use crate::swe2d::{Gpu, N1, NN, ORDER};
 use crate::three_d::{
     Advected, BarotropicDevice, ExteriorDevice, Interface, RiversDevice, Statics3D, Transport3D,
 };
 
+/// Gravity and the Boussinesq density of the fixtures.
+pub(crate) const G: f64 = 9.81;
+pub(crate) const RHO0: f64 = 1025.0;
+
 /// σ-levels of the fixtures (Chiloé's 3D case has 20).
-const LEVELS: usize = 20;
+pub(crate) const LEVELS: usize = 20;
 /// The tracers' ranges, narrower than the water's in places so that the end
 /// layers' bound (`in_range`) acts.
 const T_RANGE: (f64, f64) = (5.5, 11.0);
@@ -63,27 +77,93 @@ const NAMES: [&str; 6] = ["T", "S", "u", "v", "k", "psi"];
 
 /// A fixture's shape.
 #[derive(Clone, Copy)]
-struct Shape {
-    nx: usize,
-    ny: usize,
+pub(crate) struct Shape {
+    pub(crate) nx: usize,
+    pub(crate) ny: usize,
     /// Interior vertices moved by up to this share of the element size
-    jitter: f64,
+    pub(crate) jitter: f64,
     /// Doubly periodic, else walled
-    periodic: bool,
+    pub(crate) periodic: bool,
     /// A walled beach with flats, films and dry columns (else a bed
     /// 12–28 m deep): subcell elements, thin columns, the pass's subcell
     /// fluxes in some, fallback and pooled elements
-    beach: bool,
+    pub(crate) beach: bool,
     /// A channel open at both ends (x = 0 and x = L), nested in a parent at
     /// x = L, with fixed and upwind tracer conditions at x = 0, and rivers
-    channel: bool,
+    pub(crate) channel: bool,
     /// ROMS's Vstretching 4 (θ_s 5, θ_b 0.4), else uniform levels
-    stretched: bool,
-    /// T and S advected about a reference stratification
-    reference: bool,
+    pub(crate) stretched: bool,
+    /// A reference stratification (T and S advected about it, and it by the
+    /// pressure gradient's adjoint): evenly spaced and linear between its
+    /// samples, cubic on the beaches, unevenly spaced in the channel
+    pub(crate) reference: bool,
     /// Every element's forward-Euler step (s): long enough, and end layers
     /// shed more than half their water in it (`in_range`'s share)
-    euler_dt: f64,
+    pub(crate) euler_dt: f64,
+}
+
+impl Shape {
+    /// The wet fixture of 480 elements the others vary.
+    pub(crate) const WET: Self = Self {
+        nx: 24,
+        ny: 20,
+        jitter: 0.0,
+        periodic: true,
+        beach: false,
+        channel: false,
+        stretched: false,
+        reference: false,
+        euler_dt: 0.05,
+    };
+    /// The walled beach of 720 elements.
+    pub(crate) const BEACH: Self = Self {
+        nx: 36,
+        ny: 20,
+        periodic: false,
+        beach: true,
+        reference: true,
+        ..Self::WET
+    };
+    /// The channel of 360 elements, open at both ends.
+    pub(crate) const CHANNEL: Self = Self {
+        nx: 30,
+        ny: 12,
+        jitter: 0.15,
+        periodic: false,
+        channel: true,
+        stretched: true,
+        reference: true,
+        euler_dt: 40.0,
+        ..Self::WET
+    };
+
+    /// The reference stratification of a fixture of this shape: a smooth
+    /// pycnocline about 3 m (beach) or 10 m deep (the fixtures' water's,
+    /// less its front and noise), sampled evenly and linear between the
+    /// samples (`from_fn`, as `from_mean` is), cubic (`from_smooth_fn`) on
+    /// the beaches, at uneven heights in the channel.
+    fn profile(self) -> Option<TracerReferenceProfile> {
+        if !self.reference {
+            return None;
+        }
+        let z0 = if self.beach { 3.0 } else { 10.0 };
+        let smooth = move |z: f64| {
+            let t = ((z + z0) / 3.0).tanh();
+            (8.0 + 3.0 * t, 33.0 - 1.5 * t)
+        };
+        Some(if self.beach {
+            TracerReferenceProfile::from_smooth_fn(-10.0, 3.0, 27, smooth)
+        } else if self.channel {
+            let heights = vec![
+                -33.0, -27.0, -22.0, -18.0, -15.0, -13.0, -11.5, -10.6, -10.0, -9.3, -8.5, -7.2,
+                -5.5, -3.0, -1.0, 0.6, 2.0,
+            ];
+            let (temp, salt) = heights.iter().map(|&z| smooth(z)).unzip();
+            TracerReferenceProfile::new(heights, temp, salt)
+        } else {
+            TracerReferenceProfile::from_fn(-33.0, 2.0, 71, smooth)
+        })
+    }
 }
 
 /// A nesting parent's values outside the open faces it covers.
@@ -115,20 +195,23 @@ struct Rivers {
 
 /// A mesh, its σ-levels, a stratified, sheared state on it and a
 /// barotropic pass that its layers do not sum to.
-struct Fixture {
-    mesh: Mesh2D,
-    ops: DGOperators2D,
-    geom: GeometricFactors2D,
-    bathymetry: Bathymetry2D,
-    sigma: SigmaGrid,
-    boundaries: Boundaries3D,
+pub(crate) struct Fixture {
+    pub(crate) mesh: Mesh2D,
+    pub(crate) ops: DGOperators2D,
+    pub(crate) geom: GeometricFactors2D,
+    pub(crate) bathymetry: Bathymetry2D,
+    pub(crate) sigma: SigmaGrid,
+    pub(crate) boundaries: Boundaries3D,
     /// Columns thinner than this exchange no baroclinic transport
-    min_column_depth: f64,
+    pub(crate) min_column_depth: f64,
     /// The thin columns at rest, as the mode splitter's stage values are;
-    /// k and ψ at the w-points
-    state: Solution3D,
-    /// The reference stratification of T and S at each column's levels
-    reference: Option<[Vec<f64>; 2]>,
+    /// k and ψ at the w-points; the density of the linear equation of state
+    pub(crate) state: Solution3D,
+    /// The reference stratification, if any
+    pub(crate) profile: Option<TracerReferenceProfile>,
+    /// It at the state's levels, with the elements' displacements (the CPU's
+    /// `ReferenceFields::fill`, `set_displacements`)
+    pub(crate) fields: Option<ReferenceFields>,
     bar_hu: Vec<f64>,
     bar_hv: Vec<f64>,
     bar_face: Vec<f64>,
@@ -149,7 +232,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(shape: Shape) -> Self {
+    pub(crate) fn new(shape: Shape) -> Self {
         let Shape {
             nx,
             ny,
@@ -158,7 +241,7 @@ impl Fixture {
             beach,
             channel,
             stretched,
-            reference,
+            reference: _,
             euler_dt,
         } = shape;
         let mut mesh = quad_mesh(nx, ny, jitter, periodic && !beach && !channel);
@@ -194,7 +277,6 @@ impl Fixture {
         let mut state = Solution3D::new(ne, NN, nl);
         state.tke = vec![0.0; ne * NN * nw];
         state.gls = vec![0.0; ne * NN * nw];
-        let mut references = [vec![0.0; ne * NN * nl], vec![0.0; ne * NN * nl]];
         let mut rng = Lcg(20_261_123);
         let mut bar_hu = vec![0.0; ne * NN];
         let mut bar_hv = vec![0.0; ne * NN];
@@ -247,9 +329,6 @@ impl Fixture {
                     let interface = ((z + z0 + front) / 1.5).tanh();
                     state.temp[at] = 8.0 + 3.0 * interface + 0.05 * (rng.next() - 0.5);
                     state.salt[at] = 33.0 - 1.5 * interface + 0.02 * (rng.next() - 0.5);
-                    let smooth = ((z + z0) / 3.0).tanh();
-                    references[0][at] = 8.0 + 3.0 * smooth;
-                    references[1][at] = 33.0 - 1.5 * smooth;
                     rhs_u0[at] = 1e-3 * (rng.next() - 0.5);
                     rhs_v0[at] = 1e-3 * (rng.next() - 0.5);
                 }
@@ -412,6 +491,25 @@ impl Fixture {
                 conc,
             });
         }
+        // The density, and the reference at the state's levels
+        let eos = LinearEOS::default();
+        eos.update_density(&mut state);
+        let profile = shape.profile();
+        let fields = profile.as_ref().map(|profile| {
+            let mut fields = ReferenceFields::default();
+            let all = Blocks::All(ne);
+            fields.fill(
+                profile,
+                |t, s| eos.compute_density(t, s, 0.0),
+                |t, s| eos.density_partials(t, s),
+                &state,
+                &bathymetry,
+                &sigma,
+                all,
+            );
+            fields.set_displacements(&state, &geom, &bathymetry, &sigma, min_column_depth, all);
+            fields
+        });
         Self {
             subcell,
             pooled,
@@ -424,7 +522,8 @@ impl Fixture {
             boundaries,
             min_column_depth,
             state,
-            reference: reference.then_some(references),
+            profile,
+            fields,
             bar_hu,
             bar_hv,
             bar_face,
@@ -469,8 +568,36 @@ impl Fixture {
         }
     }
 
-    fn n_elements(&self) -> usize {
+    pub(crate) fn n_elements(&self) -> usize {
         self.mesh.n_elements
+    }
+
+    /// The GPU's momentum terms of this fixture over `statics`, with
+    /// `coriolis`, the linear equation of state, the fixture's reference
+    /// (if any) and, if `balanced`, the CPU's balanced reference state.
+    pub(crate) fn baroclinic(
+        &self,
+        gpu: &Arc<Gpu>,
+        statics: &Statics3D,
+        coriolis: &CoriolisSource2D,
+        balanced: Option<&dgcom::solver::rhs::BalancedReference>,
+    ) -> Result<Baroclinic3D, Box<dyn std::error::Error>> {
+        Baroclinic3D::new(
+            gpu,
+            statics,
+            &self.mesh,
+            &self.ops,
+            &self.sigma,
+            BaroclinicSetup {
+                coriolis,
+                eos: LinearEOS::default(),
+                profile: self.profile.as_ref(),
+                balanced,
+                g: G,
+                rho0: RHO0,
+                min_column_depth: self.min_column_depth,
+            },
+        )
     }
 
     fn rhs(&self) -> [Vec<f64>; 6] {
@@ -486,6 +613,15 @@ impl Fixture {
     }
 
     fn statics(&self, gpu: &Gpu) -> Result<Statics3D, Box<dyn std::error::Error>> {
+        self.statics_in(gpu, MetricForm::Averaged)
+    }
+
+    /// The fixture's tables with the volume terms in `metric`'s form.
+    pub(crate) fn statics_in(
+        &self,
+        gpu: &Gpu,
+        metric: MetricForm,
+    ) -> Result<Statics3D, Box<dyn std::error::Error>> {
         Statics3D::upload(
             gpu,
             &self.mesh,
@@ -494,7 +630,7 @@ impl Fixture {
             &self.bathymetry,
             &self.sigma,
             &self.boundaries,
-            MetricForm::Averaged,
+            metric,
         )
     }
 }
@@ -550,7 +686,7 @@ fn cpu_advect(
         VerticalAdvection::Centred,
         Blocks::All(ne),
     );
-    let reference = |t: usize| fx.reference.as_ref().map(|r| &r[t][..]);
+    let reference = |t: usize| fx.fields.as_ref().map(|r| &r.tracers[t][..]);
     apply_tracer_transport_3d(
         [
             AdvectedTracer {
@@ -578,6 +714,22 @@ fn cpu_advect(
         VerticalAdvection::LimitedAkima,
         Blocks::All(ne),
     );
+    // The reference's own advection, as `compute_transport_rhs_3d` adds it
+    if let Some(fields) = &fx.fields {
+        add_reference_advection(
+            [rhs_t, rhs_s],
+            [&fx.state.temp, &fx.state.salt],
+            fields,
+            &fx.state,
+            layers,
+            &fx.ops,
+            &fx.geom,
+            &fx.sigma,
+            &fx.bathymetry,
+            fx.min_column_depth,
+            Blocks::All(ne),
+        );
+    }
     let bc = ExtrapolationTracerBC3D;
     apply_w_point_transport_3d(
         [
@@ -637,9 +789,13 @@ fn cpu(fx: &Fixture) -> Cpu {
 /// The fixture's fields on the device.
 struct Device {
     eta: DeviceBuffer<f64>,
+    /// The density, which the displacements read (kept while the device may)
+    _rho: DeviceBuffer<f64>,
     /// T, S, u, v, k, ψ
     fields: [DeviceBuffer<f64>; 6],
-    reference: Option<[DeviceBuffer<f64>; 2]>,
+    /// The reference at the state's levels, filled on the device, and its
+    /// advection
+    baroclinic: RefCell<Baroclinic3D>,
     barotropic: BarotropicDevice,
     /// The parent's u, v, T, S outside the open faces
     parent: Option<[ExteriorDevice; 4]>,
@@ -656,6 +812,8 @@ enum Mutant {
     None,
     /// T and S without their reference
     NoReference,
+    /// T and S about their reference, but without its own advection
+    NoReferenceAdvection,
     /// T and S at the central value beside thin columns, not the donor's
     CentralTracers,
     /// T's boundary condition the interior's value
@@ -695,8 +853,13 @@ impl Device {
             None => None,
         };
         let form = |bc: &dyn TracerBoundaryCondition3D| bc.device_form().expect("a device form");
+        let (eta, rho) = (up(&s.eta.data)?, up(&s.rho)?);
+        // The reference at the state's levels, filled on the device
+        let mut baroclinic = fx.baroclinic(gpu, &statics, &CoriolisSource2D::f_plane(0.0), None)?;
+        baroclinic.reference(&statics, &eta, &rho)?;
         let device = Self {
-            eta: up(&s.eta.data)?,
+            eta,
+            _rho: rho,
             fields: [
                 up(&s.temp)?,
                 up(&s.salt)?,
@@ -705,10 +868,7 @@ impl Device {
                 up(&s.tke)?,
                 up(&s.gls)?,
             ],
-            reference: match &fx.reference {
-                Some([t, s]) => Some([up(t)?, up(s)?]),
-                None => None,
-            },
+            baroclinic: RefCell::new(baroclinic),
             barotropic: BarotropicDevice {
                 hu: up(&fx.bar_hu)?,
                 hv: up(&fx.bar_hv)?,
@@ -779,44 +939,62 @@ impl Device {
             false,
             sources,
         )?;
-        let reference = |i: usize| {
-            self.reference
-                .as_ref()
-                .filter(|_| mutant != Mutant::NoReference)
-                .map(|r| &r[i])
-        };
         let t_bc = if mutant == Mutant::ExtrapolatedT {
             DeviceTracerBC3D::Extrapolation
         } else {
             self.bcs[0]
         };
-        transport.advect(
-            [
-                &Advected {
-                    field: t,
-                    reference: reference(0),
-                    range: T_RANGE,
-                    exterior: parent(2).filter(|_| mutant != Mutant::NoParentT),
-                    bc: t_bc,
+        // About the reference (then its advection adds the sources after
+        // its own), or without one
+        let referenced = mutant != Mutant::NoReference && self.baroclinic.borrow().fields.is_some();
+        {
+            let baroclinic = self.baroclinic.borrow();
+            let reference = |i: usize| {
+                baroclinic
+                    .fields
+                    .as_ref()
+                    .filter(|_| referenced)
+                    .map(|f| &f.tracers[i])
+            };
+            transport.advect(
+                [
+                    &Advected {
+                        field: t,
+                        reference: reference(0),
+                        range: T_RANGE,
+                        exterior: parent(2).filter(|_| mutant != Mutant::NoParentT),
+                        bc: t_bc,
+                    },
+                    &Advected {
+                        field: s,
+                        reference: reference(1),
+                        range: S_RANGE,
+                        exterior: parent(3),
+                        bc: self.bcs[1],
+                    },
+                ],
+                [&mut *rhs_t, &mut *rhs_s],
+                VerticalAdvection::LimitedAkima,
+                if mutant == Mutant::CentralTracers {
+                    Interface::Central
+                } else {
+                    Interface::DonorBesideThin
                 },
-                &Advected {
-                    field: s,
-                    reference: reference(1),
-                    range: S_RANGE,
-                    exterior: parent(3),
-                    bc: self.bcs[1],
-                },
-            ],
-            [&mut *rhs_t, &mut *rhs_s],
-            VerticalAdvection::LimitedAkima,
-            if mutant == Mutant::CentralTracers {
-                Interface::Central
-            } else {
-                Interface::DonorBesideThin
-            },
-            true,
-            sources,
-        )?;
+                true,
+                sources && !referenced,
+            )?;
+        }
+        if referenced && mutant != Mutant::NoReferenceAdvection {
+            self.baroclinic.borrow_mut().advect_reference(
+                transport,
+                &self.eta,
+                t,
+                s,
+                &mut *rhs_t,
+                &mut *rhs_s,
+                sources,
+            )?;
+        }
         transport.advect_w(
             [k, psi],
             [rhs_k, rhs_psi],
@@ -835,15 +1013,15 @@ impl Device {
 
 /// Agreement of one field: its values identical to the bit, the largest
 /// difference in ulp and relative to the field's largest magnitude.
-struct Agreement {
-    identical: usize,
-    len: usize,
+pub(crate) struct Agreement {
+    pub(crate) identical: usize,
+    pub(crate) len: usize,
     worst_ulps: u64,
     worst_rel: f64,
     first_difference: Option<usize>,
 }
 
-fn agreement(cpu: &[f64], gpu: &[f64]) -> Agreement {
+pub(crate) fn agreement(cpu: &[f64], gpu: &[f64]) -> Agreement {
     assert_eq!(cpu.len(), gpu.len(), "the field's length");
     let scale = cpu.iter().fold(0.0f64, |m, x| m.max(x.abs()));
     let mut a = Agreement {
@@ -869,7 +1047,7 @@ fn agreement(cpu: &[f64], gpu: &[f64]) -> Agreement {
 
 /// Compare `gpu` (downloaded) with `cpu`, print the line, and whether they
 /// are the same to the bit.
-fn report(
+pub(crate) fn report(
     gpu: &Gpu,
     name: &str,
     cpu: &[f64],
@@ -887,6 +1065,46 @@ fn report(
              field's largest; first at {at}: CPU {:e}, GPU {:e}",
             a.identical, a.len, a.worst_ulps, a.worst_rel, cpu[at], values[at]
         );
+    }
+    Ok(same)
+}
+
+/// The device's reference fields (`baroclinic`'s) against the CPU's
+/// `fields`, with the elements' displacements if `displacements`. Whether
+/// all are the same to the bit.
+pub(crate) fn report_reference(
+    gpu: &Gpu,
+    fields: &ReferenceFields,
+    baroclinic: &Baroclinic3D,
+    displacements: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let device = baroclinic
+        .fields
+        .as_ref()
+        .expect("a reference on the device");
+    let mut same = true;
+    for (name, cpu, gpu_values) in [
+        ("reference T", &fields.tracers[0], &device.tracers[0]),
+        ("reference S", &fields.tracers[1], &device.tracers[1]),
+        ("gradient T", &fields.gradients[0], &device.gradients[0]),
+        ("gradient S", &fields.gradients[1], &device.gradients[1]),
+        ("reference rho", &fields.density, &device.density),
+        (
+            "stratification",
+            &fields.stratification,
+            &device.stratification,
+        ),
+        ("residual", &fields.residual, &device.residual),
+    ] {
+        same &= report(gpu, name, cpu, gpu_values)?;
+    }
+    if displacements {
+        same &= report(
+            gpu,
+            "displacement",
+            &fields.displacement,
+            &device.displacement,
+        )?;
     }
     Ok(same)
 }
@@ -994,6 +1212,10 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
     device.layers(&mut transport)?;
     let layers = &cpu.layers;
     let mut same = report_kinds(gpu, &fx, layers, &transport)?;
+    // The reference at the levels, filled on the device
+    if let Some(fields) = &fx.fields {
+        same &= report_reference(gpu, fields, &device.baroclinic.borrow(), false)?;
+    }
     if !shape.beach {
         let any = layers.subcell_elements.iter().any(|&s| s);
         same &= !any;
@@ -1047,6 +1269,11 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
             shape.reference,
             Mutant::NoReference,
             "no reference on the device",
+        ),
+        (
+            shape.reference,
+            Mutant::NoReferenceAdvection,
+            "no advection of the reference",
         ),
         (
             shape.beach,

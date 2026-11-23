@@ -68,9 +68,9 @@ use crate::swe2d::{Gpu, N1, NN, ORDER, face_node};
 pub const MAX_LEVELS: usize = 64;
 
 /// The other side of a face node (`Statics3D::across`) at a wall ...
-const WALL: u32 = u32::MAX;
+pub(crate) const WALL: u32 = u32::MAX;
 /// ... and at an open face.
-const OPEN: u32 = u32::MAX - 1;
+pub(crate) const OPEN: u32 = u32::MAX - 1;
 /// No slot (an exterior field's at a face node without its values).
 const NONE: u32 = u32::MAX;
 
@@ -82,12 +82,12 @@ pub const NSUB: usize = 2 * N1 * (N1 - 1);
 
 /// An element's kind (`Transport3D::kinds`): its layers move through the
 /// subcell interfaces (`LayerTransport::subcell_elements`) ...
-const SUBCELL: u32 = 1;
+pub(crate) const SUBCELL: u32 = 1;
 /// ... without the pass's interface fluxes (`LayerTransport::fallback`) ...
 const FALLBACK: u32 = 2;
 /// ... and its volume sources move water between its nodes (fallback, or
 /// balanced only as a whole by the pass: `BarotropicFlux::pooled`).
-const POOLING: u32 = 4;
+pub(crate) const POOLING: u32 = 4;
 
 /// A vertical scheme as the column kernel takes it (a kernel parameter is a
 /// number).
@@ -1174,7 +1174,7 @@ pub mod kernels3d {
 // =============================================================================
 
 /// A launch over `n` threads in blocks of `block`.
-fn launch(n: usize, block: u32) -> LaunchConfig {
+pub(crate) fn launch(n: usize, block: u32) -> LaunchConfig {
     let n = n as u32;
     LaunchConfig {
         grid_dim: (n.div_ceil(block).max(1), 1, 1),
@@ -1184,43 +1184,45 @@ fn launch(n: usize, block: u32) -> LaunchConfig {
 }
 
 /// Threads per block of the column kernels.
-const COLUMN_BLOCK: u32 = 128;
+pub(crate) const COLUMN_BLOCK: u32 = 128;
 /// Threads per block of the element-and-level kernels.
-const LEVEL_BLOCK: u32 = 128;
+pub(crate) const LEVEL_BLOCK: u32 = 128;
 
 /// What the 3D transport kernels read of a mesh and its σ-levels, packed as
 /// they read it, on the device; every value from the CPU's own functions.
 pub struct Statics3D {
     pub n_elements: usize,
     pub n_levels: usize,
-    bed: DeviceBuffer<f64>,
+    pub(crate) bed: DeviceBuffer<f64>,
     /// Whether element `k`'s volume terms take the averaged metric
     /// (`MetricForm::Averaged` on an element that is not a parallelogram)
-    averaged: DeviceBuffer<u32>,
+    pub(crate) averaged: DeviceBuffer<u32>,
     /// `J∇r`, `J∇s` of every node (`GeometricFactors2D::contravariant`)
-    contra: DeviceBuffer<[f64; 4]>,
-    jinv: DeviceBuffer<f64>,
+    pub(crate) contra: DeviceBuffer<[f64; 4]>,
+    pub(crate) jinv: DeviceBuffer<f64>,
     /// Nodal masses (GLL weight × J, `GeometricFactors2D::node_mass`)
-    mass: DeviceBuffer<f64>,
+    pub(crate) mass: DeviceBuffer<f64>,
     /// Per face node (`(k·4 + face)·N1 + fi`): the outward normal and the
     /// lift's scale (`GeometricFactors2D::lift_scale`)
-    fnode: DeviceBuffer<[f64; 3]>,
+    pub(crate) fnode: DeviceBuffer<[f64; 3]>,
     /// Per face node: the flat node on the other side, [`WALL`] at a wall,
     /// [`OPEN`] at an open face
-    across: DeviceBuffer<u32>,
-    dr: DeviceBuffer<f64>,
-    ds: DeviceBuffer<f64>,
-    lift: DeviceBuffer<f64>,
+    pub(crate) across: DeviceBuffer<u32>,
+    pub(crate) dr: DeviceBuffer<f64>,
+    pub(crate) ds: DeviceBuffer<f64>,
+    pub(crate) lift: DeviceBuffer<f64>,
     /// The GLL weights on [−1, 1]
-    w: DeviceBuffer<f64>,
+    pub(crate) w: DeviceBuffer<f64>,
     /// Per subcell interface (`k·NSUB + slot`): its contravariant direction
     /// (`telescoped_interfaces` of the line's `line_metric`)
-    sub_metric: DeviceBuffer<[f64; 2]>,
+    pub(crate) sub_metric: DeviceBuffer<[f64; 2]>,
     /// Per GLL line (`(k·2 + dir)·N1 + line`): `line_metric` at its first
     /// and last node
     line_ends: DeviceBuffer<[f64; 2]>,
-    d_sigma: DeviceBuffer<f64>,
-    sigma_w: DeviceBuffer<f64>,
+    pub(crate) d_sigma: DeviceBuffer<f64>,
+    pub(crate) sigma_w: DeviceBuffer<f64>,
+    /// The layer centres' σ
+    pub(crate) sigma_rho: DeviceBuffer<f64>,
     /// The w-cells' σ-thicknesses (`w_cell_thicknesses`)
     d_sigma_w: DeviceBuffer<f64>,
     /// Each face node's open boundary tag (`None` but at open faces), for
@@ -1260,6 +1262,16 @@ impl Statics3D {
         for (face, nodes) in ops.face_nodes.iter().enumerate() {
             for (fi, &node) in nodes.iter().enumerate() {
                 assert_eq!(face_node(face, fi), node, "face node {fi} of face {face}");
+                // The momentum kernels lift a face node's jump into that
+                // node alone
+                for i in 0..NN {
+                    let entry = ops.lift_row_major[face][i * N1 + fi];
+                    assert_eq!(
+                        entry == 0.0,
+                        i != node,
+                        "LIFT of face {face} at ({i}, {fi})"
+                    );
+                }
             }
         }
         let mut averaged = Vec::with_capacity(n_el);
@@ -1345,12 +1357,13 @@ impl Statics3D {
             line_ends: DeviceBuffer::from_host(stream, &line_ends)?,
             d_sigma: DeviceBuffer::from_host(stream, sigma.d_sigma())?,
             sigma_w: DeviceBuffer::from_host(stream, sigma.sigma_w())?,
+            sigma_rho: DeviceBuffer::from_host(stream, sigma.sigma_rho())?,
             d_sigma_w: DeviceBuffer::from_host(stream, &d_sigma_w)?,
             open_tags,
         })
     }
 
-    fn n_columns(&self) -> usize {
+    pub(crate) fn n_columns(&self) -> usize {
         self.n_elements * NN
     }
 }
@@ -1568,6 +1581,11 @@ impl Transport3D {
             none_u32: DeviceBuffer::zeroed(stream, 0)?,
             statics,
         })
+    }
+
+    /// The mesh's and the levels' tables.
+    pub fn statics(&self) -> &Statics3D {
+        &self.statics
     }
 
     /// The rivers' tables, or empty buffers for none.
@@ -1949,7 +1967,7 @@ impl Transport3D {
 
     /// `pooled_sources` of `field` into `rhs`, over the layers or the
     /// w-cells.
-    fn pooled_sources(
+    pub(crate) fn pooled_sources(
         &self,
         rhs: &mut DeviceBuffer<f64>,
         field: &DeviceBuffer<f64>,
