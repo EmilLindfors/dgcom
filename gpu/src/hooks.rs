@@ -16,7 +16,11 @@
 //!   `restore_into`), their momentum tendencies zeroed
 //!   (`zero_thin_momentum`);
 //! - the density of the linear equation of state (`update_density_on`:
-//!   `post_stage` without a limiter, `end_density`).
+//!   `post_stage` without a limiter, `end_density`);
+//! - the nesting band's relaxation of the shear and the tracers to the
+//!   parent's columns (`NestingColumns::relax_shear`, `relax_tracers`,
+//!   Phase 4.3c): the band's slots static ([`Band3D`]), the parent's columns
+//!   at them evaluated on the host and uploaded as they change.
 //!
 //! Each kernel follows its CPU loop operation for operation and calls
 //! dgcom's own pointwise functions (`layer_volume_of`, `layer_thickness_of`,
@@ -37,11 +41,13 @@ use std::sync::Arc;
 use cuda_core::DeviceBuffer;
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
+use dgcom::boundary::{NestingSlots, Supplied};
 use dgcom::physics::{EquationOfState, LinearEOS};
 use dgcom::solver::rhs::MergedTables;
 use dgcom::solver::rhs::merged_cells::dry_volume_of;
 use dgcom::solver::rhs::transport_3d::{DRY_DEPTH, layer_thickness_of, layer_volume_of};
 use dgcom::solver::state::Solution3D;
+use dgcom::vertical::depth_average;
 
 use crate::swe2d::{Gpu, NN};
 use crate::three_d::{LEVEL_BLOCK, Statics3D, launch};
@@ -543,6 +549,100 @@ pub mod kernels_hooks {
             }
         }
     }
+
+    /// `NestingColumns::relax_shear`, one thread per band slot: the shear of
+    /// `(u, v)` relaxed to the parent's (`parent_u`, `parent_v`,
+    /// `[slot][level]`) at the slot's `rate`, `rate (p_l − x_l − (⟨p⟩ −
+    /// ⟨x⟩))` with dgcom's `depth_average`, added to `rhs_u`, `rhs_v`; not
+    /// where the rate is zero, nor in a column shallower than `thin_depth`.
+    #[kernel]
+    pub fn relax_shear(
+        nl: u32,
+        n_slots: u32,
+        thin_depth: f64,
+        nodes: &[u32],
+        rate: &[f64],
+        eta: &[f64],
+        bed: &[f64],
+        d_sigma: &[f64],
+        parent_u: &[f64],
+        parent_v: &[f64],
+        u: &[f64],
+        v: &[f64],
+        mut rhs_u: DisjointSlice<f64>,
+        mut rhs_v: DisjointSlice<f64>,
+    ) {
+        let slot = thread::index_1d().get();
+        if slot >= n_slots as usize {
+            return;
+        }
+        let (r, flat) = (rate[slot], nodes[slot] as usize);
+        if r == 0.0 || eta[flat] - bed[flat] < thin_depth {
+            return;
+        }
+        let nl = nl as usize;
+        let (parent, column) = (slot * nl..(slot + 1) * nl, flat * nl..(flat + 1) * nl);
+        let ds = &d_sigma[..nl];
+        let offset_u =
+            depth_average(&parent_u[parent.clone()], ds) - depth_average(&u[column.clone()], ds);
+        let offset_v = depth_average(&parent_v[parent], ds) - depth_average(&v[column], ds);
+        // SAFETY: thread slot alone touches column flat (a node has one
+        // slot).
+        unsafe {
+            for l in 0..nl {
+                let (p, x) = (slot * nl + l, flat * nl + l);
+                *rhs_u.get_unchecked_mut(x) += r * (parent_u[p] - u[x] - offset_u);
+            }
+            for l in 0..nl {
+                let (p, x) = (slot * nl + l, flat * nl + l);
+                *rhs_v.get_unchecked_mut(x) += r * (parent_v[p] - v[x] - offset_v);
+            }
+        }
+    }
+
+    /// `NestingColumns::relax_tracers`, one thread per band slot: T and S
+    /// relaxed to the parent's at the slot's `rate` as inventories,
+    /// `D Δσ_l rate (C_p − C)`, added to `rhs_t`, `rhs_s`; not where the rate
+    /// is zero, nor in a column shallower than `thin_depth`.
+    #[kernel]
+    pub fn relax_tracers(
+        nl: u32,
+        n_slots: u32,
+        thin_depth: f64,
+        nodes: &[u32],
+        rate: &[f64],
+        eta: &[f64],
+        bed: &[f64],
+        d_sigma: &[f64],
+        parent_t: &[f64],
+        parent_s: &[f64],
+        temp: &[f64],
+        salt: &[f64],
+        mut rhs_t: DisjointSlice<f64>,
+        mut rhs_s: DisjointSlice<f64>,
+    ) {
+        let slot = thread::index_1d().get();
+        if slot >= n_slots as usize {
+            return;
+        }
+        let (r, flat) = (rate[slot], nodes[slot] as usize);
+        let depth = eta[flat] - bed[flat];
+        if r == 0.0 || depth < thin_depth {
+            return;
+        }
+        let nl = nl as usize;
+        // SAFETY: as `relax_shear`.
+        unsafe {
+            for l in 0..nl {
+                let (p, x) = (slot * nl + l, flat * nl + l);
+                *rhs_t.get_unchecked_mut(x) += depth * d_sigma[l] * r * (parent_t[p] - temp[x]);
+            }
+            for l in 0..nl {
+                let (p, x) = (slot * nl + l, flat * nl + l);
+                *rhs_s.get_unchecked_mut(x) += depth * d_sigma[l] * r * (parent_s[p] - salt[x]);
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -877,6 +977,59 @@ fn flushed_waves(
         offsets[w + 1] += offsets[w];
     }
     (order, offsets)
+}
+
+/// A nesting band on the device (dgcom's `Nesting3D`, from its
+/// [`slots`](dgcom::boundary::Nesting3D::slots)): each slot's node and
+/// relaxation rates (static), and the parent's columns at them
+/// (`NestingColumns::values`, uploaded as they change: [`Self::set_columns`]).
+pub struct Band3D {
+    n_slots: usize,
+    supplied: Supplied,
+    nodes: DeviceBuffer<u32>,
+    velocity_rate: DeviceBuffer<f64>,
+    tracer_rate: DeviceBuffer<f64>,
+    /// The parent's u, v, T, S at every slot, `[slot][level]`
+    pub values: [DeviceBuffer<f64>; 4],
+}
+
+impl Band3D {
+    /// The band of `slots` on `statics`' levels.
+    pub fn new(
+        gpu: &Gpu,
+        statics: &Statics3D,
+        slots: NestingSlots,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let st = &gpu.stream;
+        let nodes: Vec<u32> = slots.nodes.iter().map(|&n| n as u32).collect();
+        let n = nodes.len() * statics.n_levels;
+        Ok(Self {
+            n_slots: nodes.len(),
+            supplied: slots.supplied,
+            nodes: DeviceBuffer::from_host(st, &nodes)?,
+            velocity_rate: DeviceBuffer::from_host(st, slots.velocity_rate)?,
+            tracer_rate: DeviceBuffer::from_host(st, slots.tracer_rate)?,
+            values: [
+                DeviceBuffer::zeroed(st, n)?,
+                DeviceBuffer::zeroed(st, n)?,
+                DeviceBuffer::zeroed(st, n)?,
+                DeviceBuffer::zeroed(st, n)?,
+            ],
+        })
+    }
+
+    /// The parent's columns at the slots (`NestingColumns::values`: u, v,
+    /// T, S).
+    pub fn set_columns(
+        &mut self,
+        gpu: &Gpu,
+        values: [&[f64]; 4],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (to, from) in self.values.iter_mut().zip(values) {
+            to.copy_from_host(&gpu.stream, from)?;
+        }
+        Ok(())
+    }
 }
 
 /// The mode splitter's stage values and `Hydrostatic3D`'s hooks there on the
@@ -1413,6 +1566,89 @@ impl StageHooks3D {
                 &s.bed,
                 rhs_u,
                 rhs_v,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The nesting band's relaxation of the shear of `(u, v)` under `eta`
+    /// to the parent's columns of `band`, added to the velocity tendencies
+    /// `rhs_u`, `rhs_v` (`NestingColumns::relax_shear`, the thin columns
+    /// skipped); nothing if the parent supplies no velocity.
+    pub fn relax_shear(
+        &self,
+        s: &Statics3D,
+        band: &Band3D,
+        eta: &DeviceBuffer<f64>,
+        u: &DeviceBuffer<f64>,
+        v: &DeviceBuffer<f64>,
+        rhs_u: &mut DeviceBuffer<f64>,
+        rhs_v: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !band.supplied.velocity || band.n_slots == 0 {
+            return Ok(());
+        }
+        // SAFETY: the buffers are sized for this mesh and these levels, the
+        // band's for its slots.
+        unsafe {
+            self.gpu.module_hooks.relax_shear(
+                &self.gpu.stream,
+                launch(band.n_slots, LEVEL_BLOCK),
+                s.n_levels as u32,
+                band.n_slots as u32,
+                self.min_column_depth,
+                &band.nodes,
+                &band.velocity_rate,
+                eta,
+                &s.bed,
+                &s.d_sigma,
+                &band.values[0],
+                &band.values[1],
+                u,
+                v,
+                rhs_u,
+                rhs_v,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The nesting band's relaxation of T and S under `eta` to the parent's
+    /// columns of `band`, added to their inventory tendencies `rhs_t`,
+    /// `rhs_s` (`NestingColumns::relax_tracers`, the thin columns skipped);
+    /// nothing if the parent supplies no tracers.
+    pub fn relax_tracers(
+        &self,
+        s: &Statics3D,
+        band: &Band3D,
+        eta: &DeviceBuffer<f64>,
+        temp: &DeviceBuffer<f64>,
+        salt: &DeviceBuffer<f64>,
+        rhs_t: &mut DeviceBuffer<f64>,
+        rhs_s: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !band.supplied.tracers || band.n_slots == 0 {
+            return Ok(());
+        }
+        // SAFETY: as `relax_shear`.
+        unsafe {
+            self.gpu.module_hooks.relax_tracers(
+                &self.gpu.stream,
+                launch(band.n_slots, LEVEL_BLOCK),
+                s.n_levels as u32,
+                band.n_slots as u32,
+                self.min_column_depth,
+                &band.nodes,
+                &band.tracer_rate,
+                eta,
+                &s.bed,
+                &s.d_sigma,
+                &band.values[2],
+                &band.values[3],
+                temp,
+                salt,
+                rhs_t,
+                rhs_s,
             )?;
         }
         Ok(())

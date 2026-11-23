@@ -27,7 +27,8 @@
 //!   the levels, the baroclinic pressure gradient, Coriolis and the shear's
 //!   viscosity (`momentum3d`); the stage values the mode splitter makes of
 //!   a stage's inventories, with the merged cells, the thin columns' mask
-//!   and the density (`stage3d`); value for value.
+//!   and the density, and the nesting band's relaxation (`stage3d`); value
+//!   for value.
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
 //! must be the CPU's bit for bit; that is the gate.
