@@ -208,6 +208,45 @@ pub struct TracerReferenceProfile {
     inverse_widths: Vec<f64>,
 }
 
+/// A [`TracerReferenceProfile`]'s samples as slices
+/// ([`TracerReferenceProfile::view`]): what a kernel holding them in its own
+/// buffers (the GPU's) looks the profile up with, [`Self::at`] being the
+/// profile's own lookup.
+#[derive(Clone, Copy, Debug)]
+pub struct ReferenceProfileView<'a> {
+    /// The sample heights (m, increasing)
+    pub heights: &'a [f64],
+    pub temp: &'a [f64],
+    pub salt: &'a [f64],
+    /// `[dT/dz, dS/dz]` at the samples if the profile is cubic between them
+    pub slopes: Option<[&'a [f64]; 2]>,
+    /// `1/Δz` if the heights are evenly spaced (to round-off)
+    pub inverse_spacing: Option<f64>,
+    /// `1/(z_{j+1} − z_j)` of every interval between samples
+    pub inverse_widths: &'a [f64],
+}
+
+impl ReferenceProfileView<'_> {
+    /// Temperature and salinity at height `z` (one search for both): linear,
+    /// or cubic Hermite, between the samples, constant beyond them.
+    #[inline]
+    pub fn at(&self, z: f64) -> (f64, f64) {
+        let samples = |values, j: usize| ProfileSamples {
+            heights: self.heights,
+            values,
+            slopes: self.slopes.map(|slopes| slopes[j]),
+            inverse_spacing: self.inverse_spacing,
+            inverse_widths: self.inverse_widths,
+        };
+        let temp = samples(self.temp, 0);
+        let bracket = temp.bracket(z);
+        (
+            temp.at_bracket(bracket),
+            samples(self.salt, 1).at_bracket(bracket),
+        )
+    }
+}
+
 /// One tracer of a [`TracerReferenceProfile`]: its samples, and their slopes
 /// if it is cubic.
 #[derive(Clone, Copy)]
@@ -438,13 +477,19 @@ impl TracerReferenceProfile {
     /// Temperature and salinity at height `z` (one search for both).
     #[inline]
     pub fn at(&self, z: f64) -> (f64, f64) {
-        let temp = self.component(TracerComponent::Temperature);
-        let bracket = temp.bracket(z);
-        (
-            temp.at_bracket(bracket),
-            self.component(TracerComponent::Salinity)
-                .at_bracket(bracket),
-        )
+        self.view().at(z)
+    }
+
+    /// The profile's samples as slices ([`ReferenceProfileView`]).
+    pub fn view(&self) -> ReferenceProfileView<'_> {
+        ReferenceProfileView {
+            heights: &self.heights,
+            temp: &self.temp,
+            salt: &self.salt,
+            slopes: self.slopes.as_ref().map(|[t, s]| [&t[..], &s[..]]),
+            inverse_spacing: self.inverse_spacing,
+            inverse_widths: &self.inverse_widths,
+        }
     }
 
     /// The temperature at height `z`.

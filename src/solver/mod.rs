@@ -109,6 +109,7 @@ pub use limiters::{
     LimiterContext2D,
     NoLimiter2D,
     PositivityLimiter2D,
+    ReferenceProfileView,
     StandardLimiter2D,
     // 1D limiters
     TVBParameter,

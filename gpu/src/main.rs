@@ -7,7 +7,7 @@
 //! cargo oxide run --no-fmad --features simd   # ... against the SIMD batch
 //! cargo oxide run --features simd             # multiply–adds fused: the timing
 //! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, beach,
-//!                                             # transport3d; all by default)
+//!                                             # transport3d, momentum3d; all by default)
 //! target\release\dgcom-gpu.exe case <case.toml> [--set key.path=value]...
 //!                                             # a case on the CPU and the GPU, compared
 //! target\release\dgcom-gpu.exe run <case.toml> [--set ...]
@@ -22,7 +22,9 @@
 //! - **Phase 2:** a run nested in a parent model, its boundary and
 //!   relaxation band, with global steps and local time stepping (`nest`).
 //! - **Phase 4:** the 3D stages' layer transports, Ω and the advection of
-//!   u, v, T and S, value for value (`transport3d`).
+//!   u, v, T and S with the reference's (`transport3d`); the reference at
+//!   the levels, the baroclinic pressure gradient and Coriolis
+//!   (`momentum3d`); value for value.
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
 //! must be the CPU's bit for bit; that is the gate.
@@ -30,7 +32,9 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod baroclinic;
 mod case;
+mod momentum3d;
 mod nest;
 mod phase0;
 mod phase1;
@@ -86,6 +90,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if which == "all" || which == "transport3d" {
         transport3d::run(&gpu)?;
+    }
+    if which == "all" || which == "momentum3d" {
+        momentum3d::run(&gpu)?;
     }
     Ok(())
 }
