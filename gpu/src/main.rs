@@ -34,9 +34,10 @@
 //!   and the surface fluxes, and `dgcom::math` itself (`vertical3d`); the
 //!   implicit vertical advection, the split of Ω and the relaxation
 //!   (`implicit3d`); the slow forcing `G` of the barotropic pass
-//!   (`forcing3d`); the barotropic pass on global substeps with its
-//!   `DU_avg2`, filter, rivers and the 2D module's volume sources, and the
-//!   step's rates and balance (`pass3d`); value for value.
+//!   (`forcing3d`); the barotropic pass on global substeps and on local
+//!   time steps with its `DU_avg2`, filter, rivers and the 2D module's
+//!   volume sources, and the step's rates and balance (`pass3d`); value for
+//!   value.
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
 //! must be the CPU's bit for bit; that is the gate.

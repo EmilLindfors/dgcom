@@ -1228,6 +1228,12 @@ impl<S: Integrable> MultirateStepper<S> {
         &self.rate[stage]
     }
 
+    /// [`Self::rates`] of every stage, as [`Self::step`] gives them to
+    /// [`LocalTimeStepping::begin_coarse_step`].
+    pub fn stage_rates(&self) -> &[Vec<u8>] {
+        &self.rate
+    }
+
     /// The passes of one coarse step of `dt` from time `t`, with the levels
     /// of the last [`Self::assign_levels`], in order, to `pass`: for every
     /// finest substep, each stage of the elements whose RHS changes there,

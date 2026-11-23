@@ -116,7 +116,8 @@ use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{DGSolution2D, SWESolution2D};
 use crate::source::{RiverInflow, RiverSources};
 use crate::time::multirate::{
-    ElementStage, Multirate, MultiratePass, MultirateStats, MultirateStepper, RhsStencil, StagePlan,
+    ElementStage, LocalTimeStepping, Multirate, MultiratePass, MultirateStats, MultirateStepper,
+    RhsStencil, StagePlan,
 };
 use crate::time::{IntegratorInfo, SSPRK3, SspScheme};
 use crate::types::ElementIndex;
@@ -1040,9 +1041,10 @@ impl BarotropicFilter {
 }
 
 /// The barotropic pass on local time steps
-/// ([`ModeSplitIntegrator::with_barotropic_levels`]): the levels and the
-/// stage buffers of [`MultirateStepper::schedule`].
-struct BarotropicMultirate {
+/// ([`ModeSplitIntegrator::with_barotropic_levels`], [`barotropic_pass_local`]):
+/// the levels and the stage buffers of [`MultirateStepper::schedule`].
+pub struct LocalPass {
+    scheme: SspScheme,
     stepper: MultirateStepper<SWESolution2D>,
     /// The elements' time steps of the current pass
     element_dt: Vec<f64>,
@@ -1081,9 +1083,17 @@ const STAGE_SCOPES: [&str; 4] = [
 /// buffer): order 8.
 const MAX_ELEMENT_NODES: usize = 81;
 
-impl BarotropicMultirate {
-    fn new(max_levels: usize, scheme: SspScheme, like: &SWESolution2D, n_rivers: usize) -> Self {
+impl LocalPass {
+    /// Up to `max_levels` levels of `scheme`'s substeps, stage buffers like
+    /// `like`, `n_rivers` rivers.
+    pub fn new(
+        max_levels: usize,
+        scheme: SspScheme,
+        like: &SWESolution2D,
+        n_rivers: usize,
+    ) -> Self {
         Self {
+            scheme,
             stepper: MultirateStepper::new(max_levels, scheme),
             element_dt: Vec::new(),
             values: vec![like.clone(); scheme.n_stages() - 1],
@@ -1091,6 +1101,36 @@ impl BarotropicMultirate {
             acc: like.clone(),
             river_terms: Mutex::new(vec![0.0; n_rivers]),
         }
+    }
+
+    /// The levels of the pass's elements from their steps at `q` under
+    /// `local` at the barotropic CFL number `cfl`, and the coarse substep,
+    /// at most `dt_cap`: from the element steps alone, so the module's own
+    /// bound on a coarse step has nothing to add, and whole-element stage
+    /// rates (the pass finishes its stages itself and counts no line-local
+    /// breaks: TODO P2.5).
+    pub fn assign_levels(
+        &mut self,
+        local: &dyn LocalTimeStepping<SWESolution2D>,
+        mesh: &Mesh2D,
+        q: &SWESolution2D,
+        cfl: f64,
+        dt_cap: f64,
+    ) -> f64 {
+        self.element_dt.resize(mesh.n_elements, 0.0);
+        local.element_dt(q, cfl, self.scheme, &mut self.element_dt);
+        self.stepper.assign_levels_from(
+            &self.element_dt,
+            mesh,
+            &[local.stencil()],
+            Some(dt_cap),
+            None,
+        )
+    }
+
+    /// The levels, the stage rates and the work counts.
+    pub fn stepper(&self) -> &MultirateStepper<SWESolution2D> {
+        &self.stepper
     }
 
     /// One coarse substep of `q`, with its stages' terms summed into
@@ -1699,7 +1739,7 @@ pub struct ModeSplitIntegrator {
     barotropic_levels: usize,
     /// ... and of the 3D stages, see [`Self::with_baroclinic_levels`].
     baroclinic_levels: usize,
-    multirate: Option<BarotropicMultirate>,
+    multirate: Option<LocalPass>,
     filter: Option<BarotropicFilter>,
     buffers: Option<Buffers>,
     stages_3d: Option<Stages3D>,
@@ -2056,25 +2096,14 @@ impl ModeSplitIntegrator {
                 let (levels, scheme) = (self.barotropic_levels, self.barotropic_scheme);
                 let multirate = self
                     .multirate
-                    .get_or_insert_with(|| BarotropicMultirate::new(levels, scheme, q, n_rivers));
-                // Its coarse step, from the element steps alone: at most
-                // Δt over the fewest substeps, so the module's own bound on
-                // a coarse step has nothing to add, and whole-element stage
-                // rates (the pass finishes its stages itself and counts no
-                // line-local breaks: TODO P2.5)
-                let BarotropicMultirate {
-                    stepper,
-                    element_dt,
-                    ..
-                } = &mut *multirate;
-                element_dt.resize(barotropic.mesh().n_elements, 0.0);
-                local.element_dt(q, self.barotropic_cfl, scheme, element_dt);
-                let dt_coarse = stepper.assign_levels_from(
-                    element_dt,
+                    .get_or_insert_with(|| LocalPass::new(levels, scheme, q, n_rivers));
+                // Its coarse step: at most Δt over the fewest substeps
+                let dt_coarse = multirate.assign_levels(
+                    local,
                     barotropic.mesh(),
-                    &[local.stencil()],
-                    Some(dt / self.min_substeps as f64),
-                    None,
+                    q,
+                    self.barotropic_cfl,
+                    dt / self.min_substeps as f64,
                 );
                 (Some(multirate), dt_coarse)
             }
@@ -2107,38 +2136,18 @@ impl ModeSplitIntegrator {
             bottom: drag.bottom,
             column: column_drag,
         };
-        if let Some(multirate) = multirate {
-            q_avg.fill(0.0);
-            transport.clear();
-            let mut clips = 0;
-            for (m, &w_secondary) in filter.secondary_weights().iter().enumerate() {
-                let step = CoarseStep {
-                    t: t + m as f64 * dt_bt,
-                    dt: dt_bt,
-                    w_secondary,
-                    n_bt,
-                    scheme: self.barotropic_scheme,
-                    forcing: g_term,
-                    drag: pass_drag,
-                    rivers,
-                };
-                clips += profiling::scope("bt: multirate substep", || {
-                    multirate.coarse_step(barotropic, q, step, transport)
-                });
-                q_avg.axpy(filter.weights()[m], q);
-            }
-            barotropic.record_clips(clips);
-        } else {
-            let global = GlobalPass {
-                filter,
-                scheme: self.barotropic_scheme,
-                t,
-                dt_bt,
-                forcing: g_term,
-                drag: pass_drag,
-                rivers,
-            };
-            barotropic_pass(barotropic, global, work, q, q_avg, transport);
+        let inputs = PassInputs {
+            filter,
+            scheme: self.barotropic_scheme,
+            t,
+            dt_bt,
+            forcing: g_term,
+            drag: pass_drag,
+            rivers,
+        };
+        match multirate {
+            Some(local) => barotropic_pass_local(barotropic, inputs, local, q, q_avg, transport),
+            None => barotropic_pass(barotropic, inputs, work, q, q_avg, transport),
         }
         // The early weights are negative: restore positivity of the average
         barotropic.post_process(q_avg);
@@ -3028,9 +3037,10 @@ fn barotropic_stage(
     )
 }
 
-/// What a barotropic pass on global substeps takes ([`barotropic_pass`]).
+/// What a barotropic pass takes, on global substeps ([`barotropic_pass`]) or
+/// local time steps ([`barotropic_pass_local`]).
 #[derive(Clone, Copy)]
-pub struct GlobalPass<'a> {
+pub struct PassInputs<'a> {
     /// The filter: `n_bt` substeps per baroclinic step, the window's
     /// weights.
     pub filter: &'a BarotropicFilter,
@@ -3088,13 +3098,13 @@ impl PassWork {
 /// summed from zero.
 pub fn barotropic_pass<B: BarotropicPhysics>(
     barotropic: &B,
-    pass: GlobalPass<'_>,
+    pass: PassInputs<'_>,
     work: &mut PassWork,
     q: &mut SWESolution2D,
     q_avg: &mut SWESolution2D,
     transport: &mut BarotropicTransport,
 ) {
-    let GlobalPass {
+    let PassInputs {
         filter,
         scheme,
         t,
@@ -3192,6 +3202,52 @@ pub fn barotropic_pass<B: BarotropicPhysics>(
     if let Some(w) = pending_weight {
         q_avg.axpy(w, q);
     }
+}
+
+/// Step 2 of [`ModeSplitIntegrator::step`] on local time steps: the
+/// filtered barotropic pass from the transport `q` at `pass.t`, the filter's
+/// `weights().len()` coarse substeps of `pass.dt_bt`, each a
+/// [`MultirateStepper::schedule`] of `local`'s levels
+/// ([`LocalPass::assign_levels`]). Element k's stage s, whose RHS follows
+/// level `r = rates(s)[k]`, enters `DU_avg2` with `W_m b_s / (n_bt 2^r)`.
+/// `q`, `q_avg` and `transport` end as [`barotropic_pass`] leaves them.
+pub fn barotropic_pass_local<B: BarotropicPhysics>(
+    barotropic: &B,
+    pass: PassInputs<'_>,
+    local: &mut LocalPass,
+    q: &mut SWESolution2D,
+    q_avg: &mut SWESolution2D,
+    transport: &mut BarotropicTransport,
+) {
+    let PassInputs {
+        filter,
+        scheme,
+        t,
+        dt_bt,
+        forcing,
+        drag,
+        rivers,
+    } = pass;
+    q_avg.fill(0.0);
+    transport.clear();
+    let mut clips = 0;
+    for (m, &w_secondary) in filter.secondary_weights().iter().enumerate() {
+        let step = CoarseStep {
+            t: t + m as f64 * dt_bt,
+            dt: dt_bt,
+            w_secondary,
+            n_bt: filter.n_bt(),
+            scheme,
+            forcing,
+            drag,
+            rivers,
+        };
+        clips += profiling::scope("bt: multirate substep", || {
+            local.coarse_step(barotropic, q, step, transport)
+        });
+        q_avg.axpy(filter.weights()[m], q);
+    }
+    barotropic.record_clips(clips);
 }
 
 /// `(η, ū, v̄)` of the filtered transport `[h, hu, hv]` at a node, over bed

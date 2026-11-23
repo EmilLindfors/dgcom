@@ -1,9 +1,10 @@
-//! The barotropic pass's gate (P2.7 Phase 4.4c2, `notes/gpu.md`):
-//! [`BarotropicPass3D`] on the GPU against dgcom's `barotropic_pass` and
-//! what follows it in `ModeSplitIntegrator::step` (the 2D module's
-//! post-processing of the average, `barotropic_rates`,
-//! `BarotropicTransport::divergence_into`, `pooled_elements`), value for
-//! value:
+//! The barotropic pass's gate (P2.7 Phase 4.4c2–c3, `notes/gpu.md`):
+//! [`BarotropicPass3D`] on the GPU against dgcom's `barotropic_pass` on
+//! global substeps and `barotropic_pass_local` on local time steps (the
+//! levels from each side's own element steps), and what follows them in
+//! `ModeSplitIntegrator::step` (the 2D module's post-processing of the
+//! average, `barotropic_rates`, `BarotropicTransport::divergence_into`,
+//! `pooled_elements`), value for value:
 //!
 //! - the walled beach with the case runner's 2D module of a 3D run (the
 //!   wet/dry stage, Coriolis, no bed friction): its shore, films and dry
@@ -32,29 +33,30 @@ use dgcom::solver::state::Solution3D;
 use dgcom::solver::{DGSolution2D, SWESolution2D, StandardLimiter2D, WetDryConfig};
 use dgcom::source::{CoriolisSource2D, River, RiverInflow, RiverSeries, RiverSources};
 use dgcom::time::{
-    BarotropicFilter, BarotropicPhysics, BarotropicTransport, GlobalPass, MIN_BAROTROPIC_SUBSTEPS,
-    PassDrag, PassWork, SspScheme, barotropic_pass, barotropic_rates, column_drag_rates,
-    pooled_elements, to_transport,
+    BarotropicFilter, BarotropicPhysics, BarotropicTransport, LocalPass, MIN_BAROTROPIC_SUBSTEPS,
+    PassDrag, PassInputs, PassWork, SspScheme, barotropic_pass, barotropic_pass_local,
+    barotropic_rates, column_drag_rates, pooled_elements, to_transport,
 };
 use dgcom::types::ElementIndex;
 use dgcom::vertical::SigmaGrid;
 
 use crate::hooks::State3D;
 use crate::nest::{Domain, Nest};
-use crate::pass::{BarotropicPass3D, DevicePass};
+use crate::pass::{BarotropicPass3D, DevicePass, LocalPass3D};
 use crate::phase0::DX;
 use crate::stage3d::{Snapshots, report, report_mutant, start_state};
 use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, NN, ORDER};
 use crate::transport3d::{Fixture, G, LEVELS, Shape};
-
-/// The barotropic CFL number of both sides.
-const CFL: f64 = 0.5;
 
 /// What the pass takes besides the 2D module and the case (a mutant changes
 /// one on the device).
 #[derive(Clone, Copy)]
 struct Run {
     scheme: SspScheme,
+    /// The barotropic CFL number, and the levels of local time stepping
+    /// (0: global substeps)
+    cfl: f64,
+    levels: usize,
     /// Substeps beyond the CFL's
     extra: usize,
     forcing: bool,
@@ -64,9 +66,12 @@ struct Run {
 }
 
 impl Run {
-    const fn with(scheme: SspScheme) -> Self {
+    /// Global substeps of `scheme` at CFL 0.5.
+    const fn global(scheme: SspScheme) -> Self {
         Self {
             scheme,
+            cfl: 0.5,
+            levels: 0,
             extra: 0,
             forcing: true,
             bottom: true,
@@ -74,6 +79,14 @@ impl Run {
             rivers: true,
         }
     }
+
+    /// The case runner's 3D pass: SSP-RK(4,3) at CFL 2 on two levels of
+    /// local time stepping (`[three_d]`'s defaults).
+    const CASE_RUNNER: Self = Self {
+        cfl: 2.0,
+        levels: 2,
+        ..Self::global(SspScheme::Rk43)
+    };
 }
 
 /// One fixture's pass: the 3D state at the step's start (its `η`, `ū`,
@@ -156,11 +169,24 @@ fn on_cpu<BC: SWEBoundaryCondition2D + Sync>(
     let n_rivers = case.rivers.as_ref().map_or(0, RiverSources::len);
     let mut q = SWESolution2D::new(ne, nn);
     to_transport(&case.state, case.bed, &mut q);
-    let n_bt = case.substeps(physics.compute_dt_ssp(&q, CFL, Some(run.scheme)), run);
+    // The substeps, as `ModeSplitIntegrator::step` takes them: global, or
+    // the coarse substep of local time steps at most Δt over the fewest
+    let mut local = (run.levels > 0).then(|| LocalPass::new(run.levels, run.scheme, &q, n_rivers));
+    let dt_bt_max = match &mut local {
+        Some(local) => {
+            let steps = physics
+                .local_time_stepping()
+                .filter(|l| l.is_element_local())
+                .expect("the 2D module steps locally");
+            let cap = case.dt / MIN_BAROTROPIC_SUBSTEPS as f64;
+            local.assign_levels(steps, mesh, &q, run.cfl, cap)
+        }
+        None => physics.compute_dt_ssp(&q, run.cfl, Some(run.scheme)),
+    };
+    let n_bt = case.substeps(dt_bt_max, run);
     let filter = BarotropicFilter::new(n_bt);
     let mut column = vec![0.0; ne * nn];
     column_drag_rates(&case.d_sigma, &case.layers, &mut column);
-    let mut work = PassWork::new(ne, ops);
     let mut q_avg = SWESolution2D::new(ne, nn);
     let mut transport = BarotropicTransport::new(
         ne,
@@ -170,25 +196,42 @@ fn on_cpu<BC: SWEBoundaryCondition2D + Sync>(
         n_rivers,
     );
     let clips_before = physics.negative_depth_clips();
-    barotropic_pass(
-        physics,
-        GlobalPass {
-            filter: &filter,
-            scheme: run.scheme,
-            t: case.t,
-            dt_bt: case.dt / n_bt as f64,
-            forcing: &case.g,
-            drag: PassDrag {
-                bottom: Some(&case.bottom),
-                column: Some(&column),
-            },
-            rivers: case.rivers.as_ref(),
+    let inputs = PassInputs {
+        filter: &filter,
+        scheme: run.scheme,
+        t: case.t,
+        dt_bt: case.dt / n_bt as f64,
+        forcing: &case.g,
+        drag: PassDrag {
+            bottom: Some(&case.bottom),
+            column: Some(&column),
         },
-        &mut work,
-        &mut q,
-        &mut q_avg,
-        &mut transport,
-    );
+        rivers: case.rivers.as_ref(),
+    };
+    let levels: Vec<f64> = match &mut local {
+        Some(local) => {
+            barotropic_pass_local(physics, inputs, local, &mut q, &mut q_avg, &mut transport);
+            local
+                .stepper()
+                .levels()
+                .iter()
+                .map(|&l| f64::from(l))
+                .collect()
+        }
+        None => {
+            let mut work = PassWork::new(ne, ops);
+            barotropic_pass(
+                physics,
+                inputs,
+                &mut work,
+                &mut q,
+                &mut q_avg,
+                &mut transport,
+            );
+            // Every element on the one level
+            vec![0.0; ne]
+        }
+    };
     physics.post_process(&mut q_avg);
     let mut rates: [DGSolution2D; 5] = std::array::from_fn(|_| DGSolution2D::new(ne, nn));
     let [a, b, c, d, e] = &mut rates;
@@ -221,6 +264,7 @@ fn on_cpu<BC: SWEBoundaryCondition2D + Sync>(
             "pass substeps/clips".into(),
             vec![n_bt as f64, clips as f64],
         ),
+        ("pass levels".into(), levels),
         ("last substep h".into(), h),
         ("last substep hu".into(), hu),
         ("last substep hv".into(), hv),
@@ -271,6 +315,8 @@ struct Device {
     d_sigma: DeviceBuffer<f64>,
     layers: DeviceBuffer<f64>,
     column: DeviceBuffer<f64>,
+    /// The pass on local time steps, from the first step that takes it
+    local: Option<LocalPass3D>,
 }
 
 impl Device {
@@ -292,6 +338,7 @@ impl Device {
             d_sigma: DeviceBuffer::from_host(st, &case.d_sigma)?,
             layers: DeviceBuffer::from_host(st, &case.layers)?,
             column: DeviceBuffer::zeroed(st, ne * NN)?,
+            local: None,
         })
     }
 
@@ -305,7 +352,7 @@ impl Device {
     ) -> Result<Snapshots, Box<dyn std::error::Error>> {
         let st = &gpu.stream;
         let clips_before = module.negative_depth_clips();
-        let n_bt = self.step(module, case, run)?;
+        let (n_bt, levels) = self.step(module, case, run)?;
         let clips = module.negative_depth_clips() - clips_before;
         let pass = &self.pass;
         let down = |b: &DeviceBuffer<f64>| b.to_host_vec(st);
@@ -321,6 +368,7 @@ impl Device {
                 "pass substeps/clips".into(),
                 vec![n_bt as f64, clips as f64],
             ),
+            ("pass levels".into(), levels),
             ("last substep h".into(), h),
             ("last substep hu".into(), hu),
             ("last substep hv".into(), hv),
@@ -351,34 +399,62 @@ impl Device {
     }
 
     /// One step's pass on the device: the transport of the state, the
-    /// substeps, `Λ̄`, the pass and what follows it. Its substeps.
+    /// substeps (and the levels), `Λ̄`, the pass and what follows it. Its
+    /// substeps and every element's level (0 on global substeps).
     fn step(
         &mut self,
         module: &GpuSWE2D,
         case: &Case,
         run: Run,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
-        let pass = &mut self.pass;
-        pass.to_transport(&self.state, &mut self.q)?;
-        let n_bt = case.substeps(module.compute_dt_ssp(&self.q, CFL, Some(run.scheme)), run);
+    ) -> Result<(usize, Vec<f64>), Box<dyn std::error::Error>> {
+        let Self {
+            pass,
+            state,
+            q,
+            g,
+            zero_g,
+            bottom,
+            d_sigma,
+            layers,
+            column,
+            local,
+        } = self;
+        pass.to_transport(state, q)?;
+        let mut local = (run.levels > 0)
+            .then(|| local.get_or_insert_with(|| LocalPass3D::new(run.levels, run.scheme, q)));
+        let dt_bt_max = match &mut local {
+            Some(local) => {
+                let cap = case.dt / MIN_BAROTROPIC_SUBSTEPS as f64;
+                local.assign_levels(module, q, run.cfl, cap)
+            }
+            None => module.compute_dt_ssp(q, run.cfl, Some(run.scheme)),
+        };
+        let n_bt = case.substeps(dt_bt_max, run);
         let filter = BarotropicFilter::new(n_bt);
-        pass.column_drag(&self.d_sigma, &self.layers, &mut self.column)?;
-        pass.run(
-            module,
-            DevicePass {
-                filter: &filter,
-                scheme: run.scheme,
-                t: case.t,
-                dt_bt: case.dt / n_bt as f64,
-                forcing: if run.forcing { &self.g } else { &self.zero_g },
-                bottom: run.bottom.then_some(&self.bottom),
-                column: run.layers.then_some(&self.column),
-                rivers: case.rivers.as_ref().filter(|_| run.rivers),
-            },
-            &mut self.q,
-        )?;
-        pass.finish(module, &self.state, case.dt)?;
-        Ok(n_bt)
+        pass.column_drag(d_sigma, layers, column)?;
+        let inputs = DevicePass {
+            filter: &filter,
+            scheme: run.scheme,
+            t: case.t,
+            dt_bt: case.dt / n_bt as f64,
+            forcing: if run.forcing { g } else { zero_g },
+            bottom: run.bottom.then_some(&*bottom),
+            column: run.layers.then_some(&*column),
+            rivers: case.rivers.as_ref().filter(|_| run.rivers),
+        };
+        let levels = match local {
+            Some(local) => {
+                pass.run_local(module, inputs, local, q)?;
+                let levels = local.stepper().levels();
+                levels.iter().map(|&l| f64::from(l)).collect()
+            }
+            None => {
+                pass.run(module, inputs, q)?;
+                vec![0.0; case.state.n_elements]
+            }
+        };
+        pass.finish(module, state, case.dt)?;
+        Ok((n_bt, levels))
     }
 }
 
@@ -396,24 +472,43 @@ fn gate<BC: SWEBoundaryCondition2D + Sync>(
     let cpu = on_cpu(physics, case, base);
     let device = on_device(gpu, physics, case, base)?;
     let ne = case.state.n_elements;
-    let subcells = cpu[10]
-        .1
+    let field = |name: &str| {
+        &cpu.iter()
+            .find(|(n, _)| n == name)
+            .expect("a snapshot of that name")
+            .1
+    };
+    let subcells = field("DU_avg2 subcells")
         .chunks(NSUB_OF_P2)
         .filter(|s| s[0].is_finite())
         .count();
-    let pooled = cpu
-        .last()
-        .map_or(0, |(_, p)| p.iter().filter(|&&p| p > 0.0).count());
-    let sourced = cpu[11].1.iter().filter(|&&s| s != 0.0).count();
+    let pooled = field("balance pooled").iter().filter(|&&p| p > 0.0).count();
+    let sourced = field("means volume-sources")
+        .iter()
+        .filter(|&&s| s != 0.0)
+        .count();
+    let counts = field("pass substeps/clips");
+    let levels = field("pass levels");
+    let stepping = if base.levels == 0 {
+        "global substeps".to_string()
+    } else {
+        let per_level: Vec<String> = (0..=base.levels)
+            .map(|l| {
+                let n = levels.iter().filter(|&&x| x == l as f64).count();
+                format!("{n} on level {l}")
+            })
+            .collect();
+        format!("coarse substeps, elements {}", per_level.join(", "))
+    };
     println!(
-        "  {} substeps of SSP-RK{} ({} clips), {subcells} of {ne} elements on the subcells \
+        "  {} {stepping} of SSP-RK{} ({} clips), {subcells} of {ne} elements on the subcells \
          throughout, {pooled} balanced only as a whole, {sourced} nodes with a volume source",
-        cpu[0].1[0],
+        counts[0],
         match base.scheme {
             SspScheme::Rk3 => "3",
             SspScheme::Rk43 => "(4,3)",
         },
-        cpu[0].1[1],
+        counts[1],
     );
     let mut same = report(&cpu, &device);
     if mutants {
@@ -460,6 +555,9 @@ fn gate<BC: SWEBoundaryCondition2D + Sync>(
                     ..base
                 },
             ));
+        }
+        if base.levels > 0 {
+            runs.push(("global substeps", Run { levels: 0, ..base }));
         }
         for (what, run) in runs {
             same &= report_mutant(what, &cpu, &on_device(gpu, physics, case, run)?);
@@ -550,13 +648,19 @@ fn nest_state(domain: &Domain) -> Solution3D {
     state
 }
 
-/// Time the pass and what follows it on the CPU and the GPU at `fx`'s size.
-fn time(gpu: &Arc<Gpu>, fx: &Fixture, iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
+/// Time the pass with `run` and what follows it on the CPU and the GPU at
+/// `fx`'s size.
+fn time(
+    gpu: &Arc<Gpu>,
+    fx: &Fixture,
+    run: Run,
+    iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let physics = beach_physics(fx);
     let case = beach_case(fx, true);
-    let run = Run::with(SspScheme::Rk3);
     let ne = fx.n_elements();
     let mut n_bt = 0.0;
+    let mut levels = Vec::new();
     let mut cpu_time = 0.0;
     for it in 0..iterations + 1 {
         let t0 = Instant::now();
@@ -565,6 +669,7 @@ fn time(gpu: &Arc<Gpu>, fx: &Fixture, iterations: usize) -> Result<(), Box<dyn s
             cpu_time += t0.elapsed().as_secs_f64();
         }
         n_bt = snapshots[0].1[0];
+        levels = snapshots[1].1.clone();
     }
     let form = physics.device_form()?;
     let module = GpuSWE2D::from_form(gpu, &form)?;
@@ -586,38 +691,79 @@ fn time(gpu: &Arc<Gpu>, fx: &Fixture, iterations: usize) -> Result<(), Box<dyn s
         cpu_time / iterations as f64,
         gpu_time / gpu_iterations as f64,
     );
-    let stages = 3.0 * n_bt * BarotropicFilter::new(n_bt as usize).reach();
-    println!(
-        "timing, beach: {ne} P{ORDER} elements, a pass of {n_bt} substeps of SSP-RK3 \
-         ({stages:.0} stages) with three rivers and what follows it"
-    );
-    println!(
-        "  per pass: CPU ({threads} threads) {:.1} ms | GPU {:.1} ms ({:.1}×); per stage \
-         and element {:.1} ns | {:.1} ns",
-        c * 1e3,
-        g * 1e3,
-        c / g,
-        c * 1e9 / (stages * ne as f64),
-        g * 1e9 / (stages * ne as f64),
-    );
+    let n_stages = run.scheme.n_stages() as f64;
+    let substeps = n_bt * BarotropicFilter::new(n_bt as usize).reach();
+    let scheme = match run.scheme {
+        SspScheme::Rk3 => "SSP-RK3",
+        SspScheme::Rk43 => "SSP-RK(4,3)",
+    };
+    if run.levels == 0 {
+        let stages = n_stages * substeps;
+        println!(
+            "timing, beach: {ne} P{ORDER} elements, a pass of {n_bt} substeps of {scheme} \
+             ({stages:.0} stages) at CFL {} with three rivers and what follows it",
+            run.cfl
+        );
+        println!(
+            "  per pass: CPU ({threads} threads) {:.1} ms | GPU {:.1} ms ({:.1}×); per stage \
+             and element {:.1} ns | {:.1} ns",
+            c * 1e3,
+            g * 1e3,
+            c / g,
+            c * 1e9 / (stages * ne as f64),
+            g * 1e9 / (stages * ne as f64),
+        );
+    } else {
+        let finest = levels.iter().copied().fold(0.0, f64::max);
+        let fine = levels.iter().filter(|&&l| l > 0.0).count();
+        println!(
+            "timing, beach: {ne} P{ORDER} elements, a pass of {n_bt} coarse substeps of {scheme} \
+             at CFL {} on {} levels ({fine} elements finer than the coarse step, finest level \
+             {finest}) with three rivers and what follows it",
+            run.cfl, run.levels
+        );
+        println!(
+            "  per pass: CPU ({threads} threads) {:.1} ms | GPU {:.1} ms ({:.1}×)",
+            c * 1e3,
+            g * 1e3,
+            c / g,
+        );
+    }
     Ok(())
 }
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "== The barotropic pass on global substeps: G, the drags, DU_avg2, the filter, the rivers, the band's sources (Phase 4.4c2) =="
+        "== The barotropic pass, global substeps and local time steps: G, the drags, DU_avg2, the filter, the rivers, the band's sources (Phase 4.4c2–c3) =="
     );
     let mut failed = Vec::new();
     let fx = Fixture::new(Shape::BEACH);
     let physics = beach_physics(&fx);
-    for (scheme, mutants) in [(SspScheme::Rk3, true), (SspScheme::Rk43, false)] {
-        let label = match scheme {
-            SspScheme::Rk3 => "beach, rivers, SSP-RK3",
-            SspScheme::Rk43 => "beach, rivers, SSP-RK(4,3)",
-        };
+    let beach_runs = [
+        ("beach, rivers, SSP-RK3", Run::global(SspScheme::Rk3), true),
+        (
+            "beach, rivers, SSP-RK(4,3)",
+            Run::global(SspScheme::Rk43),
+            false,
+        ),
+        (
+            "beach, rivers, the case runner's pass on local time steps",
+            Run::CASE_RUNNER,
+            true,
+        ),
+        (
+            "beach, rivers, SSP-RK3 on three levels",
+            Run {
+                levels: 3,
+                ..Run::global(SspScheme::Rk3)
+            },
+            false,
+        ),
+    ];
+    for (label, run, mutants) in beach_runs {
         println!("{label}: {} P{ORDER} elements", fx.n_elements());
         let case = beach_case(&fx, true);
-        if !gate(gpu, &physics, &case, Run::with(scheme), mutants, &[])? {
+        if !gate(gpu, &physics, &case, run, mutants, &[])? {
             failed.push(label);
         }
     }
@@ -636,34 +782,35 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     let other = domain.physics(&momentum_only, bc());
     let state = nest_state(&domain);
     let case = Case::new(state, &domain.bed, None, 7200.0, 60.0);
-    let label = "nested channel, its band's sources, SSP-RK(4,3)";
-    println!(
-        "{label}: {} P{ORDER} elements, the band's level relaxed",
-        domain.mesh.n_elements
-    );
     let others = [("the band relaxing the momentum alone", &other)];
-    if !gate(
-        gpu,
-        &physics,
-        &case,
-        Run::with(SspScheme::Rk43),
-        true,
-        &others,
-    )? {
-        failed.push(label);
+    for (label, run) in [
+        (
+            "nested channel, its band's sources, SSP-RK(4,3)",
+            Run::global(SspScheme::Rk43),
+        ),
+        (
+            "nested channel, its band's sources, the case runner's pass on local time steps",
+            Run::CASE_RUNNER,
+        ),
+    ] {
+        println!(
+            "{label}: {} P{ORDER} elements, the band's level relaxed",
+            domain.mesh.n_elements
+        );
+        if !gate(gpu, &physics, &case, run, true, &others)? {
+            failed.push(label);
+        }
     }
 
-    time(
-        gpu,
-        &Fixture::new(Shape {
-            nx: 320,
-            ny: 300,
-            jitter: 0.15,
-            stretched: true,
-            ..Shape::BEACH
-        }),
-        3,
-    )?;
+    let large = Fixture::new(Shape {
+        nx: 320,
+        ny: 300,
+        jitter: 0.15,
+        stretched: true,
+        ..Shape::BEACH
+    });
+    time(gpu, &large, Run::global(SspScheme::Rk3), 3)?;
+    time(gpu, &large, Run::CASE_RUNNER, 3)?;
     if !failed.is_empty() {
         println!(
             "(not bit for bit: {}; expected only in a build with multiply–add contraction)",
