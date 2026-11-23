@@ -73,7 +73,7 @@ use crate::physics::bottom_drag::BottomDrag3D;
 use crate::physics::cage_drag::{cage_rates, for_each_caged_node, layer_coefficient};
 use crate::physics::eos::EquationOfState;
 use crate::physics::implicit_advection::{
-    ImplicitVerticalAdvection, apply_implicit_vertical_advection,
+    ImplicitVerticalAdvection, apply_implicit_vertical_advection, split_vertical_velocity,
 };
 use crate::physics::surface_fluxes::{SeaSurface, SurfaceFluxFields, SurfaceFluxes3D};
 use crate::physics::surface_stress::SurfaceStress3D;
@@ -84,9 +84,8 @@ use crate::physics::vertical_diffusion::{
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
 use crate::solver::core::blocks::{
-    Blocks, Neighbourhood, Pooled, for_each_block, reduce_blocks, update_with,
+    Blocks, Neighbourhood, for_each_block, reduce_blocks, update_with,
 };
-use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::rhs::{
     AdvectedTracer, BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D,
     ExtrapolationTracerBC3D, HorizontalViscosity3D, LayerTransport, MetricForm,
@@ -912,38 +911,15 @@ where
             d_sigma_w.resize(nl + 1, 0.0);
             w_cell_thicknesses(d_sigma, d_sigma_w);
         }
-        let (count, courant) = reduce_blocks(
+        let (count, courant) = split_vertical_velocity(
+            split,
+            [&state.eta.data, &self.bathymetry.data],
+            self.min_column_depth,
+            d_sigma,
+            euler_dt,
+            nn,
+            [&mut transport.omega, implicit],
             elements,
-            [&mut transport.omega[..], &mut implicit[..]],
-            || Pooled::take(|t: &Vec<f64>| t.len() == nl, || vec![0.0; nl]),
-            |thickness, k, [omega_k, implicit_k]| {
-                let (mut count, mut largest) = (0, 0.0_f64);
-                for i in 0..nn {
-                    let idx = k * nn + i;
-                    let column = i * (nl + 1)..(i + 1) * (nl + 1);
-                    let depth = state.eta.data[idx] - self.bathymetry.data[idx];
-                    let implicit = &mut implicit_k[column.clone()];
-                    if depth < self.min_column_depth {
-                        implicit.fill(0.0);
-                        continue;
-                    }
-                    for (h, &ds) in thickness.iter_mut().zip(d_sigma) {
-                        *h = layer_thickness_of(depth, ds);
-                    }
-                    let omega = &mut omega_k[column];
-                    let dt = euler_dt[k];
-                    largest = largest.max(split.split_column(omega, thickness, dt, implicit));
-                    if implicit.iter().any(|&w| w != 0.0) {
-                        count += 1;
-                        for (w, &w_i) in omega.iter_mut().zip(implicit.iter()) {
-                            *w -= w_i;
-                        }
-                    }
-                }
-                (count, largest)
-            },
-            || (0, 0.0),
-            |a, b| (a.0 + b.0, a.1.max(b.1)),
         );
         *columns = count;
         stats.columns = stats.columns.max(count);

@@ -647,7 +647,7 @@ struct Cpu {
 }
 
 /// The CPU's layer transports of `fx`.
-fn cpu_layers(fx: &Fixture, layers: &mut LayerTransport) {
+pub(crate) fn cpu_layers(fx: &Fixture, layers: &mut LayerTransport) {
     layers.compute(
         &fx.state,
         Some(fx.flux()),
