@@ -347,7 +347,7 @@ const SUBCELL_BLOCK: u32 = 64;
 /// with the loops unrolled the element's nodes are indexed by constants and
 /// stay in registers.
 #[inline]
-const fn face_node(face: usize, fi: usize) -> usize {
+pub(crate) const fn face_node(face: usize, fi: usize) -> usize {
     match face {
         0 => fi,
         1 => fi * N1 + N1 - 1,
@@ -2104,6 +2104,8 @@ pub mod kernels {
 pub struct Gpu {
     pub stream: Arc<Stream>,
     module: kernels::LoadedModule,
+    /// The 3D kernels (`three_d.rs`)
+    pub(crate) module3d: crate::three_d::kernels3d::LoadedModule,
     /// The device's name and compute capability
     pub name: String,
     /// Its streaming multiprocessors
@@ -2118,10 +2120,12 @@ impl Gpu {
         let name = format!("{} (sm_{major}{minor})", ctx.device_name()?);
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
+        let module3d = crate::three_d::kernels3d::load(&ctx)?;
         let sms = ctx.multiprocessor_count()?;
         Ok(Arc::new(Self {
             stream,
             module,
+            module3d,
             name,
             sms,
         }))
