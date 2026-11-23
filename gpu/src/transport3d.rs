@@ -1,37 +1,51 @@
 //! The 3D transport gate (P2.7 Phase 4, `notes/gpu.md`): the layer
 //! transports and Ω ([`Transport3D::compute`]), the advection of u and v
-//! (split form, centred in the vertical) and of T and S (LimitedAkima within
-//! their ranges, about a reference stratification or not), and the water no
-//! transport carried, on the GPU against dgcom's `LayerTransport::compute`,
-//! `apply_momentum_transport_3d`, `apply_tracer_transport_3d` and
-//! `LayerTransport::add_volume_sources` on the CPU, value for value: fully
-//! wet (Phase 4.0) and on a walled beach with flats, films and dry columns,
-//! where subcell elements, thin columns, fallback and pooled elements meet
-//! (Phase 4.1); then timed at Chiloé's size (96,000 P2 elements × 20
-//! levels).
+//! (split form, centred in the vertical), of T and S (LimitedAkima within
+//! their ranges, about a reference stratification or not) and of the
+//! turbulence's k and ψ at the w-points, the water no transport carried and
+//! the rivers', on the GPU against dgcom on the CPU, in the order
+//! `Hydrostatic3D::compute_transport_rhs_into` takes them
+//! (`LayerTransport::compute`, `apply_momentum_transport_3d`,
+//! `apply_tracer_transport_3d`, `LayerTransport::add_volume_sources`,
+//! `apply_w_point_transport_3d`, the rivers' `RiverInflow`), value for
+//! value:
+//!
+//! - fully wet, periodic and walled (Phase 4.0);
+//! - a walled beach with flats, films and dry columns, where subcell
+//!   elements, thin columns, fallback and pooled elements meet (Phase 4.1a);
+//! - a channel open at both ends, nested in a parent at one (its velocity,
+//!   T and S outside), with fixed and upwind tracer conditions at the other,
+//!   and rivers, two in one element (Phase 4.1b);
+//!
+//! then timed at Chiloé's size (96,000 P2 elements × 20 levels).
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use cuda_core::DeviceBuffer;
-use dgcom::mesh::{Bathymetry2D, Mesh2D};
+use dgcom::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
 use dgcom::solver::Blocks;
 use dgcom::solver::rhs::subcells::{
     line_metric, line_node, subcell_interfaces, subcell_slot, telescoped_interfaces,
 };
 use dgcom::solver::rhs::{
-    AdvectedTracer, BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D,
-    FaceExterior, LayerTransport, MetricForm, MomentumAdvectionForm, UNBOUNDED, VerticalAdvection,
-    apply_momentum_transport_3d, apply_tracer_transport_3d,
+    AdvectedTracer, BarotropicFlux, Boundaries3D, DeviceTracerBC3D, Exterior3D, ExteriorField,
+    ExtrapolationTracerBC3D, FaceExterior, FixedTracerBC3D, LayerTransport, MetricForm,
+    MomentumAdvectionForm, TracerBoundaryCondition3D, UNBOUNDED, UpwindTracerBC3D,
+    VerticalAdvection, apply_momentum_transport_3d, apply_tracer_transport_3d,
+    apply_w_point_transport_3d, w_cell_thicknesses,
 };
 use dgcom::solver::state::Solution3D;
+use dgcom::source::{River, RiverInflow, RiverProfile, RiverSeries, RiverSources};
 use dgcom::types::ElementIndex;
 use dgcom::vertical::{ROMSVstretching4, SigmaGrid};
 
 use crate::phase0::{DX, Lcg, quad_mesh, ulps};
 use crate::swe2d::{Gpu, N1, NN, ORDER};
-use crate::three_d::{Advected, BarotropicDevice, Interface, Statics3D, Transport3D};
+use crate::three_d::{
+    Advected, BarotropicDevice, ExteriorDevice, Interface, RiversDevice, Statics3D, Transport3D,
+};
 
 /// σ-levels of the fixtures (Chiloé's 3D case has 20).
 const LEVELS: usize = 20;
@@ -41,6 +55,11 @@ const T_RANGE: (f64, f64) = (5.5, 11.0);
 const S_RANGE: (f64, f64) = (31.6, 34.4);
 /// The baroclinic step of the barotropic flux (s).
 const DT: f64 = 30.0;
+/// The tracers' conditions at the channel's open faces without a parent.
+const T_BC: f64 = 9.25;
+const S_BC: f64 = 33.4;
+/// The fields compared, in the order of [`Cpu`]'s.
+const NAMES: [&str; 6] = ["T", "S", "u", "v", "k", "psi"];
 
 /// A fixture's shape.
 #[derive(Clone, Copy)]
@@ -55,6 +74,9 @@ struct Shape {
     /// 12–28 m deep): subcell elements, thin columns, the pass's subcell
     /// fluxes in some, fallback and pooled elements
     beach: bool,
+    /// A channel open at both ends (x = 0 and x = L), nested in a parent at
+    /// x = L, with fixed and upwind tracer conditions at x = 0, and rivers
+    channel: bool,
     /// ROMS's Vstretching 4 (θ_s 5, θ_b 0.4), else uniform levels
     stretched: bool,
     /// T and S advected about a reference stratification
@@ -62,6 +84,33 @@ struct Shape {
     /// Every element's forward-Euler step (s): long enough, and end layers
     /// shed more than half their water in it (`in_range`'s share)
     euler_dt: f64,
+}
+
+/// A nesting parent's values outside the open faces it covers.
+struct Parent {
+    tags: Vec<BoundaryTag>,
+    slot_of_node: Vec<u32>,
+    /// u, v, T, S of every slot, `[slot][level]`
+    values: [Vec<f64>; 4],
+}
+
+impl Parent {
+    fn field(&self, f: usize) -> ExteriorField<'_> {
+        ExteriorField {
+            tags: &self.tags,
+            slot_of_node: &self.slot_of_node,
+            n_levels: LEVELS,
+            values: &self.values[f],
+        }
+    }
+}
+
+/// Rivers with their step's discharge.
+struct Rivers {
+    sources: RiverSources,
+    discharge: Vec<f64>,
+    /// Each river's water's T and S at the stage
+    conc: [Vec<f64>; 2],
 }
 
 /// A mesh, its σ-levels, a stratified, sheared state on it and a
@@ -75,7 +124,8 @@ struct Fixture {
     boundaries: Boundaries3D,
     /// Columns thinner than this exchange no baroclinic transport
     min_column_depth: f64,
-    /// The thin columns at rest, as the mode splitter's stage values are
+    /// The thin columns at rest, as the mode splitter's stage values are;
+    /// k and ψ at the w-points
     state: Solution3D,
     /// The reference stratification of T and S at each column's levels
     reference: Option<[Vec<f64>; 2]>,
@@ -89,6 +139,10 @@ struct Fixture {
     subcell: Vec<f64>,
     /// The elements the pass balanced only as a whole (empty: none)
     pooled: Vec<bool>,
+    parent: Option<Parent>,
+    /// T's and S's conditions at open faces without a parent
+    bcs: [Box<dyn TracerBoundaryCondition3D>; 2],
+    rivers: Option<Rivers>,
     /// The momentum's tendencies before the advection adds to them
     rhs_u0: Vec<f64>,
     rhs_v0: Vec<f64>,
@@ -102,11 +156,20 @@ impl Fixture {
             jitter,
             periodic,
             beach,
+            channel,
             stretched,
             reference,
             euler_dt,
         } = shape;
-        let mesh = quad_mesh(nx, ny, jitter, periodic && !beach);
+        let mut mesh = quad_mesh(nx, ny, jitter, periodic && !beach && !channel);
+        if channel {
+            // Open at x = 0 and x = L (faces 3 and 1)
+            for edge in mesh.edges.iter_mut() {
+                if edge.right.is_none() && edge.left.face % 2 == 1 {
+                    edge.boundary_tag = Some(BoundaryTag::Open);
+                }
+            }
+        }
         let ops = DGOperators2D::new(ORDER);
         let geom = GeometricFactors2D::compute(&mesh, &ops);
         let (lx, ly) = (nx as f64 * DX, ny as f64 * DX);
@@ -127,8 +190,10 @@ impl Fixture {
         };
         let boundaries = Boundaries3D::default();
         let ne = mesh.n_elements;
-        let nl = LEVELS;
+        let (nl, nw) = (LEVELS, LEVELS + 1);
         let mut state = Solution3D::new(ne, NN, nl);
+        state.tke = vec![0.0; ne * NN * nw];
+        state.gls = vec![0.0; ne * NN * nw];
         let mut references = [vec![0.0; ne * NN * nl], vec![0.0; ne * NN * nl]];
         let mut rng = Lcg(20_261_123);
         let mut bar_hu = vec![0.0; ne * NN];
@@ -137,6 +202,7 @@ impl Fixture {
         let mut rhs_u0 = vec![0.0; ne * NN * nl];
         let mut rhs_v0 = vec![0.0; ne * NN * nl];
         let sigma_rho = sigma.sigma_rho().to_vec();
+        let sigma_w = sigma.sigma_w().to_vec();
         for k in 0..ne {
             let ki = ElementIndex::new(k);
             for i in 0..NN {
@@ -187,13 +253,21 @@ impl Fixture {
                     rhs_u0[at] = 1e-3 * (rng.next() - 0.5);
                     rhs_v0[at] = 1e-3 * (rng.next() - 0.5);
                 }
+                // The turbulence: largest at mid-depth and near the bed
+                for (j, &s) in sigma_w.iter().enumerate() {
+                    let at = idx * nw + j;
+                    let shape = 1.0 + (std::f64::consts::PI * s).sin().powi(2);
+                    state.tke[at] = 1e-4 * shape * (1.0 + 0.3 * rng.next());
+                    state.gls[at] = 2e-5 * shape * (1.0 + 0.3 * rng.next()) + 1e-6 * (x / lx);
+                }
                 bar_hu[idx] = depth * (0.62 * (ky * y).sin() + 0.01 * (kx * x).cos());
                 bar_hv[idx] = depth * (0.38 * (kx * x).cos() - 0.01 * (ky * y).sin());
                 eta_rate[idx] = 1e-4 * (kx * x + ky * y).sin();
             }
         }
-        // The pass's face fluxes: the central average of DU_avg2 · n, none
-        // at a wall
+        // The pass's face fluxes: the central average of DU_avg2 · n, the
+        // interior's at an open face (inflow and outflow along it), none at
+        // a wall
         let mut bar_face = vec![0.0; ne * 4 * N1];
         for k in 0..ne {
             for f in 0..4 {
@@ -207,7 +281,8 @@ impl Fixture {
                             let other = nb.element * NN + ops.face_nodes[nb.face][N1 - 1 - fi];
                             0.5 * (q(flat) + q(other))
                         }
-                        _ => 0.0,
+                        FaceExterior::Open(_) => q(flat),
+                        FaceExterior::Wall => 0.0,
                     };
                 }
             }
@@ -257,6 +332,86 @@ impl Fixture {
             }
             pooled = (0..ne).map(|_| rng.next() < 0.06).collect();
         }
+        // The channel's parent (outside x = L only) and rivers
+        let (mut parent, mut rivers) = (None, None);
+        let bcs: [Box<dyn TracerBoundaryCondition3D>; 2] = if channel {
+            [
+                Box::new(FixedTracerBC3D::new(T_BC)),
+                Box::new(UpwindTracerBC3D::new(S_BC)),
+            ]
+        } else {
+            [
+                Box::new(ExtrapolationTracerBC3D),
+                Box::new(ExtrapolationTracerBC3D),
+            ]
+        };
+        if channel {
+            let mut slot_of_node = vec![u32::MAX; ne * NN];
+            let mut n_slots = 0;
+            for edge in mesh.edges.iter().filter(|e| e.right.is_none()) {
+                let (k, f) = (edge.left.element, edge.left.face);
+                if f != 1 {
+                    continue;
+                }
+                for &node in &ops.face_nodes[f] {
+                    slot_of_node[k * NN + node] = n_slots;
+                    n_slots += 1;
+                }
+            }
+            let mut values: [Vec<f64>; 4] = Default::default();
+            for slot in 0..n_slots as usize {
+                for (l, &s) in sigma_rho.iter().enumerate() {
+                    let wave = (0.7 * slot as f64).sin();
+                    values[0].push(-0.3 + 0.1 * s + 0.05 * wave);
+                    values[1].push(0.05 + 0.02 * wave);
+                    values[2].push(7.0 - 2.0 * s + 0.2 * wave + 0.01 * l as f64);
+                    values[3].push(34.0 + 0.5 * s - 0.1 * wave);
+                }
+            }
+            parent = Some(Parent {
+                tags: vec![BoundaryTag::Open],
+                slot_of_node,
+                values,
+            });
+            // Three rivers, two of them in one element
+            let at = |fx: f64, fy: f64| [fx * lx, fy * ly];
+            let list = vec![
+                River::new("a", at(0.31, 0.47), 60.0)
+                    .with_temperature(RiverSeries::constant(4.0))
+                    .with_salinity(RiverSeries::constant(0.5)),
+                River::new("b", at(0.312, 0.472), 25.0)
+                    .with_temperature(RiverSeries::constant(5.5))
+                    .with_salinity(RiverSeries::constant(0.0))
+                    .with_profile(RiverProfile::TopFraction(0.3)),
+                River::new("c", at(0.73, 0.21), 8.0)
+                    .with_temperature(RiverSeries::constant(6.0))
+                    .with_salinity(RiverSeries::constant(2.0))
+                    .with_profile(RiverProfile::TopMetres(4.0)),
+            ];
+            let mut sources = RiverSources::new(list, &mesh, &geom, &bathymetry, 500.0, &[])
+                .expect("the rivers are in the channel");
+            sources
+                .set_levels(&sigma, &bathymetry)
+                .expect("the rivers' levels");
+            assert_eq!(
+                sources.element(0),
+                sources.element(1),
+                "two rivers share an element"
+            );
+            let conc = [
+                (0..sources.len())
+                    .map(|i| sources.river(i).temperature.at(0.0))
+                    .collect(),
+                (0..sources.len())
+                    .map(|i| sources.river(i).salinity.at(0.0))
+                    .collect(),
+            ];
+            rivers = Some(Rivers {
+                discharge: vec![58.0, 26.0, 7.5],
+                sources,
+                conc,
+            });
+        }
         Self {
             subcell,
             pooled,
@@ -274,9 +429,19 @@ impl Fixture {
             bar_hv,
             bar_face,
             eta_rate,
+            parent,
+            bcs,
+            rivers,
             rhs_u0,
             rhs_v0,
         }
+    }
+
+    fn inflow(&self) -> Option<RiverInflow<'_>> {
+        self.rivers.as_ref().map(|r| RiverInflow {
+            rivers: &r.sources,
+            discharge: &r.discharge,
+        })
     }
 
     fn flux(&self) -> BarotropicFlux<'_> {
@@ -288,13 +453,36 @@ impl Fixture {
             face: &self.bar_face,
             subcell: &self.subcell,
             eta_rate: &self.eta_rate,
-            rivers: None,
+            rivers: self.inflow(),
             pooled: &self.pooled,
+        }
+    }
+
+    fn exterior(&self) -> Exterior3D<'_> {
+        match &self.parent {
+            Some(p) => Exterior3D {
+                velocity: Some([p.field(0), p.field(1)]),
+                temp: Some(p.field(2)),
+                salt: Some(p.field(3)),
+            },
+            None => Exterior3D::default(),
         }
     }
 
     fn n_elements(&self) -> usize {
         self.mesh.n_elements
+    }
+
+    fn rhs(&self) -> [Vec<f64>; 6] {
+        let (n, nw) = (self.n_elements() * NN * LEVELS, self.state.tke.len());
+        [
+            vec![0.0; n],
+            vec![0.0; n],
+            self.rhs_u0.clone(),
+            self.rhs_v0.clone(),
+            vec![0.0; nw],
+            vec![0.0; nw],
+        ]
     }
 
     fn statics(&self, gpu: &Gpu) -> Result<Statics3D, Box<dyn std::error::Error>> {
@@ -311,12 +499,12 @@ impl Fixture {
     }
 }
 
-/// The CPU's results: the layer transports, the tendencies of T, S, u, v
-/// after the advection and after the volume sources.
+/// The CPU's results: the layer transports, the tendencies of T, S, u, v,
+/// k and ψ after the advection and after the sources.
 struct Cpu {
     layers: LayerTransport,
-    advected: [Vec<f64>; 4],
-    sourced: [Vec<f64>; 4],
+    advected: [Vec<f64>; 6],
+    sourced: [Vec<f64>; 6],
 }
 
 /// The CPU's layer transports of `fx`.
@@ -330,22 +518,23 @@ fn cpu_layers(fx: &Fixture, layers: &mut LayerTransport) {
         &fx.sigma,
         &fx.bathymetry,
         &fx.boundaries,
-        &Exterior3D::default(),
+        &fx.exterior(),
         fx.min_column_depth,
         Blocks::All(fx.n_elements()),
     );
 }
 
-/// The CPU's advection of u, v (added to `rhs[2..]`) and T, S (into
-/// `rhs[..2]`, within `ranges`) by `layers`.
+/// The CPU's advection by `layers`: u, v added to `rhs[2..4]`, T, S (within
+/// `ranges`) into `rhs[..2]`, k, ψ into `rhs[4..]`.
 fn cpu_advect(
     fx: &Fixture,
     layers: &LayerTransport,
-    rhs: &mut [Vec<f64>; 4],
+    rhs: &mut [Vec<f64>; 6],
     ranges: [(f64, f64); 2],
 ) {
     let ne = fx.n_elements();
-    let [rhs_t, rhs_s, rhs_u, rhs_v] = rhs;
+    let exterior = fx.exterior();
+    let [rhs_t, rhs_s, rhs_u, rhs_v, rhs_k, rhs_psi] = rhs;
     apply_momentum_transport_3d(
         rhs_u,
         rhs_v,
@@ -356,28 +545,27 @@ fn cpu_advect(
         &fx.ops,
         &fx.geom,
         &fx.boundaries,
-        None,
+        exterior.velocity,
         MomentumAdvectionForm::Split,
         VerticalAdvection::Centred,
         Blocks::All(ne),
     );
-    let bc = ExtrapolationTracerBC3D;
     let reference = |t: usize| fx.reference.as_ref().map(|r| &r[t][..]);
     apply_tracer_transport_3d(
         [
             AdvectedTracer {
                 rhs: rhs_t,
                 tracer: &fx.state.temp,
-                bc: &bc,
-                exterior: None,
+                bc: &*fx.bcs[0],
+                exterior: exterior.temp,
                 reference: reference(0),
                 range: ranges[0],
             },
             AdvectedTracer {
                 rhs: rhs_s,
                 tracer: &fx.state.salt,
-                bc: &bc,
-                exterior: None,
+                bc: &*fx.bcs[1],
+                exterior: exterior.salt,
                 reference: reference(1),
                 range: ranges[1],
             },
@@ -390,20 +578,44 @@ fn cpu_advect(
         VerticalAdvection::LimitedAkima,
         Blocks::All(ne),
     );
+    let bc = ExtrapolationTracerBC3D;
+    apply_w_point_transport_3d(
+        [
+            AdvectedTracer::new(rhs_k, &fx.state.tke, &bc),
+            AdvectedTracer::new(rhs_psi, &fx.state.gls, &bc),
+        ],
+        layers,
+        &fx.mesh,
+        &fx.ops,
+        &fx.geom,
+        &fx.boundaries,
+        VerticalAdvection::LimitedAkima,
+        Blocks::All(ne),
+    );
 }
 
-/// The CPU's volume sources added to `rhs`.
-fn cpu_sources(fx: &Fixture, layers: &LayerTransport, rhs: &mut [Vec<f64>; 4]) {
-    let fields = [&fx.state.temp, &fx.state.salt, &fx.state.u, &fx.state.v];
+/// The CPU's sources added to `rhs`, as `Hydrostatic3D` adds them: the
+/// water no transport carried to T, S, u, v; the rivers' water at the own
+/// value, then the water no transport carried, to k and ψ; the rivers'
+/// T and S. `pooled` in place of the fixture's (the CPU's check).
+fn cpu_sources(fx: &Fixture, layers: &LayerTransport, rhs: &mut [Vec<f64>; 6], pooled: &[bool]) {
+    let elements = Blocks::All(fx.n_elements());
+    let s = &fx.state;
+    let fields = [&s.temp, &s.salt, &s.u, &s.v];
     for (out, field) in rhs.iter_mut().zip(fields) {
-        layers.add_volume_sources(
-            out,
-            field,
-            fx.sigma.d_sigma(),
-            &fx.geom,
-            &fx.pooled,
-            Blocks::All(fx.n_elements()),
-        );
+        layers.add_volume_sources(out, field, fx.sigma.d_sigma(), &fx.geom, pooled, elements);
+    }
+    let mut d_sigma_w = vec![0.0; LEVELS + 1];
+    w_cell_thicknesses(&layers.d_sigma, &mut d_sigma_w);
+    for (out, field) in rhs[4..].iter_mut().zip([&s.tke, &s.gls]) {
+        if let Some(rivers) = fx.inflow() {
+            rivers.add_w_point_sources_at_own_value(out, field, NN, elements);
+        }
+        layers.add_volume_sources(out, field, &d_sigma_w, &fx.geom, pooled, elements);
+    }
+    if let Some(rivers) = fx.inflow() {
+        rivers.add_tracer_sources(&mut rhs[0], NN, elements, |r, _| r.temperature.at(0.0));
+        rivers.add_tracer_sources(&mut rhs[1], NN, elements, |r, _| r.salinity.at(0.0));
     }
 }
 
@@ -411,16 +623,10 @@ fn cpu(fx: &Fixture) -> Cpu {
     let ne = fx.n_elements();
     let mut layers = LayerTransport::new(ne, &fx.ops, LEVELS).with_metric(MetricForm::Averaged);
     cpu_layers(fx, &mut layers);
-    let n = ne * NN * LEVELS;
-    let mut rhs = [
-        vec![0.0; n],
-        vec![0.0; n],
-        fx.rhs_u0.clone(),
-        fx.rhs_v0.clone(),
-    ];
+    let mut rhs = fx.rhs();
     cpu_advect(fx, &layers, &mut rhs, [T_RANGE, S_RANGE]);
     let advected = rhs.clone();
-    cpu_sources(fx, &layers, &mut rhs);
+    cpu_sources(fx, &layers, &mut rhs, &fx.pooled);
     Cpu {
         layers,
         advected,
@@ -431,21 +637,74 @@ fn cpu(fx: &Fixture) -> Cpu {
 /// The fixture's fields on the device.
 struct Device {
     eta: DeviceBuffer<f64>,
-    fields: [DeviceBuffer<f64>; 4],
+    /// T, S, u, v, k, ψ
+    fields: [DeviceBuffer<f64>; 6],
     reference: Option<[DeviceBuffer<f64>; 2]>,
     barotropic: BarotropicDevice,
-    rhs_u0: Vec<f64>,
-    rhs_v0: Vec<f64>,
+    /// The parent's u, v, T, S outside the open faces
+    parent: Option<[ExteriorDevice; 4]>,
+    /// T's and S's conditions at the open faces
+    bcs: [DeviceTracerBC3D; 2],
+    /// The rivers' T and S
+    river_conc: Option<[DeviceBuffer<f64>; 2]>,
+    rhs0: [Vec<f64>; 6],
+}
+
+/// What the device gets wrong on purpose, for the gate to catch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mutant {
+    None,
+    /// T and S without their reference
+    NoReference,
+    /// T and S at the central value beside thin columns, not the donor's
+    CentralTracers,
+    /// T's boundary condition the interior's value
+    ExtrapolatedT,
+    /// No river water in T
+    NoRiverT,
+    /// No parent's T outside the open faces (T's boundary condition there)
+    NoParentT,
 }
 
 impl Device {
-    fn upload(gpu: &Gpu, fx: &Fixture) -> Result<Self, Box<dyn std::error::Error>> {
+    /// The fixture's fields and its transports' statics (with the rivers),
+    /// on the device.
+    fn upload(
+        gpu: &Arc<Gpu>,
+        fx: &Fixture,
+    ) -> Result<(Self, Transport3D), Box<dyn std::error::Error>> {
         let up = |v: &[f64]| DeviceBuffer::from_host(&gpu.stream, v);
         let s = &fx.state;
         let pooled: Vec<u32> = fx.pooled.iter().map(|&p| u32::from(p)).collect();
-        Ok(Self {
+        let statics = fx.statics(gpu)?;
+        let rivers = match &fx.rivers {
+            Some(r) => {
+                let mut device = RiversDevice::new(gpu, &statics, &r.sources)?;
+                device.set_discharge(gpu, &r.discharge)?;
+                Some(device)
+            }
+            None => None,
+        };
+        let parent = match &fx.parent {
+            Some(p) => Some([
+                ExteriorDevice::new(gpu, &statics, &p.field(0))?,
+                ExteriorDevice::new(gpu, &statics, &p.field(1))?,
+                ExteriorDevice::new(gpu, &statics, &p.field(2))?,
+                ExteriorDevice::new(gpu, &statics, &p.field(3))?,
+            ]),
+            None => None,
+        };
+        let form = |bc: &dyn TracerBoundaryCondition3D| bc.device_form().expect("a device form");
+        let device = Self {
             eta: up(&s.eta.data)?,
-            fields: [up(&s.temp)?, up(&s.salt)?, up(&s.u)?, up(&s.v)?],
+            fields: [
+                up(&s.temp)?,
+                up(&s.salt)?,
+                up(&s.u)?,
+                up(&s.v)?,
+                up(&s.tke)?,
+                up(&s.gls)?,
+            ],
             reference: match &fx.reference {
                 Some([t, s]) => Some([up(t)?, up(s)?]),
                 None => None,
@@ -459,44 +718,62 @@ impl Device {
                 euler_dt: up(&fx.euler_dt)?,
                 pooled: DeviceBuffer::from_host(&gpu.stream, &pooled)?,
             },
-            rhs_u0: fx.rhs_u0.clone(),
-            rhs_v0: fx.rhs_v0.clone(),
-        })
+            parent,
+            bcs: [form(&*fx.bcs[0]), form(&*fx.bcs[1])],
+            river_conc: match &fx.rivers {
+                Some(r) => Some([up(&r.conc[0])?, up(&r.conc[1])?]),
+                None => None,
+            },
+            rhs0: fx.rhs(),
+        };
+        let transport = Transport3D::new(gpu, statics, fx.min_column_depth, rivers)?;
+        Ok((device, transport))
     }
 
-    /// The tendencies' buffers at their starting values (T and S zero, u
-    /// and v the fixture's).
-    fn rhs(&self, gpu: &Gpu) -> Result<[DeviceBuffer<f64>; 4], Box<dyn std::error::Error>> {
-        let st = &gpu.stream;
-        let n = self.rhs_u0.len();
+    /// The layer transports on the device.
+    fn layers(&self, transport: &mut Transport3D) -> Result<(), Box<dyn std::error::Error>> {
+        let [_, _, u, v, ..] = &self.fields;
+        let parent = self.parent.as_ref().map(|p| [&p[0], &p[1]]);
+        transport.compute(&self.eta, u, v, &self.barotropic, parent)
+    }
+
+    /// The tendencies' buffers at their starting values.
+    fn rhs(&self, gpu: &Gpu) -> Result<[DeviceBuffer<f64>; 6], Box<dyn std::error::Error>> {
+        let up = |v: &Vec<f64>| DeviceBuffer::from_host(&gpu.stream, v);
+        let r = &self.rhs0;
         Ok([
-            DeviceBuffer::zeroed(st, n)?,
-            DeviceBuffer::zeroed(st, n)?,
-            DeviceBuffer::from_host(st, &self.rhs_u0)?,
-            DeviceBuffer::from_host(st, &self.rhs_v0)?,
+            up(&r[0])?,
+            up(&r[1])?,
+            up(&r[2])?,
+            up(&r[3])?,
+            up(&r[4])?,
+            up(&r[5])?,
         ])
     }
 
-    /// The advection of u, v and T, S on the device, as [`cpu_advect`], and
-    /// with `sources` the volume sources, as [`cpu_sources`]; or a
-    /// `mutant` of it.
+    /// The advection of u, v, T, S, k and ψ on the device, as
+    /// [`cpu_advect`], and with `sources` the sources, as [`cpu_sources`];
+    /// or a `mutant` of it.
     fn advect(
         &self,
         transport: &Transport3D,
-        rhs: &mut [DeviceBuffer<f64>; 4],
+        rhs: &mut [DeviceBuffer<f64>; 6],
         mutant: Mutant,
         sources: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let [t, s, u, v] = &self.fields;
-        let [rhs_t, rhs_s, rhs_u, rhs_v] = rhs;
-        let unbounded = |field| Advected {
+        let [t, s, u, v, k, psi] = &self.fields;
+        let [rhs_t, rhs_s, rhs_u, rhs_v, rhs_k, rhs_psi] = rhs;
+        let parent = |f: usize| self.parent.as_ref().map(|p| &p[f]);
+        let velocity = |field, f| Advected {
             field,
             reference: None,
             range: UNBOUNDED,
+            exterior: parent(f),
+            bc: DeviceTracerBC3D::Extrapolation,
         };
         transport.advect(
-            [&unbounded(u), &unbounded(v)],
-            [rhs_u, rhs_v],
+            [&velocity(u, 0), &velocity(v, 1)],
+            [&mut *rhs_u, &mut *rhs_v],
             VerticalAdvection::Centred,
             Interface::Central,
             false,
@@ -508,20 +785,29 @@ impl Device {
                 .filter(|_| mutant != Mutant::NoReference)
                 .map(|r| &r[i])
         };
+        let t_bc = if mutant == Mutant::ExtrapolatedT {
+            DeviceTracerBC3D::Extrapolation
+        } else {
+            self.bcs[0]
+        };
         transport.advect(
             [
                 &Advected {
                     field: t,
                     reference: reference(0),
                     range: T_RANGE,
+                    exterior: parent(2).filter(|_| mutant != Mutant::NoParentT),
+                    bc: t_bc,
                 },
                 &Advected {
                     field: s,
                     reference: reference(1),
                     range: S_RANGE,
+                    exterior: parent(3),
+                    bc: self.bcs[1],
                 },
             ],
-            [rhs_t, rhs_s],
+            [&mut *rhs_t, &mut *rhs_s],
             VerticalAdvection::LimitedAkima,
             if mutant == Mutant::CentralTracers {
                 Interface::Central
@@ -530,18 +816,21 @@ impl Device {
             },
             true,
             sources,
-        )
+        )?;
+        transport.advect_w(
+            [k, psi],
+            [rhs_k, rhs_psi],
+            VerticalAdvection::LimitedAkima,
+            sources,
+        )?;
+        if sources && let Some([conc_t, conc_s]) = &self.river_conc {
+            if mutant != Mutant::NoRiverT {
+                transport.river_sources(rhs_t, conc_t)?;
+            }
+            transport.river_sources(rhs_s, conc_s)?;
+        }
+        Ok(())
     }
-}
-
-/// What the device gets wrong on purpose, for the gate to catch.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mutant {
-    None,
-    /// T and S without their reference
-    NoReference,
-    /// T and S at the central value beside thin columns, not the donor's
-    CentralTracers,
 }
 
 /// Agreement of one field: its values identical to the bit, the largest
@@ -587,11 +876,7 @@ fn report(
     device: &DeviceBuffer<f64>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let values = device.to_host_vec(&gpu.stream)?;
-    Ok(report_values(name, cpu, &values))
-}
-
-fn report_values(name: &str, cpu: &[f64], values: &[f64]) -> bool {
-    let a = agreement(cpu, values);
+    let a = agreement(cpu, &values);
     let same = a.identical == a.len;
     if same {
         println!("    {name:<16} {} of {} bit-identical", a.identical, a.len);
@@ -603,7 +888,7 @@ fn report_values(name: &str, cpu: &[f64], values: &[f64]) -> bool {
             a.identical, a.len, a.worst_ulps, a.worst_rel, cpu[at], values[at]
         );
     }
-    same
+    Ok(same)
 }
 
 /// The device's element kinds and thin columns against the CPU's
@@ -653,6 +938,38 @@ fn report_kinds(
     Ok(wrong == 0)
 }
 
+/// How many of `field`'s values a mutant of the device changes against
+/// the CPU's `cpu`; prints the line. Whether the gate catches it.
+fn report_mutant(
+    gpu: &Gpu,
+    device: &Device,
+    transport: &Transport3D,
+    mutant: Mutant,
+    what: &str,
+    field: usize,
+    cpu: &Cpu,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let sources = mutant == Mutant::NoRiverT;
+    let mut rhs = device.rhs(gpu)?;
+    device.advect(transport, &mut rhs, mutant, sources)?;
+    let values = rhs[field].to_host_vec(&gpu.stream)?;
+    let expected = if sources {
+        &cpu.sourced[field]
+    } else {
+        &cpu.advected[field]
+    };
+    let a = agreement(expected, &values);
+    let caught = a.identical < a.len;
+    println!(
+        "    mutant ({what}): {} {} of {} differ{}",
+        NAMES[field],
+        a.len - a.identical,
+        a.len,
+        if caught { ", caught" } else { ": NOT CAUGHT" }
+    );
+    Ok(caught)
+}
+
 /// One fixture on both: every output compared. Whether all are the same to
 /// the bit.
 fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::error::Error>> {
@@ -673,10 +990,8 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
         }
     );
     let cpu = cpu(&fx);
-    let mut transport = Transport3D::new(gpu, fx.statics(gpu)?, fx.min_column_depth)?;
-    let device = Device::upload(gpu, &fx)?;
-    let [_, _, u, v] = &device.fields;
-    transport.compute(&device.eta, u, v, &device.barotropic)?;
+    let (device, mut transport) = Device::upload(gpu, &fx)?;
+    device.layers(&mut transport)?;
     let layers = &cpu.layers;
     let mut same = report_kinds(gpu, &fx, layers, &transport)?;
     if !shape.beach {
@@ -715,19 +1030,18 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
     );
     same &= residual_same;
 
-    let names = ["T", "S", "u", "v"];
     for (sources, results, prefix) in [
         (false, &cpu.advected, "advected"),
         (true, &cpu.sourced, "+ sources"),
     ] {
         let mut rhs = device.rhs(gpu)?;
         device.advect(&transport, &mut rhs, Mutant::None, sources)?;
-        for ((name, cpu), gpu_values) in names.iter().zip(results).zip(&rhs) {
+        for ((name, cpu), gpu_values) in NAMES.iter().zip(results).zip(&rhs) {
             same &= report(gpu, &format!("{prefix} {name}"), cpu, gpu_values)?;
         }
     }
 
-    // The mutants: the gate must see each
+    // The mutants: the gate must catch each
     let mutants = [
         (
             shape.reference,
@@ -739,72 +1053,69 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
             Mutant::CentralTracers,
             "T at the central value beside thin columns",
         ),
+        (
+            shape.channel,
+            Mutant::ExtrapolatedT,
+            "T's open boundary extrapolated, not fixed",
+        ),
+        (shape.channel, Mutant::NoRiverT, "no river water in T"),
+        (
+            shape.channel,
+            Mutant::NoParentT,
+            "no parent's T outside x = L",
+        ),
     ];
     for (applies, mutant, what) in mutants {
-        if !applies {
-            continue;
+        if applies {
+            same &= report_mutant(gpu, &device, &transport, mutant, what, 0, &cpu)?;
         }
-        let mut rhs = device.rhs(gpu)?;
-        device.advect(&transport, &mut rhs, mutant, false)?;
-        let t = rhs[0].to_host_vec(&gpu.stream)?;
-        let a = agreement(&cpu.advected[0], &t);
+    }
+    // And the layer transports without the parent's velocity
+    if device.parent.is_some() {
+        let [_, _, u, v, ..] = &device.fields;
+        let mut without = Device::upload(gpu, &fx)?.1;
+        without.compute(&device.eta, u, v, &device.barotropic, None)?;
+        let faces = without.face.to_host_vec(&gpu.stream)?;
+        let a = agreement(&layers.face, &faces);
+        let caught = a.identical < a.len;
         println!(
-            "    mutant ({what}): T {} of {} differ{}",
+            "    mutant (no parent's velocity outside x = L): layer face {} of {} differ{}",
             a.len - a.identical,
             a.len,
-            if a.identical < a.len {
-                ", caught"
-            } else {
-                ": NOT CAUGHT"
-            }
+            if caught { ", caught" } else { ": NOT CAUGHT" }
         );
-        same &= a.identical < a.len;
+        same &= caught;
     }
     // That the fixture reaches the pooled sources: without the pass's pooled
     // elements (the fallback ones still pool) the sources differ (on the
     // CPU alone)
     if !fx.pooled.is_empty() {
         let mut unpooled = cpu.advected.clone();
-        let fields = [&fx.state.temp, &fx.state.salt, &fx.state.u, &fx.state.v];
-        for (out, field) in unpooled.iter_mut().zip(fields) {
-            layers.add_volume_sources(
-                out,
-                field,
-                fx.sigma.d_sigma(),
-                &fx.geom,
-                &[],
-                Blocks::All(ne),
-            );
-        }
+        cpu_sources(&fx, layers, &mut unpooled, &[]);
         let differ = |t: usize| {
             let a = agreement(&cpu.sourced[t], &unpooled[t]);
             a.len - a.identical
         };
         println!(
-            "    the pooled elements act (CPU, none pooled): T {} and u {} of {} values differ",
+            "    the pooled elements act (CPU, none pooled): T {}, u {} and k {} values differ",
             differ(0),
             differ(2),
-            ne * NN * LEVELS
+            differ(4)
         );
     }
     // That the fixture reaches the end layers' bound: unbounded ranges give
     // other tendencies (on the CPU alone)
-    let n = ne * NN * LEVELS;
-    let mut unbounded = [
-        vec![0.0; n],
-        vec![0.0; n],
-        fx.rhs_u0.clone(),
-        fx.rhs_v0.clone(),
-    ];
+    let mut unbounded = fx.rhs();
     cpu_advect(&fx, layers, &mut unbounded, [UNBOUNDED; 2]);
     let differ = |t: usize| {
         let a = agreement(&cpu.advected[t], &unbounded[t]);
         a.len - a.identical
     };
     println!(
-        "    the ranges act (CPU, unbounded): T {} and S {} of {n} values differ",
+        "    the ranges act (CPU, unbounded): T {} and S {} of {} values differ",
         differ(0),
-        differ(1)
+        differ(1),
+        ne * NN * LEVELS
     );
     println!(
         "  {}",
@@ -827,14 +1138,8 @@ fn time(
     let fx = Fixture::new(shape);
     let ne = fx.n_elements();
     let points = (ne * LEVELS) as f64;
-    let n = ne * NN * LEVELS;
     let mut layers = LayerTransport::new(ne, &fx.ops, LEVELS).with_metric(MetricForm::Averaged);
-    let mut rhs = [
-        vec![0.0; n],
-        vec![0.0; n],
-        fx.rhs_u0.clone(),
-        fx.rhs_v0.clone(),
-    ];
+    let mut rhs = fx.rhs();
     // CPU: warm up, then each part on its own
     let mut cpu_parts = [0.0; 2];
     for it in 0..iterations + 2 {
@@ -842,7 +1147,7 @@ fn time(
         cpu_layers(&fx, &mut layers);
         let t1 = Instant::now();
         cpu_advect(&fx, &layers, &mut rhs, [T_RANGE, S_RANGE]);
-        cpu_sources(&fx, &layers, &mut rhs);
+        cpu_sources(&fx, &layers, &mut rhs, &fx.pooled);
         let t2 = Instant::now();
         if it >= 2 {
             cpu_parts[0] += (t1 - t0).as_secs_f64();
@@ -856,16 +1161,14 @@ fn time(
         (ne * NN * LEVELS) as f64 / 1e6,
         100.0 * subcell as f64 / ne as f64
     );
-    let mut transport = Transport3D::new(gpu, fx.statics(gpu)?, fx.min_column_depth)?;
-    let device = Device::upload(gpu, &fx)?;
+    let (device, mut transport) = Device::upload(gpu, &fx)?;
     let mut rhs = device.rhs(gpu)?;
-    let [_, _, u, v] = &device.fields;
     let gpu_iterations = 5 * iterations;
     let mut gpu_parts = [0.0; 2];
     for it in 0..gpu_iterations + 2 {
         gpu.stream.synchronize()?;
         let t0 = Instant::now();
-        transport.compute(&device.eta, u, v, &device.barotropic)?;
+        device.layers(&mut transport)?;
         gpu.stream.synchronize()?;
         let t1 = Instant::now();
         device.advect(&transport, &mut rhs, Mutant::None, true)?;
@@ -879,16 +1182,19 @@ fn time(
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let per = |total: f64, count: usize| total * 1e9 / (count as f64 * points);
     println!("  per element and level (CPU {threads} threads | GPU, ×):");
-    let names = ["layer transports and Ω", "advection, volume sources"];
+    let names = [
+        "layer transports and Ω",
+        "advection (u, v, T, S, k, ψ), sources",
+    ];
     let (mut cpu_all, mut gpu_all) = (0.0, 0.0);
     for ((name, c), g) in names.iter().zip(cpu_parts).zip(gpu_parts) {
         let (c, g) = (per(c, iterations), per(g, gpu_iterations));
         cpu_all += c;
         gpu_all += g;
-        println!("    {name:<26} {c:7.2} ns | {g:6.2} ns ({:.1}×)", c / g);
+        println!("    {name:<38} {c:7.2} ns | {g:6.2} ns ({:.1}×)", c / g);
     }
     println!(
-        "    {:<26} {cpu_all:7.2} ns | {gpu_all:6.2} ns ({:.1}×); per stage {:.1} ms | {:.2} ms",
+        "    {:<38} {cpu_all:7.2} ns | {gpu_all:6.2} ns ({:.1}×); per stage {:.1} ms | {:.2} ms",
         "all",
         cpu_all / gpu_all,
         cpu_all * points / 1e6,
@@ -905,6 +1211,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
         jitter: 0.0,
         periodic: true,
         beach: false,
+        channel: false,
         stretched: false,
         reference: false,
         euler_dt: 0.05,
@@ -912,12 +1219,21 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     let beach = Shape {
         nx: 36,
         ny: 20,
-        jitter: 0.0,
         periodic: false,
         beach: true,
-        stretched: false,
         reference: true,
-        euler_dt: 0.05,
+        ..wet
+    };
+    let channel = Shape {
+        nx: 30,
+        ny: 12,
+        jitter: 0.15,
+        periodic: false,
+        channel: true,
+        stretched: true,
+        reference: true,
+        euler_dt: 40.0,
+        ..wet
     };
     let fixtures = [
         ("periodic, parallelograms", wet),
@@ -957,6 +1273,10 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
                 euler_dt: 40.0,
                 ..beach
             },
+        ),
+        (
+            "channel, open ends, a parent, rivers, jittered, stretched, reference",
+            channel,
         ),
     ];
     let mut failed = Vec::new();
