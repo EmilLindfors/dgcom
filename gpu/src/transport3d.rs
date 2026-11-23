@@ -897,7 +897,7 @@ impl Device {
     fn layers(&self, transport: &mut Transport3D) -> Result<(), Box<dyn std::error::Error>> {
         let [_, _, u, v, ..] = &self.fields;
         let parent = self.parent.as_ref().map(|p| [&p[0], &p[1]]);
-        transport.compute(&self.eta, u, v, &self.barotropic, parent)
+        transport.compute(&self.eta, u, v, Some(&self.barotropic), parent)
     }
 
     /// The tendencies' buffers at their starting values.
@@ -1305,7 +1305,7 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
     if device.parent.is_some() {
         let [_, _, u, v, ..] = &device.fields;
         let mut without = Device::upload(gpu, &fx)?.1;
-        without.compute(&device.eta, u, v, &device.barotropic, None)?;
+        without.compute(&device.eta, u, v, Some(&device.barotropic), None)?;
         let faces = without.face.to_host_vec(&gpu.stream)?;
         let a = agreement(&layers.face, &faces);
         let caught = a.identical < a.len;

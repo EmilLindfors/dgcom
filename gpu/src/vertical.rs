@@ -491,6 +491,16 @@ struct CagesDevice {
     net_depths: DeviceBuffer<f64>,
 }
 
+/// Whether each of `n_columns` columns has a cage entry (`for_each_caged_node`'s
+/// nodes), as a u32 per column.
+pub fn caged_columns(cages: &CageDrag2D, n_columns: usize) -> Vec<u32> {
+    let mut caged = vec![0; n_columns];
+    for entry in cages.nodes() {
+        caged[entry.node] = 1;
+    }
+    caged
+}
+
 /// What [`Vertical3D::new`] takes of a 3D physics module.
 pub struct VerticalSetup<'a> {
     pub mixing: &'a GlsMixing,

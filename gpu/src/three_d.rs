@@ -274,9 +274,11 @@ pub mod kernels3d {
         if k >= n_elements as usize {
             return;
         }
-        let pass = bar_subcell[k * NSUB..(k + 1) * NSUB]
-            .iter()
-            .all(|f| f.is_finite());
+        // Without a barotropic flux (`bar_subcell` empty) no pass moved it
+        let pass = !bar_subcell.is_empty()
+            && bar_subcell[k * NSUB..(k + 1) * NSUB]
+                .iter()
+                .all(|f| f.is_finite());
         let mut any_thin = false;
         // SAFETY: thread k alone writes element k's kind and nodes.
         unsafe {
@@ -322,7 +324,10 @@ pub mod kernels3d {
         }
         let nl = nl as usize;
         let depth = eta[idx] - bed[idx];
-        let dt = if depth > 0.0 {
+        // Without a barotropic flux (`bar_hu` empty) no correction and no
+        // step
+        let corrected = !bar_hu.is_empty();
+        let dt = if corrected && depth > 0.0 {
             euler_dt[idx / NN] / depth
         } else {
             0.0
@@ -340,6 +345,9 @@ pub mod kernels3d {
                 *hv.get_unchecked_mut(idx * nl + l) = b;
                 sum_u += a;
                 sum_v += b;
+            }
+            if !corrected {
+                return;
             }
             let (corr_u, corr_v) = (bar_hu[idx] - sum_u, bar_hv[idx] - sum_v);
             for l in 0..nl {
@@ -409,6 +417,10 @@ pub mod kernels3d {
                 };
                 *face.get_unchecked_mut(s * nl + l) = flux;
                 sum += flux;
+            }
+            // Without a barotropic flux (`bar_face` empty) no correction
+            if bar_face.is_empty() {
+                return;
             }
             let corr = bar_face[s] - sum;
             for l in 0..nl {
@@ -623,7 +635,13 @@ pub mod kernels3d {
         }
         let nl = nl as usize;
         let (k, node) = (idx / NN, idx % NN);
-        let rate = eta_rate[idx];
+        // Without a barotropic flux (`eta_rate` empty) the column's own
+        // divergence, summed as the CPU sums it
+        let rate = if eta_rate.is_empty() {
+            -div[idx * nl..(idx + 1) * nl].iter().sum::<f64>()
+        } else {
+            eta_rate[idx]
+        };
         let base = idx * (nl + 1);
         let rivers = if river_offsets.is_empty() {
             0..0
@@ -1614,7 +1632,7 @@ impl Transport3D {
         eta: &DeviceBuffer<f64>,
         u: &DeviceBuffer<f64>,
         v: &DeviceBuffer<f64>,
-        barotropic: &BarotropicDevice,
+        barotropic: Option<&BarotropicDevice>,
         parent: Option<[&ExteriorDevice; 2]>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let gpu = self.gpu.clone();
@@ -1625,8 +1643,18 @@ impl Transport3D {
         let n_slots = s.n_elements * SLOTS;
         let n_sub = s.n_elements * NSUB;
         let n_levels = s.n_elements * s.n_levels;
+        // Without a barotropic flux (`LayerTransport::compute` with `None`:
+        // the layers' own transports, the slow forcing's) every pass array
+        // is empty, and so are the rivers (the pass's)
+        let none = &self.none;
+        let (bar_subcell, bar_hu, bar_hv, bar_face, eta_rate, euler_dt) = match barotropic {
+            Some(b) => (&b.subcell, &b.hu, &b.hv, &b.face, &b.eta_rate, &b.euler_dt),
+            None => (none, none, none, none, none, none),
+        };
+        let pooled = barotropic.map_or(&self.none_u32, |b| &b.pooled);
         // Field by field, so that the outputs below can be borrowed apart
-        let (offsets, by_element, q, share, weights) = match &self.rivers {
+        let rivers = self.rivers.as_ref().filter(|_| barotropic.is_some());
+        let (offsets, by_element, q, share, weights) = match rivers {
             Some(r) => (&r.offsets, &r.by_element, &r.q, &r.share, &r.weights),
             None => (
                 &self.none_u32,
@@ -1651,8 +1679,8 @@ impl Transport3D {
                 self.min_column_depth,
                 eta,
                 &s.bed,
-                &barotropic.subcell,
-                &barotropic.pooled,
+                bar_subcell,
+                pooled,
                 &mut self.kinds,
                 &mut self.thin,
             )?;
@@ -1666,9 +1694,9 @@ impl Transport3D {
                 u,
                 v,
                 &s.d_sigma,
-                &barotropic.euler_dt,
-                &barotropic.hu,
-                &barotropic.hv,
+                euler_dt,
+                bar_hu,
+                bar_hv,
                 &mut self.hu,
                 &mut self.hv,
                 &mut self.dt_over_depth,
@@ -1690,7 +1718,7 @@ impl Transport3D {
                 &self.hu,
                 &self.hv,
                 &s.d_sigma,
-                &barotropic.face,
+                bar_face,
                 &mut self.face,
             )?;
             m.layer_subcells(
@@ -1701,7 +1729,7 @@ impl Transport3D {
                 &self.kinds,
                 &self.thin,
                 &s.sub_metric,
-                &barotropic.subcell,
+                bar_subcell,
                 &self.hu,
                 &self.hv,
                 &s.d_sigma,
@@ -1734,7 +1762,7 @@ impl Transport3D {
                 nl,
                 n_columns as u32,
                 &self.div,
-                &barotropic.eta_rate,
+                eta_rate,
                 &s.d_sigma,
                 &s.sigma_w,
                 offsets,
