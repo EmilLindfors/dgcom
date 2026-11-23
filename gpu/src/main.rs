@@ -8,8 +8,8 @@
 //! cargo oxide run --features simd             # multiply–adds fused: the timing
 //! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, beach,
 //!                                             # transport3d, momentum3d, stage3d,
-//!                                             # limiter3d, vertical3d, implicit3d; all
-//!                                             # by default)
+//!                                             # limiter3d, vertical3d, implicit3d,
+//!                                             # forcing3d; all by default)
 //! target\release\dgcom-gpu.exe case <case.toml> [--set key.path=value]...
 //!                                             # a case on the CPU and the GPU, compared
 //! target\release\dgcom-gpu.exe run <case.toml> [--set ...]
@@ -33,7 +33,8 @@
 //!   step's vertical terms, GLS and the implicit diffusion with the drags
 //!   and the surface fluxes, and `dgcom::math` itself (`vertical3d`); the
 //!   implicit vertical advection, the split of Ω and the relaxation
-//!   (`implicit3d`); value for value.
+//!   (`implicit3d`); the slow forcing `G` of the barotropic pass
+//!   (`forcing3d`); value for value.
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
 //! must be the CPU's bit for bit; that is the gate.
@@ -43,6 +44,8 @@ use std::process::ExitCode;
 
 mod baroclinic;
 mod case;
+mod forcing;
+mod forcing3d;
 mod hooks;
 mod implicit3d;
 mod limiter;
@@ -122,6 +125,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if which == "all" || which == "implicit3d" {
         implicit3d::run(&gpu)?;
+    }
+    if which == "all" || which == "forcing3d" {
+        forcing3d::run(&gpu)?;
     }
     Ok(())
 }
