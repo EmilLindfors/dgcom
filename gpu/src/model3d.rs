@@ -26,12 +26,13 @@
 //! The device takes global 3D steps (the case runner's default; local time
 //! steps of the 3D stages are 4.5d). The forcing a trait object evaluates
 //! on the host is evaluated there at the CPU's times and uploaded: a
-//! surface stress field, the rivers' tracers, and a nesting band's columns
-//! (`Nesting3D::columns` on the band's nodes, gathered from the device, its
-//! cache the CPU's; a fixed parent's once, 4.5g). Not yet on the device: the
-//! surface heat and fresh-water
-//! fluxes, the viscosity once per step; [`Model3D::new`] refuses them by
-//! name.
+//! surface stress field, the rivers' tracers, the surface heat and
+//! fresh-water fluxes (over the sea surface gathered from the device, 4.5h),
+//! and a nesting band's columns (`Nesting3D::columns` on the band's nodes,
+//! gathered from the device, its cache the CPU's; a fixed parent's once,
+//! 4.5g). Not yet on the device: the viscosity once per step, the
+//! conservative momentum form, the constant-depth pressure gradient;
+//! [`Model3D::new`] refuses them by name.
 //!
 //! As `Simulation3D`'s model ([`RunModel3D`], 4.5c) it runs the step's
 //! bound (4.5e), `post_process` and the blow-up check on the device. Its
@@ -52,8 +53,8 @@ use dgcom::boundary::{DeviceParent3D, Nesting3D, SWEBoundaryCondition2D, Supplie
 use dgcom::case::StateView3D;
 use dgcom::mesh::Mesh2D;
 use dgcom::physics::{
-    GlsMixing, Hydrostatic3D, LinearEOS, PhysicsModule, SWEPhysics2D, TimeStepLimits,
-    VerticalMixing,
+    GlsMixing, Hydrostatic3D, LinearEOS, PhysicsModule, SWEPhysics2D, SeaSurface,
+    SurfaceFluxFields, TimeStepLimits, VerticalMixing,
 };
 use dgcom::profiling;
 use dgcom::simulation::{NonFinite, RunModel3D, non_finite_of_masks};
@@ -251,6 +252,29 @@ pub mod kernels_model {
                 *out_t.get_unchecked_mut(to) = temp[from];
                 *out_s.get_unchecked_mut(to) = salt[from];
             }
+        }
+    }
+
+    /// The sea surface (`surface_fluxes_at`): every column's top layer of
+    /// T and S, a thread per column.
+    #[kernel]
+    pub fn sea_surface(
+        nl: u32,
+        n: u32,
+        temp: &[f64],
+        salt: &[f64],
+        mut sst: DisjointSlice<f64>,
+        mut sss: DisjointSlice<f64>,
+    ) {
+        let col = thread::index_1d().get();
+        if col >= n as usize {
+            return;
+        }
+        let top = (col + 1) * nl as usize - 1;
+        // SAFETY: thread col alone writes column col (col < n).
+        unsafe {
+            *sst.get_unchecked_mut(col) = temp[top];
+            *sss.get_unchecked_mut(col) = salt[top];
         }
     }
 
@@ -576,6 +600,28 @@ impl Nest3D {
     }
 }
 
+/// The surface heat and fresh-water fluxes' fields of every column: the sea
+/// surface's T and S gathered on the device, both on the host with the
+/// fluxes the physics evaluates there, and the fluxes on the device.
+struct SurfaceFluxWork {
+    surface: [DeviceBuffer<f64>; 2],
+    /// SST, SSS, non-solar, shortwave, E − P
+    host: [Vec<f64>; 5],
+    fluxes: [DeviceBuffer<f64>; 3],
+}
+
+impl SurfaceFluxWork {
+    fn new(gpu: &Gpu, n_columns: usize) -> Self {
+        let zeros =
+            || cuda(DeviceBuffer::<f64>::zeroed(&gpu.stream, n_columns).map_err(Into::into));
+        Self {
+            surface: [zeros(), zeros()],
+            host: std::array::from_fn(|_| vec![0.0; n_columns]),
+            fluxes: [zeros(), zeros(), zeros()],
+        }
+    }
+}
+
 /// The step's buffers and the device modules ([`SplitModel::Work`] of
 /// [`Model3D`]).
 pub struct Work3D {
@@ -609,6 +655,8 @@ pub struct Work3D {
     stages: Option<Stages3D>,
     /// The columns' sums or means of u and v
     sums: [DeviceBuffer<f64>; 2],
+    /// The surface heat and fresh-water fluxes, if the physics has them
+    surface_fluxes: Option<SurfaceFluxWork>,
     /// The surface stress field (host and device), the rivers' T and S
     stress_host: [Vec<f64>; 2],
     stress: Option<[DeviceBuffer<f64>; 2]>,
@@ -717,9 +765,6 @@ where
         physics: &'a Hydrostatic3D<LinearEOS, GlsMixing, BC>,
     ) -> Result<Self, String> {
         let refuse = |what: &str| Err(format!("{what} is not on the device yet"));
-        if physics.surface_fluxes.is_some() {
-            return refuse("the surface heat and fresh-water fluxes");
-        }
         if physics.viscosity_once_per_step() {
             return refuse("the viscosity once per step");
         }
@@ -849,6 +894,62 @@ where
             &p.boundaries,
             p.metric_form(),
         ))
+    }
+
+    /// The surface heat and fresh-water fluxes at `t` over `state`'s sea
+    /// surface into `work`'s device buffers (`Hydrostatic3D`'s
+    /// `surface_fluxes_at`: the physics' own fluxes on the host, from the
+    /// top layer of T and S), if the physics has them.
+    fn surface_fluxes_at(&self, state: &State3D, t: f64, work: &mut Work3D) {
+        let (Some(fluxes), Some(w)) = (&self.physics.surface_fluxes, &mut work.surface_fluxes)
+        else {
+            return;
+        };
+        let (gpu, s) = (&self.gpu, &work.statics);
+        let (st, n) = (&gpu.stream, s.n_columns());
+        let [sst_d, sss_d] = &mut w.surface;
+        // SAFETY: T and S hold every column's levels, the surface a value a
+        // column.
+        unsafe {
+            cuda(
+                gpu.module_model
+                    .sea_surface(
+                        st,
+                        launch(n, COLUMN_BLOCK),
+                        s.n_levels as u32,
+                        n as u32,
+                        &state.temp,
+                        &state.salt,
+                        sst_d,
+                        sss_d,
+                    )
+                    .map_err(Into::into),
+            );
+        }
+        profiling::scope("device: surface fluxes", || {
+            let [sst, sss, nonsolar, shortwave, freshwater] = &mut w.host;
+            cuda(sst_d.copy_to_host(st, sst).map_err(Into::into));
+            cuda(sss_d.copy_to_host(st, sss).map_err(Into::into));
+            fluxes.surface_fluxes_into(
+                t,
+                SeaSurface {
+                    temperature: sst,
+                    salinity: sss,
+                },
+                SurfaceFluxFields {
+                    nonsolar,
+                    shortwave,
+                    freshwater,
+                },
+            );
+            for (to, from) in w
+                .fluxes
+                .iter_mut()
+                .zip([&*nonsolar, &*shortwave, &*freshwater])
+            {
+                cuda(to.copy_from_host(st, from).map_err(Into::into));
+            }
+        });
     }
 
     /// The surface stress field at `t` into `work`'s device buffers, if the
@@ -1050,6 +1151,10 @@ where
             implicit_dt: zeros(ne),
             stages: None,
             sums: [zeros(n_columns), zeros(n_columns)],
+            surface_fluxes: p
+                .surface_fluxes
+                .as_ref()
+                .map(|_| SurfaceFluxWork::new(gpu, n_columns)),
             stress_host: [Vec::new(), Vec::new()],
             stress: None,
             river_conc: rivers.map(|r| [zeros(r.len()), zeros(r.len())]),
@@ -1750,19 +1855,24 @@ where
                 state.gls = up(psi0);
             }
         }
-        // The surface stress at the middle of the step
+        // The surface fluxes and stress at the middle of the step, the fluxes
+        // over the state's sea surface
+        self.surface_fluxes_at(state, t + 0.5 * dt, work);
         self.stress_at(t + 0.5 * dt, work);
         let Work3D {
             statics,
             vertical,
             stress,
             roughness,
+            surface_fluxes,
             ..
         } = work;
         let surface = SurfaceDevice {
             stress: stress.as_ref().map(|[x, y]| [x, y]),
             roughness: roughness.as_ref(),
-            tracers: None,
+            tracers: surface_fluxes
+                .as_ref()
+                .map(|w| [&w.fluxes[0], &w.fluxes[1], &w.fluxes[2]]),
         };
         cuda(vertical.step(statics, state, surface, dt));
     }
