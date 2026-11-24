@@ -434,6 +434,18 @@ Measured on the RTX 3090 with Nsight Systems' per-launch durations against each 
 - **The gate, `dgcom-gpu step3d`** (also in `all`): four steps of the case runner's model and integrator, CPU (`Hydrostatic3D`) against the device (`Model3D`), every field (η, ū, v̄, u, v, T, S, k, ψ, ρ) and the splitter's counts after every step. The model: the beach's wet/dry 2D module with a β-plane, k-ε, the log-layer drag, three net cages, uniform stresses and a turning wind field, the beach's three rivers, the reference with its pressure gradient, advection and Kuzmin limiter, implicit vertical advection, Smagorinsky 0.1. The integrator: the pass on two levels, SSP-RK(4,3) in both. From no turbulence, as a case starts (the closure allocates it in the first step, the stage buffers take it from the second). Steps at the 3D CFL number 4 (24.0 s; 16.6 s jittered).
   - The beach (720 elements × 20 levels; 313 cells merged and 468 kept over the four steps) and the beach jittered by 0.2 on Vstretching 4 (369, 387): **bit for bit** (`--no-fmad`), 939,603 values a step, on the first run.
   - Mutants caught, each giving the device another input: no wind field (2.95 M values), no rivers (2.24 M), no cages (1.86 M), explicit vertical advection (2.77 M), no tracer limiter (2.81 M), no reference (2.90 M), Smagorinsky 0.12 (2.89 M), a 4 mm bed roughness (2.93 M), global substeps (3.08 M), SSP-RK3 stages (2.99 M), at least 40 substeps (3.08 M).
+  - The same on the RTX 3090 (the Ubuntu server, CUDA 13): bit for bit, all 11 mutants caught. The whole suite on the laptop (`dgcom-gpu all`, 246 s): every gate bit for bit, every mutant caught.
+  - With FMA the four steps drift apart where a threshold decides (the merged cells: 314 against 315 after four steps on the 3090): up to 5e-3 of T's largest value in places after four steps, ≈ 1e-8 in η.
+- **Time** (FMA, the beach jittered by 0.15 on Vstretching 4, the case runner's model and integrator, steps of 15.9–16.2 s with 5 coarse barotropic substeps; three steps after an untimed one):
+
+  | | elements × 20 levels | CPU | GPU | |
+  |---|---|---|---|---|
+  | RTX 4060 Laptop, its 24 threads | 23,940 | 1,434 ms | 648 ms | 2.2× |
+  | | 47,912 | 3,016 ms | 1,231 ms | 2.4× |
+  | | 96,000 | 6,420 ms | 52,871 ms | the model does not fit 8 GB: paged |
+  | RTX 3090, the server's CPU | 96,000 | 20,868 ms | 1,218 ms | 17.1× (5.3× the laptop's 24 threads) |
+
+  Without FMA the 3090 takes 1,371 ms at 96,000 and the laptop 1,485 ms at 48,000 (160 × 300). The device model takes ≈ 136 kB an element (3.6 GB at 24,000, 6.5 GB at 48,000; Parked below). Its per-section profile (Nsight Systems) is next, with 4.5c's `Simulation3D` around it.
 
 ## Phase 4.5a: the mode splitter generic over its backend (2026-11-24)
 
