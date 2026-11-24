@@ -50,6 +50,7 @@ use dgcom::mesh::Mesh2D;
 use dgcom::physics::{
     GlsMixing, Hydrostatic3D, LinearEOS, PhysicsModule, SWEPhysics2D, VerticalMixing,
 };
+use dgcom::profiling;
 use dgcom::simulation::{NonFinite, RunModel3D, non_finite_field};
 use dgcom::solver::rhs::{MomentumAdvectionForm, PressureGradientForm};
 use dgcom::solver::state::Solution3D;
@@ -1270,7 +1271,9 @@ where
         // The nesting parent's columns of the values: its values outside the
         // open faces it covers, its relaxation of the tracers below
         if let Some(nest) = nest.as_mut() {
-            nest.evaluate(gpu, s, p, vals, time);
+            profiling::scope("device: nesting columns", || {
+                nest.evaluate(gpu, s, p, vals, time)
+            });
         }
         let (ext_velocity, ext_tracers) = nest
             .as_ref()
@@ -1791,13 +1794,19 @@ where
                     .map_err(Into::into),
             );
         }
-        let mut host = self.host();
-        cuda(state.download_into(gpu, &mut host));
-        cuda(
-            work.w
-                .copy_to_host(&gpu.stream, &mut host.w)
-                .map_err(Into::into),
-        );
+        // The step's kernels, then the copy (`DG_PROFILE`: each apart)
+        profiling::scope("device: wait for the step", || {
+            cuda(gpu.stream.synchronize().map_err(Into::into))
+        });
+        profiling::scope("device: state to the host", || {
+            let mut host = self.host();
+            cuda(state.download_into(gpu, &mut host));
+            cuda(
+                work.w
+                    .copy_to_host(&gpu.stream, &mut host.w)
+                    .map_err(Into::into),
+            );
+        });
     }
 
     fn non_finite(&self, _state: &State3D) -> Option<NonFinite> {
