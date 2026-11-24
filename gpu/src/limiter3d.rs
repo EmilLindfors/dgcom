@@ -27,6 +27,7 @@ use dgcom::solver::{
 
 use crate::hooks::State3D;
 use crate::limiter::{Limiter3D, VertexPatches};
+use crate::listed::On;
 use crate::stage3d::{Snapshots, report, report_mutant};
 use crate::swe2d::{Gpu, NN, ORDER};
 use crate::three_d::Statics3D;
@@ -105,7 +106,7 @@ fn on_device(
 ) -> Result<Snapshots, Box<dyn std::error::Error>> {
     let mut limiter = Limiter3D::new(gpu, statics, patches, config, thin_depth)?;
     let mut values = State3D::upload(gpu, state)?;
-    limiter.apply(statics, &mut values)?;
+    limiter.apply(statics, &mut values, On::ALL)?;
     let mut host = state.clone();
     values.download_into(gpu, &mut host)?;
     Ok(snapshots(&host))
@@ -348,7 +349,7 @@ fn time_on(
         values.copy_from(gpu, &start)?;
         gpu.stream.synchronize()?;
         let t0 = Instant::now();
-        limiter.apply(&statics, &mut values)?;
+        limiter.apply(&statics, &mut values, On::ALL)?;
         gpu.stream.synchronize()?;
         if it >= 2 {
             gpu_time += t0.elapsed().as_secs_f64();

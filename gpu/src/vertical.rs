@@ -44,6 +44,7 @@ use dgcom::source::CageDrag2D;
 use dgcom::vertical::SigmaGrid;
 
 use crate::hooks::State3D;
+use crate::listed::{On, is_member, listed_index};
 use crate::swe2d::{Gpu, NN};
 use crate::three_d::{COLUMN_BLOCK, MAX_LEVELS, Statics3D, launch};
 
@@ -167,11 +168,14 @@ pub mod kernels_vertical {
     /// inventory of u, v, T or S (or k, ψ on the w-cells, if not empty)
     /// relaxed with its implicit fluxes `implicit` over its element's `dt`,
     /// by dgcom's `relax_column`. Launched for up to six threads per column.
+    /// Only the columns of the elements `member` flags (empty: every
+    /// element).
     #[kernel]
     pub fn relax_implicit(
         nl: u32,
         counts: &[u32],
         active: &[u32],
+        member: &[u32],
         eta: &[f64],
         bed: &[f64],
         d_sigma: &[f64],
@@ -191,6 +195,9 @@ pub mod kernels_vertical {
             return;
         }
         let col = active[j] as usize;
+        if !is_member(member, col / NN) {
+            return;
+        }
         let (nl, nw) = (nl as usize, nl as usize + 1);
         let omega = &implicit[col * nw..(col + 1) * nw];
         let (pointer, nc, cells, w_points) = match field {
@@ -332,11 +339,13 @@ pub mod kernels_vertical {
     /// of `JerlovWater::ALL`), the drag rates (empty for none); a thin
     /// column its fluxes with `thin_bed` m of water under it (if
     /// `thin_bed_on`), then the depth mean in its layers. The viscosity and
-    /// diffusivity of the columns of water into `av`, `kt`.
+    /// diffusivity of the columns of water into `av`, `kt`. Only the columns
+    /// of the elements `listed` (empty: every element).
     #[kernel]
     pub fn vertical_columns(
         nl: u32,
         n: u32,
+        listed: &[u32],
         gls: &[GlsDevice],
         uniform: &[f64],
         stress_x: &[f64],
@@ -375,6 +384,7 @@ pub mod kernels_vertical {
         if idx >= n as usize {
             return;
         }
+        let idx = listed_index(idx, listed, NN);
         let (nl, nw) = (nl as usize, nl as usize + 1);
         let h = -bed[idx];
         let fluxes = if nonsolar.is_empty() {
@@ -542,6 +552,8 @@ pub struct Implicit3D {
     /// `active`, in no particular order)
     counts: DeviceBuffer<u32>,
     active: DeviceBuffer<u32>,
+    /// Every element, as a list
+    none_u32: DeviceBuffer<u32>,
 }
 
 impl Implicit3D {
@@ -560,6 +572,7 @@ impl Implicit3D {
             implicit: DeviceBuffer::zeroed(st, n * (statics.n_levels + 1))?,
             counts: DeviceBuffer::zeroed(st, 1)?,
             active: DeviceBuffer::zeroed(st, n)?,
+            none_u32: DeviceBuffer::zeroed(st, 0)?,
         })
     }
 
@@ -608,13 +621,14 @@ impl Implicit3D {
     }
 
     /// `implicit_vertical_advection` of the inventories `stage` with the
-    /// implicit part of the last [`Self::split`], each element over its
-    /// `dt`.
+    /// implicit part of the last [`Self::split`], each element of `on` over
+    /// its `dt`.
     pub fn relax(
         &self,
         s: &Statics3D,
         stage: &mut State3D,
         dt: &DeviceBuffer<f64>,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let n = s.n_columns();
         let State3D {
@@ -636,6 +650,7 @@ impl Implicit3D {
                 s.n_levels as u32,
                 &self.counts,
                 &self.active,
+                on.member(&self.none_u32),
                 eta,
                 &s.bed,
                 &s.d_sigma,
@@ -708,6 +723,7 @@ pub struct Vertical3D {
     pub eddy_viscosity: DeviceBuffer<f64>,
     pub eddy_diffusivity: DeviceBuffer<f64>,
     none: DeviceBuffer<f64>,
+    none_u32: DeviceBuffer<u32>,
 }
 
 impl Vertical3D {
@@ -790,6 +806,7 @@ impl Vertical3D {
             eddy_viscosity: zeros(n_columns * (nl + 1))?,
             eddy_diffusivity: zeros(n_columns * (nl + 1))?,
             none: zeros(0)?,
+            none_u32: DeviceBuffer::zeroed(st, 0)?,
         })
     }
 
@@ -850,19 +867,21 @@ impl Vertical3D {
         Ok(())
     }
 
-    /// `vertical_implicit` of `state` over `dt` with the step's surface
-    /// fields and the drag rates of the last [`Self::drag_rates`].
+    /// `vertical_implicit` of `state`'s columns of the elements of `on` over
+    /// `dt` with the step's surface fields and the drag rates of the last
+    /// [`Self::drag_rates`].
     pub fn step(
         &mut self,
         s: &Statics3D,
         state: &mut State3D,
         surface: SurfaceDevice,
         dt: f64,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let gpu = &self.gpu;
         let (m, st) = (&gpu.module_vertical, &gpu.stream);
         let none = &self.none;
-        let n = s.n_columns();
+        let n = on.count(s.n_elements) * NN;
         let [stress_x, stress_y] = surface.stress.unwrap_or([none, none]);
         let [nonsolar, shortwave, freshwater] = surface.tracers.unwrap_or([none, none, none]);
         let State3D {
@@ -885,6 +904,7 @@ impl Vertical3D {
                 launch(n, COLUMN_BLOCK),
                 s.n_levels as u32,
                 n as u32,
+                on.listed(&self.none_u32),
                 &self.gls,
                 &self.uniform,
                 stress_x,
