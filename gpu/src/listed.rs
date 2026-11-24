@@ -146,7 +146,13 @@ impl Lists {
         let entry = Entry {
             host: list.to_vec(),
             list: DeviceList {
-                listed: DeviceBuffer::from_host(st, list)?,
+                // An empty list's elements are never read (no thread), its
+                // flags all zero: no element
+                listed: if list.is_empty() {
+                    DeviceBuffer::zeroed(st, 0)?
+                } else {
+                    DeviceBuffer::from_host(st, list)?
+                },
                 member: DeviceBuffer::from_host(st, &member)?,
                 len: list.len(),
             },

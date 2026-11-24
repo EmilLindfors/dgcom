@@ -1798,8 +1798,8 @@ impl StageHooks3D {
         Ok(())
     }
 
-    /// `to = from` on the rows of the elements of `on` (`copy_rows`), `per`
-    /// values of a node's.
+    /// `to = from` on the rows of the elements of `on` (`copy_rows`),
+    /// `per_node` values a node.
     pub fn copy_rows(
         &self,
         s: &Statics3D,
