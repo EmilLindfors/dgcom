@@ -79,8 +79,9 @@ pub trait RunModel3D: SplitModel {
     fn post_process(&self, state: &mut Self::State, work: &mut Self::Work);
 
     /// The prognostic field with values that are not finite in the fewest
-    /// elements, if any.
-    fn non_finite(&self, state: &Self::State) -> Option<NonFinite>;
+    /// elements, if any ([`non_finite_field`]); after [`Self::post_process`],
+    /// `work` as there.
+    fn non_finite(&self, state: &Self::State, work: &mut Self::Work) -> Option<NonFinite>;
 }
 
 impl<EOS, MIX, BC> RunModel3D for Hydrostatic3D<EOS, MIX, BC>
@@ -131,7 +132,7 @@ where
         Hydrostatic3D::post_process(self, state);
     }
 
-    fn non_finite(&self, state: &Solution3D) -> Option<NonFinite> {
+    fn non_finite(&self, state: &Solution3D, _work: &mut Self::Work) -> Option<NonFinite> {
         non_finite_field(state)
     }
 }
@@ -399,16 +400,19 @@ impl<M: RunModel3D> Simulation3D<M> {
             n_steps += 1;
 
             // Post-process
+            let work = self
+                .integrator
+                .work_mut()
+                .expect("the integrator's buffers after a step");
             crate::profiling::scope("step: post_process", || {
-                let work = self
-                    .integrator
-                    .work_mut()
-                    .expect("the integrator's buffers after a step");
                 self.physics.post_process(state, work)
             });
             // A blown-up step leaves NaN or infinities, which every later
             // step would carry on to `t_end` (the step bounds skip NaN)
-            if let Some(bad) = self.physics.non_finite(state) {
+            let non_finite = crate::profiling::scope("step: non-finite check", || {
+                self.physics.non_finite(state, work)
+            });
+            if let Some(bad) = non_finite {
                 // Where: the elements it has reached, and the first of them
                 let corners = self
                     .physics
@@ -542,18 +546,22 @@ pub struct NonFinite {
     pub elements: usize,
 }
 
+/// The prognostic fields [`non_finite_field`] checks, in its order: bit `f`
+/// of an element's mask ([`non_finite_of_masks`]) is field `f`'s.
+pub const NON_FINITE_FIELDS: [&str; 5] = ["η", "u", "v", "T", "S"];
+
 /// The prognostic field (η, u, v, T, S) with values that are not finite in
 /// the fewest elements, the nearest to where the blow-up began (a value that
 /// every element uses, as the barotropic step, spreads it everywhere in a
 /// step), if any.
 pub fn non_finite_field(state: &Solution3D) -> Option<NonFinite> {
     let layer = state.n_nodes * state.n_levels;
-    let fields: [(&'static str, &[f64], usize); 5] = [
-        ("η", &state.eta.data, state.n_nodes),
-        ("u", &state.u, layer),
-        ("v", &state.v, layer),
-        ("T", &state.temp, layer),
-        ("S", &state.salt, layer),
+    let fields: [(&[f64], usize); 5] = [
+        (&state.eta.data, state.n_nodes),
+        (&state.u, layer),
+        (&state.v, layer),
+        (&state.temp, layer),
+        (&state.salt, layer),
     ];
     // Every step scans these: in parallel
     let all_finite = |values: &[f64]| {
@@ -566,22 +574,42 @@ pub fn non_finite_field(state: &Solution3D) -> Option<NonFinite> {
         #[cfg(not(feature = "parallel"))]
         finite(values)
     };
-    fields
-        .into_iter()
-        .filter_map(|(field, values, per_element)| {
-            if all_finite(values) {
-                return None;
-            }
-            let bad: Vec<usize> = values
-                .chunks(per_element.max(1))
+    if fields.iter().all(|(values, _)| all_finite(values)) {
+        return None;
+    }
+    // A blow-up: where, element by element
+    let masks: Vec<u32> = (0..state.n_elements)
+        .map(|k| {
+            fields
+                .iter()
                 .enumerate()
-                .filter(|(_, c)| !c.iter().all(|x| x.is_finite()))
-                .map(|(k, _)| k)
-                .collect();
+                .filter(|(_, (values, per))| {
+                    !values[k * per..(k + 1) * per].iter().all(|x| x.is_finite())
+                })
+                .fold(0, |mask, (f, _)| mask | 1 << f)
+        })
+        .collect();
+    non_finite_of_masks(&masks)
+}
+
+/// [`non_finite_field`] from every element's mask of the fields
+/// ([`NON_FINITE_FIELDS`]) with a value that is not finite there: the field
+/// in the fewest elements (the first of the fields so tied), with its first
+/// element. A device's check (`gpu/`) gives the masks.
+pub fn non_finite_of_masks(masks: &[u32]) -> Option<NonFinite> {
+    NON_FINITE_FIELDS
+        .iter()
+        .enumerate()
+        .filter_map(|(f, &field)| {
+            let mut bad = masks
+                .iter()
+                .enumerate()
+                .filter(|(_, mask)| *mask & 1 << f != 0);
+            let (first, _) = bad.next()?;
             Some(NonFinite {
                 field,
-                first: bad[0],
-                elements: bad.len(),
+                first,
+                elements: 1 + bad.count(),
             })
         })
         .min_by_key(|bad| bad.elements)
@@ -3478,6 +3506,57 @@ mod tests {
             "{:?}",
             result.error
         );
+    }
+
+    /// The blow-up check names the field with non-finite values in the
+    /// fewest elements (the earlier field of a tie), its first element and
+    /// their number, from the state as from a device's masks.
+    #[test]
+    fn the_non_finite_field_is_the_one_in_the_fewest_elements() {
+        let (_, mut state, _) = beach_3d(0.3);
+        assert!(non_finite_field(&state).is_none());
+        let layer = state.n_nodes * state.n_levels;
+        // T in elements 3, 5 and 9; S in 7 and 2; v in 4 and 8 (S's tie);
+        // u's infinity in 6, 1 and 0
+        for k in [3, 5, 9] {
+            state.temp[k * layer + 2] = f64::NAN;
+        }
+        for k in [7, 2] {
+            state.salt[k * layer] = f64::NAN;
+        }
+        for k in [8, 4] {
+            state.v[k * layer + layer - 1] = f64::NAN;
+        }
+        for k in [6, 1, 0] {
+            state.u[k * layer] = f64::INFINITY;
+        }
+        let bad = non_finite_field(&state).expect("non-finite values");
+        assert_eq!((bad.field, bad.first, bad.elements), ("v", 4, 2));
+        // η's one element beats them all
+        state.eta.data[5 * state.n_nodes + 1] = f64::NEG_INFINITY;
+        let bad = non_finite_field(&state).expect("non-finite values");
+        assert_eq!((bad.field, bad.first, bad.elements), ("η", 5, 1));
+        // The masks alone give the same
+        let mut masks = vec![0u32; state.n_elements];
+        masks[5] = 1;
+        for k in [6, 1, 0] {
+            masks[k] |= 2;
+        }
+        for k in [8, 4] {
+            masks[k] |= 4;
+        }
+        for k in [3, 5, 9] {
+            masks[k] |= 8;
+        }
+        for k in [7, 2] {
+            masks[k] |= 16;
+        }
+        let bad = non_finite_of_masks(&masks).expect("non-finite values");
+        assert_eq!((bad.field, bad.first, bad.elements), ("η", 5, 1));
+        masks[5] &= !1;
+        let bad = non_finite_of_masks(&masks).expect("non-finite values");
+        assert_eq!((bad.field, bad.first, bad.elements), ("v", 4, 2));
+        assert!(non_finite_of_masks(&vec![0; state.n_elements]).is_none());
     }
 
     /// TODO P4.5 gate: a stratified lake at rest with dry land stays at

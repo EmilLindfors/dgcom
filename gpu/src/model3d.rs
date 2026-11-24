@@ -32,10 +32,11 @@
 //! fluxes, the viscosity once per step; [`Model3D::new`] refuses them by
 //! name.
 //!
-//! As `Simulation3D`'s model ([`RunModel3D`], 4.5c) it keeps a copy of the
-//! state on the host, downloaded after every step's `post_process` (its
-//! tracer limiter, density and `w` on the device): the step's bound is the
-//! CPU's own `compute_dt_ssp` of that copy, and a run's callbacks read it.
+//! As `Simulation3D`'s model ([`RunModel3D`], 4.5c) it runs the step's
+//! bound (4.5e), `post_process` and the blow-up check on the device. Its
+//! copy of the state on the host is copied as a run's callback asks for it
+//! ([`HostView3D`], 4.5f): the depth means for the stations, the whole state
+//! at outputs.
 
 // As `three_d.rs`: the device loops index arrays by the loop variable.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
@@ -43,16 +44,18 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use cuda_core::DeviceBuffer;
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
 use dgcom::boundary::{NestingSlots, SWEBoundaryCondition2D, Supplied};
+use dgcom::case::StateView3D;
 use dgcom::mesh::Mesh2D;
 use dgcom::physics::{
     GlsMixing, Hydrostatic3D, LinearEOS, PhysicsModule, SWEPhysics2D, TimeStepLimits,
     VerticalMixing,
 };
 use dgcom::profiling;
-use dgcom::simulation::{NonFinite, RunModel3D, non_finite_field};
+use dgcom::simulation::{NonFinite, RunModel3D, non_finite_of_masks};
 use dgcom::solver::rhs::{MomentumAdvectionForm, PressureGradientForm};
 use dgcom::solver::state::Solution3D;
 use dgcom::solver::{Blocks, SWESolution2D};
@@ -66,7 +69,9 @@ use dgcom::vertical::{SigmaGrid, depth_average};
 use crate::baroclinic::{Baroclinic3D, BaroclinicSetup};
 use crate::bound3d::Bound3D;
 use crate::forcing::{ForcingSetup, SlowForcing3D};
-use crate::hooks::{Band3D, Merged3D, StageHooks3D, StageValues3D, Stash3D, State3D};
+use crate::hooks::{
+    Band3D, Merged3D, StageHooks3D, StageValues3D, Stash3D, State3D, prefix_to_host,
+};
 use crate::limiter::{Limiter3D, VertexPatches};
 use crate::pass::{BarotropicPass3D, DevicePass, LocalPass3D};
 use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, NN};
@@ -291,6 +296,51 @@ pub mod kernels_model {
             unsafe {
                 *u.get_unchecked_mut(idx * nl + l) += su;
                 *v.get_unchecked_mut(idx * nl + l) += sv;
+            }
+        }
+    }
+
+    /// The blow-up check's masks (`non_finite_field`), a thread per layer
+    /// value (`n` of them, `per_element` an element's): in `masks[k]` the
+    /// bit of every field (`NON_FINITE_FIELDS`: η, u, v, T, S as bits 0–4)
+    /// with a value that is not finite in element `k`, and in `count[0]` how
+    /// many values were (both zeroed before). Only a blow-up's values touch
+    /// the atomics.
+    #[kernel]
+    pub fn non_finite_masks(
+        per_element: u32,
+        nn: u32,
+        n: u32,
+        eta: &[f64],
+        u: &[f64],
+        v: &[f64],
+        temp: &[f64],
+        salt: &[f64],
+        masks: *mut u32,
+        count: *mut u32,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        let bit = |x: f64, bit: u32| if x.is_finite() { 0 } else { bit };
+        let layers = bit(u[i], 2) | bit(v[i], 4) | bit(temp[i], 8) | bit(salt[i], 16);
+        // η's values are the first n / levels threads'
+        let n_eta = (n / per_element * nn) as usize;
+        let surface = if i < n_eta { bit(eta[i], 1) } else { 0 };
+        // SAFETY: `masks` holds a u32 per element, `count` one; only atomics
+        // touch them here.
+        unsafe {
+            if layers != 0 {
+                DeviceAtomicU32::from_ptr(masks.add(i / per_element as usize))
+                    .fetch_or(layers, AtomicOrdering::Relaxed);
+            }
+            if surface != 0 {
+                DeviceAtomicU32::from_ptr(masks.add(i / nn as usize))
+                    .fetch_or(surface, AtomicOrdering::Relaxed);
+            }
+            if layers | surface != 0 {
+                DeviceAtomicU32::from_ptr(count).fetch_add(1, AtomicOrdering::Relaxed);
             }
         }
     }
@@ -558,6 +608,9 @@ pub struct Work3D {
     w: DeviceBuffer<f64>,
     /// The step's bound
     bound: Bound3D,
+    /// The blow-up check's masks (an element's fields with a value not
+    /// finite) and count
+    non_finite: [DeviceBuffer<u32>; 2],
 }
 
 impl Work3D {
@@ -619,9 +672,25 @@ pub struct Model3D<'a, BC: SWEBoundaryCondition2D> {
     /// density between steps
     statics: Statics3D,
     density: StageHooks3D,
-    /// The state on the host as of the last `post_process` (or the start):
-    /// the step's bound and a run's callbacks read it
-    host: Mutex<Solution3D>,
+    /// The state on the host, as much of it as a run's callbacks asked for
+    /// since the last step ([`HostView3D`])
+    host: Mutex<HostCopy>,
+}
+
+/// How much of the state on the host is of the device's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Copied {
+    Nothing,
+    /// η, ū, v̄
+    DepthMeans,
+    /// Every field, `w` and the eddy coefficients
+    All,
+}
+
+/// The state on the host and how much of it is the device's.
+struct HostCopy {
+    state: Solution3D,
+    copied: Copied,
 }
 
 impl<'a, BC> Model3D<'a, BC>
@@ -682,19 +751,35 @@ where
             element_local,
             statics,
             density,
-            host: Mutex::new(Solution3D::new(ne, nn, nl)),
+            host: Mutex::new(HostCopy {
+                state: Solution3D::new(ne, nn, nl),
+                copied: Copied::Nothing,
+            }),
         })
     }
 
     /// Start a run from `state` (the host's copy, its `w` and eddy
     /// coefficients included, which the device does not hold).
     pub fn start_from(&mut self, state: &Solution3D) {
-        *self.host.lock().expect("the host's copy") = state.clone();
+        *self.host_copy() = HostCopy {
+            state: state.clone(),
+            copied: Copied::All,
+        };
     }
 
-    /// The state on the host as of the last step's `post_process` (or the
-    /// run's start).
-    pub fn host(&self) -> MutexGuard<'_, Solution3D> {
+    /// The device state `device` on the host as a run's callback asks for
+    /// it, `work` the integrator's (its `w` and eddy coefficients; none
+    /// before the first step, when the host's are the start's).
+    pub fn view<'m>(&'m self, device: &'m State3D, work: Option<&'m Work3D>) -> HostView3D<'m> {
+        HostView3D {
+            gpu: &self.gpu,
+            device,
+            work,
+            host: self.host_copy(),
+        }
+    }
+
+    fn host_copy(&self) -> MutexGuard<'_, HostCopy> {
         self.host.lock().expect("the host's copy")
     }
 
@@ -962,8 +1047,9 @@ where
                 .as_ref()
                 .map(|nesting| Nest3D::new(gpu, &statics, nesting.slots(), NN)),
             // The start's (its bound reads it before the first step)
-            w: up(&self.host().w),
+            w: up(&self.host_copy().state.w),
             bound,
+            non_finite: [ne, 1].map(|n| cuda(DeviceBuffer::zeroed(st, n).map_err(Into::into))),
             statics,
         }
     }
@@ -1778,13 +1864,9 @@ where
     BC: SWEBoundaryCondition2D + Clone + Send + Sync,
     SWEPhysics2D<BC>: PhysicsModule<SWESolution2D>,
 {
-    /// The start on the host (its `w` and eddy coefficients the host's,
-    /// [`Model3D::start_from`]); the reference is the physics' own, set
-    /// before the model was built.
-    fn prepare(&mut self, state: &State3D) {
-        let mut host = self.host.lock().expect("the host's copy");
-        cuda(state.download_into(&self.gpu, &mut host));
-    }
+    /// Nothing: the start on the host is [`Model3D::start_from`]'s, the
+    /// reference the physics' own, set before the model was built.
+    fn prepare(&mut self, _state: &State3D) {}
 
     /// `Hydrostatic3D::compute_dt_ssp` with the bounds from the device
     /// (`Self::time_step_limits`), recorded as the CPU records them.
@@ -1799,16 +1881,19 @@ where
         self.physics.step_of(limits, scheme)
     }
 
+    /// The CPU's of the whole state on the host (the device takes global
+    /// 3D steps: 4.5d).
     fn element_steps_into(
         &self,
-        _state: &State3D,
+        state: &State3D,
         cfl: f64,
         scheme: SspScheme,
         out: &mut [f64],
-        _work: &mut Work3D,
+        work: &mut Work3D,
     ) {
+        let mut view = self.view(state, Some(work));
         self.physics
-            .element_steps_into(&self.host(), cfl, scheme, out);
+            .element_steps_into(view.full(), cfl, scheme, out);
     }
 
     fn stencils(&self) -> Vec<RhsStencil> {
@@ -1825,8 +1910,8 @@ where
 
     /// `Hydrostatic3D::post_process` on the device: the tracer limiter and
     /// the density; `w` from the state's own layer transports, their thin
-    /// columns at rest (`update_vertical_velocity`); then the state to the
-    /// host.
+    /// columns at rest (`update_vertical_velocity`). The host's copy is then
+    /// of the last step.
     fn post_process(&self, state: &mut State3D, work: &mut Work3D) {
         cuda(work.hooks.post_process(&work.statics, state));
         cuda(work.forcing.layer_transports(state));
@@ -1847,22 +1932,105 @@ where
                     .map_err(Into::into),
             );
         }
-        // The step's kernels, then the copy (`DG_PROFILE`: each apart)
-        profiling::scope("device: wait for the step", || {
-            cuda(gpu.stream.synchronize().map_err(Into::into))
-        });
-        profiling::scope("device: state to the host", || {
-            let mut host = self.host();
-            cuda(state.download_into(gpu, &mut host));
-            cuda(
-                work.w
-                    .copy_to_host(&gpu.stream, &mut host.w)
-                    .map_err(Into::into),
-            );
-        });
+        self.host_copy().copied = Copied::Nothing;
     }
 
-    fn non_finite(&self, _state: &State3D) -> Option<NonFinite> {
-        non_finite_field(&self.host())
+    /// `non_finite_field` on the device: every element's mask of the fields
+    /// with a value that is not finite there, and how many values; the masks
+    /// to the host only after a blow-up, for `non_finite_of_masks`.
+    fn non_finite(&self, state: &State3D, work: &mut Work3D) -> Option<NonFinite> {
+        let (gpu, s) = (&self.gpu, &work.statics);
+        let st = &gpu.stream;
+        let [masks, count] = &mut work.non_finite;
+        cuda(masks.zero_async(st).map_err(Into::into));
+        cuda(count.zero_async(st).map_err(Into::into));
+        let per_element = NN * s.n_levels;
+        let n = s.n_elements * per_element;
+        // SAFETY: the state's fields are this mesh's; `masks` holds a u32 per
+        // element, `count` one.
+        unsafe {
+            cuda(
+                gpu.module_model
+                    .non_finite_masks(
+                        st,
+                        launch(n, COLUMN_BLOCK),
+                        per_element as u32,
+                        NN as u32,
+                        n as u32,
+                        &state.eta,
+                        &state.u,
+                        &state.v,
+                        &state.temp,
+                        &state.salt,
+                        masks.cu_deviceptr() as *mut u32,
+                        count.cu_deviceptr() as *mut u32,
+                    )
+                    .map_err(Into::into),
+            );
+        }
+        // The step's kernels, then the count (`DG_PROFILE`: apart)
+        profiling::scope("device: wait for the step", || {
+            cuda(st.synchronize().map_err(Into::into))
+        });
+        if cuda(prefix_to_host(gpu, count, 1))[0] == 0 {
+            return None;
+        }
+        non_finite_of_masks(&cuda(prefix_to_host(gpu, masks, s.n_elements)))
+    }
+}
+
+/// The device's state on the host as a run's callback asks for it
+/// ([`Model3D::view`]): each part copied the first time it is asked for
+/// after a step, and kept for the rest of the step's callbacks.
+pub struct HostView3D<'m> {
+    gpu: &'m Gpu,
+    device: &'m State3D,
+    work: Option<&'m Work3D>,
+    host: MutexGuard<'m, HostCopy>,
+}
+
+impl HostView3D<'_> {
+    /// At least `what` of the device's state on the host.
+    fn copy(&mut self, what: Copied) {
+        if self.host.copied >= what {
+            return;
+        }
+        let (gpu, device, work) = (self.gpu, self.device, self.work);
+        let host = &mut self.host.state;
+        profiling::scope("device: state to the host", || {
+            let st = &gpu.stream;
+            match what {
+                Copied::Nothing => {}
+                Copied::DepthMeans => {
+                    for (to, from) in [
+                        (&mut host.eta.data, &device.eta),
+                        (&mut host.ubar.data, &device.ubar),
+                        (&mut host.vbar.data, &device.vbar),
+                    ] {
+                        cuda(from.copy_to_host(st, to).map_err(Into::into));
+                    }
+                }
+                Copied::All => {
+                    cuda(device.download_into(gpu, host));
+                    if let Some(work) = work {
+                        cuda(work.w.copy_to_host(st, &mut host.w).map_err(Into::into));
+                        work.eddy_coefficients_into(host);
+                    }
+                }
+            }
+        });
+        self.host.copied = what;
+    }
+}
+
+impl StateView3D for HostView3D<'_> {
+    fn depth_means(&mut self) -> &Solution3D {
+        self.copy(Copied::DepthMeans);
+        &self.host.state
+    }
+
+    fn full(&mut self) -> &Solution3D {
+        self.copy(Copied::All);
+        &self.host.state
     }
 }

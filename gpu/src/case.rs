@@ -12,7 +12,7 @@ use std::time::Instant;
 use dgcom::boundary::MultiBoundaryCondition2D;
 use dgcom::case::{
     CaseDevice, CaseFile, DeviceCallback3D, DeviceRun, DeviceRun3D, DeviceRunReport,
-    DeviceRunReport3D, RunReport, StationSeries,
+    DeviceRunReport3D, RunReport, StateView3D, StationSeries,
 };
 use dgcom::physics::{GlsMixing, Hydrostatic3D, LinearEOS, SWEDeviceForm2D};
 use dgcom::simulation::{Simulation, Simulation3D, SimulationResult};
@@ -27,8 +27,8 @@ use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, MAX_DEVICE_LEVELS};
 /// The CUDA backend of the case runner: a 2D run's state and physics on a
 /// CUDA GPU, stepped by dgcom's own `Simulation`, the state back on the host
 /// at every output; a 3D run's on the device as [`Model3D`], stepped by
-/// dgcom's own `Simulation3D`, the state back on the host after every step
-/// (its bound is the CPU's of that copy).
+/// dgcom's own `Simulation3D`, the depth means back on the host after every
+/// step (the stations) and the whole state at outputs.
 pub struct Cuda;
 
 impl CaseDevice for Cuda {
@@ -98,16 +98,17 @@ impl CaseDevice for Cuda {
             .with_dt_max(run.dt_max)
             .with_landing_interval(run.landing_interval);
         let (t_start, t_end) = run.span;
-        let result = sim.run_with_context_callback(&mut device, t_start, t_end, |_, t, context| {
-            let host = context.physics.host();
-            callback(&host, t, &|| context.integrator().slow_forcing_record());
+        let result = sim.run_with_context_callback(&mut device, t_start, t_end, |s, t, context| {
+            let mut view = context.physics.view(s, context.integrator().work());
+            callback(&mut view, t, &|| context.integrator().slow_forcing_record());
         });
-        // The end state, with the vertical terms' eddy coefficients
-        *state = sim.physics().host().clone();
-        if let Some(work) = sim.integrator().work() {
-            work.eddy_coefficients_into(state);
-        }
+        // The end state, whole (the last callback's, if an output asked)
         let integrator = sim.integrator();
+        *state = sim
+            .physics()
+            .view(&device, integrator.work())
+            .full()
+            .clone();
         Ok(DeviceRunReport3D {
             result,
             last_substeps: integrator.last_substeps(),
