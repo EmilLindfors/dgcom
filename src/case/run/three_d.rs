@@ -460,12 +460,9 @@ impl CaseFile {
                     .with_landing_interval(field_every);
                 let result =
                     sim.run_with_context_callback(&mut state, t_start, t_end, |s, t, context| {
-                        on_step(
-                            &mut &*s,
-                            t,
-                            &|s| context.physics.tracer_ranges(s),
-                            &|s| context.restart(s, t),
-                        )
+                        on_step(&mut &*s, t, &|s| context.physics.tracer_ranges(s), &|s| {
+                            context.restart(s, t)
+                        })
                     });
                 let integrator = sim.integrator();
                 let mut steps = vec![0.0; domain.mesh.n_elements];

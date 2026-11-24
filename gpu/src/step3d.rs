@@ -521,7 +521,11 @@ fn non_finite_gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Bo
     let physics = physics(&fx, Terms::CASE_RUNNER);
     let mut start = start_state(&fx);
     physics.update_density(&mut start);
-    let (ne, nn, layer) = (start.n_elements, start.n_nodes, start.n_nodes * start.n_levels);
+    let (ne, nn, layer) = (
+        start.n_elements,
+        start.n_nodes,
+        start.n_nodes * start.n_levels,
+    );
     // The values planted: (field as NON_FINITE_FIELDS numbers it, element,
     // value within the element's), as NaN or an infinity
     let mixed = vec![
