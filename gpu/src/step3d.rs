@@ -64,6 +64,8 @@ struct Terms {
     /// and whether they read the sea surface's T
     fluxes: Option<JerlovWater>,
     flux_sst: bool,
+    /// The shear's viscosity once per step (`with_viscosity_once_per_step`)
+    viscosity_once: bool,
 }
 
 impl Terms {
@@ -78,6 +80,7 @@ impl Terms {
         roughness: 0.003,
         fluxes: Some(JerlovWater::III),
         flux_sst: true,
+        viscosity_once: false,
     };
 }
 
@@ -155,6 +158,9 @@ fn physics(fx: &Fixture, terms: Terms) -> Physics {
                 sst: terms.flux_sst,
             })
             .with_shortwave_absorption(water);
+    }
+    if terms.viscosity_once {
+        physics = physics.with_viscosity_once_per_step();
     }
     physics.boundaries = fx.boundaries.clone();
     match &fx.profile {
@@ -263,9 +269,14 @@ fn on_device(
 
 /// One fixture on both sides, and if `mutants` the mutants; whether every
 /// field of every step is the same to the bit (and every mutant caught).
-fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape, mutants: bool) -> Result<bool, Box<dyn Error>> {
+fn gate(
+    gpu: &Arc<Gpu>,
+    label: &str,
+    shape: Shape,
+    base: Terms,
+    mutants: bool,
+) -> Result<bool, Box<dyn Error>> {
     let fx = Fixture::new(shape);
-    let base = Terms::CASE_RUNNER;
     let physics = physics(&fx, base);
     // As a case starts: no turbulence (the closure allocates it at the
     // first step's end), the density of the start's T and S
@@ -295,6 +306,18 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape, mutants: bool) -> Result<bool
         1e3 * cpu_time / STEPS as f64,
         1e3 * device_time / STEPS as f64
     );
+    if base.viscosity_once {
+        // The viscosity's own tendency at every stage
+        let mutant = self::physics(
+            &fx,
+            Terms {
+                viscosity_once: false,
+                ..base
+            },
+        );
+        let (mutant, _) = on_device(gpu, &mutant, run, &start, dt)?;
+        same &= report_mutant("the viscosity at every stage", &cpu, &mutant);
+    }
     if !mutants {
         return Ok(same);
     }
@@ -695,7 +718,8 @@ fn time(gpu: &Arc<Gpu>, fx: &Fixture, steps: usize) -> Result<(), Box<dyn Error>
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
     println!("3D steps, whole: ModeSplitIntegrator with the device's model against the CPU's");
-    let mut same = gate(gpu, "beach", Shape::BEACH, true)?;
+    let base = Terms::CASE_RUNNER;
+    let mut same = gate(gpu, "beach", Shape::BEACH, base, true)?;
     same &= gate(
         gpu,
         "beach, jittered and stretched",
@@ -703,6 +727,17 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
             jitter: 0.2,
             stretched: true,
             ..Shape::BEACH
+        },
+        base,
+        false,
+    )?;
+    same &= gate(
+        gpu,
+        "beach, the viscosity once per step",
+        Shape::BEACH,
+        Terms {
+            viscosity_once: true,
+            ..base
         },
         false,
     )?;
