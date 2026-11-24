@@ -102,6 +102,31 @@ pub enum DragCoefficient {
 }
 
 impl DragCoefficient {
+    /// The coefficient as a device kernel takes it (P2.7): its formulation's
+    /// number and [`Self::Constant`]'s value (0 for the others), which
+    /// [`Self::from_device_code`] reads back.
+    pub fn device_code(self) -> (u32, f64) {
+        match self {
+            Self::Constant(cd) => (0, cd),
+            Self::LargePond => (1, 0.0),
+            Self::Wu => (2, 0.0),
+            Self::Smith => (3, 0.0),
+            Self::YellandTaylor => (4, 0.0),
+        }
+    }
+
+    /// The coefficient of [`Self::device_code`].
+    #[inline]
+    pub fn from_device_code(kind: u32, cd: f64) -> Self {
+        match kind {
+            0 => Self::Constant(cd),
+            1 => Self::LargePond,
+            2 => Self::Wu,
+            3 => Self::Smith,
+            _ => Self::YellandTaylor,
+        }
+    }
+
     /// Compute drag coefficient for given wind speed.
     ///
     /// # Arguments

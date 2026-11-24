@@ -6,7 +6,7 @@
 //! cargo oxide run --no-fmad                   # the gates, against the scalar CPU kernel
 //! cargo oxide run --no-fmad --features simd   # ... against the SIMD batch
 //! cargo oxide run --features simd             # multiply–adds fused: the timing
-//! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, beach,
+//! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, weather, beach,
 //!                                             # transport3d, momentum3d, stage3d,
 //!                                             # limiter3d, vertical3d, implicit3d,
 //!                                             # forcing3d, pass3d, step3d; all by
@@ -23,7 +23,9 @@
 //!   physics module, against the same run on the CPU; a case file through
 //!   dgcom's case runner (`case`).
 //! - **Phase 2:** a run nested in a parent model, its boundary and
-//!   relaxation band, with global steps and local time stepping (`nest`).
+//!   relaxation band, with global steps and local time stepping (`nest`);
+//!   under a weather model's air pressure, the open boundary raised by the
+//!   inverse barometer (`weather`, Phase 4.5i).
 //! - **Phase 4:** the 3D stages' layer transports, Ω and the advection of
 //!   u, v, T and S with the reference's (`transport3d`); the reference at
 //!   the levels, the baroclinic pressure gradient, Coriolis and the shear's
@@ -70,6 +72,7 @@ mod transport3d;
 mod vertical;
 mod vertical3d;
 mod viscosity;
+mod weather;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -113,6 +116,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if which == "all" || which == "nest" {
         nest::run_gates(&gpu)?;
+    }
+    if which == "all" || which == "weather" {
+        weather::run(&gpu)?;
     }
     if which == "beach" {
         phase1::run_beach(&gpu)?;

@@ -28,7 +28,10 @@ pub use friction::{
     BottomFriction2D, ChezyFriction2D, DeviceFriction2D, ManningFriction2D,
     SpatiallyVaryingManning2D,
 };
-pub use gridded_atmosphere::{GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress};
+pub use gridded_atmosphere::{
+    AtmosphereConstants, AtmosphereSnapshot, GriddedAtmosphere2D, GriddedSurfaceFluxes,
+    GriddedWindStress, add_snapshot, atmosphere_source, inverse_barometer_level,
+};
 pub use viscosity::HorizontalViscosity2D;
 pub use waves::{WaveCurrentFriction2D, WaveForce2D};
 pub use wind::{DragCoefficient, RHO_AIR, RHO_WATER, WindStress2D};

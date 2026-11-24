@@ -11,8 +11,12 @@
 //! node by node (`BoundaryTides`: each constituent's time factors from the
 //! host once per stage time, the sums per node on the device) or a parent
 //! model node by node (`OceanModelState`: its series per node on the device,
-//! the time stencil from the host), Coriolis, the nesting's relaxation band
-//! (`NestingRelaxation2D`, a kernel after the element kernels); global
+//! the time stencil from the host), raised by a weather's inverse barometer
+//! (`InverseBarometer`), Coriolis, the nesting's relaxation band
+//! (`NestingRelaxation2D`, a kernel after the element kernels), a weather's
+//! air pressure (`GriddedAtmosphere2D`: its regridded snapshots in device
+//! slots, the time stencil from the host, a kernel in the CPU's order of the
+//! sources); global
 //! steps through the fused per-element stages, and local time stepping
 //! (dgcom's `Multirate`, [`LocalTimeStepping`]: each pass a prefix of the
 //! coarse step's elements and edges sorted by level, each element's stage
@@ -41,7 +45,7 @@ use cuda_device::{DisjointSlice, device, kernel, thread, warp};
 use cuda_host::cuda_module;
 use dgcom::SWEState2D;
 use dgcom::boundary::{
-    BCContext2D, DeviceBoundary2D, DeviceExternal2D, ElevationOnly, ExternalState,
+    BCContext2D, DeviceBoundary2D, DeviceExternal2D, DeviceLevel, ElevationOnly, ExternalState,
     NestingRelaxation2D, OceanModelState, Reflective2D, SWEBoundaryCondition2D,
     characteristic_boundary_state, parent_external_state, parent_state, parent_term,
     relaxation_source, tide_state, tide_term,
@@ -61,7 +65,9 @@ use dgcom::solver::{
     reconstruct_subcell, wet_dry_element,
 };
 use dgcom::source::{
-    CageNode, CoriolisSource2D, DeviceFriction2D, DeviceSource2D, ManningFriction2D,
+    AtmosphereConstants, CageNode, CoriolisSource2D, DeviceFriction2D, DeviceSource2D,
+    DragCoefficient, GriddedAtmosphere2D, ManningFriction2D, add_snapshot, atmosphere_source,
+    inverse_barometer_level,
 };
 use dgcom::time::{
     Integrable, LocalTimeStepping, NodeLines, ShuOsherStage, SspScheme, StagePlan, element_stage,
@@ -135,10 +141,54 @@ pub struct OpenForm {
     pub parent: u32,
     /// The tides' largest transport-scaling factor (0: not scaled)
     pub max_transport_ratio: f64,
+    /// Raised by the weather's inverse-barometer level (1) times
+    /// `raise_factor` (`InverseBarometer`), or not (0)
+    pub raise: u32,
+    pub raise_factor: f64,
 }
 
-// SAFETY: plain old data (u32s and an f64, `#[repr(C)]`).
+// SAFETY: plain old data (u32s and f64s, `#[repr(C)]`).
 unsafe impl cuda_core::DeviceCopy for OpenForm {}
+
+/// Device slots of the weather's regridded snapshots ([`Weather`]): the
+/// CPU keeps as many (`GriddedAtmosphere2D`'s cache).
+const WEATHER_SLOTS: usize = 4;
+/// The weather's moment in a level's row of the moments: the ramp, the
+/// number of snapshots, each snapshot's slot, then each one's weight.
+const WEATHER_MOMENT: usize = 2 + 2 * WEATHER_SLOTS;
+
+/// The weather's slots as the kernels read them ([`Weather`]).
+type WeatherSlots<'a> = (
+    &'a [[f32; 5]],
+    &'a [[f32; 5]],
+    &'a [[f32; 5]],
+    &'a [[f32; 5]],
+);
+
+/// The weather at flat node `node` (`[u, v, ∂p/∂x, ∂p/∂y, p − p_ref]`,
+/// unramped): its snapshots summed with their weights from the weather's
+/// moment `m` (a level's row from the weather's offset), in turn from zero,
+/// as `GriddedAtmosphere2D` sums them (dgcom's `add_snapshot`).
+#[inline]
+fn weather_at(node: usize, m: &[f64], slots: WeatherSlots<'_>) -> [f64; 5] {
+    let mut sum = [0.0; 5];
+    for j in 0..m[1] as usize {
+        let values = match m[2 + j] as usize {
+            0 => &slots.0[node],
+            1 => &slots.1[node],
+            2 => &slots.2[node],
+            _ => &slots.3[node],
+        };
+        add_snapshot(&mut sum, m[2 + WEATHER_SLOTS + j], values);
+    }
+    sum
+}
+
+/// The weather's inverse-barometer level as the boundary kernel reads it:
+/// its moment's offset in a level's row, whether the level is the
+/// pressure's (else 0, `GriddedAtmosphere2D::has_level`), the water's
+/// density, its slots.
+type WeatherLevel<'a> = (usize, bool, f64, WeatherSlots<'a>);
 
 /// A parent model on the device (`OceanModelState`), in a device buffer:
 /// where its slots' series and data start in the parent tables, and its
@@ -797,6 +847,7 @@ fn boundary_node(
     tides: TideRows<'_>,
     parents: ParentRows<'_>,
     parent_slot: &[u32],
+    weather: WeatherLevel<'_>,
     level: &[u32],
     (h, hu, hv, bed): (&[f64], &[f64], &[f64], &[f64]),
     affine: &[u32],
@@ -832,17 +883,30 @@ fn boundary_node(
         } else {
             tides.0[e] as usize + fi
         };
-        let external = open_external(
+        let moment = &moments[l * width..(l + 1) * width];
+        let mut external = open_external(
             open,
             form,
             i,
             bed[left],
             row,
-            &moments[l * width..(l + 1) * width],
+            moment,
             tides,
             parents,
             parent_slot,
         );
+        // Raised by the weather's inverse barometer at the face node
+        // (`InverseBarometer`, `GriddedAtmosphere2D`'s level by node index)
+        if form.raise != 0 {
+            let (offset, has_level, rho_water, slots) = weather;
+            let level = if has_level {
+                let m = &moment[offset..offset + WEATHER_MOMENT];
+                inverse_barometer_level(weather_at(left, m, slots)[4], m[0], rho_water)
+            } else {
+                0.0
+            };
+            external.eta += form.raise_factor * level;
+        }
         open_flux(
             &q_left, state, bed[left], normal, time, g, h_min, external, open, i,
         )
@@ -1050,6 +1114,13 @@ pub mod kernels {
         parent_series: &[[f32; 3]],
         parent_slots: &[[f64; 2]],
         parent_row_slot: &[u32],
+        weather_moment: u32,
+        weather_level: u32,
+        weather_rho: f64,
+        w0: &[[f32; 5]],
+        w1: &[[f32; 5]],
+        w2: &[[f32; 5]],
+        w3: &[[f32; 5]],
         level: &[u32],
         list: &[u32],
         n: u32,
@@ -1087,6 +1158,12 @@ pub mod kernels {
             ),
             (parents, parent_series, parent_slots),
             parent_row_slot,
+            (
+                weather_moment as usize,
+                weather_level != 0,
+                weather_rho,
+                (w0, w1, w2, w3),
+            ),
             level,
             (h, hu, hv, bed),
             affine,
@@ -1101,6 +1178,73 @@ pub mod kernels {
         unsafe {
             let slots = out.as_mut_ptr().add(e) as *mut [f64; 3];
             *slots.add(fi) = f;
+        }
+    }
+
+    /// The weather's momentum source (`GriddedAtmosphere2D::add_element`),
+    /// added to the RHS `out_hu`, `out_hv` of the listed elements (one
+    /// thread per element) in the CPU's order of the sources: at each node
+    /// at least `h_min` deep, its snapshots summed ([`weather_at`], the
+    /// weather's moment from `offset` in its level's row of `moments`), the
+    /// wind and the pressure gradient ramped where on, dgcom's
+    /// `atmosphere_source`.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn atmosphere_forcing(
+        offset: u32,
+        wind: u32,
+        pressure: u32,
+        drag: u32,
+        cd: f64,
+        rho_air: f64,
+        rho_water: f64,
+        h_min: f64,
+        w0: &[[f32; 5]],
+        w1: &[[f32; 5]],
+        w2: &[[f32; 5]],
+        w3: &[[f32; 5]],
+        moments: &[f64],
+        width: u32,
+        level: &[u32],
+        list: &[u32],
+        n: u32,
+        h: &[f64],
+        mut out_hu: DisjointSlice<f64>,
+        mut out_hv: DisjointSlice<f64>,
+    ) {
+        let Some(k) = item(thread::index_1d().get(), list, n) else {
+            return;
+        };
+        let constants = AtmosphereConstants {
+            drag: DragCoefficient::from_device_code(drag, cd),
+            rho_air,
+            rho_water,
+            h_min,
+        };
+        let row = level_of(level, k) * width as usize + offset as usize;
+        let m = &moments[row..row + WEATHER_MOMENT];
+        let ramp = m[0];
+        let wind = if wind != 0 { ramp } else { 0.0 };
+        let pressure = if pressure != 0 { ramp } else { 0.0 };
+        for i in 0..NN {
+            let node = k * NN + i;
+            let depth = h[node];
+            if depth < h_min {
+                continue;
+            }
+            let [u, v, px, py, _] = weather_at(node, m, (w0, w1, w2, w3));
+            let (su, sv) = atmosphere_source(
+                depth,
+                (wind * u, wind * v),
+                (pressure * px, pressure * py),
+                constants,
+            );
+            // SAFETY: thread k writes only its own element's rows (the
+            // listed elements are distinct), and k < n_elements.
+            unsafe {
+                *out_hu.get_unchecked_mut(node) += su;
+                *out_hv.get_unchecked_mut(node) += sv;
+            }
         }
     }
 
@@ -2641,6 +2785,13 @@ pub struct GpuSWE2D<'a> {
     /// CPU adds them (after the Coriolis force)
     parents: Vec<&'a OceanModelState>,
     relaxations: Vec<(usize, &'a NestingRelaxation2D)>,
+    /// The sources after the element kernels, in the CPU's order
+    post: Vec<Post>,
+    /// The weather of the air-pressure source or of the open boundaries'
+    /// inverse barometer, with its moment's offset in a level's row, and its
+    /// regridded snapshots on the device
+    atmosphere: Option<(&'a GriddedAtmosphere2D, usize)>,
+    weather: Mutex<Weather>,
     forcing: Forcing,
     coriolis: Option<CoriolisSource2D>,
     wet_dry: Option<WetDryConfig>,
@@ -2676,6 +2827,77 @@ pub struct GpuSWE2D<'a> {
     no_list: DeviceBuffer<u32>,
     no_rows: Mutex<[DeviceBuffer<f64>; 3]>,
     no_mass: Mutex<DeviceBuffer<f64>>,
+}
+
+/// A source the RHS adds after the element kernels (which add the Coriolis
+/// force), in the CPU's order.
+#[derive(Clone, Copy, Debug)]
+enum Post {
+    /// A relaxation band, by its index in [`GpuSWE2D::relaxations`]
+    Relaxation(usize),
+    /// The weather's momentum source
+    Atmosphere,
+}
+
+/// The weather's regridded snapshots on the device
+/// (`GriddedAtmosphere2D::regridded`): [`WEATHER_SLOTS`] slots, each with
+/// the snapshot it holds and the last RHS that read it.
+struct Weather {
+    slots: [DeviceBuffer<[f32; 5]>; WEATHER_SLOTS],
+    held: [Option<(usize, u64)>; WEATHER_SLOTS],
+    /// The RHS being filled
+    rhs: u64,
+}
+
+impl Weather {
+    /// Slots of `n_flat` nodes each (none without a weather).
+    fn new(gpu: &Gpu, n_flat: usize) -> Result<Self, String> {
+        let zeroed = || DeviceBuffer::zeroed(&gpu.stream, n_flat).map_err(|e| e.to_string());
+        Ok(Self {
+            slots: [zeroed()?, zeroed()?, zeroed()?, zeroed()?],
+            held: [None; WEATHER_SLOTS],
+            rhs: 0,
+        })
+    }
+
+    /// The slot holding snapshot `t` of `atmosphere`: uploaded into an empty
+    /// slot, else the one read longest ago (never one this RHS reads), if no
+    /// slot holds it.
+    fn slot(&mut self, gpu: &Gpu, atmosphere: &GriddedAtmosphere2D, t: usize) -> usize {
+        if let Some(s) = self
+            .held
+            .iter()
+            .position(|h| h.is_some_and(|(i, _)| i == t))
+        {
+            self.held[s] = Some((t, self.rhs));
+            return s;
+        }
+        let s = (0..WEATHER_SLOTS)
+            .min_by_key(|&s| self.held[s].map_or(0, |(_, rhs)| rhs + 1))
+            .expect("slots");
+        assert!(
+            self.held[s].is_none_or(|(_, rhs)| rhs < self.rhs),
+            "more than {WEATHER_SLOTS} weather snapshots in one RHS"
+        );
+        // A synchronous copy: the kernels queued before it have read the slot
+        self.slots[s]
+            .copy_from_host(&gpu.stream, &atmosphere.regridded(t))
+            .expect("weather snapshot upload");
+        self.held[s] = Some((t, self.rhs));
+        s
+    }
+
+    /// `atmosphere`'s moment at `time` into `m` ([`WEATHER_MOMENT`] values):
+    /// the ramp, the snapshots' count, their slots and weights.
+    fn moment(&mut self, gpu: &Gpu, atmosphere: &GriddedAtmosphere2D, time: f64, m: &mut [f64]) {
+        let (stencil, ramp) = atmosphere.moment(time);
+        m[0] = ramp;
+        m[1] = stencil.len as f64;
+        for (j, (t, w)) in stencil.terms().enumerate() {
+            m[2 + j] = self.slot(gpu, atmosphere, t) as f64;
+            m[2 + WEATHER_SLOTS + j] = w;
+        }
+    }
 }
 
 /// What the 3D model's barotropic pass takes from a stage's RHS besides the
@@ -2775,6 +2997,7 @@ impl Forcing {
         mesh: &Mesh2D,
         ops: &DGOperators2D,
         opens: &[(DeviceExternal2D<'_>, ElevationOnly)],
+        raises: &[Option<f64>],
         code: impl Fn(Option<BoundaryTag>) -> u32,
         parents: &[&OceanModelState],
     ) -> Result<Self, String> {
@@ -2813,6 +3036,13 @@ impl Forcing {
                     ..OpenForm::default()
                 },
             });
+        }
+        // The inverse barometer's factors
+        for (form, raise) in forms.iter_mut().zip(raises) {
+            if let Some(factor) = *raise {
+                form.raise = 1;
+                form.raise_factor = factor;
+            }
         }
         let n_flat = mesh.n_elements * NN;
         let mut parent_forms = Vec::with_capacity(parents.len());
@@ -3143,7 +3373,19 @@ impl<'a> GpuSWE2D<'a> {
         // by index
         let mut wall_h_min = None;
         let mut opens = Vec::new();
+        let mut raises = Vec::new();
         let mut codes = Vec::new();
+        // The weather, of the inverse barometer or the source (one)
+        let mut atmosphere: Option<&'a GriddedAtmosphere2D> = None;
+        let mut weather_of = |a: &'a GriddedAtmosphere2D| match atmosphere {
+            Some(held) if !held.is(a) => {
+                Err("two weather models (GriddedAtmosphere2D)".to_string())
+            }
+            _ => {
+                atmosphere = Some(a);
+                Ok(())
+            }
+        };
         for &(tag, boundary) in &form.boundaries {
             let code = match boundary {
                 DeviceBoundary2D::Wall { h_min } => {
@@ -3156,11 +3398,19 @@ impl<'a> GpuSWE2D<'a> {
                 DeviceBoundary2D::Characteristic {
                     external,
                     elevation_only,
+                    raise,
                 } => {
                     if opens.len() == MAX_OPEN {
                         return Err(format!("more than {MAX_OPEN} open boundaries"));
                     }
                     opens.push((external, elevation_only));
+                    raises.push(match raise {
+                        Some((DeviceLevel::Atmosphere(a), factor)) => {
+                            weather_of(a)?;
+                            Some(factor)
+                        }
+                        None => None,
+                    });
                     (opens.len() - 1) as u32
                 }
             };
@@ -3173,13 +3423,15 @@ impl<'a> GpuSWE2D<'a> {
                 .expect("every boundary tag has a form")
         };
         // The sources: the Coriolis force (in the element kernels) first,
-        // then the relaxation bands (a kernel each, after them)
+        // then the relaxation bands and the weather (a kernel each, after
+        // them, in the CPU's order)
         let mut coriolis = None;
         let mut relaxations: Vec<&NestingRelaxation2D> = Vec::new();
+        let mut post = Vec::new();
         for source in &form.sources {
             match *source {
                 DeviceSource2D::Coriolis(c) => {
-                    if coriolis.is_some() || !relaxations.is_empty() {
+                    if coriolis.is_some() || !post.is_empty() {
                         return Err(
                             "a Coriolis force after another source (the device adds it first)"
                                 .into(),
@@ -3187,7 +3439,24 @@ impl<'a> GpuSWE2D<'a> {
                     }
                     coriolis = Some(c);
                 }
-                DeviceSource2D::NestingRelaxation(r) => relaxations.push(r),
+                DeviceSource2D::NestingRelaxation(r) => {
+                    relaxations.push(r);
+                    post.push(Post::Relaxation(relaxations.len() - 1));
+                }
+                DeviceSource2D::Atmosphere(a) => {
+                    // The wind stress's speed is the platform's hypot on the
+                    // CPU (a 3D run's 2D module has the pressure alone)
+                    if a.switches()[0] {
+                        return Err("the weather's wind stress on the depth mean (a 2D run's; \
+                                    P2.7, notes/gpu.md)"
+                            .into());
+                    }
+                    if post.iter().any(|p| matches!(p, Post::Atmosphere)) {
+                        return Err("the weather's source twice".into());
+                    }
+                    weather_of(a)?;
+                    post.push(Post::Atmosphere);
+                }
             }
         }
         // Every parent once
@@ -3223,7 +3492,14 @@ impl<'a> GpuSWE2D<'a> {
             coriolis.as_ref(),
         )
         .map_err(device)?;
-        let forcing = Forcing::upload(gpu, mesh, ops, &opens, boundary, &parents)?;
+        let mut forcing = Forcing::upload(gpu, mesh, ops, &opens, &raises, boundary, &parents)?;
+        // The weather's moment after the tides' and the parents'
+        let atmosphere = atmosphere.map(|a| {
+            let offset = forcing.width;
+            forcing.width += WEATHER_MOMENT;
+            (a, offset)
+        });
+        let weather = Weather::new(gpu, atmosphere.map_or(0, |_| mesh.n_elements * NN))?;
         let stream = &gpu.stream;
         let zeroed = |n| DeviceBuffer::zeroed(stream, n).map_err(|e| e.to_string());
         Ok(Self {
@@ -3277,6 +3553,9 @@ impl<'a> GpuSWE2D<'a> {
             boundary: Mutex::new(BoundaryUploads::new(gpu, forcing.width)?),
             parents,
             relaxations,
+            post,
+            atmosphere,
+            weather: Mutex::new(weather),
             forcing,
         })
     }
@@ -3385,13 +3664,29 @@ impl<'a> GpuSWE2D<'a> {
         let mut faces = self.faces.lock().expect("face buffer");
         let mut no_mass = self.no_mass.lock().expect("empty rows");
         let mut uploads = self.boundary.lock().expect("boundary data");
+        let mut weather = self.weather.lock().expect("weather slots");
+        weather.rhs += 1;
         let width = self.forcing.width;
         let (boundary, moments) = uploads.upload(&gpu.stream, |levels, moments| {
             for (l, &time) in times.iter().enumerate() {
-                let open = self.open_states(time, &mut moments[l * width..(l + 1) * width]);
+                let row = &mut moments[l * width..(l + 1) * width];
+                let open = self.open_states(time, row);
+                if let Some((atmosphere, offset)) = self.atmosphere {
+                    weather.moment(
+                        gpu,
+                        atmosphere,
+                        time,
+                        &mut row[offset..offset + WEATHER_MOMENT],
+                    );
+                }
                 levels[l] = StageLevel { time, open };
             }
         });
+        let (weather_offset, weather_level, weather_rho) =
+            self.atmosphere.map_or((0, false, 0.0), |(a, offset)| {
+                (offset, a.has_level(), a.constants().rho_water)
+            });
+        let [w0, w1, w2, w3] = &weather.slots;
         let (coriolis, f0) = self.coriolis_args();
         let elements_cfg = gpu.spread(n_elements, ELEMENT_BLOCK);
         let mut split = self.split.lock().expect("split lists");
@@ -3486,6 +3781,13 @@ impl<'a> GpuSWE2D<'a> {
                         &self.forcing.series,
                         &self.forcing.slots,
                         &self.forcing.parent_row_slot,
+                        weather_offset as u32,
+                        u32::from(weather_level),
+                        weather_rho,
+                        w0,
+                        w1,
+                        w2,
+                        w3,
                         level,
                         boundary_list,
                         n_boundary as u32,
@@ -3596,11 +3898,50 @@ impl<'a> GpuSWE2D<'a> {
                     )
                     .expect("element RHS (subcells)");
             }
-            // The relaxation bands, in the CPU's order, after the Coriolis
-            // force of the element kernels
+            // The relaxation bands and the weather, in the CPU's order, after
+            // the Coriolis force of the element kernels
             let f = &self.forcing;
-            for &(p, relaxation) in &self.relaxations {
+            for post in &self.post {
                 let [out_h, out_hu, out_hv] = out.fields_mut();
+                let (p, relaxation) = match *post {
+                    Post::Relaxation(j) => self.relaxations[j],
+                    Post::Atmosphere => {
+                        let (atmosphere, offset) = self.atmosphere.expect("a weather");
+                        let [wind, pressure] = atmosphere.switches();
+                        if !wind && !pressure {
+                            continue;
+                        }
+                        let c = atmosphere.constants();
+                        let (drag, cd) = c.drag.device_code();
+                        gpu.module
+                            .atmosphere_forcing(
+                                &gpu.stream,
+                                gpu.spread(n_pass, 256),
+                                offset as u32,
+                                u32::from(wind),
+                                u32::from(pressure),
+                                drag,
+                                cd,
+                                c.rho_air,
+                                c.rho_water,
+                                c.h_min,
+                                w0,
+                                w1,
+                                w2,
+                                w3,
+                                moments,
+                                width as u32,
+                                level,
+                                element_list,
+                                n_elements,
+                                &state.h,
+                                out_hu,
+                                out_hv,
+                            )
+                            .expect("weather");
+                        continue;
+                    }
+                };
                 gpu.module
                     .nesting_relaxation(
                         &gpu.stream,

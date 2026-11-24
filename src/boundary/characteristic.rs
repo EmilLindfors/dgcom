@@ -121,6 +121,12 @@ pub trait ExternalStateProvider: Send + Sync {
     fn device_external(&self) -> Option<DeviceExternal2D<'_>> {
         None
     }
+
+    /// A level a device adds to [`Self::device_external`]'s `η`, times a
+    /// factor ([`InverseBarometer`]). `None` by default.
+    fn device_raise(&self) -> Option<(DeviceLevel<'_>, f64)> {
+        None
+    }
 }
 
 /// The external data of a [`CharacteristicOBC`] as a device evaluates it
@@ -235,6 +241,22 @@ impl ExternalStateProvider for ParentTimeSeries {
 pub trait BoundaryLevel: Send + Sync {
     /// Level at the boundary point and time of `ctx`.
     fn level(&self, ctx: &BCContext2D) -> f64;
+
+    /// This level as a device evaluates it (P2.7, `notes/gpu.md`), if it has
+    /// a device form. `None` by default.
+    fn device_form(&self) -> Option<DeviceLevel<'_>> {
+        None
+    }
+}
+
+/// A [`BoundaryLevel`] as a device evaluates it
+/// ([`BoundaryLevel::device_form`]): a closed set of forms.
+#[derive(Clone, Copy, Debug)]
+pub enum DeviceLevel<'a> {
+    /// A weather model's inverse-barometer level at the boundary's face
+    /// nodes, from its regridded snapshots
+    /// (`crate::source::inverse_barometer_level`)
+    Atmosphere(&'a crate::source::GriddedAtmosphere2D),
 }
 
 /// Any closure `(x, y, t) → level`.
@@ -304,6 +326,21 @@ where
         let mut state = self.provider.external_state(ctx);
         state.eta += self.factor * self.level.level(ctx);
         state
+    }
+
+    /// The provider's device form, raised on the device
+    /// ([`Self::device_raise`]): if both the provider and the level have
+    /// one, and the provider is not raised already.
+    fn device_external(&self) -> Option<DeviceExternal2D<'_>> {
+        self.level.device_form()?;
+        if self.provider.device_raise().is_some() {
+            return None;
+        }
+        self.provider.device_external()
+    }
+
+    fn device_raise(&self) -> Option<(DeviceLevel<'_>, f64)> {
+        Some((self.level.device_form()?, self.factor))
     }
 }
 
@@ -432,6 +469,7 @@ impl<P: ExternalStateProvider> SWEBoundaryCondition2D for CharacteristicOBC<P> {
             .map(|external| DeviceBoundary2D::Characteristic {
                 external,
                 elevation_only: self.elevation_only,
+                raise: self.provider.device_raise(),
             })
     }
 }
