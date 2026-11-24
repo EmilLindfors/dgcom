@@ -51,6 +51,7 @@ use dgcom::types::ElementIndex;
 use dgcom::vertical::{ROMSVstretching4, SigmaGrid};
 
 use crate::baroclinic::{Baroclinic3D, BaroclinicSetup};
+use crate::listed::On;
 use crate::phase0::{DX, Lcg, quad_mesh, ulps};
 use crate::swe2d::{Gpu, N1, NN, ORDER};
 use crate::three_d::{
@@ -941,6 +942,7 @@ impl Device {
             Interface::Central,
             false,
             sources,
+            On::ALL,
         )?;
         let t_bc = if mutant == Mutant::ExtrapolatedT {
             DeviceTracerBC3D::Extrapolation
@@ -985,6 +987,7 @@ impl Device {
                 },
                 true,
                 sources && !referenced,
+                On::ALL,
             )?;
         }
         if referenced && mutant != Mutant::NoReferenceAdvection {
@@ -996,6 +999,7 @@ impl Device {
                 &mut *rhs_t,
                 &mut *rhs_s,
                 sources,
+                On::ALL,
             )?;
         }
         transport.advect_w(
@@ -1003,6 +1007,7 @@ impl Device {
             [rhs_k, rhs_psi],
             VerticalAdvection::LimitedAkima,
             sources,
+            On::ALL,
         )?;
         if sources && let Some([conc_t, conc_s]) = &self.river_conc {
             if mutant != Mutant::NoRiverT {

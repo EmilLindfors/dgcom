@@ -32,6 +32,7 @@ use dgcom::solver::rhs::viscosity_3d::{mirrored_velocity, smagorinsky_areas, wal
 use dgcom::source::swe_2d::viscosity::strain_rate_magnitude;
 use dgcom::vertical::depth_average;
 
+use crate::listed::{On, listed_index};
 use crate::swe2d::{Gpu, N1, NN, face_node};
 use crate::three_d::{COLUMN_BLOCK, LEVEL_BLOCK, OPEN, Statics3D, WALL, launch};
 
@@ -371,6 +372,7 @@ pub mod kernels_viscosity {
     pub fn viscosity_diffusion(
         nl: u32,
         n: u32,
+        listed: &[u32],
         depth: &[f64],
         flux: &[[f64; 4]],
         contra: &[[f64; 4]],
@@ -388,6 +390,7 @@ pub mod kernels_viscosity {
             return;
         }
         let nl = nl as usize;
+        let t = listed_index(t, listed, nl);
         let (k, l) = (t / nl, t % nl);
         // The nodes' fluxes `[F_u, F_v]` and their contravariant components
         let mut fx = [[0.0; 2]; NN];
@@ -495,6 +498,8 @@ pub struct Viscosity3D {
     pub(crate) mean_gradient: DeviceBuffer<[f64; 4]>,
     /// Every layer's fluxes `ν D ∇u′`, `ν D ∇v′`
     flux: DeviceBuffer<[f64; 4]>,
+    /// Every element, as a list
+    none_u32: DeviceBuffer<u32>,
 }
 
 impl Viscosity3D {
@@ -528,11 +533,13 @@ impl Viscosity3D {
             mean: DeviceBuffer::zeroed(stream, ne * NN)?,
             mean_gradient: DeviceBuffer::zeroed(stream, if smagorinsky { ne * NN } else { 0 })?,
             flux: DeviceBuffer::zeroed(stream, ne * NN * nl)?,
+            none_u32: DeviceBuffer::zeroed(stream, 0)?,
         })
     }
 
     /// The viscosity's velocity tendency of the state `(eta, u, v)` added to
-    /// `rhs_u`, `rhs_v` (`apply_horizontal_viscosity_3d` on every element).
+    /// `rhs_u`, `rhs_v` (`apply_horizontal_viscosity_3d`) on the elements of
+    /// `on` (the gradients, which their faces read, of every element).
     pub fn apply(
         &mut self,
         statics: &Statics3D,
@@ -541,12 +548,13 @@ impl Viscosity3D {
         v: &DeviceBuffer<f64>,
         rhs_u: &mut DeviceBuffer<f64>,
         rhs_v: &mut DeviceBuffer<f64>,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if self.viscosity.is_zero() {
             return Ok(());
         }
         self.means(statics, eta, u, v)?;
-        self.layers(statics, u, v, rhs_u, rhs_v)
+        self.layers(statics, u, v, rhs_u, rhs_v, on)
     }
 
     /// [`Self::apply`]'s first part: the columns' depths and means, and with
@@ -608,12 +616,14 @@ impl Viscosity3D {
         v: &DeviceBuffer<f64>,
         rhs_u: &mut DeviceBuffer<f64>,
         rhs_v: &mut DeviceBuffer<f64>,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let gpu = self.gpu.clone();
         let (m, st) = (&gpu.module_viscosity, &gpu.stream);
         let s = statics;
         let nl = s.n_levels as u32;
         let n = s.n_elements * s.n_levels;
+        let n_listed = on.count(s.n_elements) * s.n_levels;
         // SAFETY: as in `means`; `rhs_u`, `rhs_v` are none of the inputs.
         unsafe {
             m.viscosity_layer_gradients(
@@ -638,9 +648,10 @@ impl Viscosity3D {
             )?;
             m.viscosity_diffusion(
                 st,
-                launch(n, LEVEL_BLOCK),
+                launch(n_listed, LEVEL_BLOCK),
                 nl,
-                n as u32,
+                n_listed as u32,
+                on.listed(&self.none_u32),
                 &self.depth,
                 &self.flux,
                 &s.contra,

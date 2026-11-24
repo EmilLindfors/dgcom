@@ -876,8 +876,9 @@ pub struct Work3D {
     q: DeviceState,
     /// The column mean `Λ̄` of the layer drag
     column_drag: DeviceBuffer<f64>,
-    /// A stage's `βΔt` of every element
-    implicit_dt: DeviceBuffer<f64>,
+    /// The stages' `βΔt` of every element, by content: each stage's is the
+    /// same over a step's passes
+    implicit_dt: Vec<(Vec<f64>, DeviceBuffer<f64>)>,
     stages: Option<Stages3D>,
     /// The columns' sums or means of u and v
     sums: [DeviceBuffer<f64>; 2],
@@ -1222,10 +1223,13 @@ enum StepViscosity<'b> {
     Kept(&'b [DeviceBuffer<f64>; 2]),
 }
 
-/// `Hydrostatic3D::momentum_rhs` of `values` on every element into `rhs_u`,
-/// `rhs_v`: the reference at their levels, the pressure gradient and
-/// Coriolis, the shear's viscosity (`step_viscosity`), the nesting band's
-/// relaxation of the shear, the thin columns' tendencies zero.
+/// `Hydrostatic3D::momentum_rhs` of `values` on the elements of `on` into
+/// `rhs_u`, `rhs_v` (whose other rows are not read): the reference at their
+/// levels, the pressure gradient and Coriolis, the shear's viscosity
+/// (`step_viscosity`), the nesting band's relaxation of the shear, the thin
+/// columns' tendencies zero. The pre-passes that the elements' faces read
+/// of their neighbours (the reference, the columns' pressures, the
+/// viscosity's gradients) take every element.
 fn momentum(
     gpu: &Gpu,
     s: &Statics3D,
@@ -1237,6 +1241,7 @@ fn momentum(
     step_viscosity: StepViscosity<'_>,
     rhs_u: &mut DeviceBuffer<f64>,
     rhs_v: &mut DeviceBuffer<f64>,
+    on: On<'_>,
 ) {
     cuda(baroclinic.reference(s, &values.eta, &values.rho));
     cuda(baroclinic.momentum(
@@ -1247,17 +1252,19 @@ fn momentum(
         &values.v,
         rhs_u,
         rhs_v,
+        on,
     ));
     match step_viscosity {
         StepViscosity::Own => {
-            cuda(viscosity.apply(s, &values.eta, &values.u, &values.v, rhs_u, rhs_v))
+            cuda(viscosity.apply(s, &values.eta, &values.u, &values.v, rhs_u, rhs_v, on))
         }
         StepViscosity::Keep(kept) => {
-            // From zero, as the CPU's kept tendency, then added
+            // From zero, as the CPU's kept tendency, then added (the step's
+            // start: every element)
             let [ku, kv] = &mut *kept;
             cuda(ku.zero_async(&gpu.stream).map_err(Into::into));
             cuda(kv.zero_async(&gpu.stream).map_err(Into::into));
-            cuda(viscosity.apply(s, &values.eta, &values.u, &values.v, ku, kv));
+            cuda(viscosity.apply(s, &values.eta, &values.u, &values.v, ku, kv, on));
             add_kept(gpu, kept, rhs_u, rhs_v);
         }
         StepViscosity::Kept(kept) => add_kept(gpu, kept, rhs_u, rhs_v),
@@ -1438,7 +1445,7 @@ where
             average: DeviceState::upload(gpu, &like),
             q: DeviceState::upload(gpu, &like),
             column_drag: zeros(n_columns),
-            implicit_dt: zeros(ne),
+            implicit_dt: Vec::new(),
             stages: None,
             sums: [zeros(n_columns), zeros(n_columns)],
             surface_fluxes: p
@@ -1528,6 +1535,7 @@ where
                 step_viscosity,
                 rhs_u,
                 rhs_v,
+                On::ALL,
             );
         }
         self.stress_at(t, work);
@@ -1741,6 +1749,7 @@ where
         };
         if !fresh.is_empty() {
             let fresh = blocks_of(n, &fresh);
+            let id = work.list(fresh);
             let Work3D {
                 gpu,
                 statics,
@@ -1750,6 +1759,7 @@ where
                 stages,
                 nest,
                 kept_viscosity,
+                lists,
                 ..
             } = work;
             let Stages3D {
@@ -1776,7 +1786,6 @@ where
                 }
                 None => StepViscosity::Own,
             };
-            // Of every element: the rate's other rows are not read
             momentum(
                 gpu,
                 statics,
@@ -1788,6 +1797,7 @@ where
                 step_viscosity,
                 u,
                 v,
+                lists.on(id),
             );
         }
         if !reused.is_empty() {
@@ -1808,12 +1818,15 @@ where
         }
     }
 
-    /// Of every element (the rate's rows of the others are not read), but
-    /// what depends on an element's stage time: the rivers' T and S and the
-    /// nesting band's columns, at the times of `rhs.on`'s elements.
+    /// The advection's kernels on `rhs.on`'s elements, their pre-passes (the
+    /// layer transports, Ω, the reference) and the tendencies' cheap tails
+    /// on every element (the rate's rows of the others are not read); the
+    /// rivers' T and S and the nesting band's columns at the listed
+    /// elements' own stage times.
     fn stage_transport(&self, state: &State3D, work: &mut Work3D, rhs: StageRhs<'_>) {
         let p = self.physics;
         let (time, elements) = (rhs.on.time, rhs.on.elements);
+        let id = work.list(elements);
         // The rivers' T and S at their elements' stage times, as the CPU
         // evaluates them (another element's river is not read)
         if let (Some(rivers), Some([conc_t, conc_s])) = (p.rivers.as_deref(), &mut work.river_conc)
@@ -1841,8 +1854,10 @@ where
             river_conc,
             gpu,
             nest,
+            lists,
             ..
         } = work;
+        let on = lists.on(id);
         let Stages3D {
             inventories,
             values,
@@ -1894,6 +1909,7 @@ where
             Interface::Central,
             false,
             true,
+            on,
         ));
         let ranges = p.tracer_limiter.advection_ranges();
         let form = |bc: &dyn dgcom::solver::rhs::TracerBoundaryCondition3D| {
@@ -1924,6 +1940,7 @@ where
                 Interface::DonorBesideThin,
                 true,
                 !referenced,
+                on,
             ));
         }
         if referenced {
@@ -1935,6 +1952,7 @@ where
                 &mut rate.temp,
                 &mut rate.salt,
                 true,
+                on,
             ));
         }
         if !vals.tke.is_empty() {
@@ -1944,6 +1962,7 @@ where
                     [&mut rate.tke, &mut rate.gls],
                     scheme,
                     true,
+                    on,
                 )),
                 None => {
                     for field in [&mut rate.tke, &mut rate.gls] {
@@ -2108,13 +2127,27 @@ where
             ..
         } = work;
         let implicit = implicit.as_ref().expect("checked above");
-        cuda(
-            implicit_dt
-                .copy_from_host(&gpu.stream, dt)
-                .map_err(Into::into),
-        );
+        // A stage's steps are the same in every pass of a coarse step: up
+        // only when new (a copy waits for the queued kernels), the oldest
+        // overwritten in stream order past one a stage of SSP-RK(4,3) twice
+        let st = &gpu.stream;
+        let at = match implicit_dt.iter().position(|(host, _)| host[..] == *dt) {
+            Some(at) => at,
+            None if implicit_dt.len() < 8 => {
+                let device = cuda(DeviceBuffer::from_host(st, dt).map_err(Into::into));
+                implicit_dt.push((dt.to_vec(), device));
+                implicit_dt.len() - 1
+            }
+            None => {
+                implicit_dt.rotate_left(1);
+                let (host, device) = implicit_dt.last_mut().expect("eight kept");
+                host.copy_from_slice(dt);
+                cuda(device.copy_from_host(st, dt).map_err(Into::into));
+                implicit_dt.len() - 1
+            }
+        };
         let stage = &mut stages.as_mut().expect("sized").inventories[out];
-        cuda(implicit.relax(statics, stage, implicit_dt, lists.on(id)));
+        cuda(implicit.relax(statics, stage, &implicit_dt[at].1, lists.on(id)));
     }
 
     fn stage_values(

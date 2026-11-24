@@ -44,6 +44,7 @@ use dgcom::types::ElementIndex;
 use dgcom::vertical::depth_average;
 
 use crate::hooks::State3D;
+use crate::listed::On;
 use crate::swe2d::{Gpu, NN};
 use crate::three_d::{Advected, COLUMN_BLOCK, Interface, Statics3D, Transport3D, launch};
 use crate::vertical::Vertical3D;
@@ -404,6 +405,7 @@ impl SlowForcing3D {
             Interface::Central,
             false,
             false,
+            On::ALL,
         )?;
         // A(ū) + D R_Cor(ū): the depth mean as one layer
         self.bar
@@ -431,6 +433,7 @@ impl SlowForcing3D {
             Interface::Central,
             false,
             false,
+            On::ALL,
         )?;
         let none = &self.none;
         let [stress_x, stress_y] = stress.unwrap_or([none, none]);

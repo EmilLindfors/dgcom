@@ -62,6 +62,7 @@ use dgcom::source::RiverSources;
 use dgcom::types::ElementIndex;
 use dgcom::vertical::SigmaGrid;
 
+use crate::listed::{On, listed_index};
 use crate::swe2d::{Gpu, N1, NN, ORDER, face_node};
 
 /// Most σ-levels a column kernel takes (its scratch is local arrays).
@@ -692,6 +693,7 @@ pub mod kernels3d {
         nl: u32,
         w_points: u32,
         n: u32,
+        listed: &[u32],
         overwrite: u32,
         donor: u32,
         kinds: &[u32],
@@ -730,6 +732,7 @@ pub mod kernels3d {
         let nl = nl as usize;
         let wp = w_points != 0;
         let nf = nl + usize::from(wp);
+        let t = listed_index(t, listed, nf);
         let (k, l) = (t / nf, t % nf);
         let mut q_u = [0.0; NN];
         let mut q_v = [0.0; NN];
@@ -936,11 +939,13 @@ pub mod kernels3d {
     /// is not pooling, the water no transport carried at the field's own
     /// value, `Δσ_l s C` (`LayerTransport::add_volume_sources`), added, as
     /// the CPU adds it after the advection (`pooled_sources` adds the
-    /// pooling elements').
+    /// pooling elements'). Only the columns of the elements `listed` (empty:
+    /// every element).
     #[kernel]
     pub fn advect_vertical(
         nl: u32,
         n_columns: u32,
+        listed: &[u32],
         scheme: u32,
         range_min: f64,
         range_max: f64,
@@ -957,6 +962,7 @@ pub mod kernels3d {
         if idx >= n_columns as usize {
             return;
         }
+        let idx = listed_index(idx, listed, NN);
         let nl = nl as usize;
         let column = &field[idx * nl..(idx + 1) * nl];
         let reference = if reference.is_empty() {
@@ -1001,11 +1007,13 @@ pub mod kernels3d {
     /// column's own value (`RiverInflow::add_w_point_sources_at_own_value`,
     /// none if `river_offsets` is empty) and, if `volume_source` is not
     /// empty and the column's element is not pooling, the water no
-    /// transport carried (the pooling elements' in `pooled_sources`).
+    /// transport carried (the pooling elements' in `pooled_sources`). Only
+    /// the columns of the elements `listed` (empty: every element).
     #[kernel]
     pub fn advect_vertical_w(
         nl: u32,
         n_columns: u32,
+        listed: &[u32],
         scheme: u32,
         kinds: &[u32],
         field: &[f64],
@@ -1023,6 +1031,7 @@ pub mod kernels3d {
         if idx >= n_columns as usize {
             return;
         }
+        let idx = listed_index(idx, listed, NN);
         let nl = nl as usize;
         let nw = nl + 1;
         let (k, node) = (idx / NN, idx % NN);
@@ -1824,11 +1833,12 @@ impl Transport3D {
         interface: Interface,
         overwrite: bool,
         w_points: bool,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let gpu = self.gpu.clone();
         let s = &self.statics;
         let nf = s.n_levels + usize::from(w_points);
-        let n = s.n_elements * nf;
+        let n = on.count(s.n_elements) * nf;
         assert!(
             !w_points || fields.iter().all(|a| a.exterior.is_none()),
             "exterior values are the layers'"
@@ -1852,6 +1862,7 @@ impl Transport3D {
                 s.n_levels as u32,
                 u32::from(w_points),
                 n as u32,
+                on.listed(&self.none_u32),
                 u32::from(overwrite),
                 u32::from(interface == Interface::DonorBesideThin),
                 &self.kinds,
@@ -1895,7 +1906,8 @@ impl Transport3D {
     /// `interface`'s value; with `sources`, then the water no transport
     /// carried at each field's value (`LayerTransport::add_volume_sources`),
     /// as `Hydrostatic3D::compute_transport_rhs_into` adds it to T, S, u and
-    /// v.
+    /// v; on the elements of `on` (the pooling elements' water on every
+    /// element).
     pub fn advect(
         &self,
         fields: [&Advected; 2],
@@ -1904,6 +1916,7 @@ impl Transport3D {
         interface: Interface,
         overwrite: bool,
         sources: bool,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let [rhs_a, rhs_b] = rhs;
         self.advect_horizontal(
@@ -1912,12 +1925,13 @@ impl Transport3D {
             interface,
             overwrite,
             false,
+            on,
         )?;
         let gpu = self.gpu.clone();
         let (m, st) = (&gpu.module3d, &gpu.stream);
         let s = &self.statics;
         let nl = s.n_levels as u32;
-        let n_columns = s.n_columns();
+        let n_columns = on.count(s.n_elements) * NN;
         // SAFETY: as in `compute`; `rhs` are none of the inputs.
         unsafe {
             for (advected, rhs) in fields.iter().zip([rhs_a, rhs_b]) {
@@ -1926,6 +1940,7 @@ impl Transport3D {
                     launch(n_columns, COLUMN_BLOCK),
                     nl,
                     n_columns as u32,
+                    on.listed(&self.none_u32),
                     scheme_code(vertical),
                     advected.range.0,
                     advected.range.1,
@@ -1955,13 +1970,15 @@ impl Transport3D {
     /// boundary condition), overwriting `rhs`, the vertical reconstruction
     /// by `vertical`; with `sources`, then the rivers' water at each
     /// column's own value and the water no transport carried, as
-    /// `Hydrostatic3D`'s turbulence advection adds them.
+    /// `Hydrostatic3D`'s turbulence advection adds them; on the elements of
+    /// `on` (the pooling elements' water on every element).
     pub fn advect_w(
         &self,
         fields: [&DeviceBuffer<f64>; 2],
         rhs: [&mut DeviceBuffer<f64>; 2],
         vertical: VerticalAdvection,
         sources: bool,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let advected = fields.map(|field| Advected {
             field,
@@ -1977,11 +1994,12 @@ impl Transport3D {
             Interface::DonorBesideThin,
             true,
             true,
+            on,
         )?;
         let gpu = self.gpu.clone();
         let (m, st) = (&gpu.module3d, &gpu.stream);
         let s = &self.statics;
-        let n_columns = s.n_columns();
+        let n_columns = on.count(s.n_elements) * NN;
         let [offsets, by_element] = self.river_tables();
         let [q, share, weights] = self.river_values();
         let none_u32 = &self.none_u32;
@@ -1998,6 +2016,7 @@ impl Transport3D {
                     launch(n_columns, COLUMN_BLOCK),
                     s.n_levels as u32,
                     n_columns as u32,
+                    on.listed(none_u32),
                     scheme_code(vertical),
                     &self.kinds,
                     field,
