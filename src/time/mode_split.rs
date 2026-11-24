@@ -2413,6 +2413,17 @@ impl<W: SplitWork> ModeSplitIntegrator<W> {
         self.work.as_ref()
     }
 
+    /// The backend's buffers, made for `state` if no step has made them yet
+    /// (a step's bound on a backend that keeps its modules there), as
+    /// [`Self::step`] makes them: after the turbulence, on local time steps
+    /// of the 3D stages.
+    pub fn work_for<M: SplitModel<Work = W>>(&mut self, model: &M, state: &mut M::State) -> &mut W {
+        if self.work.is_none() && self.baroclinic_levels > 0 {
+            model.start_turbulence(state);
+        }
+        self.work.get_or_insert_with(|| model.new_work(state))
+    }
+
     /// Barotropic substeps per baroclinic step used by the last step (0 before
     /// the first step).
     pub fn last_substeps(&self) -> usize {

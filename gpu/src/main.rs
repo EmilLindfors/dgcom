@@ -47,6 +47,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod baroclinic;
+mod bound3d;
 mod case;
 mod forcing;
 mod forcing3d;

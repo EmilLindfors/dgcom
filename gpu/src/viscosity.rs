@@ -269,6 +269,99 @@ pub mod kernels_viscosity {
         }
     }
 
+    /// The largest viscosity of each element's nodes that are not thin at
+    /// each level, from the background up, into `largest`
+    /// (`[element][level]`): `largest_horizontal_viscosity_3d`'s `ν D / D`
+    /// with Smagorinsky's `ν` as [`viscosity_layer_gradients`] takes it, one
+    /// thread per element and level.
+    #[kernel]
+    pub fn viscosity_largest(
+        nl: u32,
+        n: u32,
+        background: f64,
+        depth: &[f64],
+        mean: &[[f64; 2]],
+        mean_gradient: &[[f64; 4]],
+        area: &[f64],
+        u: &[f64],
+        v: &[f64],
+        metric: &[[f64; 4]],
+        dr: &[f64],
+        ds: &[f64],
+        fnode: &[[f64; 3]],
+        across: &[u32],
+        lift: &[f64],
+        mut largest: DisjointSlice<f64>,
+    ) {
+        let t = thread::index_1d().get();
+        if t >= n as usize {
+            return;
+        }
+        let nl = nl as usize;
+        let (k, l) = (t / nl, t % nl);
+        let shear = |idx: usize| {
+            if depth[idx] == 0.0 {
+                [0.0; 2]
+            } else {
+                let [mu, mv] = mean[idx];
+                [u[idx * nl + l] - mu, v[idx * nl + l] - mv]
+            }
+        };
+        let mut own = [[0.0; 2]; NN];
+        #[unroll]
+        for i in 0..NN {
+            own[i] = shear(k * NN + i);
+        }
+        let g = pair_gradients(
+            k,
+            &own,
+            |_, nb| shear(nb),
+            metric,
+            dr,
+            ds,
+            fnode,
+            across,
+            lift,
+        );
+        let mut most = background;
+        #[unroll]
+        for i in 0..NN {
+            let idx = k * NN + i;
+            let d = depth[idx];
+            if d > 0.0 {
+                let [ux, uy, vx, vy] = g[i];
+                let m = mean_gradient[idx];
+                let strain = strain_rate_magnitude(ux + m[0], uy + m[1], vx + m[2], vy + m[3]);
+                let nu = background + area[k] * strain;
+                most = most.max(nu * d / d);
+            }
+        }
+        // SAFETY: thread (k, l) alone writes level l of element k.
+        unsafe { *largest.get_unchecked_mut(t) = most };
+    }
+
+    /// Every element's largest of its levels' (`viscosity_largest`), one
+    /// thread per element.
+    #[kernel]
+    pub fn viscosity_element_largest(
+        nl: u32,
+        ne: u32,
+        levels: &[f64],
+        mut largest: DisjointSlice<f64>,
+    ) {
+        let k = thread::index_1d().get();
+        if k >= ne as usize {
+            return;
+        }
+        let nl = nl as usize;
+        let mut most = levels[k * nl];
+        for l in 1..nl {
+            most = most.max(levels[k * nl + l]);
+        }
+        // SAFETY: thread k alone writes element k.
+        unsafe { *largest.get_unchecked_mut(k) = most };
+    }
+
     /// The BR1 divergence of every layer's fluxes, one thread per element and
     /// level (`br1_diffusion_element`): the conservative volume term, the
     /// central face flux (at a wall the normal stress alone, at an open face
@@ -559,6 +652,60 @@ impl Viscosity3D {
                 &s.lift,
                 rhs_u,
                 rhs_v,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `largest_horizontal_viscosity_3d` of the state `(eta, u, v)` with
+    /// Smagorinsky: every element's largest viscosity into `largest`
+    /// (`[element]`), each level's into `levels` (`[element][level]`).
+    pub(crate) fn largest(
+        &mut self,
+        statics: &Statics3D,
+        eta: &DeviceBuffer<f64>,
+        u: &DeviceBuffer<f64>,
+        v: &DeviceBuffer<f64>,
+        levels: &mut DeviceBuffer<f64>,
+        largest: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(self.viscosity.smagorinsky > 0.0, "Smagorinsky's viscosity");
+        self.means(statics, eta, u, v)?;
+        let gpu = self.gpu.clone();
+        let (m, st) = (&gpu.module_viscosity, &gpu.stream);
+        let s = statics;
+        let nl = s.n_levels as u32;
+        let n = s.n_elements * s.n_levels;
+        // SAFETY: as in `means`; `levels` holds a value per element and
+        // level, `largest` one per element.
+        unsafe {
+            m.viscosity_largest(
+                st,
+                launch(n, LEVEL_BLOCK),
+                nl,
+                n as u32,
+                self.viscosity.background,
+                &self.depth,
+                &self.mean,
+                &self.mean_gradient,
+                &self.area,
+                u,
+                v,
+                &self.metric,
+                &s.dr,
+                &s.ds,
+                &s.fnode,
+                &s.across,
+                &s.lift,
+                levels,
+            )?;
+            m.viscosity_element_largest(
+                st,
+                launch(s.n_elements, COLUMN_BLOCK),
+                nl,
+                s.n_elements as u32,
+                levels,
+                largest,
             )?;
         }
         Ok(())

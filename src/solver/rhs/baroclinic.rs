@@ -1709,119 +1709,16 @@ impl ReferenceFields {
         scratch: &mut [f64],
     ) -> f64 {
         let (nn, nl) = (ops.n_nodes, sigma.n_levels());
-        let eta = |i: usize| state.eta.data[k * nn + i];
-        let bed = |i: usize| bathymetry.data[k * nn + i];
-        let wet = |i: usize| eta(i) - bed(i) >= min_column_depth;
-        // Each column's largest N and largest N |σ|
-        let (strata, sums) = scratch[..5 * nn].split_at_mut(2 * nn);
-        let (largest, deepest) = strata.split_at_mut(nn);
-        for i in 0..nn {
-            let column = &self.stratification[(k * nn + i) * nl..][..nl];
-            let (mut n2, mut n2_sigma2) = (0.0_f64, 0.0_f64);
-            for (&gamma, &s) in column.iter().zip(sigma.sigma_rho()) {
-                let gamma = gamma.max(0.0);
-                n2 = n2.max(gamma);
-                n2_sigma2 = n2_sigma2.max(gamma * s * s);
-            }
-            (largest[i], deepest[i]) = if wet(i) {
-                ((buoyancy * n2).sqrt(), (buoyancy * n2_sigma2).sqrt())
-            } else {
-                (0.0, 0.0)
-            };
-        }
-        if largest.iter().all(|&n| n == 0.0) {
-            return 0.0;
-        }
-        let weight = |i: usize| geom.node_mass(k, i) * (eta(i) - bed(i));
-        if !(0..nn).all(wet) {
-            // The subcell interfaces between two columns that are not thin
-            let n1 = ops.n_1d;
-            let (row, columns) = sums.split_at_mut(nn);
-            let (column_x, column_y) = columns.split_at_mut(nn);
-            row.fill(0.0);
-            column_x.fill(0.0);
-            column_y.fill(0.0);
-            let mut line = [(0.0, 0.0); MAX_N_1D];
-            let mut interfaces = [(0.0, 0.0); MAX_N_1D + 1];
-            for dir in 0..2 {
-                for at in 0..n1 {
-                    let affine = line_metric(ops, geom, k, dir, at, &mut line[..n1]);
-                    telescoped_interfaces(
-                        &ops.weights_1d,
-                        &ops.dr_1d_row_major,
-                        &line[..n1],
-                        affine,
-                        &mut interfaces,
-                    );
-                    for a in 0..n1 - 1 {
-                        let (i, j) = (line_node(n1, dir, at, a), line_node(n1, dir, at, a + 1));
-                        if !(wet(i) && wet(j)) {
-                            continue;
-                        }
-                        let (mx, my) = interfaces[a + 1];
-                        let (mx, my) =
-                            (ops.weights_1d[at] * mx.abs(), ops.weights_1d[at] * my.abs());
-                        let (d_eta, d_bed) = ((eta(j) - eta(i)).abs(), (bed(j) - bed(i)).abs());
-                        // N |z_b − z_a| at most, in each end's stratification
-                        let rise = |a: usize| largest[a] * d_eta + deepest[a] * d_bed;
-                        let (m_i, m_j) = (geom.node_mass(k, i), geom.node_mass(k, j));
-                        let ratio = (weight(j) / weight(i)).sqrt();
-                        // √(D_b / (m_a m_b D_a)), and with a and b exchanged
-                        let (cross_ij, cross_ji) = (ratio / m_j, 1.0 / (ratio * m_i));
-                        row[i] += rise(i) * (mx + my) * (1.0 / m_i + cross_ij);
-                        row[j] += rise(j) * (mx + my) * (1.0 / m_j + cross_ji);
-                        let to_i = rise(i) / m_i + rise(j) * cross_ji;
-                        let to_j = rise(j) / m_j + rise(i) * cross_ij;
-                        column_x[i] += to_i * mx;
-                        column_y[i] += to_i * my;
-                        column_x[j] += to_j * mx;
-                        column_y[j] += to_j * my;
-                    }
-                }
-            }
-            let (mut widest, mut total) = (0.0_f64, 0.0);
-            for &ds in sigma.d_sigma() {
-                widest = widest.max(ds.sqrt());
-                total += ds.sqrt();
-            }
-            let rows = 0.25 * widest * row.iter().fold(0.0_f64, |m, &r| m.max(r));
-            let columns = 0.25
-                * total
-                * column_x
-                    .iter()
-                    .zip(&*column_y)
-                    .fold(0.0_f64, |m, (&x, &y)| m.max(x).max(y));
-            return (rows * columns).sqrt();
-        }
-        let averaged = metric.averaged_on(geom, k);
-        let (mut rows, mut columns) = (0.0_f64, 0.0_f64);
-        for i in 0..nn {
-            // ∇η and ∇B at the node, and the sums over the other nodes of
-            // its row and of its velocity's two columns
-            let (mut grad_eta, mut grad_bed) = ((0.0, 0.0), (0.0, 0.0));
-            let (mut row, mut column) = (0.0, (0.0, 0.0));
-            for j in (0..nn).filter(|&j| j != i) {
-                let [(dx_ij, dy_ij), (dx_ji, dy_ji)] =
-                    pair_derivatives(ops, geom, k, i, j, averaged);
-                let (d_eta, d_bed) = (eta(j) - eta(i), bed(j) - bed(i));
-                grad_eta = (grad_eta.0 + dx_ij * d_eta, grad_eta.1 + dy_ij * d_eta);
-                grad_bed = (grad_bed.0 + dx_ij * d_bed, grad_bed.1 + dy_ij * d_bed);
-                let ratio = (weight(j) / weight(i)).sqrt();
-                row += (largest[i] * d_eta.abs() + deepest[i] * d_bed.abs())
-                    * ratio
-                    * (dx_ji.abs() + dy_ji.abs());
-                let from_j = (largest[j] * d_eta.abs() + deepest[j] * d_bed.abs()) / ratio;
-                column = (
-                    column.0 + from_j * dx_ij.abs(),
-                    column.1 + from_j * dy_ij.abs(),
-                );
-            }
-            let own_x = largest[i] * grad_eta.0.abs() + deepest[i] * grad_bed.0.abs();
-            let own_y = largest[i] * grad_eta.1.abs() + deepest[i] * grad_bed.1.abs();
-            rows = rows.max(0.5 * (own_x + own_y + row));
-            columns = columns.max(0.5 * (own_x + column.0).max(own_y + column.1));
-        }
-        (rows * columns).sqrt()
+        let element = CpuElement::new(ops, geom, &state.eta.data, &bathymetry.data, metric, k);
+        sloping_level_rate_of(
+            &element,
+            &self.stratification[k * nn * nl..(k + 1) * nn * nl],
+            sigma.sigma_rho(),
+            sigma.d_sigma(),
+            buoyancy,
+            min_column_depth,
+            scratch,
+        )
     }
 
     /// The largest frequency (1/s) of the reference's waves along the
@@ -1872,181 +1769,396 @@ impl ReferenceFields {
     ) -> Option<f64> {
         let (nn, nl) = (ops.n_nodes, sigma.n_levels());
         assert!(nl <= MAX_LEVELS, "at most {MAX_LEVELS} levels, not {nl}");
-        let eta = |i: usize| state.eta.data[k * nn + i];
-        let depth = |i: usize| state.eta.data[k * nn + i] - bathymetry.data[k * nn + i];
-        if !(0..nn).all(|i| depth(i) >= min_column_depth) {
-            return None;
-        }
-        let (sigma_rho, d_sigma) = (sigma.sigma_rho(), sigma.d_sigma());
+        let element = CpuElement::new(ops, geom, &state.eta.data, &bathymetry.data, metric, k);
         let block = k * nn * nl..(k + 1) * nn * nl;
-        let stratification = &self.stratification[block.clone()];
-        let density = &self.density[block.clone()];
-        let residual = &self.residual[block];
-        let per_element = nn * nl;
-        let (velocity, rest) = scratch[..5 * per_element].split_at_mut(2 * per_element);
-        let (vx, vy) = velocity.split_at_mut(per_element);
-        let (anomaly, rest) = rest.split_at_mut(per_element);
-        // n / √(m D) of every row, and the displacement's s n √(m D Δσ) / W
-        let (tangent, taken) = rest.split_at_mut(per_element);
-        let (mut weight, mut scale, mut mean_weight) = (0.0, 0.0, 0.0);
-        for i in 0..nn {
-            let volume = geom.node_mass(k, i) * depth(i);
-            for l in 0..nl {
-                let gamma = stratification[i * nl + l].max(0.0);
-                tangent[i * nl + l] = (buoyancy * gamma / volume).sqrt();
-                weight += volume * d_sigma[l] * gamma * residual[i * nl + l];
-                scale += volume * d_sigma[l] * gamma * gamma;
-                mean_weight += volume * d_sigma[l] * gamma;
-            }
-        }
-        if mean_weight <= 0.0 {
-            return Some(0.0);
-        }
-        let shaped = has_residual(weight, scale);
-        let weight = if shaped { weight } else { mean_weight };
-        for i in 0..nn {
-            let volume = geom.node_mass(k, i) * depth(i);
-            for l in 0..nl {
-                let c = i * nl + l;
-                let shape = if shaped { residual[c] } else { 1.0 };
-                taken[c] = shape * tangent[c] * volume * d_sigma[l].sqrt() / weight;
-            }
-        }
-        let averaged = metric.averaged_on(geom, k);
-        let apart = |a: usize, b: usize| ops.dr[(a, b)] == 0.0 && ops.ds[(a, b)] == 0.0;
-        // Every pair's (i, j, ½ √(m_i D_i) D_ij, ½ √(m_j D_j) D_ji, η_j − η_i,
-        // D_j − D_i)
-        let pairs = || {
-            (0..nn).flat_map(move |i| {
-                (i + 1..nn)
-                    .filter(move |&j| !(apart(i, j) && apart(j, i)))
-                    .map(move |j| {
-                        let [(dx_ij, dy_ij), (dx_ji, dy_ji)] =
-                            pair_derivatives(ops, geom, k, i, j, averaged);
-                        let at_i = 0.5 * (geom.node_mass(k, i) * depth(i)).sqrt();
-                        let at_j = 0.5 * (geom.node_mass(k, j) * depth(j)).sqrt();
-                        (
-                            (i, j),
-                            (at_i * dx_ij, at_i * dy_ij),
-                            (at_j * dx_ji, at_j * dy_ji),
-                            (eta(j) - eta(i), depth(j) - depth(i)),
-                        )
-                    })
-            })
-        };
-        // e √Δσ of a pair on level l
-        let mut root = [0.0; MAX_LEVELS];
-        for (root, ds) in root.iter_mut().zip(d_sigma) {
-            *root = ds.sqrt();
-        }
-        let error = |i: usize, j: usize, l: usize, dz: f64| {
-            let (a, c) = (i * nl + l, j * nl + l);
-            root[l]
-                * (2.0 * (density[c] - density[a]) + (stratification[a] + stratification[c]) * dz)
-        };
-        // v ← Bᵀ r
-        let transpose = |anomaly: &[f64], vx: &mut [f64], vy: &mut [f64]| {
-            vx.fill(0.0);
-            vy.fill(0.0);
-            let moved: f64 = taken.iter().zip(anomaly).map(|(t, r)| t * r).sum();
-            for ((i, j), (ax, ay), (bx, by), (d_eta, d_depth)) in pairs() {
-                for l in 0..nl {
-                    let (a, c) = (i * nl + l, j * nl + l);
-                    let dz = d_eta + sigma_rho[l] * d_depth;
-                    let w = (tangent[a] * anomaly[a] + tangent[c] * anomaly[c]) * dz
-                        - moved * error(i, j, l, dz);
-                    vx[a] += ax * w;
-                    vy[a] += ay * w;
-                    vx[c] -= bx * w;
-                    vy[c] -= by * w;
-                }
-            }
-        };
-        // Start from the anomaly n: every stratified row, in phase
-        for (r, &gamma) in anomaly.iter_mut().zip(stratification) {
-            *r = (buoyancy * gamma.max(0.0)).sqrt();
-        }
-        transpose(anomaly, vx, vy);
-        let norm = |x: &[f64]| x.iter().map(|x| x * x).sum::<f64>().sqrt();
-        let mut frequency = 0.0_f64;
-        for iteration in 0..40 {
-            let length = (norm(vx).powi(2) + norm(vy).powi(2)).sqrt();
-            if length == 0.0 {
-                return Some(frequency);
-            }
-            vx.iter_mut()
-                .chain(vy.iter_mut())
-                .for_each(|v| *v /= length);
-            // r ← B v
-            anomaly.fill(0.0);
-            let mut made = 0.0;
-            for ((i, j), (ax, ay), (bx, by), (d_eta, d_depth)) in pairs() {
-                for l in 0..nl {
-                    let (a, c) = (i * nl + l, j * nl + l);
-                    let half = (ax * vx[a] + ay * vy[a]) - (bx * vx[c] + by * vy[c]);
-                    let dz = d_eta + sigma_rho[l] * d_depth;
-                    anomaly[a] += tangent[a] * dz * half;
-                    anomaly[c] += tangent[c] * dz * half;
-                    made += half * error(i, j, l, dz);
-                }
-            }
-            for (r, t) in anomaly.iter_mut().zip(&*taken) {
-                *r -= t * made;
-            }
-            let last = frequency;
-            frequency = norm(anomaly);
-            if iteration >= 2 && (frequency - last).abs() <= 3e-4 * frequency {
-                break;
-            }
-            transpose(anomaly, vx, vy);
-        }
-        Some(frequency)
+        sloping_level_frequency_of(
+            &element,
+            ElementReference {
+                density: &self.density[block.clone()],
+                stratification: &self.stratification[block.clone()],
+                residual: &self.residual[block],
+            },
+            sigma.sigma_rho(),
+            sigma.d_sigma(),
+            buoyancy,
+            min_column_depth,
+            scratch,
+        )
     }
 }
 
-/// Add to the tracers' inventory tendencies `rhs` (`[T, S]`, `∂(H_z C)/∂t`,
-/// layout of [`Solution3D`]) what turns the conservative advection of the
-/// reference stratification into its advection by the vertical velocity
-/// that is the pressure gradient's adjoint (see "About a reference").
-///
-/// The edges are those the pressure gradient acts along: the pairs of nodes
-/// of an element on a level (where no column of the element is thin and its
-/// layers move by the pairs, not on the subcells), in a subcell element the
-/// interfaces between two columns that are not thin (the layers' shares of
-/// the barotropic flux), and the σ-surfaces between the layers of a column
-/// that is not thin. Each carries a volume flux `f_ab` out of node `a` (per
-/// unit horizontal area of `a`): the split form's `Φ_ij/m_i`, the subcell
-/// interface's, or `±Ω`. The conservative advection changes `C_a` by
-/// `−½ f_ab (C_b − C_a)` along it. Of that jump the reference's share is
-/// `θ_ab (C̄_b − C̄_a)` (`θ` is 1 in a fluid stratified like the reference),
-/// and this adds
-///
-/// ```text
-///     ½ f_ab θ_ab [(C̄_b − C̄_a) − γ_a (z_b − z_a)]
-/// ```
-///
-/// so that the reference's share is advected as `−γ_a w_a`, with `γ_a` the
-/// reference's gradient over the layer ([`ReferenceFields::gradients`]) and
-/// `H_z,a w_a = ½ Σ_b f_ab (z_b − z_a)`, the adjoint of the pressure
-/// gradient's sum over the same edges. The other edges (the element faces,
-/// which join nodes at one height, and an interface to a thin column) are
-/// left to the conservative advection.
-///
-/// The tracer these terms would make in an element (the trapezoid rule's
-/// error of the reference's gradient along its edges) is taken back as a
-/// displacement of the element's stratification, `−H_z Γ g R/N` at every
-/// layer with `R` the element's sum of the terms, `g` the stratification's
-/// residual about its column's line in `z` ([`ReferenceFields::residual`])
-/// and `N = Σ m H_z Γ g` (`g = 1`, a uniform displacement, where the levels
-/// see no residual: one or two levels, a reference quadratic in `z`): every
-/// element with a stratified layer keeps its inventory of `T` and of `S` to
-/// round-off. The pressure gradient's displacement term
-/// ([`ReferenceFields::set_displacements`]) is this step's adjoint.
-///
-/// `tracers` are the advected concentrations, `reference` the reference at
-/// the levels of `state`'s `η`, `transport` the stage's layer transports.
-/// A uniform tracer gets nothing (`θ = 0`); a reference linear in `z` adds
-/// nothing (its chords are its tangents).
+/// An element as the sloping levels' bounds read it
+/// ([`ReferenceFields::sloping_level_rate`],
+/// [`ReferenceFields::sloping_level_frequency`]): the CPU's from its
+/// operators and geometry ([`CpuElement`]), a device's from its tables.
+pub trait SlopingElement {
+    /// Its nodes, and the nodes along a GLL line.
+    fn n_nodes(&self) -> usize;
+    fn n_1d(&self) -> usize;
+    /// Node `i`'s free surface and bed.
+    fn eta(&self, i: usize) -> f64;
+    fn bed(&self, i: usize) -> f64;
+    /// Node `i`'s mass (its GLL weight times `J`).
+    fn node_mass(&self, i: usize) -> f64;
+    /// The pair `(i, j)`'s derivative coefficients ([`pair_coefficients`],
+    /// the volume terms' form).
+    fn pair(&self, i: usize, j: usize) -> [(f64, f64); 2];
+    /// Whether `D_r` and `D_s` are both zero at `(a, b)`.
+    fn apart(&self, a: usize, b: usize) -> bool;
+    /// The GLL weight of line `at`.
+    fn weight_1d(&self, at: usize) -> f64;
+    /// The contravariant directions of line `at`'s (along `dir`) subcell
+    /// interfaces into `out[1..n_1d]` (`telescoped_interfaces` of its
+    /// `line_metric`).
+    fn line_interfaces(&self, dir: usize, at: usize, out: &mut [(f64, f64)]);
+}
+
+/// Element `k` of `ops` and `geom`, with the free surface `eta` and the bed
+/// `bed` (`[element][node]`), its volume terms in `metric`'s form.
+pub struct CpuElement<'a> {
+    ops: &'a DGOperators2D,
+    geom: &'a GeometricFactors2D,
+    eta: &'a [f64],
+    bed: &'a [f64],
+    k: usize,
+    averaged: bool,
+}
+
+impl<'a> CpuElement<'a> {
+    pub fn new(
+        ops: &'a DGOperators2D,
+        geom: &'a GeometricFactors2D,
+        eta: &'a [f64],
+        bed: &'a [f64],
+        metric: MetricForm,
+        k: usize,
+    ) -> Self {
+        Self {
+            ops,
+            geom,
+            eta,
+            bed,
+            k,
+            averaged: metric.averaged_on(geom, k),
+        }
+    }
+}
+
+impl SlopingElement for CpuElement<'_> {
+    fn n_nodes(&self) -> usize {
+        self.ops.n_nodes
+    }
+
+    fn n_1d(&self) -> usize {
+        self.ops.n_1d
+    }
+
+    fn eta(&self, i: usize) -> f64 {
+        self.eta[self.k * self.ops.n_nodes + i]
+    }
+
+    fn bed(&self, i: usize) -> f64 {
+        self.bed[self.k * self.ops.n_nodes + i]
+    }
+
+    fn node_mass(&self, i: usize) -> f64 {
+        self.geom.node_mass(self.k, i)
+    }
+
+    fn pair(&self, i: usize, j: usize) -> [(f64, f64); 2] {
+        pair_derivatives(self.ops, self.geom, self.k, i, j, self.averaged)
+    }
+
+    fn apart(&self, a: usize, b: usize) -> bool {
+        self.ops.dr[(a, b)] == 0.0 && self.ops.ds[(a, b)] == 0.0
+    }
+
+    fn weight_1d(&self, at: usize) -> f64 {
+        self.ops.weights_1d[at]
+    }
+
+    fn line_interfaces(&self, dir: usize, at: usize, out: &mut [(f64, f64)]) {
+        let n1 = self.ops.n_1d;
+        let mut line = [(0.0, 0.0); MAX_N_1D];
+        let affine = line_metric(self.ops, self.geom, self.k, dir, at, &mut line[..n1]);
+        telescoped_interfaces(
+            &self.ops.weights_1d,
+            &self.ops.dr_1d_row_major,
+            &line[..n1],
+            affine,
+            out,
+        );
+    }
+}
+
+/// [`ReferenceFields::sloping_level_rate`] of the element `e` with its
+/// reference's stratification `stratification` (`[node][level]`) over the
+/// levels `sigma_rho`, `d_sigma`: a device's bound calls it too. `scratch`
+/// holds five numbers per node.
+pub fn sloping_level_rate_of<E: SlopingElement>(
+    e: &E,
+    stratification: &[f64],
+    sigma_rho: &[f64],
+    d_sigma: &[f64],
+    buoyancy: f64,
+    min_column_depth: f64,
+    scratch: &mut [f64],
+) -> f64 {
+    let (nn, nl) = (e.n_nodes(), d_sigma.len());
+    let wet = |i: usize| e.eta(i) - e.bed(i) >= min_column_depth;
+    // Each column's largest N and largest N |σ|
+    let (strata, sums) = scratch[..5 * nn].split_at_mut(2 * nn);
+    let (largest, deepest) = strata.split_at_mut(nn);
+    for i in 0..nn {
+        let column = &stratification[i * nl..(i + 1) * nl];
+        let (mut n2, mut n2_sigma2) = (0.0_f64, 0.0_f64);
+        for (&gamma, &s) in column.iter().zip(sigma_rho) {
+            let gamma = gamma.max(0.0);
+            n2 = n2.max(gamma);
+            n2_sigma2 = n2_sigma2.max(gamma * s * s);
+        }
+        (largest[i], deepest[i]) = if wet(i) {
+            ((buoyancy * n2).sqrt(), (buoyancy * n2_sigma2).sqrt())
+        } else {
+            (0.0, 0.0)
+        };
+    }
+    if largest.iter().all(|&n| n == 0.0) {
+        return 0.0;
+    }
+    let weight = |i: usize| e.node_mass(i) * (e.eta(i) - e.bed(i));
+    if !(0..nn).all(wet) {
+        // The subcell interfaces between two columns that are not thin
+        let n1 = e.n_1d();
+        let (row, columns) = sums.split_at_mut(nn);
+        let (column_x, column_y) = columns.split_at_mut(nn);
+        // (loops: a device has no `fill`)
+        for x in row
+            .iter_mut()
+            .chain(column_x.iter_mut())
+            .chain(column_y.iter_mut())
+        {
+            *x = 0.0;
+        }
+        let mut interfaces = [(0.0, 0.0); MAX_N_1D + 1];
+        for dir in 0..2 {
+            for at in 0..n1 {
+                e.line_interfaces(dir, at, &mut interfaces);
+                for a in 0..n1 - 1 {
+                    let (i, j) = (line_node(n1, dir, at, a), line_node(n1, dir, at, a + 1));
+                    if !(wet(i) && wet(j)) {
+                        continue;
+                    }
+                    let (mx, my) = interfaces[a + 1];
+                    let (mx, my) = (e.weight_1d(at) * mx.abs(), e.weight_1d(at) * my.abs());
+                    let (d_eta, d_bed) = ((e.eta(j) - e.eta(i)).abs(), (e.bed(j) - e.bed(i)).abs());
+                    // N |z_b − z_a| at most, in each end's stratification
+                    let rise = |a: usize| largest[a] * d_eta + deepest[a] * d_bed;
+                    let (m_i, m_j) = (e.node_mass(i), e.node_mass(j));
+                    let ratio = (weight(j) / weight(i)).sqrt();
+                    // √(D_b / (m_a m_b D_a)), and with a and b exchanged
+                    let (cross_ij, cross_ji) = (ratio / m_j, 1.0 / (ratio * m_i));
+                    row[i] += rise(i) * (mx + my) * (1.0 / m_i + cross_ij);
+                    row[j] += rise(j) * (mx + my) * (1.0 / m_j + cross_ji);
+                    let to_i = rise(i) / m_i + rise(j) * cross_ji;
+                    let to_j = rise(j) / m_j + rise(i) * cross_ij;
+                    column_x[i] += to_i * mx;
+                    column_y[i] += to_i * my;
+                    column_x[j] += to_j * mx;
+                    column_y[j] += to_j * my;
+                }
+            }
+        }
+        let (mut widest, mut total) = (0.0_f64, 0.0);
+        for &ds in d_sigma {
+            widest = widest.max(ds.sqrt());
+            total += ds.sqrt();
+        }
+        let rows = 0.25 * widest * row.iter().fold(0.0_f64, |m, &r| m.max(r));
+        let columns = 0.25
+            * total
+            * column_x
+                .iter()
+                .zip(&*column_y)
+                .fold(0.0_f64, |m, (&x, &y)| m.max(x).max(y));
+        return (rows * columns).sqrt();
+    }
+    let (mut rows, mut columns) = (0.0_f64, 0.0_f64);
+    for i in 0..nn {
+        // ∇η and ∇B at the node, and the sums over the other nodes of
+        // its row and of its velocity's two columns
+        let (mut grad_eta, mut grad_bed) = ((0.0, 0.0), (0.0, 0.0));
+        let (mut row, mut column) = (0.0, (0.0, 0.0));
+        for j in (0..nn).filter(|&j| j != i) {
+            let [(dx_ij, dy_ij), (dx_ji, dy_ji)] = e.pair(i, j);
+            let (d_eta, d_bed) = (e.eta(j) - e.eta(i), e.bed(j) - e.bed(i));
+            grad_eta = (grad_eta.0 + dx_ij * d_eta, grad_eta.1 + dy_ij * d_eta);
+            grad_bed = (grad_bed.0 + dx_ij * d_bed, grad_bed.1 + dy_ij * d_bed);
+            let ratio = (weight(j) / weight(i)).sqrt();
+            row += (largest[i] * d_eta.abs() + deepest[i] * d_bed.abs())
+                * ratio
+                * (dx_ji.abs() + dy_ji.abs());
+            let from_j = (largest[j] * d_eta.abs() + deepest[j] * d_bed.abs()) / ratio;
+            column = (
+                column.0 + from_j * dx_ij.abs(),
+                column.1 + from_j * dy_ij.abs(),
+            );
+        }
+        let own_x = largest[i] * grad_eta.0.abs() + deepest[i] * grad_bed.0.abs();
+        let own_y = largest[i] * grad_eta.1.abs() + deepest[i] * grad_bed.1.abs();
+        rows = rows.max(0.5 * (own_x + own_y + row));
+        columns = columns.max(0.5 * (own_x + column.0).max(own_y + column.1));
+    }
+    (rows * columns).sqrt()
+}
+
+/// [`ReferenceFields::sloping_level_frequency`] of the element `e` with its
+/// reference `reference` (`[node][level]`) over the levels `sigma_rho`,
+/// `d_sigma` (at most [`MAX_LEVELS`]): a device's bound calls it too.
+/// `scratch` holds five numbers per node and level.
+pub fn sloping_level_frequency_of<E: SlopingElement>(
+    e: &E,
+    reference: ElementReference<'_>,
+    sigma_rho: &[f64],
+    d_sigma: &[f64],
+    buoyancy: f64,
+    min_column_depth: f64,
+    scratch: &mut [f64],
+) -> Option<f64> {
+    let (nn, nl) = (e.n_nodes(), d_sigma.len());
+    let eta = |i: usize| e.eta(i);
+    let depth = |i: usize| e.eta(i) - e.bed(i);
+    if !(0..nn).all(|i| depth(i) >= min_column_depth) {
+        return None;
+    }
+    let ElementReference {
+        density,
+        stratification,
+        residual,
+    } = reference;
+    let per_element = nn * nl;
+    let (velocity, rest) = scratch[..5 * per_element].split_at_mut(2 * per_element);
+    let (vx, vy) = velocity.split_at_mut(per_element);
+    let (anomaly, rest) = rest.split_at_mut(per_element);
+    // n / √(m D) of every row, and the displacement's s n √(m D Δσ) / W
+    let (tangent, taken) = rest.split_at_mut(per_element);
+    let (mut weight, mut scale, mut mean_weight) = (0.0, 0.0, 0.0);
+    for i in 0..nn {
+        let volume = e.node_mass(i) * depth(i);
+        for l in 0..nl {
+            let gamma = stratification[i * nl + l].max(0.0);
+            tangent[i * nl + l] = (buoyancy * gamma / volume).sqrt();
+            weight += volume * d_sigma[l] * gamma * residual[i * nl + l];
+            scale += volume * d_sigma[l] * gamma * gamma;
+            mean_weight += volume * d_sigma[l] * gamma;
+        }
+    }
+    if mean_weight <= 0.0 {
+        return Some(0.0);
+    }
+    let shaped = has_residual(weight, scale);
+    let weight = if shaped { weight } else { mean_weight };
+    for i in 0..nn {
+        let volume = e.node_mass(i) * depth(i);
+        for l in 0..nl {
+            let c = i * nl + l;
+            let shape = if shaped { residual[c] } else { 1.0 };
+            taken[c] = shape * tangent[c] * volume * d_sigma[l].sqrt() / weight;
+        }
+    }
+    // Every pair's (i, j, ½ √(m_i D_i) D_ij, ½ √(m_j D_j) D_ji, η_j − η_i,
+    // D_j − D_i)
+    let pairs = || {
+        (0..nn).flat_map(move |i| {
+            (i + 1..nn)
+                .filter(move |&j| !(e.apart(i, j) && e.apart(j, i)))
+                .map(move |j| {
+                    let [(dx_ij, dy_ij), (dx_ji, dy_ji)] = e.pair(i, j);
+                    let at_i = 0.5 * (e.node_mass(i) * depth(i)).sqrt();
+                    let at_j = 0.5 * (e.node_mass(j) * depth(j)).sqrt();
+                    (
+                        (i, j),
+                        (at_i * dx_ij, at_i * dy_ij),
+                        (at_j * dx_ji, at_j * dy_ji),
+                        (eta(j) - eta(i), depth(j) - depth(i)),
+                    )
+                })
+        })
+    };
+    // e √Δσ of a pair on level l
+    let mut root = [0.0; MAX_LEVELS];
+    for (root, ds) in root.iter_mut().zip(d_sigma) {
+        *root = ds.sqrt();
+    }
+    let error = |i: usize, j: usize, l: usize, dz: f64| {
+        let (a, c) = (i * nl + l, j * nl + l);
+        root[l] * (2.0 * (density[c] - density[a]) + (stratification[a] + stratification[c]) * dz)
+    };
+    // v ← Bᵀ r
+    let transpose = |anomaly: &[f64], vx: &mut [f64], vy: &mut [f64]| {
+        // (loops: a device has no `fill`)
+        for v in vx.iter_mut().chain(vy.iter_mut()) {
+            *v = 0.0;
+        }
+        let moved: f64 = taken.iter().zip(anomaly).map(|(t, r)| t * r).sum();
+        for ((i, j), (ax, ay), (bx, by), (d_eta, d_depth)) in pairs() {
+            for l in 0..nl {
+                let (a, c) = (i * nl + l, j * nl + l);
+                let dz = d_eta + sigma_rho[l] * d_depth;
+                let w = (tangent[a] * anomaly[a] + tangent[c] * anomaly[c]) * dz
+                    - moved * error(i, j, l, dz);
+                vx[a] += ax * w;
+                vy[a] += ay * w;
+                vx[c] -= bx * w;
+                vy[c] -= by * w;
+            }
+        }
+    };
+    // Start from the anomaly n: every stratified row, in phase
+    for (r, &gamma) in anomaly.iter_mut().zip(stratification) {
+        *r = (buoyancy * gamma.max(0.0)).sqrt();
+    }
+    transpose(anomaly, vx, vy);
+    let norm = |x: &[f64]| x.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let mut frequency = 0.0_f64;
+    for iteration in 0..40 {
+        // (the squares as products: `powi(2)`'s bits)
+        let (norm_x, norm_y) = (norm(vx), norm(vy));
+        let length = (norm_x * norm_x + norm_y * norm_y).sqrt();
+        if length == 0.0 {
+            return Some(frequency);
+        }
+        vx.iter_mut()
+            .chain(vy.iter_mut())
+            .for_each(|v| *v /= length);
+        // r ← B v
+        for r in anomaly.iter_mut() {
+            *r = 0.0;
+        }
+        let mut made = 0.0;
+        for ((i, j), (ax, ay), (bx, by), (d_eta, d_depth)) in pairs() {
+            for l in 0..nl {
+                let (a, c) = (i * nl + l, j * nl + l);
+                let half = (ax * vx[a] + ay * vy[a]) - (bx * vx[c] + by * vy[c]);
+                let dz = d_eta + sigma_rho[l] * d_depth;
+                anomaly[a] += tangent[a] * dz * half;
+                anomaly[c] += tangent[c] * dz * half;
+                made += half * error(i, j, l, dz);
+            }
+        }
+        for (r, t) in anomaly.iter_mut().zip(&*taken) {
+            *r -= t * made;
+        }
+        let last = frequency;
+        frequency = norm(anomaly);
+        if iteration >= 2 && (frequency - last).abs() <= 3e-4 * frequency {
+            break;
+        }
+        transpose(anomaly, vx, vy);
+    }
+    Some(frequency)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn add_reference_advection(
     rhs: [&mut [f64]; 2],

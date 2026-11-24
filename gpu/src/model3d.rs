@@ -48,7 +48,8 @@ use cuda_host::cuda_module;
 use dgcom::boundary::{NestingSlots, SWEBoundaryCondition2D, Supplied};
 use dgcom::mesh::Mesh2D;
 use dgcom::physics::{
-    GlsMixing, Hydrostatic3D, LinearEOS, PhysicsModule, SWEPhysics2D, VerticalMixing,
+    GlsMixing, Hydrostatic3D, LinearEOS, PhysicsModule, SWEPhysics2D, TimeStepLimits,
+    VerticalMixing,
 };
 use dgcom::profiling;
 use dgcom::simulation::{NonFinite, RunModel3D, non_finite_field};
@@ -63,6 +64,7 @@ use dgcom::time::{
 use dgcom::vertical::{SigmaGrid, depth_average};
 
 use crate::baroclinic::{Baroclinic3D, BaroclinicSetup};
+use crate::bound3d::Bound3D;
 use crate::forcing::{ForcingSetup, SlowForcing3D};
 use crate::hooks::{Band3D, Merged3D, StageHooks3D, StageValues3D, Stash3D, State3D};
 use crate::limiter::{Limiter3D, VertexPatches};
@@ -552,8 +554,10 @@ pub struct Work3D {
     roughness: Option<DeviceBuffer<f64>>,
     /// The nesting band, if the model is nested
     nest: Option<Nest3D>,
-    /// `w` of the end state (`post_process`)
+    /// `w` of the end state (`post_process`), or of the start
     w: DeviceBuffer<f64>,
+    /// The step's bound
+    bound: Bound3D,
 }
 
 impl Work3D {
@@ -694,6 +698,36 @@ where
         self.host.lock().expect("the host's copy")
     }
 
+    /// `Hydrostatic3D::time_step_limits` of the device state `s` (its `w`
+    /// the last step's, or the start's), on the device (`Bound3D`): and how
+    /// many elements had their sloping levels' frequency measured.
+    pub fn time_step_limits(
+        &self,
+        s: &State3D,
+        work: &mut Work3D,
+        cfl: f64,
+        scheme: SspScheme,
+    ) -> (TimeStepLimits, usize) {
+        let Work3D {
+            statics,
+            baroclinic,
+            viscosity,
+            bound,
+            w,
+            ..
+        } = work;
+        cuda(bound.limits(
+            statics,
+            self.physics,
+            baroclinic,
+            viscosity,
+            s,
+            w,
+            cfl,
+            scheme,
+        ))
+    }
+
     /// The 2D module's negative-depth clips.
     pub fn negative_depth_clips(&self) -> usize {
         self.module.negative_depth_clips()
@@ -827,6 +861,7 @@ where
             p.horizontal_viscosity,
             thin,
         ));
+        let bound = cuda(Bound3D::new(gpu, &statics, p, reference.is_some()));
         let limiter = cuda(Limiter3D::new(
             gpu,
             &statics,
@@ -926,7 +961,9 @@ where
                 .nesting
                 .as_ref()
                 .map(|nesting| Nest3D::new(gpu, &statics, nesting.slots(), NN)),
-            w: zeros(n),
+            // The start's (its bound reads it before the first step)
+            w: up(&self.host().w),
+            bound,
             statics,
         }
     }
@@ -1749,11 +1786,27 @@ where
         cuda(state.download_into(&self.gpu, &mut host));
     }
 
-    fn compute_dt_ssp(&self, _state: &State3D, cfl: f64, scheme: SspScheme) -> f64 {
-        self.physics.compute_dt_ssp(&self.host(), cfl, scheme)
+    /// `Hydrostatic3D::compute_dt_ssp` with the bounds from the device
+    /// (`Self::time_step_limits`), recorded as the CPU records them.
+    fn compute_dt_ssp(
+        &self,
+        state: &State3D,
+        cfl: f64,
+        scheme: SspScheme,
+        work: &mut Work3D,
+    ) -> f64 {
+        let (limits, _) = self.time_step_limits(state, work, cfl, scheme);
+        self.physics.step_of(limits, scheme)
     }
 
-    fn element_steps_into(&self, _state: &State3D, cfl: f64, scheme: SspScheme, out: &mut [f64]) {
+    fn element_steps_into(
+        &self,
+        _state: &State3D,
+        cfl: f64,
+        scheme: SspScheme,
+        out: &mut [f64],
+        _work: &mut Work3D,
+    ) {
         self.physics
             .element_steps_into(&self.host(), cfl, scheme, out);
     }

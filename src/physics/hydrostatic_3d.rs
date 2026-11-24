@@ -93,7 +93,7 @@ use crate::solver::rhs::{
     TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D, apply_coriolis_3d,
     apply_horizontal_viscosity_3d, apply_momentum_transport_3d, apply_w_point_transport_3d,
     compute_momentum_rhs_3d, compute_transport_rhs_3d, element_dt_viscous_swe_2d,
-    largest_horizontal_viscosity_3d, w_cell_thicknesses,
+    largest_horizontal_viscosity_3d, viscous_dt, viscous_metric, w_cell_thicknesses,
 };
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
@@ -282,7 +282,7 @@ impl TimeStepLimit {
 
     /// The shorter of the two (the lower element on a tie: exact, so a
     /// reduction does not depend on its grouping).
-    fn min(self, other: Self) -> Self {
+    pub fn min(self, other: Self) -> Self {
         if (other.dt, other.element) < (self.dt, self.element) {
             other
         } else {
@@ -353,6 +353,86 @@ pub struct TimeStepLimits {
     pub viscosity: TimeStepLimit,
 }
 
+impl TimeStepLimits {
+    /// The step the bounds but the sloping levels' allow: what an element's
+    /// sloping levels are measured against
+    /// ([`sloping_level_step_unmeasured`]). The vertical bound counts with
+    /// explicit vertical advection (`explicit_vertical`), times `scheme`'s
+    /// SSP coefficient.
+    pub fn needed(&self, explicit_vertical: bool, scheme: SspScheme) -> f64 {
+        let mut needed = self
+            .advection
+            .dt
+            .min(self.coriolis.dt)
+            .min(self.viscosity.dt);
+        if explicit_vertical {
+            needed = needed.min(scheme.ssp_coefficient() * self.vertical.dt);
+        }
+        needed
+    }
+
+    /// The step of every bound ([`Hydrostatic3D::compute_dt_ssp`]); 1 s if
+    /// none bounds it.
+    pub fn step(&self, explicit_vertical: bool, scheme: SspScheme) -> f64 {
+        let mut dt = self
+            .advection
+            .dt
+            .min(self.coriolis.dt)
+            .min(self.sloping_levels.dt)
+            .min(self.viscosity.dt);
+        if explicit_vertical {
+            dt = dt.min(scheme.ssp_coefficient() * self.vertical.dt);
+        }
+        if dt == f64::INFINITY { 1.0 } else { dt }
+    }
+}
+
+/// The share of the scheme's reach along the imaginary axis that the step
+/// takes of the reference's waves along sloping levels
+/// ([`Hydrostatic3D::SLOPING_LEVEL_MARGIN`]).
+const SLOPING_LEVEL_MARGIN: f64 = 0.85;
+
+/// How far from setting the step an element's bound on its sloping levels'
+/// frequency has to be for the frequency not to be measured: the bound is
+/// the pairs' (1.2 to 1.5 times their frequency) and does not count the
+/// element's displacement, which has put the frequency up to 3 % above it
+/// under a smooth reference.
+const SLOPING_LEVEL_SLACK: f64 = 1.5;
+
+/// `ω Δt` at most this on an element's sloping levels in `scheme`:
+/// [`Hydrostatic3D::SLOPING_LEVEL_MARGIN`] of its reach along the imaginary
+/// axis ([`SspScheme::imaginary_axis_limit`]).
+pub fn sloping_level_limit(scheme: SspScheme) -> f64 {
+    SLOPING_LEVEL_MARGIN * scheme.imaginary_axis_limit()
+}
+
+/// The step an element's sloping levels allow without measuring their
+/// frequency, from the bound `rate` on it
+/// ([`ReferenceFields::sloping_level_rate`]): unbounded at a zero rate, the
+/// bound's `1/rate` with a thin column (`any_thin`: the barotropic pass's
+/// flow), the bound's `limit / rate` ([`sloping_level_limit`]) if that is
+/// [`SLOPING_LEVEL_SLACK`] times the step `needed` of the other bounds
+/// ([`TimeStepLimits::needed`]); `None` where the frequency has to be
+/// measured (the step is then `limit / frequency`,
+/// [`ReferenceFields::sloping_level_frequency`]).
+pub fn sloping_level_step_unmeasured(
+    rate: f64,
+    any_thin: bool,
+    limit: f64,
+    needed: f64,
+) -> Option<f64> {
+    if rate == 0.0 {
+        return Some(f64::INFINITY);
+    }
+    if any_thin {
+        return Some(1.0 / rate);
+    }
+    if limit / rate >= SLOPING_LEVEL_SLACK * needed {
+        return Some(limit / rate);
+    }
+    None
+}
+
 /// An element's own step from horizontal advection and internal waves
 /// ([`Hydrostatic3D::element_advection_steps`]) and what sets it at its
 /// binding node.
@@ -370,17 +450,93 @@ pub struct ElementStep {
     pub depth: f64,
 }
 
-/// [`Hydrostatic3D::element_rates`]' result.
+/// [`Hydrostatic3D::element_rates`]' result: the rates an element's columns
+/// put on the 3D step (1/s), and what set the wave rate.
 #[derive(Clone, Copy, Debug, Default)]
-struct ElementRates {
-    wave: f64,
-    vertical: f64,
+pub struct ElementRates {
+    /// The largest `(|u| + c₁)/h` of its columns
+    pub wave: f64,
+    /// The largest `|w|/(Δσ D)` of its layers
+    pub vertical: f64,
     /// The reference's internal waves along the σ-levels (1/s)
-    sloping_levels: f64,
-    speed: f64,
-    c1: f64,
-    length: f64,
-    depth: f64,
+    pub sloping_levels: f64,
+    /// The speed, the internal-wave speed, the length and the depth of the
+    /// column that set `wave`
+    pub speed: f64,
+    pub c1: f64,
+    pub length: f64,
+    pub depth: f64,
+}
+
+/// One water column as [`element_column_rates`] reads it.
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnState<'a> {
+    /// Its depth (m)
+    pub depth: f64,
+    /// Its `u`, `v`, `w` and `ρ` at the layers
+    pub u: &'a [f64],
+    pub v: &'a [f64],
+    pub w: &'a [f64],
+    pub rho: &'a [f64],
+    /// `1/h = (|∇r| + |∇s|)/2` at its node
+    pub inverse_length: f64,
+}
+
+/// Floor (m/s) of the internal-wave speed of the 3D step's bound
+/// ([`Hydrostatic3D::MIN_INTERNAL_WAVE_SPEED`]).
+pub const MIN_INTERNAL_WAVE_SPEED: f64 = 0.1;
+
+/// The rates an element's `n_nodes` columns put on the 3D step, but the
+/// sloping levels' ([`Hydrostatic3D::element_rates`]): `column(i)` is node
+/// `i`'s column, `None` for a thin one (the 2D module's and its own CFL's
+/// business). Over the levels `sigma_rho`, `d_sigma`, with gravity `g` and
+/// the reference density `rho0`. A device's bound calls it too, so its
+/// speeds take `math::hypot` (the same bits everywhere).
+pub fn element_column_rates<'a>(
+    n_nodes: usize,
+    sigma_rho: &[f64],
+    d_sigma: &[f64],
+    g: f64,
+    rho0: f64,
+    column: impl Fn(usize) -> Option<ColumnState<'a>>,
+) -> ElementRates {
+    let nl = d_sigma.len();
+    let mut rates = ElementRates::default();
+    for i in 0..n_nodes {
+        let Some(c) = column(i) else {
+            continue;
+        };
+        let mut speed = 0.0_f64;
+        for l in 0..nl {
+            speed = speed.max(crate::math::hypot(c.u[l], c.v[l]));
+            rates.vertical = rates.vertical.max(c.w[l].abs() / (d_sigma[l] * c.depth));
+        }
+        // WKB: Σ N Δz = Σ √(−(g/ρ₀) Δρ Δz) over the interior w-points
+        let mut integral = 0.0;
+        for l in 1..nl {
+            let dz = (sigma_rho[l] - sigma_rho[l - 1]) * c.depth;
+            let n2_dz2 = -g / rho0 * (c.rho[l] - c.rho[l - 1]) * dz;
+            integral += n2_dz2.max(0.0).sqrt();
+        }
+        let c1 = (integral / std::f64::consts::PI).max(MIN_INTERNAL_WAVE_SPEED);
+        let wave = (speed + c1) * c.inverse_length;
+        if wave > rates.wave {
+            rates.wave = wave;
+            rates.speed = speed;
+            rates.c1 = c1;
+            rates.length = 1.0 / c.inverse_length;
+            rates.depth = c.depth;
+        }
+    }
+    rates
+}
+
+/// `1/h = (|∇r| + |∇s|)/2` at node `i` of element `k` (`1/√J` on a square):
+/// the length of [`element_column_rates`]. Static: a device takes it as a
+/// table.
+pub fn inverse_length(geom: &GeometricFactors2D, k: usize, i: usize) -> f64 {
+    let ((rx, ry), (sx, sy)) = (geom.grad_r(k, i), geom.grad_s(k, i));
+    0.5 * (rx.hypot(ry) + sx.hypot(sy))
 }
 
 impl<EOS, MIX, BC> Hydrostatic3D<EOS, MIX, BC>
@@ -655,7 +811,7 @@ where
     /// step unbounded). 0.1 m/s is the first-mode speed of weak
     /// stratification, `g′ ≈ 10⁻³ m/s²` over 10 m. A heuristic, not a
     /// stability limit.
-    pub const MIN_INTERNAL_WAVE_SPEED: f64 = 0.1;
+    pub const MIN_INTERNAL_WAVE_SPEED: f64 = MIN_INTERNAL_WAVE_SPEED;
 
     /// Default of [`Self::with_min_column_depth`] (m), ROMS's usual `Dcrit`.
     pub const DEFAULT_MIN_COLUMN_DEPTH: f64 = 0.1;
@@ -1882,23 +2038,16 @@ where
     /// element's frequency does not count: the splitting from the
     /// barotropic pass, the faces, a nonlinear equation of state, and the
     /// power iteration's approach from below.
-    pub const SLOPING_LEVEL_MARGIN: f64 = 0.85;
-
-    /// How far from setting the step an element's bound on its sloping
-    /// levels' frequency has to be for the frequency not to be measured:
-    /// the bound is the pairs' (1.2 to 1.5 times their frequency) and does
-    /// not count the element's displacement, which has put the frequency
-    /// up to 3 % above it under a smooth reference.
-    const SLOPING_LEVEL_SLACK: f64 = 1.5;
+    pub const SLOPING_LEVEL_MARGIN: f64 = SLOPING_LEVEL_MARGIN;
 
     /// The step element `k`'s sloping levels allow `scheme`, given the
     /// bound `rate` on their frequency
     /// ([`ReferenceFields::sloping_level_rate`]): with the measured
-    /// frequency if the bound comes within [`Self::SLOPING_LEVEL_SLACK`] of
-    /// the step `needed` of it (the step the other bounds allow), with the
+    /// frequency if the bound comes within [`SLOPING_LEVEL_SLACK`] of the
+    /// step `needed` of it (the step the other bounds allow), with the
     /// bound itself otherwise (a shorter step than the element allows, and
-    /// longer than `needed`). `scratch` holds five numbers per node and
-    /// level.
+    /// longer than `needed`; [`sloping_level_step_unmeasured`]). `scratch`
+    /// holds five numbers per node and level.
     #[allow(clippy::too_many_arguments)]
     fn sloping_level_step(
         &self,
@@ -1910,17 +2059,12 @@ where
         needed: f64,
         scratch: &mut [f64],
     ) -> f64 {
-        if rate == 0.0 {
-            return f64::INFINITY;
-        }
         // A thin column: the barotropic pass's flow, on the bound
         let nn = state.n_nodes;
-        if (0..nn).any(|i| self.is_thin(state, k * nn + i)) {
-            return 1.0 / rate;
-        }
-        let limit = Self::SLOPING_LEVEL_MARGIN * scheme.imaginary_axis_limit();
-        if limit / rate >= Self::SLOPING_LEVEL_SLACK * needed {
-            return limit / rate;
+        let any_thin = (0..nn).any(|i| self.is_thin(state, k * nn + i));
+        let limit = sloping_level_limit(scheme);
+        if let Some(dt) = sloping_level_step_unmeasured(rate, any_thin, limit, needed) {
+            return dt;
         }
         let frequency = reference
             .sloping_level_frequency(
@@ -1950,21 +2094,18 @@ where
     /// elements: raise it with the scheme (see
     /// `ModeSplitIntegrator::with_baroclinic_scheme`).
     pub fn compute_dt_ssp(&self, state: &Solution3D, cfl: f64, scheme: SspScheme) -> f64 {
-        let limits = self.time_step_limits(state, cfl, scheme);
-        let mut dt = limits
-            .advection
-            .dt
-            .min(limits.coriolis.dt)
-            .min(limits.sloping_levels.dt)
-            .min(limits.viscosity.dt);
-        if self.implicit_vertical_advection.is_none() {
-            dt = dt.min(scheme.ssp_coefficient() * limits.vertical.dt);
-        }
+        self.step_of(self.time_step_limits(state, cfl, scheme), scheme)
+    }
+
+    /// The step of `limits` in `scheme` ([`TimeStepLimits::step`]),
+    /// recorded as the last ([`Self::last_time_step_limits`]): a device
+    /// that computes the limits itself takes its step here.
+    pub fn step_of(&self, limits: TimeStepLimits, scheme: SspScheme) -> f64 {
         *self
             .last_time_step_limits
             .lock()
             .expect("Failed to lock last_time_step_limits") = Some(limits);
-        if dt == f64::INFINITY { 1.0 } else { dt }
+        limits.step(self.implicit_vertical_advection.is_none(), scheme)
     }
 
     /// The bounds of the last [`Self::compute_dt`] (see
@@ -1988,63 +2129,40 @@ where
     ) -> ElementRates {
         let (nn, nl) = (state.n_nodes, state.n_levels);
         let (sigma_rho, d_sigma) = (self.sigma.sigma_rho(), self.sigma.d_sigma());
-        let mut rates = ElementRates {
-            sloping_levels: reference.map_or(0.0, |fields| {
-                fields.sloping_level_rate(
-                    state,
-                    &self.ops,
-                    &self.geom,
-                    &self.bathymetry,
-                    &self.sigma,
-                    self.g / self.rho0,
-                    self.min_column_depth,
-                    self.metric_form(),
-                    k,
-                    scratch,
-                )
-            }),
-            ..ElementRates::default()
-        };
-        for i in 0..nn {
+        let sloping_levels = reference.map_or(0.0, |fields| {
+            fields.sloping_level_rate(
+                state,
+                &self.ops,
+                &self.geom,
+                &self.bathymetry,
+                &self.sigma,
+                self.g / self.rho0,
+                self.min_column_depth,
+                self.metric_form(),
+                k,
+                scratch,
+            )
+        });
+        let column = |i: usize| {
             let idx = k * nn + i;
             // Thin films are the 2D module's (and its own CFL's) business
             if self.is_thin(state, idx) {
-                continue;
+                return None;
             }
-            let depth = state.eta.data[idx] - self.bathymetry.data[idx];
-            let column = idx * nl..(idx + 1) * nl;
-            let (u, v, w, rho) = (
-                &state.u[column.clone()],
-                &state.v[column.clone()],
-                &state.w[column.clone()],
-                &state.rho[column],
-            );
-            let mut speed = 0.0_f64;
-            for l in 0..nl {
-                speed = speed.max(u[l].hypot(v[l]));
-                rates.vertical = rates.vertical.max(w[l].abs() / (d_sigma[l] * depth));
-            }
-            // WKB: Σ N Δz = Σ √(−(g/ρ₀) Δρ Δz) over the interior w-points
-            let mut integral = 0.0;
-            for l in 1..nl {
-                let dz = (sigma_rho[l] - sigma_rho[l - 1]) * depth;
-                let n2_dz2 = -self.g / self.rho0 * (rho[l] - rho[l - 1]) * dz;
-                integral += n2_dz2.max(0.0).sqrt();
-            }
-            let c1 = (integral / std::f64::consts::PI).max(Self::MIN_INTERNAL_WAVE_SPEED);
-            // 1/h = (|∇r| + |∇s|)/2: 1/√J on a square
-            let ((rx, ry), (sx, sy)) = (self.geom.grad_r(k, i), self.geom.grad_s(k, i));
-            let inverse_length = 0.5 * (rx.hypot(ry) + sx.hypot(sy));
-            let wave = (speed + c1) * inverse_length;
-            if wave > rates.wave {
-                rates.wave = wave;
-                rates.speed = speed;
-                rates.c1 = c1;
-                rates.length = 1.0 / inverse_length;
-                rates.depth = depth;
-            }
+            let layers = idx * nl..(idx + 1) * nl;
+            Some(ColumnState {
+                depth: state.eta.data[idx] - self.bathymetry.data[idx],
+                u: &state.u[layers.clone()],
+                v: &state.v[layers.clone()],
+                w: &state.w[layers.clone()],
+                rho: &state.rho[layers],
+                inverse_length: inverse_length(&self.geom, k, i),
+            })
+        };
+        ElementRates {
+            sloping_levels,
+            ..element_column_rates(nn, sigma_rho, d_sigma, self.g, self.rho0, column)
         }
-        rates
     }
 
     /// The vertical Courant number (on the forward-Euler step) up to which an
@@ -2283,25 +2401,26 @@ where
                     .filter_map(|face| self.mesh.neighbor(ElementIndex::new(k), face))
                     .map(|nb| largest[nb.element])
                     .fold(largest[k], f64::max);
-                let dt = element_dt_viscous_swe_2d(
-                    &self.mesh,
-                    &self.ops,
-                    &self.geom,
+                let dt = viscous_dt(
                     nu,
+                    viscous_metric(&self.mesh, &self.ops, &self.geom, k),
                     self.ops.order,
                     cfl,
-                    k,
                 );
                 viscosity = viscosity.min(TimeStepLimit { dt, element: k });
             }
         }
 
         // The sloping levels, against the step the others allow
-        let mut needed = advection.dt.min(coriolis.dt).min(viscosity.dt);
-        if self.implicit_vertical_advection.is_none() {
-            needed = needed.min(scheme.ssp_coefficient() * vertical.dt);
-        }
-        let sloping_levels = self.with_reference_fields(state, |reference| {
+        let mut limits = TimeStepLimits {
+            advection,
+            vertical,
+            coriolis,
+            sloping_levels: TimeStepLimit::NONE,
+            viscosity,
+        };
+        let needed = limits.needed(self.implicit_vertical_advection.is_none(), scheme);
+        limits.sloping_levels = self.with_reference_fields(state, |reference| {
             let Some(reference) = reference else {
                 return TimeStepLimit::NONE;
             };
@@ -2325,13 +2444,7 @@ where
                 TimeStepLimit::min,
             )
         });
-        TimeStepLimits {
-            advection,
-            vertical,
-            coriolis,
-            sloping_levels,
-            viscosity,
-        }
+        limits
     }
 
     /// The end state of a step: its tracers limited (the mode splitter's
