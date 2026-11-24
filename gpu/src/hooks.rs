@@ -1067,7 +1067,7 @@ impl MergedLists {
 
 /// The first `n` values of `buf` (waits for the device): what
 /// `DeviceBuffer::copy_to_host` does, on a prefix.
-fn prefix_to_host<T: Default + Clone>(
+pub(crate) fn prefix_to_host<T: Default + Clone>(
     gpu: &Gpu,
     buf: &DeviceBuffer<T>,
     n: usize,

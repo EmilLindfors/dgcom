@@ -26,6 +26,7 @@ use dgcom::physics::{
     BottomDrag3D, GlsMixing, Hydrostatic3D, ImplicitVerticalAdvection, LinearEOS, TimeStepLimit,
     TimeStepLimits,
 };
+use dgcom::simulation::{NonFinite, RunModel3D, non_finite_field};
 use dgcom::solver::state::Solution3D;
 use dgcom::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
 use dgcom::time::SplitModel;
@@ -511,6 +512,75 @@ fn bound_gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn
     Ok(same)
 }
 
+/// The blow-up check's gate on one fixture: `non_finite_field` of states
+/// with values that are not finite planted in them, on the CPU and on the
+/// device (`RunModel3D::non_finite`): the same field, first element and
+/// number of elements, or none for the finite start.
+fn non_finite_gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn Error>> {
+    let fx = Fixture::new(shape);
+    let physics = physics(&fx, Terms::CASE_RUNNER);
+    let mut start = start_state(&fx);
+    physics.update_density(&mut start);
+    let (ne, nn, layer) = (start.n_elements, start.n_nodes, start.n_nodes * start.n_levels);
+    // The values planted: (field as NON_FINITE_FIELDS numbers it, element,
+    // value within the element's), as NaN or an infinity
+    let mixed = vec![
+        (3, 3, 2),
+        (3, 5, 0),
+        (3, 9, 1),
+        (4, 7, 0),
+        (4, 2, layer - 1),
+        (2, 8, layer - 1),
+        (2, 4, 3),
+        (1, 6, 0),
+        (1, 1, 5),
+        (1, 0, 0),
+    ];
+    let with_eta = [mixed.clone(), vec![(0, 5, 1)]].concat();
+    let cases: [(&str, Vec<(usize, usize, usize)>); 6] = [
+        ("finite", vec![]),
+        ("T in 3 elements, S and v in 2, u in 3", mixed),
+        ("and η in 1", with_eta),
+        ("S in the last value", vec![(4, ne - 1, layer - 1)]),
+        ("η in the last value", vec![(0, ne - 1, nn - 1)]),
+        ("T everywhere", (0..ne).map(|k| (3, k, k % layer)).collect()),
+    ];
+    let mut model = Model3D::new(gpu, &physics)?;
+    let mut same = true;
+    for (what, planted) in cases {
+        let mut state = start.clone();
+        for (n, &(field, k, i)) in planted.iter().enumerate() {
+            let bad = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY][n % 3];
+            match field {
+                0 => state.eta.data[k * nn + i] = bad,
+                1 => state.u[k * layer + i] = bad,
+                2 => state.v[k * layer + i] = bad,
+                3 => state.temp[k * layer + i] = bad,
+                _ => state.salt[k * layer + i] = bad,
+            }
+        }
+        model.start_from(&state);
+        let device = State3D::upload(gpu, &state)?;
+        let mut work = model.new_work(&device);
+        let cpu = non_finite_field(&state);
+        let on_gpu = model.non_finite(&device, &mut work);
+        let key = |bad: &Option<NonFinite>| bad.as_ref().map(|b| (b.field, b.first, b.elements));
+        let agree = key(&cpu) == key(&on_gpu);
+        same &= agree;
+        let show = |bad: &Option<NonFinite>| match bad {
+            Some(b) => format!("{} in {} elements from {}", b.field, b.elements, b.first),
+            None => "none".into(),
+        };
+        println!(
+            "  {label}, {what}: CPU {}, GPU {}{}",
+            show(&cpu),
+            show(&on_gpu),
+            if agree { "" } else { ": DIFFERENT" }
+        );
+    }
+    Ok(same)
+}
+
 /// Whole steps of the case runner's model on `fx`, after one untimed step
 /// on each side: the CPU's 24 threads against the device.
 fn time(gpu: &Arc<Gpu>, fx: &Fixture, steps: usize) -> Result<(), Box<dyn Error>> {
@@ -575,6 +645,8 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
         },
         false,
     )?;
+    println!("3D blow-up check: the device's against non_finite_field");
+    same &= non_finite_gate(gpu, "beach", Shape::BEACH)?;
     println!("3D step's bound: the device's against Hydrostatic3D::time_step_limits");
     same &= bound_gate(gpu, "beach", Shape::BEACH)?;
     same &= bound_gate(

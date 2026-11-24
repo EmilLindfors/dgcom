@@ -26,5 +26,6 @@ mod simulation_3d;
 
 pub use runner::{Simulation, SimulationConfig, SimulationResult};
 pub use simulation_3d::{
-    NonFinite, RunContext3D, RunModel3D, Simulation3D, non_finite_field, restart_of, resume_into,
+    NON_FINITE_FIELDS, NonFinite, RunContext3D, RunModel3D, Simulation3D, non_finite_field,
+    non_finite_of_masks, restart_of, resume_into,
 };

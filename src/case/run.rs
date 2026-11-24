@@ -194,10 +194,12 @@ pub trait CaseDevice {
     /// Step the case's 3D `physics` on CUDA device `ordinal` from `state`
     /// over `run.span` with `integrator` (configured, and resumed if the run
     /// is), as `Simulation3D::run_with_context_callback` with `run`'s CFL
-    /// number, largest step and landing interval, calling `callback` with
-    /// the state on the host (its `w` the device's) at the start and after
-    /// every step, and the integrator's slow-forcing record for a restart;
-    /// `state` is left with the state at the end.
+    /// number, largest step and landing interval, calling `callback` at the
+    /// start and after every step with the state on the host as it asks for
+    /// it ([`StateView3D`]: the depth means, or the whole state with the
+    /// device's `w` and eddy coefficients) and the integrator's slow-forcing
+    /// record for a restart; `state` is left with the whole state at the
+    /// end.
     fn run_3d(
         &self,
         ordinal: usize,
@@ -209,9 +211,34 @@ pub trait CaseDevice {
     ) -> Result<DeviceRunReport3D, String>;
 }
 
-/// A 3D device run's callback: the state on the host, its time, and the
-/// integrator's slow-forcing record for a restart.
-pub type DeviceCallback3D<'a> = dyn FnMut(&Solution3D, f64, &dyn Fn() -> SlowForcingRecord) + 'a;
+/// A 3D device run's callback: the state on the host as it asks for it, its
+/// time, and the integrator's slow-forcing record for a restart.
+pub type DeviceCallback3D<'a> =
+    dyn FnMut(&mut dyn StateView3D, f64, &dyn Fn() -> SlowForcingRecord) + 'a;
+
+/// The state a 3D run's callback reads, at the call's time: the surface and
+/// depth means at every call (the stations), the whole state where it asks
+/// (the outputs). A device run (P2.7) copies each to the host the first
+/// time a call asks for it: the depth means are ≈ 1/20 of a 20-level state.
+/// On the CPU both are the state itself.
+pub trait StateView3D {
+    /// The state with η, ū and v̄ of the call's time; its other fields may
+    /// be older.
+    fn depth_means(&mut self) -> &Solution3D;
+
+    /// The whole state of the call's time.
+    fn full(&mut self) -> &Solution3D;
+}
+
+impl StateView3D for &Solution3D {
+    fn depth_means(&mut self) -> &Solution3D {
+        self
+    }
+
+    fn full(&mut self) -> &Solution3D {
+        self
+    }
+}
 
 /// The settings of a 3D run on a device, as the CPU's `Simulation3D` takes
 /// them.

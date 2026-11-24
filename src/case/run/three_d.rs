@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use super::{
-    CaseDevice, DeviceRun3D, H_VELOCITY, Output, Progress, RunReport, StationSample,
+    CaseDevice, DeviceRun3D, H_VELOCITY, Output, Progress, RunReport, StateView3D, StationSample,
     boundary_conditions, restart, score_gauges, summarize, volume,
 };
 use crate::boundary::{
@@ -369,10 +369,12 @@ impl CaseFile {
         // stopped run wrote out: its samples are the next interpolation's
         // start only
         let mut at_restart = resumed.is_some();
-        let mut on_step = |s: &Solution3D,
+        // Every step reads the depth means (the stations), a field output
+        // the whole state: a device run copies only what is read
+        let mut on_step = |view: &mut dyn StateView3D,
                            t: f64,
-                           ranges: &dyn Fn() -> crate::physics::TracerRanges,
-                           capture: &dyn Fn() -> Restart3D| {
+                           ranges: &dyn Fn(&Solution3D) -> crate::physics::TracerRanges,
+                           capture: &dyn Fn(&Solution3D) -> Restart3D| {
             if failure.is_some() {
                 return;
             }
@@ -382,16 +384,21 @@ impl CaseFile {
                 (n - n.round()).abs() < 1e-6 || t >= t_end - 1e-6
             };
             let on_field = field_time && !first;
-            let now: Vec<StationSample> = domain
-                .stations
-                .iter()
-                .map(|st| {
-                    StationSample::of(
-                        &sample_depth_mean(&st.level, s, bed, &mut nodes),
-                        &sample_depth_mean(&st.current, s, bed, &mut nodes),
-                    )
-                })
-                .collect();
+            let now: Vec<StationSample> = if domain.stations.is_empty() {
+                Vec::new()
+            } else {
+                let s = view.depth_means();
+                domain
+                    .stations
+                    .iter()
+                    .map(|st| {
+                        StationSample::of(
+                            &sample_depth_mean(&st.level, s, bed, &mut nodes),
+                            &sample_depth_mean(&st.current, s, bed, &mut nodes),
+                        )
+                    })
+                    .collect()
+            };
             let written = (|| -> Result<(), CaseError> {
                 while next_station <= t + 1e-6 {
                     if (t - next_station).abs() <= 1e-6 {
@@ -407,13 +414,14 @@ impl CaseFile {
                 }
                 // A new snapshot file starts with the restart's frame
                 if first && field_time && !output.snapshot_continued {
-                    output.write_snapshot_3d(t, s)?;
+                    output.write_snapshot_3d(t, view.full())?;
                 }
                 if on_field {
+                    let s = view.full();
                     barotropic(s, &mut q);
                     output.write_snapshot_3d(t, s)?;
                     if let Some(restarts) = restarts.as_mut().filter(|r| r.due(t)) {
-                        let mut restart = capture();
+                        let mut restart = capture(s);
                         restart.driver = output.driver_data(self, volume_start);
                         restarts.write(t, |path| restart.write(path))?;
                     }
@@ -423,7 +431,7 @@ impl CaseFile {
             previous = Some((t, now));
             match written {
                 Ok(()) if on_field => progress(&Progress {
-                    tracers: Some(ranges()),
+                    tracers: Some(ranges(view.full())),
                     ..summarize(domain, &q, t, t_end)
                 }),
                 Ok(()) => {}
@@ -452,9 +460,12 @@ impl CaseFile {
                     .with_landing_interval(field_every);
                 let result =
                     sim.run_with_context_callback(&mut state, t_start, t_end, |s, t, context| {
-                        on_step(s, t, &|| context.physics.tracer_ranges(s), &|| {
-                            context.restart(s, t)
-                        })
+                        on_step(
+                            &mut &*s,
+                            t,
+                            &|s| context.physics.tracer_ranges(s),
+                            &|s| context.restart(s, t),
+                        )
                     });
                 let integrator = sim.integrator();
                 let mut steps = vec![0.0; domain.mesh.n_elements];
@@ -484,8 +495,8 @@ impl CaseFile {
                         integrator,
                         &mut state,
                         &run,
-                        &mut |s, t, record| {
-                            on_step(s, t, &|| physics.tracer_ranges(s), &|| {
+                        &mut |view, t, record| {
+                            on_step(view, t, &|s| physics.tracer_ranges(s), &|s| {
                                 restart_of(physics, record(), s, t)
                             })
                         },
