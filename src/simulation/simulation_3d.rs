@@ -273,7 +273,6 @@ where
                 );
                 let stencils = self.physics.stage_stencils();
                 self.integrator.assign_baroclinic_levels(
-                    state,
                     &self.element_dt,
                     &self.physics.mesh,
                     &stencils,
@@ -2584,7 +2583,6 @@ mod tests {
         for _ in 0..6 {
             physics.update_density(&mut state);
             let dt = integrator.assign_baroclinic_levels(
-                &state,
                 &element_dt,
                 &physics.mesh,
                 &stencils,
@@ -2852,7 +2850,6 @@ mod tests {
         for n in 0..steps {
             physics.update_density(state);
             let dt = integrator.assign_baroclinic_levels(
-                state,
                 element_dt,
                 &physics.mesh,
                 &stencils,
@@ -5517,7 +5514,6 @@ mod tests {
             physics.update_density(&mut state);
             let dt = match element_dt {
                 Some(element_dt) => integrator.assign_baroclinic_levels(
-                    &state,
                     element_dt,
                     &physics.mesh,
                     &stencils,

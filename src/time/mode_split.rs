@@ -87,6 +87,15 @@
 //! dispersion of the vertical shear and the surface/bottom stresses of the 3D
 //! columns (see [`crate::physics::Hydrostatic3D`]).
 //!
+//! # Backends
+//!
+//! [`ModeSplitIntegrator::step`] is the step's control, written once: the
+//! substeps and the filter, the slow forcing's AB3 weights, the 3D stages'
+//! schedule and which buffer each stage reads and writes. The work on the
+//! fields is the model's ([`SplitModel`]), section by section, in its own
+//! buffers: every [`ModeSplitPhysics`] does it in the CPU's ([`CpuWork`]),
+//! a device (`gpu/`'s CUDA model, P2.7) in its own.
+//!
 //! # Accuracy and known gaps (TODO P4.1)
 //!
 //! - The slow coupling is third order (AB3 step average of `G`).
@@ -771,6 +780,304 @@ impl<'a> StepDrag<'a> {
     }
 }
 
+/// Which drags a step has ([`SplitModel::drag_rates`]; their rates are the
+/// model's, frozen over the step).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DragKinds {
+    /// A bottom drag ([`ModeSplitPhysics::bottom_drag_into`]).
+    pub bottom: bool,
+    /// A drag within the column ([`ModeSplitPhysics::layer_drag_into`]).
+    pub layers: bool,
+}
+
+/// How many 3D stage buffers of each kind a step takes
+/// ([`SplitModel::start_stages`]): the stages' inventories, their values
+/// (the substep start's and every stage's) and, with several levels, the
+/// substeps' results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageSlots {
+    pub inventories: usize,
+    pub values: usize,
+    /// Whether the substeps' results are a buffer of their own (several
+    /// levels; at one level the last stage is the step's result).
+    pub acc: bool,
+}
+
+/// One barotropic pass as the splitter sets it up
+/// ([`SplitModel::barotropic_pass`]).
+#[derive(Clone, Copy, Debug)]
+pub struct SplitPass<'a> {
+    /// The filter: `n_bt` substeps per baroclinic step, the window's weights.
+    pub filter: &'a BarotropicFilter,
+    /// The substeps' scheme.
+    pub scheme: SspScheme,
+    /// The pass's start `tⁿ` and its (coarse) substep `Δt/n_bt` (s).
+    pub t: f64,
+    pub dt_bt: f64,
+    /// On the local time steps of [`SplitModel::assign_pass_levels`].
+    pub local: bool,
+    /// The step's drags, whose depth-mean parts the pass applies.
+    pub drag: DragKinds,
+}
+
+/// A 3D stage's RHS as the splitter sets it up
+/// ([`SplitModel::stage_transport`]).
+#[derive(Clone, Copy, Debug)]
+pub struct StageRhs<'a> {
+    /// The stage's input inventories: the state's (`None`, a step's first
+    /// stage) or a stage's slot.
+    pub input: Option<usize>,
+    /// The values slot of the RHS argument.
+    pub values: usize,
+    /// The elements and their stage times.
+    pub on: StageElements<'a>,
+    /// The baroclinic step (s) and every element's forward-Euler step in it.
+    pub dt: f64,
+    pub euler_dt: &'a [f64],
+}
+
+/// Where [`SplitModel::vertical_terms`] acts: the state (at the step's end)
+/// or a values slot (a substep ending within the step).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Columns {
+    State,
+    Values(usize),
+}
+
+/// A 3D model as [`ModeSplitIntegrator::step`] steps it, on some backend:
+/// every [`ModeSplitPhysics`] on the CPU, or a device's (`gpu/`'s CUDA
+/// model, P2.7).
+///
+/// The step's control is the splitter's, written once: the substeps and
+/// the filter, the slow forcing's AB3 weights, the 3D stages' schedule
+/// (local time steps included) and which buffer each stage reads and
+/// writes. Every operation on fields is the model's, in its own buffers
+/// ([`Self::Work`]), which the splitter addresses by slot. The methods are
+/// called in the order of the [module docs](self)' sections, with the slot
+/// numbers of [`StageSlots`].
+pub trait SplitModel {
+    /// The 3D state between steps (velocities and concentrations).
+    type State;
+    /// The splitter's buffers on this backend (sized on the first step).
+    type Work: SplitWork;
+
+    /// Elements of the mesh.
+    fn n_elements(&self) -> usize;
+
+    /// The splitter's buffers for `state`.
+    fn new_work(&self, state: &Self::State) -> Self::Work;
+
+    /// A prognostic closure's turbulence at its initial values where
+    /// `state` has none yet: the first step on local time steps of the 3D
+    /// stages, whose closure would otherwise allocate it within the step.
+    fn start_turbulence(&self, state: &mut Self::State);
+
+    /// (1) The drags' rates of the step at `state` and `t`, frozen over it,
+    /// and which there are.
+    fn drag_rates(&self, state: &Self::State, t: f64, work: &mut Self::Work) -> DragKinds;
+
+    /// (1) The momentum tendency `R₃D` of `state` at `t` (kept for the first
+    /// 3D stage), and from it the slow forcing `G(t)` as the newest of the
+    /// last three, which move one back to make room.
+    fn slow_forcing(&self, state: &Self::State, t: f64, work: &mut Self::Work);
+
+    /// (1) The step average of `G`: `Σ_j weights[j]·G_j` over the newest
+    /// `weights.len()`, summed from zero in that order.
+    fn average_slow_forcing(&self, work: &mut Self::Work, weights: &[f64]);
+
+    /// (1) The barotropic transport `(η − B, (η − B)ū, (η − B)v̄)` of `state`,
+    /// the pass's start.
+    fn to_transport(&self, state: &Self::State, work: &mut Self::Work);
+
+    /// (2) The pass's levels of local time stepping, up to `levels` of
+    /// `scheme`'s substeps at the CFL number `cfl`, from the transport's
+    /// element steps, and the coarse substep (at most `dt_cap`); `None`
+    /// where the 2D module has no element-local steps (the pass then takes
+    /// global substeps).
+    fn assign_pass_levels(
+        &self,
+        work: &mut Self::Work,
+        levels: usize,
+        scheme: SspScheme,
+        cfl: f64,
+        dt_cap: f64,
+    ) -> Option<f64>;
+
+    /// (2) The global substep the transport allows at the CFL number `cfl`
+    /// in `scheme`.
+    fn pass_step(&self, work: &Self::Work, cfl: f64, scheme: SspScheme) -> f64;
+
+    /// (2) The filtered barotropic pass ([`barotropic_pass`],
+    /// [`barotropic_pass_local`]): its average, post-processed by the 2D
+    /// module (the filter's early weights are negative), and `DU_avg2`.
+    fn barotropic_pass(&self, work: &mut Self::Work, pass: SplitPass<'_>);
+
+    /// (2–3) What follows the pass: the constant barotropic rates of the
+    /// step `dt` from `state`, the divergence of `DU_avg2`, the elements it
+    /// balances only as a whole and the water no flux carried.
+    fn after_pass(&self, state: &Self::State, dt: f64, work: &mut Self::Work);
+
+    /// (3) The thin cells carried with their neighbours through the step
+    /// ([`MergedCells`]) from what the pass moved, every element's
+    /// forward-Euler step in the stages `euler_dt`; their tracers' means
+    /// and density in `state`.
+    fn merge_cells(
+        &self,
+        state: &mut Self::State,
+        dt: f64,
+        euler_dt: &[f64],
+        work: &mut Self::Work,
+    );
+
+    /// (3) The stage buffers sized for `slots`; the values the substeps'
+    /// first RHS reads in values slot `start` (the state's, masked), the
+    /// state's fields to inventories, and what passes through the flushed
+    /// elements in the start's values.
+    fn start_stages(
+        &self,
+        state: &mut Self::State,
+        work: &mut Self::Work,
+        slots: StageSlots,
+        start: usize,
+    );
+
+    /// (3) A stage's velocity tendency into the work's rate, from values slot
+    /// `values` on `on`; at a step's first stage (`reuse_at = Some(tⁿ)`)
+    /// the elements at `tⁿ` take `R₃D` of [`Self::slow_forcing`].
+    fn stage_momentum(
+        &self,
+        work: &mut Self::Work,
+        values: usize,
+        on: StageElements<'_>,
+        reuse_at: Option<f64>,
+    );
+
+    /// (3) The rest of a stage's RHS: the velocity tendency to inventories
+    /// under the input's `η`, the transport's terms, the column sums of the
+    /// momentum set to the barotropic transport's rate, and the barotropic
+    /// rates.
+    fn stage_transport(&self, state: &Self::State, work: &mut Self::Work, rhs: StageRhs<'_>);
+
+    /// (3) Inventory slot `out = a·state + b·input + c·rate` per element
+    /// (`plan`), the input the state's (`None`) or a slot's.
+    fn combine_stage(
+        &self,
+        state: &Self::State,
+        work: &mut Self::Work,
+        input: Option<usize>,
+        out: usize,
+        elements: Blocks<'_>,
+        plan: &StagePlan<'_>,
+    );
+
+    /// (3) The implicit part of the vertical advection on inventory slot
+    /// `out`, element k over `dt[k]`.
+    fn implicit_advection(
+        &self,
+        work: &mut Self::Work,
+        out: usize,
+        elements: Blocks<'_>,
+        dt: &[f64],
+    );
+
+    /// (3) Values slot `write` from inventory slot `inventories` and values
+    /// slot `read` (`read_write`; the same slot: in place), limited (but at
+    /// the stage's `end`), with their density; the limited tracers and the
+    /// dry nodes' last values back into the inventories; masked for the
+    /// next RHS.
+    fn stage_values(
+        &self,
+        work: &mut Self::Work,
+        inventories: usize,
+        read_write: (usize, usize),
+        elements: Blocks<'_>,
+        end: bool,
+    );
+
+    /// (3) Inventory slot `last` into the substeps' results (several
+    /// levels).
+    fn accumulate_stage(
+        &self,
+        work: &mut Self::Work,
+        last: usize,
+        elements: Blocks<'_>,
+        plan: &StagePlan<'_>,
+    );
+
+    /// (3) The substeps of `elements` end: their result (inventory slot
+    /// `result`, or the substeps' results) into the state.
+    fn finish_substep(
+        &self,
+        state: &mut Self::State,
+        work: &mut Self::Work,
+        result: Option<usize>,
+        elements: Blocks<'_>,
+    );
+
+    /// (3) A substep ending within the step: values slot `start` from the
+    /// state's inventories (the last values of slot `last`;
+    /// `last_start = (last, start)`), with their density.
+    fn substep_values(
+        &self,
+        state: &Self::State,
+        work: &mut Self::Work,
+        last_start: (usize, usize),
+        elements: Blocks<'_>,
+    );
+
+    /// (3–4) The implicit vertical terms of `columns` over `[t, t + dt]` on
+    /// `elements`, with the step's drags.
+    #[allow(clippy::too_many_arguments)]
+    fn vertical_terms(
+        &self,
+        columns: Columns,
+        state: &mut Self::State,
+        work: &mut Self::Work,
+        elements: Blocks<'_>,
+        t: f64,
+        dt: f64,
+        drag: DragKinds,
+    );
+
+    /// (3) A substep ending within the step, after its vertical terms: the
+    /// depth means of values slot `start` back to `ū`, `v̄`, limited, its
+    /// inventories the state's, masked for the next substep's RHS.
+    fn restart_substep(
+        &self,
+        state: &mut Self::State,
+        work: &mut Self::Work,
+        start: usize,
+        elements: Blocks<'_>,
+    );
+
+    /// (3) The step's end: the last stage's values (slot `last`) unmasked,
+    /// their density the state's, the filtered barotropic state, the
+    /// inventories back to velocities and concentrations.
+    fn end_step(&self, state: &mut Self::State, work: &mut Self::Work, last: usize);
+
+    /// (4) The depth means of `u`, `v` back to `ū`, `v̄` after the vertical
+    /// terms.
+    fn restore_depth_means(&self, state: &mut Self::State, work: &mut Self::Work);
+}
+
+/// What the splitter asks of a [`SplitModel::Work`] between steps.
+pub trait SplitWork {
+    /// The cells merged and those kept, summed over the steps so far
+    /// ([`ModeSplitIntegrator::merged_cells`]).
+    fn merged_cells(&self) -> [usize; 2];
+
+    /// The barotropic pass's local time stepping's work counts, if it has
+    /// run on it.
+    fn barotropic_multirate_stats(&self) -> Option<MultirateStats>;
+
+    /// The newest `n` slow forcings `G`, newest first, on the host (what a
+    /// restart holds).
+    fn slow_forcing(&self, n: usize) -> Vec<SWESolution2D>;
+
+    /// Take `g` (newest first) as the newest slow forcings.
+    fn restore_slow_forcing(&mut self, g: Vec<SWESolution2D>);
+}
+
 /// Weights `w_j` such that `Σ w_j G(t_j)` is the average over `[tⁿ, tⁿ + Δt]`
 /// of the polynomial through the stored values of `G`.
 ///
@@ -808,76 +1115,61 @@ pub fn step_average_weights(tau: &[f64], dt: f64) -> [f64; 3] {
     w
 }
 
-/// `G` at the last (up to) three baroclinic steps, newest first.
-struct SlowForcingHistory {
-    g: [SWESolution2D; 3],
+/// The start times of the last (up to) three baroclinic steps, newest
+/// first: the splitter's side of the slow forcing's history (its `G` are
+/// the model's, [`SplitModel::slow_forcing`]).
+#[derive(Clone, Debug)]
+struct ForcingTimes {
     t: [f64; 3],
     len: usize,
     /// Start time of the next step if the run continues, for detecting restarts.
     next_t: f64,
 }
 
-impl SlowForcingHistory {
-    fn new(ne: usize, nn: usize) -> Self {
+impl ForcingTimes {
+    fn new() -> Self {
         Self {
-            g: std::array::from_fn(|_| SWESolution2D::new(ne, nn)),
             t: [0.0; 3],
             len: 0,
             next_t: f64::NAN,
         }
     }
 
-    /// Make room for `G(t)` at slot 0. The history restarts when `t` does not
-    /// continue the previous step.
-    fn push(&mut self, t: f64, dt: f64) -> &mut SWESolution2D {
+    /// Make room for `G(t)`, the newest (the model moves its `G` back with
+    /// these times). The history restarts when `t` does not continue the
+    /// previous step.
+    fn push(&mut self, t: f64, dt: f64) {
         if self.len > 0 && (t - self.next_t).abs() > 1e-9 * dt {
             self.len = 0;
         }
-        self.g.rotate_right(1);
         self.t.rotate_right(1);
         self.t[0] = t;
         self.len = (self.len + 1).min(3);
-        &mut self.g[0]
     }
 
-    /// The history as a restart carries it.
-    fn record(&self) -> SlowForcingRecord {
-        SlowForcingRecord {
-            g: self.g[..self.len].to_vec(),
-            t: self.t[..self.len].to_vec(),
-            next_t: self.next_t,
-        }
-    }
-
-    /// Continue from `record` (see [`ModeSplitIntegrator::restore_slow_forcing`]).
-    fn restore(&mut self, record: SlowForcingRecord) {
+    /// Continue from the times of `record` (see
+    /// [`ModeSplitIntegrator::restore_slow_forcing`]).
+    fn restore(&mut self, record: &SlowForcingRecord) {
         let len = record.g.len();
         assert!(
             len <= 3 && record.t.len() == len,
             "a slow-forcing record holds up to three G with their times, got {len} G and {} times",
             record.t.len()
         );
-        for (slot, g) in self.g.iter_mut().zip(record.g) {
-            assert!(
-                g.n_elements == slot.n_elements && g.n_nodes == slot.n_nodes,
-                "the slow-forcing record is of another mesh"
-            );
-            *slot = g;
-        }
         self.t[..len].copy_from_slice(&record.t);
         self.len = len;
         self.next_t = record.next_t;
     }
 
-    /// Step average of `G` over `[t, t + dt]` into `out`, from the past
-    /// values that reach back far enough for the step: the `j`-th only if
-    /// it is at least `j·dt/2` old. A step much longer than the history's
-    /// spacing (a resume with local time steps, 8× the restart's steps)
-    /// would extrapolate the quadratic far past its points, with weights of
-    /// 18, −29 and 13 against AB3's 1.9, −1.3 and 0.4; it takes fewer
-    /// points until the history has the new spacing. Steps that change by
-    /// less than half keep all three.
-    fn step_average(&mut self, dt: f64, out: &mut SWESolution2D) {
+    /// The weights of the step average of `G` over `[t, t + dt]`, of the
+    /// newest `n` (`w[..n]`): the past values that reach back far enough
+    /// for the step, the `j`-th only if it is at least `j·dt/2` old. A step
+    /// much longer than the history's spacing (a resume with local time
+    /// steps, 8× the restart's steps) would extrapolate the quadratic far
+    /// past its points, with weights of 18, −29 and 13 against AB3's 1.9,
+    /// −1.3 and 0.4; it takes fewer points until the history has the new
+    /// spacing. Steps that change by less than half keep all three.
+    fn step_average(&mut self, dt: f64) -> ([f64; 3], usize) {
         let mut tau = [0.0; 3];
         for (tau_j, t_j) in tau.iter_mut().zip(&self.t[..self.len]) {
             *tau_j = t_j - self.t[0];
@@ -887,11 +1179,8 @@ impl SlowForcingHistory {
             .count()
             + 1;
         let w = step_average_weights(&tau[..n], dt);
-        out.fill(0.0);
-        for (g, &wj) in self.g[..n].iter().zip(&w) {
-            out.axpy(wj, g);
-        }
         self.next_t = self.t[0] + dt;
+        (w, n)
     }
 }
 
@@ -1045,6 +1334,7 @@ impl BarotropicFilter {
 /// the levels and the stage buffers of [`MultirateStepper::schedule`].
 pub struct LocalPass {
     scheme: SspScheme,
+    max_levels: usize,
     stepper: MultirateStepper<SWESolution2D>,
     /// The elements' time steps of the current pass
     element_dt: Vec<f64>,
@@ -1094,6 +1384,7 @@ impl LocalPass {
     ) -> Self {
         Self {
             scheme,
+            max_levels,
             stepper: MultirateStepper::new(max_levels, scheme),
             element_dt: Vec::new(),
             values: vec![like.clone(); scheme.n_stages() - 1],
@@ -1342,7 +1633,8 @@ impl LocalPass {
     }
 }
 
-/// Field buffers sized on the first step and reused afterwards.
+/// The CPU's field buffers of a step, sized on the first step and reused
+/// afterwards.
 struct Buffers {
     /// Horizontal momentum tendency `R₃D` at `tⁿ`, reused as the first 3D stage.
     rhs_n: Solution3D,
@@ -1361,8 +1653,9 @@ struct Buffers {
     q_avg: SWESolution2D,
     /// Step-averaged slow forcing `G` of the transport (zero for `h`).
     forcing: SWESolution2D,
-    /// `G` of the last steps, for the step average.
-    history: SlowForcingHistory,
+    /// `G` of the last three steps, newest first, for the step average
+    /// (their times are the splitter's).
+    history: [SWESolution2D; 3],
     /// DU_avg2 of the last step.
     transport: BarotropicTransport,
     /// Depth means of the u/v tendency (or of u/v after diffusion).
@@ -1404,7 +1697,7 @@ impl Buffers {
             work: PassWork::new(ne, ops),
             q_avg: SWESolution2D::new(ne, nn),
             forcing: SWESolution2D::new(ne, nn),
-            history: SlowForcingHistory::new(ne, nn),
+            history: std::array::from_fn(|_| SWESolution2D::new(ne, nn)),
             transport: BarotropicTransport::new(ne, nn, n_face_values, n_subcell_values, n_rivers),
             mean_u: DGSolution2D::new(ne, nn),
             mean_v: DGSolution2D::new(ne, nn),
@@ -1429,44 +1722,28 @@ struct StageValues {
     stash: StageStash,
 }
 
-/// The buffers of the 3D stages and their schedule (section 3 of
-/// [`ModeSplitIntegrator::step`]): every element steps its own substeps
-/// over the levels of `stepper` (one level: the global step).
-///
-/// With several levels every stage's inventories and values stay alive
-/// through the step (a stage reads its neighbours' at their own current
-/// stage). At one level a stage reads only the one before: two inventory
-/// slots in turn and one values buffer, updated in place, as much as global
-/// steps ever needed.
-struct Stages3D {
-    stepper: MultirateStepper<Solution3D>,
-    /// Whether the levels were assigned for the next step
-    /// ([`ModeSplitIntegrator::assign_baroclinic_levels`]).
-    assigned: bool,
-    /// One level only (global steps).
-    one_level: bool,
-    /// The stages' inventories (their combinations), by
-    /// [`Self::inventory_slot`].
+/// The CPU's buffers of the 3D stages, by slot ([`StageSlots`]). With
+/// several levels every stage's inventories and values stay alive through
+/// the step (a stage reads its neighbours' at their own current stage). At
+/// one level a stage reads only the one before: two inventory slots in turn
+/// and one values buffer, updated in place, as much as global steps ever
+/// needed.
+struct StageBuffers {
+    slots: StageSlots,
+    /// The stages' inventories (their combinations).
     inventories: Vec<Solution3D>,
     /// The values (velocities, concentrations) of the substep starts and of
-    /// the stages, by [`Self::values_slot`]: the RHS arguments.
+    /// the stages: the RHS arguments.
     values: Vec<StageValues>,
     /// The substeps' results, the mean of their last stages (inventories;
     /// empty at one level, where the last stage is the result).
     acc: Solution3D,
     /// One stage's RHS.
     rate: Solution3D,
-    /// Per element: its stage time in the current pass, its forward-Euler
-    /// step, and every stage's `βΔt_ℓ`.
-    time: Vec<f64>,
-    euler_dt: Vec<f64>,
-    implicit_dt: Vec<Vec<f64>>,
-    /// The elements of a first stage that do not start at `tⁿ`.
-    fresh: Vec<u32>,
 }
 
-impl Stages3D {
-    fn new(state: &Solution3D, scheme: SspScheme, max_levels: usize) -> Self {
+impl StageBuffers {
+    fn new(state: &Solution3D, slots: StageSlots) -> Self {
         let (ne, nn, nl) = (state.n_elements, state.n_nodes, state.n_levels);
         // The combinations carry no diagnostics; the values the density
         // (the RHS reads it there) and the eddy coefficients (the vertical
@@ -1486,29 +1763,88 @@ impl Stages3D {
                 stash: StageStash::default(),
             }
         };
-        let n_stages = scheme.n_stages();
-        let one_level = max_levels == 0;
-        let (n_inventories, n_values) = if one_level {
-            (2, 1)
-        } else {
-            (n_stages, n_stages + 1)
-        };
+        Self {
+            slots,
+            inventories: (0..slots.inventories).map(|_| inventories()).collect(),
+            values: (0..slots.values).map(|_| values()).collect(),
+            acc: if slots.acc {
+                inventories()
+            } else {
+                Solution3D::new(0, nn, nl)
+            },
+            rate: inventories(),
+        }
+    }
+
+    /// Size every buffer's turbulence like `state`'s.
+    fn fit(&mut self, state: &Solution3D) {
+        let (n_tke, n_gls) = (state.tke.len(), state.gls.len());
+        let Self {
+            slots,
+            inventories,
+            values,
+            acc,
+            rate,
+        } = self;
+        let buffers = inventories
+            .iter_mut()
+            .chain(values.iter_mut().map(|v| &mut v.values))
+            .chain([rate])
+            .chain(slots.acc.then_some(acc));
+        for buffer in buffers {
+            buffer.tke.resize(n_tke, 0.0);
+            buffer.gls.resize(n_gls, 0.0);
+        }
+    }
+}
+
+/// The 3D stages' schedule (section 3 of [`ModeSplitIntegrator::step`]):
+/// every element steps its own substeps over the levels of `stepper` (one
+/// level: the global step); which buffer slot each stage reads and writes;
+/// every element's steps.
+struct Schedule3D {
+    stepper: MultirateStepper<Solution3D>,
+    /// Whether the levels were assigned for the next step
+    /// ([`ModeSplitIntegrator::assign_baroclinic_levels`]).
+    assigned: bool,
+    /// One level only (global steps).
+    one_level: bool,
+    /// Per element: its stage time in the current pass, its forward-Euler
+    /// step, and every stage's `βΔt_ℓ`.
+    time: Vec<f64>,
+    euler_dt: Vec<f64>,
+    implicit_dt: Vec<Vec<f64>>,
+    /// The elements of one level whose substeps end.
+    group: Vec<u32>,
+}
+
+impl Schedule3D {
+    fn new(scheme: SspScheme, max_levels: usize) -> Self {
         Self {
             stepper: MultirateStepper::new(max_levels, scheme).with_longest_coarse_step(true),
             assigned: false,
-            one_level,
-            inventories: (0..n_inventories).map(|_| inventories()).collect(),
-            values: (0..n_values).map(|_| values()).collect(),
-            acc: if one_level {
-                Solution3D::new(0, nn, nl)
-            } else {
-                inventories()
-            },
-            rate: inventories(),
-            time: vec![0.0; ne],
-            euler_dt: vec![0.0; ne],
-            implicit_dt: vec![vec![0.0; ne]; n_stages],
-            fresh: Vec::new(),
+            one_level: max_levels == 0,
+            time: Vec::new(),
+            euler_dt: Vec::new(),
+            implicit_dt: vec![Vec::new(); scheme.n_stages()],
+            group: Vec::new(),
+        }
+    }
+
+    /// The buffers a step of `n_stages` stages takes.
+    fn slots(&self, n_stages: usize) -> StageSlots {
+        if self.one_level {
+            StageSlots {
+                inventories: 2,
+                values: 1,
+                acc: false,
+            }
+        } else {
+            StageSlots {
+                inventories: n_stages,
+                values: n_stages + 1,
+                acc: true,
+            }
         }
     }
 
@@ -1527,25 +1863,69 @@ impl Stages3D {
         }
     }
 
-    /// Size every buffer's turbulence like `state`'s.
-    fn fit(&mut self, state: &Solution3D) {
-        let (n_tke, n_gls) = (state.tke.len(), state.gls.len());
-        let one_level = self.one_level;
-        let Self {
-            inventories,
-            values,
-            acc,
-            rate,
-            ..
-        } = self;
-        let buffers = inventories
-            .iter_mut()
-            .chain(values.iter_mut().map(|v| &mut v.values))
-            .chain([rate])
-            .chain((!one_level).then_some(acc));
-        for buffer in buffers {
-            buffer.tke.resize(n_tke, 0.0);
-            buffer.gls.resize(n_gls, 0.0);
+    /// Each of the `n_elements` elements' steps over the coarse step `dt`
+    /// in `scheme`: its forward-Euler step and every stage's `βΔt_ℓ`.
+    fn set_steps(&mut self, n_elements: usize, dt: f64, scheme: SspScheme) {
+        self.time.resize(n_elements, 0.0);
+        self.euler_dt.resize(n_elements, 0.0);
+        for dt_s in &mut self.implicit_dt {
+            dt_s.resize(n_elements, 0.0);
+        }
+        for (k, &level) in self.stepper.levels().iter().enumerate() {
+            let dt_l = dt / (1u64 << level) as f64;
+            self.euler_dt[k] = dt_l / scheme.ssp_coefficient();
+            for (dt_s, stage) in self.implicit_dt.iter_mut().zip(scheme.stages()) {
+                dt_s[k] = stage.beta * dt_l;
+            }
+        }
+    }
+}
+
+/// The CPU's buffers of [`ModeSplitIntegrator`]: the [`SplitModel::Work`]
+/// of every [`ModeSplitPhysics`].
+pub struct CpuWork {
+    buffers: Buffers,
+    /// The 3D stages' (sized at a step's start, [`SplitModel::start_stages`])
+    stages: Option<StageBuffers>,
+    /// The barotropic pass on local time steps, once it has run on them
+    local: Option<LocalPass>,
+    /// The elements of a first stage that do not start at `tⁿ`
+    fresh: Vec<u32>,
+}
+
+impl CpuWork {
+    fn stages_mut(&mut self) -> &mut StageBuffers {
+        stages_of(&mut self.stages)
+    }
+}
+
+/// The stage buffers, once [`SplitModel::start_stages`] has sized them.
+fn stages_of(stages: &mut Option<StageBuffers>) -> &mut StageBuffers {
+    stages
+        .as_mut()
+        .expect("the stages' buffers are sized at the step's start (start_stages)")
+}
+
+impl SplitWork for CpuWork {
+    fn merged_cells(&self) -> [usize; 2] {
+        self.buffers.merged.counts()
+    }
+
+    fn barotropic_multirate_stats(&self) -> Option<MultirateStats> {
+        self.local.as_ref().map(|local| local.stepper.stats())
+    }
+
+    fn slow_forcing(&self, n: usize) -> Vec<SWESolution2D> {
+        self.buffers.history[..n].to_vec()
+    }
+
+    fn restore_slow_forcing(&mut self, g: Vec<SWESolution2D>) {
+        for (slot, g) in self.buffers.history.iter_mut().zip(g) {
+            assert!(
+                g.n_elements == slot.n_elements && g.n_nodes == slot.n_nodes,
+                "the slow-forcing record is of another mesh"
+            );
+            *slot = g;
         }
     }
 }
@@ -1724,8 +2104,10 @@ fn accumulate_stage(
 }
 
 /// Mode-split time integrator: one filtered barotropic pass per baroclinic
-/// SSP-RK3 or SSP-RK(4,3) step (see the module docs).
-pub struct ModeSplitIntegrator {
+/// SSP-RK3 or SSP-RK(4,3) step (see the module docs), on the buffers `W` of
+/// its model's backend ([`SplitModel`]): the CPU's ([`CpuWork`], every
+/// [`ModeSplitPhysics`]) unless set otherwise ([`Self::on`]).
+pub struct ModeSplitIntegrator<W = CpuWork> {
     /// Coupling method.
     pub split_method: SplitMethod,
     barotropic_cfl: f64,
@@ -1739,10 +2121,12 @@ pub struct ModeSplitIntegrator {
     barotropic_levels: usize,
     /// ... and of the 3D stages, see [`Self::with_baroclinic_levels`].
     baroclinic_levels: usize,
-    multirate: Option<LocalPass>,
     filter: Option<BarotropicFilter>,
-    buffers: Option<Buffers>,
-    stages_3d: Option<Stages3D>,
+    /// The start times of the slow forcing's history (its `G` are the
+    /// work's).
+    forcing_times: ForcingTimes,
+    schedule: Option<Schedule3D>,
+    work: Option<W>,
     /// A history to continue from, applied at the next step (see
     /// [`Self::restore_slow_forcing`]).
     restored_slow_forcing: Option<SlowForcingRecord>,
@@ -1767,7 +2151,8 @@ impl ModeSplitIntegrator {
     pub const FORCING_REACH: f64 = 4.0 / 3.0;
 
     /// Integrator with the default barotropic CFL and at least
-    /// [`MIN_BAROTROPIC_SUBSTEPS`] substeps per step.
+    /// [`MIN_BAROTROPIC_SUBSTEPS`] substeps per step, on the CPU (on
+    /// another backend: [`Self::on`]).
     pub fn new() -> Self {
         Self {
             split_method: SplitMethod::GTerm,
@@ -1777,11 +2162,41 @@ impl ModeSplitIntegrator {
             min_substeps: MIN_BAROTROPIC_SUBSTEPS,
             barotropic_levels: 0,
             baroclinic_levels: 0,
-            multirate: None,
             filter: None,
-            buffers: None,
-            stages_3d: None,
+            forcing_times: ForcingTimes::new(),
+            schedule: None,
+            work: None,
             restored_slow_forcing: None,
+        }
+    }
+
+    /// The barotropic transport (DU_avg2) of the last step, if any.
+    pub fn barotropic_transport(&self) -> Option<&BarotropicTransport> {
+        self.work.as_ref().map(|work| &work.buffers.transport)
+    }
+}
+
+impl<W: SplitWork> ModeSplitIntegrator<W> {
+    /// This integrator, set up as it is, on another backend's buffers `V`
+    /// (a device's [`SplitModel::Work`]); before its first step.
+    pub fn on<V: SplitWork>(self) -> ModeSplitIntegrator<V> {
+        assert!(
+            self.work.is_none() && self.filter.is_none(),
+            "an integrator changes its backend before its first step"
+        );
+        ModeSplitIntegrator {
+            split_method: self.split_method,
+            barotropic_cfl: self.barotropic_cfl,
+            barotropic_scheme: self.barotropic_scheme,
+            baroclinic_scheme: self.baroclinic_scheme,
+            min_substeps: self.min_substeps,
+            barotropic_levels: self.barotropic_levels,
+            baroclinic_levels: self.baroclinic_levels,
+            filter: None,
+            forcing_times: self.forcing_times,
+            schedule: self.schedule,
+            work: None,
+            restored_slow_forcing: self.restored_slow_forcing,
         }
     }
 
@@ -1821,6 +2236,7 @@ impl ModeSplitIntegrator {
     /// by the CFL number.
     pub fn with_baroclinic_scheme(mut self, scheme: SspScheme) -> Self {
         self.baroclinic_scheme = scheme;
+        self.schedule = None;
         self
     }
 
@@ -1853,14 +2269,15 @@ impl ModeSplitIntegrator {
             Multirate::<SSPRK3>::MAX_LEVELS
         );
         self.barotropic_levels = max_levels;
-        self.multirate = None;
         self
     }
 
     /// Work counts of the barotropic pass's local time stepping so far
     /// (`None` before its first step, or without it).
     pub fn barotropic_multirate_stats(&self) -> Option<MultirateStats> {
-        self.multirate.as_ref().map(|m| m.stepper.stats())
+        self.work
+            .as_ref()
+            .and_then(SplitWork::barotropic_multirate_stats)
     }
 
     /// Step the 3D stages with local time stepping ([`MultirateStepper`],
@@ -1887,7 +2304,7 @@ impl ModeSplitIntegrator {
             Multirate::<SSPRK3>::MAX_LEVELS
         );
         self.baroclinic_levels = max_levels;
-        self.stages_3d = None;
+        self.schedule = None;
         self
     }
 
@@ -1896,9 +2313,9 @@ impl ModeSplitIntegrator {
         self.baroclinic_levels
     }
 
-    /// Assign the 3D stages' levels for the next [`Self::step`] of `state`
-    /// from every element's stable step `element_dt` on `mesh`, with the
-    /// rates of each stage spread over what a stage value reads, `stencils`
+    /// Assign the 3D stages' levels for the next [`Self::step`] from every
+    /// element's stable step `element_dt` on `mesh`, with the rates of each
+    /// stage spread over what a stage value reads, `stencils`
     /// ([`ModeSplitPhysics::stage_stencils`]), and return the coarse step:
     /// `2^L` times the smallest element step, at most the largest one and
     /// `dt_cap` (see [`MultirateStepper::assign_levels_from`]).
@@ -1913,7 +2330,6 @@ impl ModeSplitIntegrator {
     /// shrinks all levels with it.
     pub fn assign_baroclinic_levels(
         &mut self,
-        state: &Solution3D,
         element_dt: &[f64],
         mesh: &Mesh2D,
         stencils: &[RhsStencil],
@@ -1925,11 +2341,11 @@ impl ModeSplitIntegrator {
             "local time stepping of the 3D stages is off (with_baroclinic_levels)"
         );
         let (scheme, levels) = (self.baroclinic_scheme, self.baroclinic_levels);
-        let stages = self
-            .stages_3d
-            .get_or_insert_with(|| Stages3D::new(state, scheme, levels));
-        stages.assigned = true;
-        stages
+        let schedule = self
+            .schedule
+            .get_or_insert_with(|| Schedule3D::new(scheme, levels));
+        schedule.assigned = true;
+        schedule
             .stepper
             .assign_levels_from(element_dt, mesh, stencils, dt_cap, landing)
     }
@@ -1938,7 +2354,7 @@ impl ModeSplitIntegrator {
     /// before its first step, or without it).
     pub fn baroclinic_multirate_stats(&self) -> Option<MultirateStats> {
         (self.baroclinic_levels > 0)
-            .then(|| self.stages_3d.as_ref().map(|s| s.stepper.stats()))
+            .then(|| self.schedule.as_ref().map(|s| s.stepper.stats()))
             .flatten()
     }
 
@@ -1953,18 +2369,20 @@ impl ModeSplitIntegrator {
         self
     }
 
-    /// The barotropic transport (DU_avg2) of the last step, if any.
-    pub fn barotropic_transport(&self) -> Option<&BarotropicTransport> {
-        self.buffers.as_ref().map(|b| &b.transport)
-    }
-
     /// The slow forcing the next step's AB3 average continues from (empty
     /// before the first step): with the state, what a restart needs to
     /// continue the run bit for bit.
     pub fn slow_forcing_record(&self) -> SlowForcingRecord {
-        match (&self.restored_slow_forcing, &self.buffers) {
+        match (&self.restored_slow_forcing, &self.work) {
             (Some(record), _) => record.clone(),
-            (None, Some(buffers)) => buffers.history.record(),
+            (None, Some(work)) => {
+                let times = &self.forcing_times;
+                SlowForcingRecord {
+                    g: work.slow_forcing(times.len),
+                    t: times.t[..times.len].to_vec(),
+                    next_t: times.next_t,
+                }
+            }
             (None, None) => SlowForcingRecord::empty(),
         }
     }
@@ -1976,142 +2394,71 @@ impl ModeSplitIntegrator {
         self.restored_slow_forcing = Some(record);
     }
 
-    /// Barotropic substeps per baroclinic step used by the last step (0 before
-    /// the first step).
     /// The thin cells carried with their neighbours because more water
     /// left them in a stage than they held, and the cells of the groups
     /// that kept their values because even their whole element did not hold
     /// it (the one case in which a tracer's inventory is not kept), summed
     /// over the steps so far ([`crate::solver::rhs::MergedCells`]).
     pub fn merged_cells(&self) -> [usize; 2] {
-        self.buffers
-            .as_ref()
-            .map_or([0; 2], |buffers| buffers.merged.counts())
+        self.work.as_ref().map_or([0; 2], SplitWork::merged_cells)
     }
 
+    /// Barotropic substeps per baroclinic step used by the last step (0 before
+    /// the first step).
     pub fn last_substeps(&self) -> usize {
         self.filter.as_ref().map_or(0, BarotropicFilter::n_bt)
     }
 
-    /// Perform one baroclinic (3D) time step of `state` from `t` to `t + dt`.
-    pub fn step<P: ModeSplitPhysics>(
+    /// Perform one baroclinic (3D) time step of `state` from `t` to `t + dt`
+    /// (see the module docs; `model` does each section's work on its own
+    /// buffers, [`SplitModel`]).
+    pub fn step<M: SplitModel<Work = W>>(
         &mut self,
-        state: &mut Solution3D,
-        physics: &P,
+        state: &mut M::State,
+        model: &M,
         dt: f64,
         t: f64,
     ) {
-        let sigma = physics.sigma();
-        let bathymetry = physics.bathymetry();
-        let barotropic = physics.barotropic();
-        let rivers = physics.rivers();
-        let n_rivers = rivers.map_or(0, RiverSources::len);
+        let ne = model.n_elements();
+        let (scheme, levels) = (self.baroclinic_scheme, self.baroclinic_levels);
         // A prognostic closure's turbulence, from the first step on local
         // time steps. The closure allocates it at its first call, the end of
         // a substep: with several levels that is inside the step, for the
         // elements of one level, after the stages' buffers were sized
         // without it (a run from rest then read an empty tendency). One
         // level keeps the closure's own first call, and its bits.
-        if self.baroclinic_levels > 0
-            && let Some([k0, psi0]) = physics.initial_turbulence()
-        {
-            let n_w = state.n_elements * state.n_nodes * (state.n_levels + 1);
-            if state.tke.len() != n_w {
-                state.tke = vec![k0; n_w];
-                state.gls = vec![psi0; n_w];
-            }
+        if levels > 0 {
+            model.start_turbulence(state);
         }
-        let Buffers {
-            rhs_n,
-            pooled,
-            column_source,
-            merged,
-            d_sigma_w,
-            transport_divergence,
-            q,
-            work,
-            q_avg,
-            forcing: g_term,
-            history,
-            transport,
-            mean_u,
-            mean_v,
-            rate_eta,
-            rate_ubar,
-            rate_vbar,
-            rate_hu,
-            rate_hv,
-            drag_rate,
-            layer_drag_rate,
-            column_drag_rate,
-        } = self
-            .buffers
-            .get_or_insert_with(|| Buffers::new(state, barotropic.operators(), n_rivers));
-        assert_eq!(
-            transport.discharge.len(),
-            n_rivers,
-            "the number of rivers changed between steps"
-        );
+        let work = self.work.get_or_insert_with(|| model.new_work(state));
         if let Some(record) = self.restored_slow_forcing.take() {
-            history.restore(record);
+            self.forcing_times.restore(&record);
+            work.restore_slow_forcing(record.g);
         }
 
         // 1. Slow forcing: Gⁿ from R₃D at tⁿ, averaged over the step (AB3);
         // the drag rates of the step
-        let bottom_drag = physics.bottom_drag_into(state, t, drag_rate);
-        let drag_rate: &[f64] = drag_rate;
-        let n_layer_values = state.u.len();
-        if layer_drag_rate.len() != n_layer_values {
-            layer_drag_rate.resize(n_layer_values, 0.0);
-        }
-        let layer_drag = physics.layer_drag_into(state, t, layer_drag_rate);
-        if layer_drag {
-            column_drag_rate.resize(state.eta.data.len(), 0.0);
-            column_drag_rates(sigma.d_sigma(), layer_drag_rate, column_drag_rate);
-        }
-        let drag = StepDrag {
-            bottom: bottom_drag.then_some(drag_rate),
-            layers: layer_drag.then_some(&layer_drag_rate[..]),
-        };
-        let column_drag = layer_drag.then_some(&column_drag_rate[..]);
+        let drag = model.drag_rates(state, t, work);
+        let times = &mut self.forcing_times;
         profiling::scope("split: slow forcing", || {
-            profiling::scope("3d: momentum rhs", || {
-                physics.momentum_rhs_into(state, t, rhs_n)
-            });
-            profiling::scope("split: G", || {
-                physics.slow_forcing_into(state, rhs_n, t, history.push(t, dt))
-            });
+            times.push(t, dt);
+            model.slow_forcing(state, t, work)
         });
-        history.step_average(dt, g_term);
-        to_transport(state, bathymetry, q);
+        let (weights, n_weights) = times.step_average(dt);
+        model.average_slow_forcing(work, &weights[..n_weights]);
+        model.to_transport(state, work);
 
         // 2. One filtered barotropic pass, on local time steps if asked for
         // (the levels of the step's start state, as the global substep is)
-        let local = (self.barotropic_levels > 0)
-            .then(|| barotropic.local_time_stepping())
-            .flatten()
-            .filter(|local| local.is_element_local());
-        let (multirate, dt_bt_max) = match local {
-            Some(local) => {
-                let (levels, scheme) = (self.barotropic_levels, self.barotropic_scheme);
-                let multirate = self
-                    .multirate
-                    .get_or_insert_with(|| LocalPass::new(levels, scheme, q, n_rivers));
-                // Its coarse step: at most Δt over the fewest substeps
-                let dt_coarse = multirate.assign_levels(
-                    local,
-                    barotropic.mesh(),
-                    q,
-                    self.barotropic_cfl,
-                    dt / self.min_substeps as f64,
-                );
-                (Some(multirate), dt_coarse)
-            }
-            None => (
-                None,
-                barotropic.compute_dt_ssp(q, self.barotropic_cfl, Some(self.barotropic_scheme)),
-            ),
-        };
+        let (cfl, pass_scheme) = (self.barotropic_cfl, self.barotropic_scheme);
+        // Its coarse step: at most Δt over the fewest substeps
+        let dt_coarse = (self.barotropic_levels > 0)
+            .then(|| {
+                let dt_cap = dt / self.min_substeps as f64;
+                model.assign_pass_levels(work, self.barotropic_levels, pass_scheme, cfl, dt_cap)
+            })
+            .flatten();
+        let dt_bt_max = dt_coarse.unwrap_or_else(|| model.pass_step(work, cfl, pass_scheme));
         assert!(
             dt_bt_max > 0.0,
             "barotropic time step {dt_bt_max} is not positive"
@@ -2129,339 +2476,62 @@ impl ModeSplitIntegrator {
             self.filter = Some(BarotropicFilter::new(n_bt));
         }
         let filter = self.filter.as_ref().expect("filter was just set");
-        let dt_bt = dt / n_bt as f64;
-
         let pass = profiling::start();
-        let pass_drag = PassDrag {
-            bottom: drag.bottom,
-            column: column_drag,
-        };
-        let inputs = PassInputs {
-            filter,
-            scheme: self.barotropic_scheme,
-            t,
-            dt_bt,
-            forcing: g_term,
-            drag: pass_drag,
-            rivers,
-        };
-        match multirate {
-            Some(local) => barotropic_pass_local(barotropic, inputs, local, q, q_avg, transport),
-            None => barotropic_pass(barotropic, inputs, work, q, q_avg, transport),
-        }
-        // The early weights are negative: restore positivity of the average
-        barotropic.post_process(q_avg);
-        profiling::stop("split: barotropic pass", pass);
-
-        // Constant barotropic rates over the step
-        barotropic_rates(
-            state,
-            bathymetry,
-            q_avg,
-            dt,
-            [rate_eta, rate_ubar, rate_vbar, rate_hu, rate_hv],
+        model.barotropic_pass(
+            work,
+            SplitPass {
+                filter,
+                scheme: pass_scheme,
+                t,
+                dt_bt: dt / n_bt as f64,
+                local: dt_coarse.is_some(),
+                drag,
+            },
         );
+        profiling::stop("split: barotropic pass", pass);
+        // Constant barotropic rates over the step, and what the pass moved
+        model.after_pass(state, dt, work);
 
         // 3. 3D stages with the barotropic state prescribed, the velocity and
         // the tracers as inventories H_z·u, H_z·C (the stage's η sets H_z)
-        let river_inflow = rivers.map(|rivers| RiverInflow {
-            rivers,
-            discharge: &transport.discharge,
-        });
-        let geom = barotropic.geometry();
-        // Elements where the pass broke the nodal identity ∂η/∂t = −∇·DU_avg2
-        // (WetDry subcells, positivity limiter): their nodal residual is
-        // water moved between their nodes
-        transport.divergence_into(
-            barotropic.operators(),
-            geom,
-            barotropic.metric_form(),
-            transport_divergence,
-        );
-        pooled_elements(
-            &state.eta.data,
-            bathymetry,
-            rate_eta,
-            transport_divergence,
-            transport,
-            river_inflow,
-            dt,
-            column_source,
-            pooled,
-        );
-        let pooled: &[bool] = pooled;
-        w_cell_thicknesses(sigma.d_sigma(), d_sigma_w);
-        // The σ-thicknesses of the cells of each inventory field
-        let cells = [sigma.d_sigma(), &d_sigma_w[..]];
-        let cells_of = |field: usize| cells[usize::from(field >= N_LAYER_FIELDS)];
-        // The 3D stages' steps: each element's forward-Euler step
-        let ne = state.n_elements;
-        let scheme = self.baroclinic_scheme;
-        let levels = self.baroclinic_levels;
-        let stages_3d = self
-            .stages_3d
-            .get_or_insert_with(|| Stages3D::new(state, scheme, levels));
-        stages_3d.fit(state);
+        let schedule = self
+            .schedule
+            .get_or_insert_with(|| Schedule3D::new(scheme, levels));
         if levels == 0 {
-            stages_3d.stepper.assign_one_level(ne);
+            schedule.stepper.assign_one_level(ne);
         } else {
             assert!(
-                std::mem::take(&mut stages_3d.assigned),
+                std::mem::take(&mut schedule.assigned),
                 "assign_baroclinic_levels before every step with local time stepping"
             );
         }
-        for (k, &level) in stages_3d.stepper.levels().iter().enumerate() {
-            let dt_l = dt / (1u64 << level) as f64;
-            stages_3d.euler_dt[k] = dt_l / scheme.ssp_coefficient();
-        }
+        // Each element's steps over the coarse step: its forward-Euler step
+        // and every stage's βΔt_ℓ
+        schedule.set_steps(ne, dt, scheme);
         // The thin cells that lose more than their water in a stage are
         // carried with their neighbours, as one cell from the step's start
-        merged.find(&StepWater {
-            mesh: barotropic.mesh(),
-            ops: barotropic.operators(),
-            geom,
-            bathymetry,
-            eta: &state.eta.data,
-            eta_rate: &rate_eta.data,
-            dt,
-            euler_dt: &stages_3d.euler_dt,
-            face: &transport.face,
-            subcell: &transport.subcell,
-            source: column_source,
-            thin_depth: physics.min_column_depth(),
-        });
-        if !merged.elements().is_empty() {
-            let Solution3D {
-                eta,
-                temp,
-                salt,
-                tke,
-                gls,
-                ..
-            } = &mut *state;
-            let fields = [temp, salt, tke, gls].into_iter().enumerate();
-            for (slot, field) in fields.filter(|(_, field)| !field.is_empty()) {
-                let cells = cells_of(N_MOMENTUM_FIELDS + slot);
-                merged.start(field, cells, &eta.data, bathymetry, geom);
-            }
-            // Their density, which the stages read
-            physics.end_density(state, blocks_of(ne, merged.elements()));
-        }
-        let merged: &MergedCells = merged;
-        // The tracers and the turbulence of a group of cells are one
-        // cell's; the momentum is each node's own (a thin column's is the
-        // depth mean's)
-        let merged_of = |field: usize| (field >= N_MOMENTUM_FIELDS).then_some(merged);
-        // Inventories of `s` → velocities and concentrations in `out`'s
-        // inventory fields (which hold the last values, kept where there is
-        // no water), on `elements`
-        let to_values = |s: &Solution3D, out: &mut Solution3D, elements: Blocks, end: bool| {
-            let eta = &s.eta.data;
-            let fields = inventory_fields(s)
-                .into_iter()
-                .zip(inventory_fields_mut(out));
-            for (field, (q, out)) in fields.enumerate() {
-                if !q.is_empty() {
-                    let cells = cells_of(field);
-                    let merged = merged_of(field);
-                    from_inventory(q, eta, cells, bathymetry, geom, merged, out, elements, end);
-                }
-            }
-        };
-        let to_inventories = |s: &mut Solution3D, elements: Blocks| {
-            let Solution3D {
-                eta,
-                u,
-                v,
-                temp,
-                salt,
-                tke,
-                gls,
-                ..
-            } = s;
-            for (field, q) in [u, v, temp, salt, tke, gls].into_iter().enumerate() {
-                if !q.is_empty() {
-                    to_inventory(q, &eta.data, cells_of(field), bathymetry, elements);
-                }
-            }
-        };
-        // The values of the inventories `inv` in `out`, unmasked, on
-        // `elements`. Where there is no water a value is the last one: the
-        // RHS argument's, unmasked (`from`'s, or `out`'s own in place).
-        // `out`'s density is left to the caller (`post_stage` and
-        // `end_density` both set it on all of `elements`)
-        let values_of = |inv: &Solution3D,
-                         out: &mut StageValues,
-                         from: Option<&StageValues>,
-                         elements: Blocks| {
-            let StageValues { values, stash } = out;
-            let Some(from) = from else {
-                stash.restore_into(values, elements);
-                copy_barotropic_rows(inv, values, elements);
-                to_values(inv, values, elements, false);
-                return;
-            };
-            // Each field in one pass, element by element: the last values
-            // (copied, the masked columns' velocities restored), then the
-            // conversion. `ū` and `v̄` are the inventories' own
-            let (eta, nn) = (&inv.eta.data, inv.n_nodes);
-            let fields = inventory_fields(inv)
-                .into_iter()
-                .zip(inventory_fields(&from.values))
-                .zip(inventory_fields_mut(values));
-            for (field, ((q, last), out)) in fields.enumerate() {
-                if q.is_empty() {
-                    continue;
-                }
-                let len = last.len() / inv.n_elements;
-                let last = |k: usize, out_k: &mut [f64]| {
-                    out_k.copy_from_slice(&last[k * len..(k + 1) * len]);
-                    from.stash.restore_velocity(field, k, nn, out_k);
-                };
-                let (cells, merged) = (cells_of(field), merged_of(field));
-                from_inventory_after(
-                    q, eta, cells, bathymetry, geom, merged, out, elements, false, last,
-                );
-            }
-            copy_barotropic_rows(inv, values, elements);
-        };
-        // A stage's values from its inventories `inv` (the combination's,
-        // after the implicit vertical advection) and its RHS argument's
-        // values `from`, then limited (`post_stage`; only the density at
-        // the step's end, `end_density`, which the caller post-processes),
-        // their tracers back into `inv`, and masked for the next RHS
-        let stage_values = |inv: &mut Solution3D,
-                            out: &mut StageValues,
-                            from: Option<&StageValues>,
-                            elements: Blocks,
-                            end: bool| {
-            let convert = profiling::start();
-            values_of(inv, out, from, elements);
-            let StageValues { values, stash } = out;
-            profiling::stop("3d: hook conversions", convert);
-            if end {
-                profiling::scope("3d: density", || physics.end_density(values, elements));
-            } else {
-                profiling::scope("3d: post_stage", || physics.post_stage(values, elements));
-            }
-            let convert = profiling::start();
-            // (not a flushed element's, whose values are not its inventory's)
-            for (q, c) in [(&mut inv.temp, &values.temp), (&mut inv.salt, &values.salt)] {
-                let cells = sigma.d_sigma();
-                inventory_of(
-                    q,
-                    c,
-                    &inv.eta.data,
-                    cells,
-                    bathymetry,
-                    Some(merged),
-                    elements,
-                );
-            }
-            // Where a node has (almost) no water its value is the last one:
-            // its inventory is that value's, as for T and S, so that it wets
-            // from it
-            let Solution3D {
-                eta,
-                u,
-                v,
-                tke,
-                gls,
-                ..
-            } = &mut *inv;
-            for (field, q, c) in [
-                (0, u, &values.u),
-                (1, v, &values.v),
-                (4, tke, &values.tke),
-                (5, gls, &values.gls),
-            ] {
-                if !q.is_empty() {
-                    let (cells, merged) = (cells_of(field), merged_of(field));
-                    dry_inventories(q, c, &eta.data, cells, bathymetry, merged, elements);
-                }
-            }
-            stash.forget(elements);
-            physics.mask_stage(values, elements, stash);
-            profiling::stop("3d: hook conversions", convert);
-        };
-
-        let shu_osher = scheme.stages();
-        let n_stages = shu_osher.len();
+        model.merge_cells(state, dt, &schedule.euler_dt, work);
+        let n_stages = scheme.n_stages();
         let inventory_slot: Vec<usize> =
-            (0..n_stages).map(|s| stages_3d.inventory_slot(s)).collect();
+            (0..n_stages).map(|s| schedule.inventory_slot(s)).collect();
         let values_slot: Vec<usize> = (0..=n_stages)
-            .map(|s| stages_3d.values_slot(s.checked_sub(1)))
+            .map(|s| schedule.values_slot(s.checked_sub(1)))
             .collect();
         let start_slot = values_slot[0];
         let last_values = values_slot[n_stages];
         let last_inventories = inventory_slot[n_stages - 1];
-        let one_level = stages_3d.one_level;
-        let Stages3D {
+        // The values the substeps' first RHS reads: the step's start, masked
+        model.start_stages(state, work, schedule.slots(n_stages), start_slot);
+        let Schedule3D {
             stepper,
-            inventories,
-            values,
-            acc,
-            rate,
+            one_level,
             time,
             euler_dt,
             implicit_dt,
-            fresh,
+            group,
             ..
-        } = stages_3d;
-        // Each element's steps over the coarse step: its forward-Euler step
-        // and every stage's βΔt_ℓ
-        for (k, &level) in stepper.levels().iter().enumerate() {
-            let dt_l = dt / (1u64 << level) as f64;
-            euler_dt[k] = dt_l / scheme.ssp_coefficient();
-            for (dt_s, stage) in implicit_dt.iter_mut().zip(shu_osher) {
-                dt_s[k] = stage.beta * dt_l;
-            }
-        }
-        let barotropic_flux = BarotropicFlux {
-            dt,
-            euler_dt,
-            hu: &transport.hu.data,
-            hv: &transport.hv.data,
-            face: &transport.face,
-            subcell: &transport.subcell,
-            eta_rate: &rate_eta.data,
-            rivers: river_inflow,
-            pooled,
-        };
-        let all = Blocks::All(ne);
-        // The values the substeps' first RHS reads: the step's start, masked
-        // (`ModeSplitPhysics::mask_stage`)
-        {
-            let StageValues { values, stash } = &mut values[start_slot];
-            copy_barotropic_rows(state, values, all);
-            for (to, from) in inventory_fields_mut(values)
-                .into_iter()
-                .zip(inventory_fields(state))
-            {
-                copy_field(to, from);
-            }
-            copy_field(&mut values.rho, &state.rho);
-            stash.forget(all);
-            physics.mask_stage(values, all, stash);
-        }
-        to_inventories(state, all);
-        // What a flushed element's nodes show to the first stage: what
-        // passes through it
-        if !merged.elements().is_empty() {
-            let StageValues { values, .. } = &mut values[start_slot];
-            let fields = inventory_fields(state)
-                .into_iter()
-                .zip(inventory_fields_mut(values))
-                .enumerate()
-                .skip(N_MOMENTUM_FIELDS);
-            for (field, (q, out)) in fields {
-                if !q.is_empty() {
-                    let cells = cells_of(field);
-                    let eta = &state.eta.data;
-                    merged.pass_through(q, eta, cells, bathymetry, geom, out, all, false);
-                }
-            }
-        }
+        } = schedule;
+        let (one_level, euler_dt): (bool, &[f64]) = (*one_level, euler_dt);
         let substeps = 1usize << stepper.finest_level();
         let mut finished = 0;
         let stage_time = profiling::start();
@@ -2483,88 +2553,41 @@ impl ModeSplitIntegrator {
                 let end = s + 1 == n_stages;
                 // The RHS argument's inventories (the substep start's in
                 // the first stage) and this stage's
-                let (input, out) = match s.checked_sub(1) {
-                    None => (&*state, &mut inventories[inventory_slot[s]]),
-                    Some(previous) => {
-                        read_write(inventories, inventory_slot[previous], inventory_slot[s])
-                    }
-                };
+                let input = s.checked_sub(1).map(|previous| inventory_slot[previous]);
+                let out = inventory_slot[s];
                 let (read, write) = (values_slot[s], values_slot[s + 1]);
                 // The RHS: R₃D, reused where a substep starts at tⁿ in the
                 // first stage, as velocity tendencies
-                let input_values = &values[read].values;
                 profiling::scope("3d: momentum rhs", || {
-                    if s == 0 {
-                        copy_rows_where(&mut rate.u, &rhs_n.u, elements, |k| time[k] == t);
-                        copy_rows_where(&mut rate.v, &rhs_n.v, elements, |k| time[k] == t);
-                        fresh.clear();
-                        fresh.extend(list.iter().filter(|&&k| time[k as usize] != t));
-                        if !fresh.is_empty() {
-                            let on = StageElements {
-                                elements: blocks_of(ne, fresh),
-                                ..on
-                            };
-                            physics.stage_momentum_rhs_into(input_values, on, rate);
-                        }
-                    } else {
-                        physics.stage_momentum_rhs_into(input_values, on, rate);
-                    }
+                    model.stage_momentum(work, read, on, (s == 0).then_some(t))
                 });
                 // Velocity tendencies → inventory tendencies, then the
                 // advection's
-                let convert = profiling::start();
-                to_inventory(
-                    &mut rate.u,
-                    &input.eta.data,
-                    sigma.d_sigma(),
-                    bathymetry,
-                    elements,
-                );
-                to_inventory(
-                    &mut rate.v,
-                    &input.eta.data,
-                    sigma.d_sigma(),
-                    bathymetry,
-                    elements,
-                );
-                profiling::stop("3d: rhs conversions", convert);
-                profiling::scope("3d: transport rhs", || {
-                    physics.transport_rhs_into(input_values, on, barotropic_flux, rate)
-                });
-                let tail = profiling::start();
-                set_column_sums(sigma, &mut rate.u, rate_hu, elements);
-                set_column_sums(sigma, &mut rate.v, rate_hv, elements);
-                copy_rows(&mut rate.eta.data, &rate_eta.data, elements);
-                copy_rows(&mut rate.ubar.data, &rate_ubar.data, elements);
-                copy_rows(&mut rate.vbar.data, &rate_vbar.data, elements);
-                profiling::stop("3d: rhs tail", tail);
+                let rhs = StageRhs {
+                    input,
+                    values: read,
+                    on,
+                    dt,
+                    euler_dt,
+                };
+                model.stage_transport(state, work, rhs);
                 profiling::scope("3d: rk combination", || {
-                    combine_stage(out, state, input, rate, elements, plan)
+                    model.combine_stage(state, work, input, out, elements, plan)
                 });
                 // The implicit part of the vertical advection, on the
                 // stage's inventories and thicknesses
                 profiling::scope("3d: implicit vertical advection", || {
-                    physics.implicit_vertical_advection(out, elements, &implicit_dt[s])
+                    model.implicit_advection(work, out, elements, &implicit_dt[s])
                 });
-                if read == write {
-                    stage_values(out, &mut values[write], None, elements, end);
-                } else {
-                    let (from, to) = read_write(values, read, write);
-                    stage_values(out, to, Some(from), elements, end);
-                }
+                model.stage_values(work, out, (read, write), elements, end);
                 if end && !one_level {
-                    accumulate_stage(acc, out, elements, plan);
+                    model.accumulate_stage(work, out, elements, plan);
                 }
             }
             MultiratePass::Finish { elements: list, .. } => {
                 let elements = blocks_of(ne, list);
                 // At one level the last stage is the step's result
-                let result = if one_level {
-                    &inventories[last_inventories]
-                } else {
-                    &*acc
-                };
-                copy_stage_rows(state, result, elements);
+                model.finish_substep(state, work, one_level.then_some(last_inventories), elements);
                 finished += 1;
                 // A substep ending within the step ends as the step does:
                 // its values (the last stage's where there is no water),
@@ -2572,64 +2595,862 @@ impl ModeSplitIntegrator {
                 // mean back to ū, limited; the next substep's start
                 if finished < substeps {
                     let t_end = t + finished as f64 * dt / substeps as f64;
-                    let (from, to) = read_write(values, last_values, start_slot);
-                    let convert = profiling::start();
-                    values_of(state, to, Some(from), elements);
-                    let StageValues { values, stash } = to;
-                    profiling::stop("3d: hook conversions", convert);
-                    physics.end_density(values, elements);
+                    model.substep_values(state, work, (last_values, start_slot), elements);
                     let levels = stepper.levels();
                     for level in 0..=stepper.finest_level() {
-                        fresh.clear();
-                        fresh.extend(
+                        group.clear();
+                        group.extend(
                             list.iter()
                                 .filter(|&&k| levels[k as usize] as usize == level),
                         );
-                        if fresh.is_empty() {
+                        if group.is_empty() {
                             continue;
                         }
                         let dt_l = dt / (1u64 << level) as f64;
                         profiling::scope("split: vertical implicit", || {
-                            let group = blocks_of(ne, fresh);
-                            physics.vertical_implicit(values, group, t_end - dt_l, dt_l, drag)
+                            let columns = Columns::Values(start_slot);
+                            let on = blocks_of(ne, group);
+                            model.vertical_terms(columns, state, work, on, t_end - dt_l, dt_l, drag)
                         });
                     }
-                    reset_depth_means(sigma, values, elements);
-                    physics.post_stage(values, elements);
-                    let convert = profiling::start();
-                    let Solution3D {
-                        eta,
-                        u,
-                        v,
-                        temp,
-                        salt,
-                        tke,
-                        gls,
-                        ..
-                    } = &mut *state;
-                    let fields = [u, v, temp, salt, tke, gls]
-                        .into_iter()
-                        .zip(inventory_fields(values));
-                    for (field, (q, c)) in fields.enumerate() {
-                        if !q.is_empty() {
-                            let (cells, merged) = (cells_of(field), merged_of(field));
-                            inventory_of(q, c, &eta.data, cells, bathymetry, merged, elements);
-                        }
-                    }
-                    stash.forget(elements);
-                    physics.mask_stage(values, elements, stash);
-                    profiling::stop("3d: hook conversions", convert);
+                    model.restart_substep(state, work, start_slot, elements);
                 }
             }
         });
         stepper.count_step(dt);
         profiling::stop("split: 3D stages", stage_time);
+        // The last stage's values unmasked, their density the state's; the
+        // filtered barotropic state; the inventories back to velocities
+        // and concentrations with the new H_z
+        model.end_step(state, work, last_values);
+
+        // 4. The implicit vertical terms change the depth mean through the
+        // surface and bottom stresses, which G has already given to the
+        // barotropic mode: reset it to ū.
+        profiling::scope("split: vertical implicit", || {
+            if stepper.finest_level() == 0 {
+                let all = Blocks::All(ne);
+                return model.vertical_terms(Columns::State, state, work, all, t, dt, drag);
+            }
+            // Each element over its last substep
+            let levels = stepper.levels();
+            for level in 0..=stepper.finest_level() {
+                group.clear();
+                group.extend((0..ne as u32).filter(|&k| levels[k as usize] as usize == level));
+                if !group.is_empty() {
+                    let dt_l = dt / (1u64 << level) as f64;
+                    let on = blocks_of(ne, group);
+                    model.vertical_terms(
+                        Columns::State,
+                        state,
+                        work,
+                        on,
+                        t + dt - dt_l,
+                        dt_l,
+                        drag,
+                    );
+                }
+            }
+        });
+        model.restore_depth_means(state, work);
+    }
+}
+
+/// What the CPU's conversions between a step's values and inventories read:
+/// the σ-thicknesses of each field's cells, the bed, the step's merged
+/// cells.
+struct Conversions<'a> {
+    /// Of the layers and of the w-cells
+    cells: [&'a [f64]; 2],
+    bathymetry: &'a Bathymetry2D,
+    geom: &'a GeometricFactors2D,
+    merged: &'a MergedCells,
+}
+
+impl<'a> Conversions<'a> {
+    fn of<P: ModeSplitPhysics>(physics: &'a P, buffers: &'a Buffers) -> Self {
+        Self {
+            cells: [physics.sigma().d_sigma(), &buffers.d_sigma_w],
+            bathymetry: physics.bathymetry(),
+            geom: physics.barotropic().geometry(),
+            merged: &buffers.merged,
+        }
+    }
+
+    /// The σ-thicknesses of the cells of inventory field `field`.
+    fn cells_of(&self, field: usize) -> &'a [f64] {
+        self.cells[usize::from(field >= N_LAYER_FIELDS)]
+    }
+
+    /// The tracers and the turbulence of a group of cells are one cell's;
+    /// the momentum is each node's own (a thin column's is the depth
+    /// mean's).
+    fn merged_of(&self, field: usize) -> Option<&'a MergedCells> {
+        (field >= N_MOMENTUM_FIELDS).then_some(self.merged)
+    }
+
+    /// Inventories of `s` → velocities and concentrations in `out`'s
+    /// inventory fields (which hold the last values, kept where there is no
+    /// water), on `elements`.
+    fn to_values(&self, s: &Solution3D, out: &mut Solution3D, elements: Blocks, end: bool) {
+        let eta = &s.eta.data;
+        let fields = inventory_fields(s)
+            .into_iter()
+            .zip(inventory_fields_mut(out));
+        for (field, (q, out)) in fields.enumerate() {
+            if !q.is_empty() {
+                let (cells, merged) = (self.cells_of(field), self.merged_of(field));
+                from_inventory(
+                    q,
+                    eta,
+                    cells,
+                    self.bathymetry,
+                    self.geom,
+                    merged,
+                    out,
+                    elements,
+                    end,
+                );
+            }
+        }
+    }
+
+    /// Every inventory field of `s` to inventories under its `η`, on
+    /// `elements`.
+    fn to_inventories(&self, s: &mut Solution3D, elements: Blocks) {
+        let Solution3D {
+            eta,
+            u,
+            v,
+            temp,
+            salt,
+            tke,
+            gls,
+            ..
+        } = s;
+        for (field, q) in [u, v, temp, salt, tke, gls].into_iter().enumerate() {
+            if !q.is_empty() {
+                to_inventory(
+                    q,
+                    &eta.data,
+                    self.cells_of(field),
+                    self.bathymetry,
+                    elements,
+                );
+            }
+        }
+    }
+
+    /// The values of the inventories `inv` in `out`, unmasked, on
+    /// `elements`. Where there is no water a value is the last one: the RHS
+    /// argument's, unmasked (`from`'s, or `out`'s own in place). `out`'s
+    /// density is left to the caller (`post_stage` and `end_density` both
+    /// set it on all of `elements`).
+    fn values_of(
+        &self,
+        inv: &Solution3D,
+        out: &mut StageValues,
+        from: Option<&StageValues>,
+        elements: Blocks,
+    ) {
+        let StageValues { values, stash } = out;
+        let Some(from) = from else {
+            stash.restore_into(values, elements);
+            copy_barotropic_rows(inv, values, elements);
+            self.to_values(inv, values, elements, false);
+            return;
+        };
+        // Each field in one pass, element by element: the last values
+        // (copied, the masked columns' velocities restored), then the
+        // conversion. `ū` and `v̄` are the inventories' own
+        let (eta, nn) = (&inv.eta.data, inv.n_nodes);
+        let fields = inventory_fields(inv)
+            .into_iter()
+            .zip(inventory_fields(&from.values))
+            .zip(inventory_fields_mut(values));
+        for (field, ((q, last), out)) in fields.enumerate() {
+            if q.is_empty() {
+                continue;
+            }
+            let len = last.len() / inv.n_elements;
+            let last = |k: usize, out_k: &mut [f64]| {
+                out_k.copy_from_slice(&last[k * len..(k + 1) * len]);
+                from.stash.restore_velocity(field, k, nn, out_k);
+            };
+            let (cells, merged) = (self.cells_of(field), self.merged_of(field));
+            from_inventory_after(
+                q,
+                eta,
+                cells,
+                self.bathymetry,
+                self.geom,
+                merged,
+                out,
+                elements,
+                false,
+                last,
+            );
+        }
+        copy_barotropic_rows(inv, values, elements);
+    }
+
+    /// A stage's values from its inventories `inv` (the combination's,
+    /// after the implicit vertical advection) and its RHS argument's values
+    /// `from`, then limited (`post_stage`; only the density at the step's
+    /// end, `end_density`, which the caller post-processes), their tracers
+    /// back into `inv`, and masked for the next RHS.
+    fn stage_values<P: ModeSplitPhysics>(
+        &self,
+        physics: &P,
+        inv: &mut Solution3D,
+        out: &mut StageValues,
+        from: Option<&StageValues>,
+        elements: Blocks,
+        end: bool,
+    ) {
+        let convert = profiling::start();
+        self.values_of(inv, out, from, elements);
+        let StageValues { values, stash } = out;
+        profiling::stop("3d: hook conversions", convert);
+        if end {
+            profiling::scope("3d: density", || physics.end_density(values, elements));
+        } else {
+            profiling::scope("3d: post_stage", || physics.post_stage(values, elements));
+        }
+        let convert = profiling::start();
+        // (not a flushed element's, whose values are not its inventory's)
+        for (q, c) in [(&mut inv.temp, &values.temp), (&mut inv.salt, &values.salt)] {
+            let cells = self.cells[0];
+            let merged = Some(self.merged);
+            inventory_of(
+                q,
+                c,
+                &inv.eta.data,
+                cells,
+                self.bathymetry,
+                merged,
+                elements,
+            );
+        }
+        // Where a node has (almost) no water its value is the last one:
+        // its inventory is that value's, as for T and S, so that it wets
+        // from it
+        let Solution3D {
+            eta,
+            u,
+            v,
+            tke,
+            gls,
+            ..
+        } = &mut *inv;
+        for (field, q, c) in [
+            (0, u, &values.u),
+            (1, v, &values.v),
+            (4, tke, &values.tke),
+            (5, gls, &values.gls),
+        ] {
+            if !q.is_empty() {
+                let (cells, merged) = (self.cells_of(field), self.merged_of(field));
+                dry_inventories(q, c, &eta.data, cells, self.bathymetry, merged, elements);
+            }
+        }
+        stash.forget(elements);
+        physics.mask_stage(values, elements, stash);
+        profiling::stop("3d: hook conversions", convert);
+    }
+}
+
+/// The CPU's step: every [`ModeSplitPhysics`] on [`CpuWork`], each section
+/// as the module docs describe it.
+impl<P: ModeSplitPhysics> SplitModel for P {
+    type State = Solution3D;
+    type Work = CpuWork;
+
+    fn n_elements(&self) -> usize {
+        self.barotropic().mesh().n_elements
+    }
+
+    fn new_work(&self, state: &Solution3D) -> CpuWork {
+        let n_rivers = self.rivers().map_or(0, RiverSources::len);
+        CpuWork {
+            buffers: Buffers::new(state, self.barotropic().operators(), n_rivers),
+            stages: None,
+            local: None,
+            fresh: Vec::new(),
+        }
+    }
+
+    fn start_turbulence(&self, state: &mut Solution3D) {
+        if let Some([k0, psi0]) = self.initial_turbulence() {
+            let n_w = state.n_elements * state.n_nodes * (state.n_levels + 1);
+            if state.tke.len() != n_w {
+                state.tke = vec![k0; n_w];
+                state.gls = vec![psi0; n_w];
+            }
+        }
+    }
+
+    fn drag_rates(&self, state: &Solution3D, t: f64, work: &mut CpuWork) -> DragKinds {
+        let b = &mut work.buffers;
+        let bottom = self.bottom_drag_into(state, t, &mut b.drag_rate);
+        let n_layer_values = state.u.len();
+        if b.layer_drag_rate.len() != n_layer_values {
+            b.layer_drag_rate.resize(n_layer_values, 0.0);
+        }
+        let layers = self.layer_drag_into(state, t, &mut b.layer_drag_rate);
+        if layers {
+            b.column_drag_rate.resize(state.eta.data.len(), 0.0);
+            column_drag_rates(
+                self.sigma().d_sigma(),
+                &b.layer_drag_rate,
+                &mut b.column_drag_rate,
+            );
+        }
+        DragKinds { bottom, layers }
+    }
+
+    fn slow_forcing(&self, state: &Solution3D, t: f64, work: &mut CpuWork) {
+        let Buffers { rhs_n, history, .. } = &mut work.buffers;
+        history.rotate_right(1);
+        profiling::scope("3d: momentum rhs", || {
+            self.momentum_rhs_into(state, t, rhs_n)
+        });
+        profiling::scope("split: G", || {
+            self.slow_forcing_into(state, rhs_n, t, &mut history[0])
+        });
+    }
+
+    fn average_slow_forcing(&self, work: &mut CpuWork, weights: &[f64]) {
+        let Buffers {
+            forcing, history, ..
+        } = &mut work.buffers;
+        forcing.fill(0.0);
+        for (g, &w) in history.iter().zip(weights) {
+            forcing.axpy(w, g);
+        }
+    }
+
+    fn to_transport(&self, state: &Solution3D, work: &mut CpuWork) {
+        to_transport(state, self.bathymetry(), &mut work.buffers.q);
+    }
+
+    fn assign_pass_levels(
+        &self,
+        work: &mut CpuWork,
+        levels: usize,
+        scheme: SspScheme,
+        cfl: f64,
+        dt_cap: f64,
+    ) -> Option<f64> {
+        let barotropic = self.barotropic();
+        let local = barotropic
+            .local_time_stepping()
+            .filter(|local| local.is_element_local())?;
+        let n_rivers = self.rivers().map_or(0, RiverSources::len);
+        let CpuWork {
+            buffers,
+            local: pass,
+            ..
+        } = work;
+        let q = &buffers.q;
+        if pass
+            .as_ref()
+            .is_none_or(|pass| pass.max_levels != levels || pass.scheme != scheme)
+        {
+            *pass = Some(LocalPass::new(levels, scheme, q, n_rivers));
+        }
+        let pass = pass.as_mut().expect("the pass was just set");
+        Some(pass.assign_levels(local, barotropic.mesh(), q, cfl, dt_cap))
+    }
+
+    fn pass_step(&self, work: &CpuWork, cfl: f64, scheme: SspScheme) -> f64 {
+        self.barotropic()
+            .compute_dt_ssp(&work.buffers.q, cfl, Some(scheme))
+    }
+
+    fn barotropic_pass(&self, work: &mut CpuWork, pass: SplitPass<'_>) {
+        let barotropic = self.barotropic();
+        let rivers = self.rivers();
+        let CpuWork { buffers, local, .. } = work;
+        let Buffers {
+            q,
+            work: pass_work,
+            q_avg,
+            forcing,
+            transport,
+            drag_rate,
+            column_drag_rate,
+            ..
+        } = buffers;
+        assert_eq!(
+            transport.discharge.len(),
+            rivers.map_or(0, RiverSources::len),
+            "the number of rivers changed between steps"
+        );
+        let drag = PassDrag {
+            bottom: pass.drag.bottom.then_some(&drag_rate[..]),
+            column: pass.drag.layers.then_some(&column_drag_rate[..]),
+        };
+        let inputs = PassInputs {
+            filter: pass.filter,
+            scheme: pass.scheme,
+            t: pass.t,
+            dt_bt: pass.dt_bt,
+            forcing,
+            drag,
+            rivers,
+        };
+        if pass.local {
+            let local = local
+                .as_mut()
+                .expect("the pass's levels are assigned (assign_pass_levels)");
+            barotropic_pass_local(barotropic, inputs, local, q, q_avg, transport);
+        } else {
+            barotropic_pass(barotropic, inputs, pass_work, q, q_avg, transport);
+        }
+        // The early weights are negative: restore positivity of the average
+        barotropic.post_process(q_avg);
+    }
+
+    fn after_pass(&self, state: &Solution3D, dt: f64, work: &mut CpuWork) {
+        let (barotropic, bathymetry) = (self.barotropic(), self.bathymetry());
+        let Buffers {
+            q_avg,
+            rate_eta,
+            rate_ubar,
+            rate_vbar,
+            rate_hu,
+            rate_hv,
+            transport,
+            transport_divergence,
+            column_source,
+            pooled,
+            d_sigma_w,
+            ..
+        } = &mut work.buffers;
+        // Constant barotropic rates over the step
+        barotropic_rates(
+            state,
+            bathymetry,
+            q_avg,
+            dt,
+            [rate_eta, rate_ubar, rate_vbar, rate_hu, rate_hv],
+        );
+        let river_inflow = self.rivers().map(|rivers| RiverInflow {
+            rivers,
+            discharge: &transport.discharge,
+        });
+        // Elements where the pass broke the nodal identity ∂η/∂t = −∇·DU_avg2
+        // (WetDry subcells, positivity limiter): their nodal residual is
+        // water moved between their nodes
+        transport.divergence_into(
+            barotropic.operators(),
+            barotropic.geometry(),
+            barotropic.metric_form(),
+            transport_divergence,
+        );
+        pooled_elements(
+            &state.eta.data,
+            bathymetry,
+            rate_eta,
+            transport_divergence,
+            transport,
+            river_inflow,
+            dt,
+            column_source,
+            pooled,
+        );
+        w_cell_thicknesses(self.sigma().d_sigma(), d_sigma_w);
+    }
+
+    fn merge_cells(&self, state: &mut Solution3D, dt: f64, euler_dt: &[f64], work: &mut CpuWork) {
+        let barotropic = self.barotropic();
+        let (bathymetry, geom) = (self.bathymetry(), barotropic.geometry());
+        let Buffers {
+            merged,
+            rate_eta,
+            transport,
+            column_source,
+            d_sigma_w,
+            ..
+        } = &mut work.buffers;
+        merged.find(&StepWater {
+            mesh: barotropic.mesh(),
+            ops: barotropic.operators(),
+            geom,
+            bathymetry,
+            eta: &state.eta.data,
+            eta_rate: &rate_eta.data,
+            dt,
+            euler_dt,
+            face: &transport.face,
+            subcell: &transport.subcell,
+            source: column_source,
+            thin_depth: self.min_column_depth(),
+        });
+        if merged.elements().is_empty() {
+            return;
+        }
+        let cells = [self.sigma().d_sigma(), &d_sigma_w[..]];
+        let Solution3D {
+            eta,
+            temp,
+            salt,
+            tke,
+            gls,
+            ..
+        } = &mut *state;
+        let fields = [temp, salt, tke, gls].into_iter().enumerate();
+        for (slot, field) in fields.filter(|(_, field)| !field.is_empty()) {
+            let cells = cells[usize::from(N_MOMENTUM_FIELDS + slot >= N_LAYER_FIELDS)];
+            merged.start(field, cells, &eta.data, bathymetry, geom);
+        }
+        // Their density, which the stages read
+        self.end_density(state, blocks_of(state.n_elements, merged.elements()));
+    }
+
+    fn start_stages(
+        &self,
+        state: &mut Solution3D,
+        work: &mut CpuWork,
+        slots: StageSlots,
+        start: usize,
+    ) {
+        let CpuWork {
+            buffers, stages, ..
+        } = work;
+        if stages.as_ref().is_none_or(|stages| stages.slots != slots) {
+            *stages = Some(StageBuffers::new(state, slots));
+        }
+        let stages = stages_of(stages);
+        stages.fit(state);
+        let conversions = Conversions::of(self, buffers);
+        let all = Blocks::All(state.n_elements);
+        // The values the substeps' first RHS reads: the step's start, masked
+        // (`ModeSplitPhysics::mask_stage`)
+        {
+            let StageValues { values, stash } = &mut stages.values[start];
+            copy_barotropic_rows(state, values, all);
+            for (to, from) in inventory_fields_mut(values)
+                .into_iter()
+                .zip(inventory_fields(state))
+            {
+                copy_field(to, from);
+            }
+            copy_field(&mut values.rho, &state.rho);
+            stash.forget(all);
+            self.mask_stage(values, all, stash);
+        }
+        conversions.to_inventories(state, all);
+        // What a flushed element's nodes show to the first stage: what
+        // passes through it
+        let merged = conversions.merged;
+        if !merged.elements().is_empty() {
+            let StageValues { values, .. } = &mut stages.values[start];
+            let fields = inventory_fields(state)
+                .into_iter()
+                .zip(inventory_fields_mut(values))
+                .enumerate()
+                .skip(N_MOMENTUM_FIELDS);
+            for (field, (q, out)) in fields {
+                if !q.is_empty() {
+                    let (cells, eta) = (conversions.cells_of(field), &state.eta.data);
+                    let (bathymetry, geom) = (conversions.bathymetry, conversions.geom);
+                    merged.pass_through(q, eta, cells, bathymetry, geom, out, all, false);
+                }
+            }
+        }
+    }
+
+    fn stage_momentum(
+        &self,
+        work: &mut CpuWork,
+        values: usize,
+        on: StageElements<'_>,
+        reuse_at: Option<f64>,
+    ) {
+        let CpuWork {
+            buffers,
+            stages,
+            fresh,
+            ..
+        } = work;
+        let StageBuffers {
+            values: all_values,
+            rate,
+            ..
+        } = stages_of(stages);
+        let input = &all_values[values].values;
+        let Some(t) = reuse_at else {
+            return self.stage_momentum_rhs_into(input, on, rate);
+        };
+        let (elements, time) = (on.elements, on.time);
+        let rhs_n = &buffers.rhs_n;
+        copy_rows_where(&mut rate.u, &rhs_n.u, elements, |k| time.at(k) == t);
+        copy_rows_where(&mut rate.v, &rhs_n.v, elements, |k| time.at(k) == t);
+        fresh.clear();
+        fresh.extend(
+            elements
+                .iter()
+                .filter(|&k| time.at(k) != t)
+                .map(|k| k as u32),
+        );
+        if !fresh.is_empty() {
+            let on = StageElements {
+                elements: blocks_of(elements.n(), fresh),
+                ..on
+            };
+            self.stage_momentum_rhs_into(input, on, rate);
+        }
+    }
+
+    fn stage_transport(&self, state: &Solution3D, work: &mut CpuWork, rhs: StageRhs<'_>) {
+        let (sigma, bathymetry) = (self.sigma(), self.bathymetry());
+        let CpuWork {
+            buffers, stages, ..
+        } = work;
+        let StageBuffers {
+            inventories,
+            values,
+            rate,
+            ..
+        } = stages_of(stages);
+        let input = match rhs.input {
+            None => state,
+            Some(slot) => &inventories[slot],
+        };
+        let elements = rhs.on.elements;
+        let convert = profiling::start();
+        to_inventory(
+            &mut rate.u,
+            &input.eta.data,
+            sigma.d_sigma(),
+            bathymetry,
+            elements,
+        );
+        to_inventory(
+            &mut rate.v,
+            &input.eta.data,
+            sigma.d_sigma(),
+            bathymetry,
+            elements,
+        );
+        profiling::stop("3d: rhs conversions", convert);
+        let Buffers {
+            transport,
+            rate_eta,
+            rate_ubar,
+            rate_vbar,
+            rate_hu,
+            rate_hv,
+            pooled,
+            ..
+        } = &*buffers;
+        let flux = BarotropicFlux {
+            dt: rhs.dt,
+            euler_dt: rhs.euler_dt,
+            hu: &transport.hu.data,
+            hv: &transport.hv.data,
+            face: &transport.face,
+            subcell: &transport.subcell,
+            eta_rate: &rate_eta.data,
+            rivers: self.rivers().map(|rivers| RiverInflow {
+                rivers,
+                discharge: &transport.discharge,
+            }),
+            pooled,
+        };
+        let input_values = &values[rhs.values].values;
+        profiling::scope("3d: transport rhs", || {
+            self.transport_rhs_into(input_values, rhs.on, flux, rate)
+        });
+        let tail = profiling::start();
+        set_column_sums(sigma, &mut rate.u, rate_hu, elements);
+        set_column_sums(sigma, &mut rate.v, rate_hv, elements);
+        copy_rows(&mut rate.eta.data, &rate_eta.data, elements);
+        copy_rows(&mut rate.ubar.data, &rate_ubar.data, elements);
+        copy_rows(&mut rate.vbar.data, &rate_vbar.data, elements);
+        profiling::stop("3d: rhs tail", tail);
+    }
+
+    fn combine_stage(
+        &self,
+        state: &Solution3D,
+        work: &mut CpuWork,
+        input: Option<usize>,
+        out: usize,
+        elements: Blocks<'_>,
+        plan: &StagePlan<'_>,
+    ) {
+        let StageBuffers {
+            inventories, rate, ..
+        } = work.stages_mut();
+        match input {
+            None => combine_stage(&mut inventories[out], state, state, rate, elements, plan),
+            Some(input) => {
+                let (input, out) = read_write(inventories, input, out);
+                combine_stage(out, state, input, rate, elements, plan);
+            }
+        }
+    }
+
+    fn implicit_advection(&self, work: &mut CpuWork, out: usize, elements: Blocks<'_>, dt: &[f64]) {
+        let stage = &mut work.stages_mut().inventories[out];
+        self.implicit_vertical_advection(stage, elements, dt);
+    }
+
+    fn stage_values(
+        &self,
+        work: &mut CpuWork,
+        inventories: usize,
+        (read, write): (usize, usize),
+        elements: Blocks<'_>,
+        end: bool,
+    ) {
+        let CpuWork {
+            buffers, stages, ..
+        } = work;
+        let conversions = Conversions::of(self, buffers);
+        let StageBuffers {
+            inventories: all,
+            values,
+            ..
+        } = stages_of(stages);
+        let inv = &mut all[inventories];
+        if read == write {
+            conversions.stage_values(self, inv, &mut values[write], None, elements, end);
+        } else {
+            let (from, to) = read_write(values, read, write);
+            conversions.stage_values(self, inv, to, Some(from), elements, end);
+        }
+    }
+
+    fn accumulate_stage(
+        &self,
+        work: &mut CpuWork,
+        last: usize,
+        elements: Blocks<'_>,
+        plan: &StagePlan<'_>,
+    ) {
+        let StageBuffers {
+            inventories, acc, ..
+        } = work.stages_mut();
+        accumulate_stage(acc, &inventories[last], elements, plan);
+    }
+
+    fn finish_substep(
+        &self,
+        state: &mut Solution3D,
+        work: &mut CpuWork,
+        result: Option<usize>,
+        elements: Blocks<'_>,
+    ) {
+        let StageBuffers {
+            inventories, acc, ..
+        } = work.stages_mut();
+        let result = match result {
+            Some(slot) => &inventories[slot],
+            None => &*acc,
+        };
+        copy_stage_rows(state, result, elements);
+    }
+
+    fn substep_values(
+        &self,
+        state: &Solution3D,
+        work: &mut CpuWork,
+        (last, start): (usize, usize),
+        elements: Blocks<'_>,
+    ) {
+        let CpuWork {
+            buffers, stages, ..
+        } = work;
+        let conversions = Conversions::of(self, buffers);
+        let (from, to) = read_write(&mut stages_of(stages).values, last, start);
+        let convert = profiling::start();
+        conversions.values_of(state, to, Some(from), elements);
+        profiling::stop("3d: hook conversions", convert);
+        self.end_density(&mut to.values, elements);
+    }
+
+    fn vertical_terms(
+        &self,
+        columns: Columns,
+        state: &mut Solution3D,
+        work: &mut CpuWork,
+        elements: Blocks<'_>,
+        t: f64,
+        dt: f64,
+        drag: DragKinds,
+    ) {
+        let CpuWork {
+            buffers, stages, ..
+        } = work;
+        let drag = StepDrag {
+            bottom: drag.bottom.then_some(&buffers.drag_rate[..]),
+            layers: drag.layers.then_some(&buffers.layer_drag_rate[..]),
+        };
+        match columns {
+            Columns::State => self.vertical_implicit(state, elements, t, dt, drag),
+            Columns::Values(slot) => {
+                let values = &mut stages_of(stages).values[slot].values;
+                self.vertical_implicit(values, elements, t, dt, drag);
+            }
+        }
+    }
+
+    fn restart_substep(
+        &self,
+        state: &mut Solution3D,
+        work: &mut CpuWork,
+        start: usize,
+        elements: Blocks<'_>,
+    ) {
+        let CpuWork {
+            buffers, stages, ..
+        } = work;
+        let conversions = Conversions::of(self, buffers);
+        let StageValues { values, stash } = &mut stages_of(stages).values[start];
+        reset_depth_means(self.sigma(), values, elements);
+        self.post_stage(values, elements);
+        let convert = profiling::start();
+        let Solution3D {
+            eta,
+            u,
+            v,
+            temp,
+            salt,
+            tke,
+            gls,
+            ..
+        } = &mut *state;
+        let fields = [u, v, temp, salt, tke, gls]
+            .into_iter()
+            .zip(inventory_fields(values));
+        for (field, (q, c)) in fields.enumerate() {
+            if !q.is_empty() {
+                let (cells, merged) = (conversions.cells_of(field), conversions.merged_of(field));
+                let bathymetry = conversions.bathymetry;
+                inventory_of(q, c, &eta.data, cells, bathymetry, merged, elements);
+            }
+        }
+        stash.forget(elements);
+        self.mask_stage(values, elements, stash);
+        profiling::stop("3d: hook conversions", convert);
+    }
+
+    fn end_step(&self, state: &mut Solution3D, work: &mut CpuWork, last: usize) {
+        let CpuWork {
+            buffers, stages, ..
+        } = work;
+        let conversions = Conversions::of(self, buffers);
+        let all = Blocks::All(state.n_elements);
         // The last stage's values unmasked (the final conversion keeps them
         // where there is no water), and their density the state's
         let StageValues {
             values: concentrations,
             stash,
-        } = &mut values[last_values];
+        } = &mut stages_of(stages).values[last];
         stash.restore_into(concentrations, all);
         stash.forget(all);
         std::mem::swap(&mut state.rho, &mut concentrations.rho);
@@ -2638,8 +3459,9 @@ impl ModeSplitIntegrator {
         // state only up to round-off, which can leave a dry node a hair below
         // its bed (η < B) and the next pass with a negative depth. Take it
         // exactly: for h̄ ≥ 0, (h̄ + B) − B ≥ 0 in floating point.
+        let q_avg = &buffers.q_avg;
         for k in 0..state.n_elements {
-            let bed = bathymetry.element(ElementIndex::new(k));
+            let bed = self.bathymetry().element(ElementIndex::new(k));
             for (i, &b) in bed.iter().enumerate() {
                 let idx = k * state.n_nodes + i;
                 let (eta, ubar, vbar) = filtered_barotropic_state(q_avg, idx, b);
@@ -2651,7 +3473,7 @@ impl ModeSplitIntegrator {
         // Inventories back to velocities and concentrations, with the new H_z
         // (the last values where there is no water are the last stage's)
         profiling::scope("split: final conversion", || {
-            to_values(state, concentrations, all, true);
+            conversions.to_values(state, concentrations, all, true);
             for (x, y) in inventory_fields_mut(state)
                 .into_iter()
                 .zip(inventory_fields_mut(concentrations))
@@ -2659,26 +3481,11 @@ impl ModeSplitIntegrator {
                 std::mem::swap(x, y);
             }
         });
+    }
 
-        // 4. The implicit vertical terms change the depth mean through the
-        // surface and bottom stresses, which G has already given to the
-        // barotropic mode: reset it to ū.
-        profiling::scope("split: vertical implicit", || {
-            if stepper.finest_level() == 0 {
-                return physics.vertical_implicit(state, all, t, dt, drag);
-            }
-            // Each element over its last substep
-            let levels = stepper.levels();
-            for level in 0..=stepper.finest_level() {
-                fresh.clear();
-                fresh.extend((0..ne as u32).filter(|&k| levels[k as usize] as usize == level));
-                if !fresh.is_empty() {
-                    let dt_l = dt / (1u64 << level) as f64;
-                    let group = blocks_of(ne, fresh);
-                    physics.vertical_implicit(state, group, t + dt - dt_l, dt_l, drag);
-                }
-            }
-        });
+    fn restore_depth_means(&self, state: &mut Solution3D, work: &mut CpuWork) {
+        let sigma = self.sigma();
+        let Buffers { mean_u, mean_v, .. } = &mut work.buffers;
         depth_average(sigma, &state.u, mean_u);
         depth_average(sigma, &state.v, mean_v);
         shift_columns(&mut state.u, state.n_levels, mean_u, &state.ubar);
@@ -3563,7 +4370,7 @@ fn shift_columns(field: &mut [f64], n_levels: usize, from: &DGSolution2D, to: &D
     );
 }
 
-impl IntegratorInfo for ModeSplitIntegrator {
+impl<W: Send + Sync> IntegratorInfo for ModeSplitIntegrator<W> {
     fn name(&self) -> &'static str {
         match self.baroclinic_scheme {
             SspScheme::Rk3 => "mode-split-filtered-ssprk3",
