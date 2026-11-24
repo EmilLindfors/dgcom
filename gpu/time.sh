@@ -179,7 +179,9 @@ say ""
 
 # 2b. The 3D stages' transport, momentum terms and hooks (Phase 4), with FMA:
 # per element and level at 96,000 P2 elements × 20 levels.
-parts="transport3d momentum3d stage3d limiter3d vertical3d implicit3d forcing3d pass3d"
+parts="transport3d momentum3d stage3d limiter3d vertical3d implicit3d forcing3d pass3d step3d"
+# The whole 3D step at Chiloé's size (≈ 13 GB on the device)
+export DGCOM_STEP3D_ELEMENTS="${DGCOM_STEP3D_ELEMENTS:-96000}"
 for part in $parts; do
     run_logged "time_$part" "$exe" "$part"
 done

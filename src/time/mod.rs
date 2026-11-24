@@ -33,7 +33,7 @@ pub use mode_split::{
     SplitWork, StageElements, StageRhs, StageSlots, StageStash, StageTime, StepDrag,
     barotropic_node_rates, barotropic_pass, barotropic_pass_local, barotropic_rates,
     barotropic_stages, column_drag_rates, filtered_state, pooled_element, pooled_elements,
-    step_average_weights, to_transport,
+    shu_osher, step_average_weights, to_transport,
 };
 pub use multirate::{
     ElementStage, LocalTimeStepping, Multirate, MultiratePass, MultirateSSPRK3, MultirateSSPRK43,
