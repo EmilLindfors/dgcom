@@ -90,8 +90,8 @@ pub use coverage::{BoundaryCoverage, CoverageError};
 pub use harmonic_tide::{HarmonicTide, tidal_ramp};
 pub use multi_bc_2d::MultiBoundaryCondition2D;
 pub use nesting_3d::{
-    ColumnContext3D, Nesting3D, NestingBand3D, NestingColumns, NestingSlots, ParentColumn,
-    ParentColumns3D, ReferenceColumns, Supplied, sample_columns,
+    ColumnContext3D, DeviceParent3D, Nesting3D, NestingBand3D, NestingColumns, NestingSlots,
+    ParentColumn, ParentColumns3D, ReferenceColumns, Supplied, sample_columns,
 };
 pub use ocean_columns::{DeepReference, OceanColumnsOptions, OceanModelColumns};
 pub use ocean_nesting::{

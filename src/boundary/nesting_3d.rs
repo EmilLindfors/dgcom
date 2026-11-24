@@ -102,6 +102,22 @@ pub trait ParentColumns3D: Send + Sync {
     /// parent does not cover the column (the node then keeps its own values:
     /// extrapolation at the boundary, no relaxation).
     fn column(&self, ctx: &ColumnContext3D, sigma: &SigmaGrid, out: ParentColumn<'_>) -> bool;
+
+    /// How a device evaluates the parent (P2.7), if it can; `None` (the
+    /// default) leaves it to the host at every evaluation.
+    fn device_form(&self) -> Option<DeviceParent3D> {
+        None
+    }
+}
+
+/// A parent as a device evaluates it ([`ParentColumns3D::device_form`]): a
+/// closed set, as the 2D forcing's device forms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceParent3D {
+    /// The same columns at every time, free surface and child state,
+    /// covering every node ([`ReferenceColumns`]): evaluated once, they hold
+    /// for the run.
+    Fixed,
 }
 
 /// A fixed reference state as the parent: the columns of a [`Solution3D`]
@@ -150,6 +166,11 @@ impl ParentColumns3D for ReferenceColumns {
         out.temp.copy_from_slice(&self.temp[column.clone()]);
         out.salt.copy_from_slice(&self.salt[column]);
         true
+    }
+
+    /// Fixed: the reference's columns, whatever the time and the child.
+    fn device_form(&self) -> Option<DeviceParent3D> {
+        Some(DeviceParent3D::Fixed)
     }
 }
 
@@ -341,6 +362,11 @@ impl Nesting3D {
     /// Number of nodes on the nested boundary or in its band.
     pub fn n_nodes(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// How a device evaluates the parent ([`ParentColumns3D::device_form`]).
+    pub fn device_form(&self) -> Option<DeviceParent3D> {
+        self.parent.device_form()
     }
 
     /// The band's slots as flat tables: what a device relaxes with, the
@@ -818,5 +844,61 @@ mod tests {
         let (u2, v2) = at(&state, 10.0);
         assert!(u2 == u1 && (v2 - v1 - 0.1).abs() < 1e-15);
         assert_eq!(nesting.n_nodes(), ops.n_face_nodes);
+    }
+
+    /// `ReferenceColumns` is a fixed parent (`DeviceParent3D::Fixed`, which
+    /// a device evaluates once): its columns are the reference's at any
+    /// time, free surface and child state, even in thin columns. A parent
+    /// with no device form has none.
+    #[test]
+    fn reference_columns_are_fixed() {
+        let band = NestingBand3D {
+            width: 1500.0,
+            velocity_timescale: Some(3600.0),
+            tracer_timescale: Some(7200.0),
+            ..NestingBand3D::default()
+        };
+        let (mesh, ops, profile) = setup(band);
+        assert_eq!(profile.device_form(), None);
+        let sigma = SigmaGrid::uniform(4);
+        let bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -20.0);
+        let n = mesh.n_elements * ops.n_nodes * 4;
+        let mut reference = Solution3D::new(mesh.n_elements, ops.n_nodes, 4);
+        reference.u = (0..n).map(|i| 0.01 * i as f64).collect();
+        reference.v = (0..n).map(|i| -0.02 * i as f64).collect();
+        reference.temp = (0..n).map(|i| 8.0 + 1e-3 * i as f64).collect();
+        reference.salt = (0..n).map(|i| 34.0 - 1e-3 * i as f64).collect();
+        let nesting = Nesting3D::new(
+            Arc::new(ReferenceColumns::from_state(&reference)),
+            &mesh,
+            &ops,
+            4,
+            &[BoundaryTag::Open],
+            &band,
+        )
+        .unwrap();
+        assert_eq!(nesting.device_form(), Some(DeviceParent3D::Fixed));
+        let values = |state: &Solution3D, t: f64, thin: f64| {
+            let columns = nesting.columns(
+                state,
+                &bathymetry,
+                &sigma,
+                StageTime::Uniform(t),
+                Blocks::All(state.n_elements),
+                thin,
+            );
+            columns.values().map(<[f64]>::to_vec)
+        };
+        let first = values(&reference, 0.0, 0.0);
+        // Another time, surface and state, and every column thin
+        let mut other = Solution3D::new(mesh.n_elements, ops.n_nodes, 4);
+        other.eta.fill(-19.9);
+        other.temp.fill(20.0);
+        assert_eq!(values(&other, 3600.0, 1.0), first);
+        let slots = nesting.slots().nodes;
+        for (slot, &flat) in slots.iter().enumerate() {
+            let column = flat * 4..(flat + 1) * 4;
+            assert_eq!(first[2][slot * 4..(slot + 1) * 4], reference.temp[column]);
+        }
     }
 }
