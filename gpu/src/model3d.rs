@@ -30,7 +30,8 @@
 //! fresh-water fluxes (over the sea surface gathered from the device, 4.5h),
 //! and a nesting band's columns (`Nesting3D::columns` on the band's nodes,
 //! gathered from the device, its cache the CPU's; a fixed parent's once,
-//! 4.5g). Not yet on the device: the viscosity once per step, the
+//! 4.5g). The viscosity once per step keeps the step start's tendency on
+//! the device and adds it at every stage (4.5j). Not yet on the device: the
 //! conservative momentum form, the constant-depth pressure gradient;
 //! [`Model3D::new`] refuses them by name.
 //!
@@ -275,6 +276,19 @@ pub mod kernels_model {
         unsafe {
             *sst.get_unchecked_mut(col) = temp[top];
             *sss.get_unchecked_mut(col) = salt[top];
+        }
+    }
+
+    /// `out += x`, a thread per value (`update_with`'s `*r += x`).
+    #[kernel]
+    pub fn add_into(n: u32, x: &[f64], mut out: DisjointSlice<f64>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: thread i alone writes value i (i < n).
+        unsafe {
+            *out.get_unchecked_mut(i) += x[i];
         }
     }
 
@@ -643,6 +657,9 @@ pub struct Work3D {
     caged: Option<DeviceBuffer<u32>>,
     /// `R₃D` at the step's start (u, v)
     rhs_n: [DeviceBuffer<f64>; 2],
+    /// With the viscosity once per step, its tendency at the step's start
+    /// (u, v), which every later stage adds
+    kept_viscosity: Option<[DeviceBuffer<f64>; 2]>,
     /// `G` of the last three steps, newest first, and their step average
     history: [DeviceState; 3],
     average: DeviceState,
@@ -765,9 +782,6 @@ where
         physics: &'a Hydrostatic3D<LinearEOS, GlsMixing, BC>,
     ) -> Result<Self, String> {
         let refuse = |what: &str| Err(format!("{what} is not on the device yet"));
-        if physics.viscosity_once_per_step() {
-            return refuse("the viscosity once per step");
-        }
         if physics.momentum_advection_form != MomentumAdvectionForm::Split {
             return refuse("the momentum's conservative advection form");
         }
@@ -969,17 +983,29 @@ where
     }
 }
 
+/// How a momentum RHS takes the shear's viscosity: of its own values, or
+/// with the viscosity once per step (`Hydrostatic3D`'s `momentum_rhs`) the
+/// step start's, kept: computed into the buffers at the step's start
+/// (`R₃D`), added at a later stage.
+enum StepViscosity<'b> {
+    Own,
+    Keep(&'b mut [DeviceBuffer<f64>; 2]),
+    Kept(&'b [DeviceBuffer<f64>; 2]),
+}
+
 /// `Hydrostatic3D::momentum_rhs` of `values` on every element into `rhs_u`,
 /// `rhs_v`: the reference at their levels, the pressure gradient and
-/// Coriolis, the shear's viscosity, the nesting band's relaxation of the
-/// shear, the thin columns' tendencies zero.
+/// Coriolis, the shear's viscosity (`step_viscosity`), the nesting band's
+/// relaxation of the shear, the thin columns' tendencies zero.
 fn momentum(
+    gpu: &Gpu,
     s: &Statics3D,
     baroclinic: &mut Baroclinic3D,
     viscosity: &mut Viscosity3D,
     hooks: &StageHooks3D,
     band: Option<&Band3D>,
     values: &State3D,
+    step_viscosity: StepViscosity<'_>,
     rhs_u: &mut DeviceBuffer<f64>,
     rhs_v: &mut DeviceBuffer<f64>,
 ) {
@@ -993,13 +1019,46 @@ fn momentum(
         rhs_u,
         rhs_v,
     ));
-    cuda(viscosity.apply(s, &values.eta, &values.u, &values.v, rhs_u, rhs_v));
+    match step_viscosity {
+        StepViscosity::Own => {
+            cuda(viscosity.apply(s, &values.eta, &values.u, &values.v, rhs_u, rhs_v))
+        }
+        StepViscosity::Keep(kept) => {
+            // From zero, as the CPU's kept tendency, then added
+            let [ku, kv] = &mut *kept;
+            cuda(ku.zero_async(&gpu.stream).map_err(Into::into));
+            cuda(kv.zero_async(&gpu.stream).map_err(Into::into));
+            cuda(viscosity.apply(s, &values.eta, &values.u, &values.v, ku, kv));
+            add_kept(gpu, kept, rhs_u, rhs_v);
+        }
+        StepViscosity::Kept(kept) => add_kept(gpu, kept, rhs_u, rhs_v),
+    }
     // The nesting band's relaxation of the shear (its columns evaluated
     // for these values: `Nest3D::evaluate`)
     if let Some(band) = band {
         cuda(hooks.relax_shear(s, band, &values.eta, &values.u, &values.v, rhs_u, rhs_v));
     }
     cuda(hooks.zero_thin_momentum(s, &values.eta, rhs_u, rhs_v));
+}
+
+/// `rhs += kept` for u and v (`update_with`).
+fn add_kept(
+    gpu: &Gpu,
+    [ku, kv]: &[DeviceBuffer<f64>; 2],
+    rhs_u: &mut DeviceBuffer<f64>,
+    rhs_v: &mut DeviceBuffer<f64>,
+) {
+    let n = rhs_u.len();
+    for (x, out) in [(ku, rhs_u), (kv, rhs_v)] {
+        // SAFETY: both hold every layer value.
+        unsafe {
+            cuda(
+                gpu.module_model
+                    .add_into(&gpu.stream, launch(n, COLUMN_BLOCK), n as u32, x, out)
+                    .map_err(Into::into),
+            );
+        }
+    }
 }
 
 impl<'a, BC> SplitModel for Model3D<'a, BC>
@@ -1144,6 +1203,8 @@ where
             merged,
             caged,
             rhs_n: [zeros(n), zeros(n)],
+            kept_viscosity: (p.viscosity_once_per_step() && !p.horizontal_viscosity.is_zero())
+                .then(|| [zeros(n), zeros(n)]),
             history,
             average: DeviceState::upload(gpu, &like),
             q: DeviceState::upload(gpu, &like),
@@ -1205,6 +1266,7 @@ where
                 hooks,
                 nest,
                 rhs_n: [rhs_u, rhs_v],
+                kept_viscosity,
                 ..
             } = work;
             // The nesting band's columns of the step's start at `t`
@@ -1212,8 +1274,21 @@ where
                 nest.evaluate(gpu, statics, self.physics, state, t);
             }
             let band = nest.as_ref().map(|nest| &nest.band);
+            let step_viscosity = match kept_viscosity {
+                Some(kept) => StepViscosity::Keep(kept),
+                None => StepViscosity::Own,
+            };
             momentum(
-                statics, baroclinic, viscosity, hooks, band, state, rhs_u, rhs_v,
+                gpu,
+                statics,
+                baroclinic,
+                viscosity,
+                hooks,
+                band,
+                state,
+                step_viscosity,
+                rhs_u,
+                rhs_v,
             );
         }
         self.stress_at(t, work);
@@ -1441,6 +1516,7 @@ where
                     hooks,
                     stages,
                     nest,
+                    kept_viscosity,
                     ..
                 } = work;
                 let Stages3D {
@@ -1455,7 +1531,22 @@ where
                 }
                 let band = nest.as_ref().map(|nest| &nest.band);
                 let (u, v) = (&mut rate.u, &mut rate.v);
-                momentum(statics, baroclinic, viscosity, hooks, band, values, u, v);
+                let step_viscosity = match kept_viscosity {
+                    Some(kept) => StepViscosity::Kept(kept),
+                    None => StepViscosity::Own,
+                };
+                momentum(
+                    gpu,
+                    statics,
+                    baroclinic,
+                    viscosity,
+                    hooks,
+                    band,
+                    values,
+                    step_viscosity,
+                    u,
+                    v,
+                );
             }
         }
     }

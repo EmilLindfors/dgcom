@@ -85,6 +85,7 @@ A cuda-oxide kernel calling `dgcom::flux::wintermeyer_flux_2d` and `entropy_stab
     - **4.5g** A fixed parent of the nesting band (`DeviceParent3D::Fixed`: `ReferenceColumns`, Chiloé's and the channel's) evaluated once (done 2026-11-24, below).
     - **4.5h** The surface heat and fresh-water fluxes: the sea surface gathered from the device, the physics' fluxes on the host, the three fields up (done 2026-11-24, below).
     - **4.5i** The weather's 2D device forms: `GriddedAtmosphere2D`'s air pressure on the depth mean and the open boundaries' `InverseBarometer` (done 2026-11-24, below): a 3D case with weather runs on the device. Next: a parent model's device form (`OceanModelColumns`: the nested cases' band); the time is in the kernels (4.5g: the step is GPU-bound).
+    - **4.5j** The viscosity once per step (`with_viscosity_once_per_step`, a P4.5 candidate): the step start's tendency kept on the device, added at every later stage (done 2026-11-24, below). Left refused: the conservative momentum form and the constant-depth pressure gradient (non-defaults no case sets; new kernels each).
   - Particles (F.2) ride along once velocities live on the device.
 
 ## Phase 0 results (2026-11-15)
@@ -423,6 +424,11 @@ Measured on the RTX 3090 with Nsight Systems' per-launch durations against each 
 
   Every other gate (`all`) still holds.
 - **Time** (FMA, RTX 4060 Laptop, the beach of 96,000 P2 elements × 20 levels jittered by 0.15 on Vstretching 4, the case runner's configuration): the vertical step with its rates 124 ms on the GPU against 174 ms on the laptop's 24 threads (1.4×); 129 against 199 before k-ε's `psi` took `k^1.5` once (the same values, one `pow` less per call). Per kernel (Nsight Systems, before the constant powers): `vertical_columns` 145 ms, `bottom_rates` 0.5, `layer_rates` 0.04. `vertical_columns` keeps a 15 kB stack (its arrays for 64 levels and GLS's work space) in 189 registers; arrays for 32 levels made it 3 % faster, so the cost is its arithmetic (FP64 at 1:64: k-ε's `pow(k, 1.5)` twice per w-point in `psi`, the four tridiagonal solves' divisions).
+
+## Phase 4.5j: the viscosity once per step on the device (2026-11-24)
+
+- **What.** `Hydrostatic3D::with_viscosity_once_per_step` (off by default; P4.5 weighs it) evaluates the shear's horizontal viscosity once a step, at its start, and gives the later stages that tendency (ROMS's once-per-step mixing). `Model3D::new` refused it. On the device (`gpu/src/model3d.rs`): `Work3D::kept_viscosity` (u, v), `momentum`'s `StepViscosity` (`Own`; `Keep`: from zero into the kept buffers at the step's start, `R₃D`, then added; `Kept`: added at a later stage), the kernel `add_into` (`update_with`'s `+=`), as `Hydrostatic3D::momentum_rhs` does.
+- **The gate** (`step3d`): the beach with the case runner's model and `with_viscosity_once_per_step` (Smagorinsky 0.1), four steps: every field **bit for bit** (`--no-fmad`, RTX 4060), on the first run. Mutant caught: the viscosity's own tendency at every stage (2.81 M values). The rest of `step3d` holds (14 mutants, the bound, the blow-up check).
 
 ## Phase 4.5i: the weather's air pressure and inverse barometer on the device (2026-11-24)
 
