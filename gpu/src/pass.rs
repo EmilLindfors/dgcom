@@ -25,8 +25,9 @@
 //!   weighted by the element's stage rate, and either the wet/dry correction
 //!   or the substep's sum (`coarse_step`); the substeps' ends are the 2D
 //!   module's `finish_where`.
-//! - **After it** ([`BarotropicPass3D::finish`]): the 2D module's wet/dry
-//!   correction of the average, the constant rates of `η`, `ū`, `v̄`, `Dū`,
+//! - **After it** ([`BarotropicPass3D::post_process_average`], then
+//!   [`BarotropicPass3D::finish`]): the 2D module's wet/dry correction of
+//!   the average, the constant rates of `η`, `ū`, `v̄`, `Dū`,
 //!   `Dv̄` over the step (`barotropic_node_rates`), the divergence of
 //!   `DU_avg2` (4.0's `layer_divergence` on one level), and the elements the
 //!   pass balanced only as a whole with every column's water that no flux
@@ -1482,19 +1483,17 @@ impl BarotropicPass3D {
         Ok(())
     }
 
-    /// What follows the pass in the step, from the state at the step's
-    /// start `state` and its length `dt`: the 2D module's wet/dry correction
-    /// of [`Self::q_avg`], the constant rates ([`Self::rates`],
-    /// `flux.eta_rate`), the divergence of `DU_avg2`, and
-    /// [`Self::column_source`] with `flux.pooled`.
-    pub fn finish(
-        &mut self,
-        module: &GpuSWE2D,
-        state: &State3D,
-        dt: f64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // The early weights are negative: the average's positivity
+    /// The 2D module's wet/dry correction of [`Self::q_avg`] after the pass
+    /// (the filter's early weights are negative: the average's positivity).
+    pub fn post_process_average(&mut self, module: &GpuSWE2D) {
         module.post_process(&mut self.q_avg);
+    }
+
+    /// What follows the pass and [`Self::post_process_average`] in the
+    /// step, from the state at the step's start `state` and its length `dt`:
+    /// the constant rates ([`Self::rates`], `flux.eta_rate`), the divergence
+    /// of `DU_avg2`, and [`Self::column_source`] with `flux.pooled`.
+    pub fn finish(&mut self, state: &State3D, dt: f64) -> Result<(), Box<dyn std::error::Error>> {
         let gpu = self.gpu.clone();
         let (m, m3, st) = (&gpu.module_pass, &gpu.module3d, &gpu.stream);
         let s = &self.statics;

@@ -2026,18 +2026,17 @@ fn copy_stage_rows(to: &mut Solution3D, from: &Solution3D, elements: Blocks) {
 /// `a·base + b·input + c·rate`, summed in that order with zero terms left out
 /// and a unit weight not multiplied: the bits of `Integrable::combine`'s
 /// `copy`, `scale`, `axpy` sequence for each SSP stage (`base` or `input`
-/// as its base).
+/// as its base). A stage weighs the start or its input (`a` or `b` not
+/// zero; NaN otherwise). A device's stage combination calls it.
 #[inline]
-fn shu_osher(base: f64, input: f64, rate: f64, a: f64, b: f64, c: f64) -> f64 {
+pub fn shu_osher(base: f64, input: f64, rate: f64, a: f64, b: f64, c: f64) -> f64 {
     let weighted = |w: f64, x: f64| if w == 1.0 { x } else { w * x };
-    let mut sum = (a != 0.0).then(|| weighted(a, base));
-    if b != 0.0 {
-        sum = Some(match sum {
-            Some(sum) => sum + b * input,
-            None => weighted(b, input),
-        });
-    }
-    let sum = sum.expect("a stage weighs the start or its input");
+    let sum = match (a != 0.0, b != 0.0) {
+        (true, true) => weighted(a, base) + b * input,
+        (true, false) => weighted(a, base),
+        (false, true) => weighted(b, input),
+        (false, false) => f64::NAN,
+    };
     if c != 0.0 { sum + c * rate } else { sum }
 }
 

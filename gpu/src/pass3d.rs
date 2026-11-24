@@ -613,7 +613,8 @@ impl Device {
                 vec![0.0; case.state.n_elements]
             }
         };
-        pass.finish(module, state, case.dt)?;
+        pass.post_process_average(module);
+        pass.finish(state, case.dt)?;
         // The thin cells that lose more than their water in a stage, at the
         // 3D stages' forward-Euler steps (the driver's to set)
         let st = &gpu.stream;
@@ -787,7 +788,7 @@ const NSUB_OF_P2: usize = crate::three_d::NSUB;
 
 /// The case runner's 2D module of a 3D run on `fx`: the wet/dry stage,
 /// Coriolis on a β-plane, walls, no bed friction.
-fn beach_physics(fx: &Fixture) -> SWEPhysics2D<Reflective2D> {
+pub(crate) fn beach_physics(fx: &Fixture) -> SWEPhysics2D<Reflective2D> {
     PhysicsBuilder::swe_2d(
         Arc::new(fx.mesh.clone()),
         Arc::new(fx.ops.clone()),
@@ -804,7 +805,7 @@ fn beach_physics(fx: &Fixture) -> SWEPhysics2D<Reflective2D> {
 
 /// Three rivers on `fx`'s wet side, two of them in one element, the third's
 /// discharge rising through the pass.
-fn beach_rivers(fx: &Fixture) -> RiverSources {
+pub(crate) fn beach_rivers(fx: &Fixture) -> RiverSources {
     let (lx, ly) = (36.0 * DX, 20.0 * DX);
     let at = |fx: f64, fy: f64| [fx * lx, fy * ly];
     let rising = RiverSeries::new(vec![0.0, 600.0], vec![5.0, 9.0]).expect("a series");

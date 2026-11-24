@@ -40,7 +40,7 @@ const TIME: f64 = 1800.0;
 const STRESS: [f64; 4] = [0.06, -0.02, 0.004, 0.001];
 
 /// A wind stress field over `fx`'s mesh, turning with time.
-fn wind(fx: &Fixture) -> AnalyticSurfaceStress {
+pub(crate) fn wind(fx: &Fixture) -> AnalyticSurfaceStress {
     AnalyticSurfaceStress::new(&fx.mesh, &fx.ops, |x, y, t| {
         let turn = 1e-4 * t + 1e-3 * x;
         [
@@ -51,7 +51,7 @@ fn wind(fx: &Fixture) -> AnalyticSurfaceStress {
 }
 
 /// A farm of three net cages where `fx` is deep.
-fn cages(fx: &Fixture) -> CageDrag2D {
+pub(crate) fn cages(fx: &Fixture) -> CageDrag2D {
     let cages = [
         NetCage::circular([300.0, 500.0], 50.0, 6.0, 0.25),
         NetCage::circular([420.0, 520.0], 50.0, 12.0, 0.2),
@@ -123,7 +123,7 @@ fn on_cpu(
     vec![("G h".into(), h), ("G hu".into(), hu), ("G hv".into(), hv)]
 }
 
-fn coriolis() -> CoriolisSource2D {
+pub(crate) fn coriolis() -> CoriolisSource2D {
     CoriolisSource2D::beta_plane(1.3e-4, 2e-11, 0.0)
 }
 

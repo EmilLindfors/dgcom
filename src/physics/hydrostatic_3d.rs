@@ -618,11 +618,18 @@ where
 
     /// The reference the kernels take: the profile, with the σ-pairs force
     /// whose adjoint its advection is.
-    fn active_reference(&self) -> Option<&TracerReferenceProfile> {
+    pub fn active_reference(&self) -> Option<&TracerReferenceProfile> {
         match self.pressure_gradient {
             PressureGradientForm::SigmaPairs => self.reference_profile.as_deref(),
             PressureGradientForm::ConstantDepth => None,
         }
+    }
+
+    /// Whether the stages after a step's first take the horizontal
+    /// viscosity's tendency of the step's start
+    /// ([`Self::with_viscosity_once_per_step`]).
+    pub fn viscosity_once_per_step(&self) -> bool {
+        self.viscosity_once_per_step
     }
 
     /// Rivers as volume sources (see [`crate::source::river`]). The mode

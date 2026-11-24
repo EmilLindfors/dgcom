@@ -9,7 +9,8 @@
 //! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, beach,
 //!                                             # transport3d, momentum3d, stage3d,
 //!                                             # limiter3d, vertical3d, implicit3d,
-//!                                             # forcing3d, pass3d; all by default)
+//!                                             # forcing3d, pass3d, step3d; all by
+//!                                             # default)
 //! target\release\dgcom-gpu.exe case <case.toml> [--set key.path=value]...
 //!                                             # a case on the CPU and the GPU, compared
 //! target\release\dgcom-gpu.exe run <case.toml> [--set ...]
@@ -53,6 +54,7 @@ mod hooks;
 mod implicit3d;
 mod limiter;
 mod limiter3d;
+mod model3d;
 mod momentum3d;
 mod nest;
 mod pass;
@@ -60,6 +62,7 @@ mod pass3d;
 mod phase0;
 mod phase1;
 mod stage3d;
+mod step3d;
 mod swe2d;
 mod three_d;
 mod transport3d;
@@ -136,6 +139,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if which == "all" || which == "pass3d" {
         pass3d::run(&gpu)?;
+    }
+    if which == "all" || which == "step3d" {
+        step3d::run(&gpu)?;
     }
     Ok(())
 }
