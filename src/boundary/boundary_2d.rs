@@ -224,6 +224,9 @@ pub enum DeviceBoundary2D<'a> {
         external: super::DeviceExternal2D<'a>,
         /// The velocity of elevation-only data
         elevation_only: super::ElevationOnly,
+        /// A level added to the external `η`, times a factor
+        /// ([`super::InverseBarometer`])
+        raise: Option<(super::DeviceLevel<'a>, f64)>,
     },
 }
 

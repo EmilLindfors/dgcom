@@ -147,6 +147,11 @@ pub enum DeviceSource2D<'a> {
     /// the parent's series per node and evaluates the source with
     /// [`crate::boundary::relaxation_source`]
     NestingRelaxation(&'a crate::boundary::NestingRelaxation2D),
+    /// A weather model's pressure gradient and wind stress
+    /// (`GriddedAtmosphere2D`): the device holds its regridded snapshots and
+    /// sums them with the host's time stencil and ramp
+    /// (`GriddedAtmosphere2D::moment`, `atmosphere_source`)
+    Atmosphere(&'a crate::source::GriddedAtmosphere2D),
 }
 
 impl std::fmt::Debug for DeviceSource2D<'_> {
@@ -158,6 +163,7 @@ impl std::fmt::Debug for DeviceSource2D<'_> {
                 .field("rate", &r.rate())
                 .field("slots", &r.parent().n_slots())
                 .finish_non_exhaustive(),
+            Self::Atmosphere(a) => f.debug_tuple("Atmosphere").field(a).finish(),
         }
     }
 }

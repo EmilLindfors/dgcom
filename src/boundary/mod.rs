@@ -82,7 +82,7 @@ pub use boundary_2d::{
     Extrapolation2D, FixedState2D, HarmonicTidal2D, Reflective2D, SWEBoundaryCondition2D, Tidal2D,
 };
 pub use characteristic::{
-    BoundaryLevel, CharacteristicOBC, DeviceExternal2D, ElevationOnly, ExternalState,
+    BoundaryLevel, CharacteristicOBC, DeviceExternal2D, DeviceLevel, ElevationOnly, ExternalState,
     ExternalStateProvider, InverseBarometer, ParentTimeSeries, StillWater,
     characteristic_boundary_state, characteristic_state,
 };

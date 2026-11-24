@@ -49,11 +49,19 @@
 //! interpolated bilinearly in space and linearly in time and each column's
 //! own surface temperature and salinity. The fluxes are not ramped: they
 //! excite no gravity waves, and the wind in them is the weather's.
+//!
+//! # On a device
+//!
+//! A device (P2.7, `notes/gpu.md`) holds the regridded snapshots
+//! ([`GriddedAtmosphere2D::regridded`]) and sums them at each stage time with
+//! the host's time stencil and ramp ([`GriddedAtmosphere2D::moment`]),
+//! through the same pointwise functions as the CPU: [`add_snapshot`],
+//! [`atmosphere_source`] and [`inverse_barometer_level`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::boundary::{BCContext2D, BoundaryLevel, tidal_ramp};
+use crate::boundary::{BCContext2D, BoundaryLevel, DeviceLevel, tidal_ramp};
 use crate::io::{
     AtmosphereField, AtmosphereReader, CoordinateProjection, P_REFERENCE, Stencil,
     TimeInterpolation, TimeStencil, east_axis,
@@ -64,7 +72,7 @@ use crate::physics::air_sea::{AirState, Coare35};
 use crate::physics::{SeaSurface, SurfaceFluxFields, SurfaceFluxes3D, SurfaceStress3D};
 use crate::solver::SWEState2D;
 use crate::solver::core::blocks::for_each_block;
-use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
+use crate::source::{DeviceSource2D, ElementSources, SourceContext2D, SourceTerm2D};
 use crate::time::ModelClock;
 use crate::types::ElementIndex;
 
@@ -125,7 +133,70 @@ struct Inner {
 
 /// One weather snapshot on the mesh nodes: `[u, v, ∂p/∂x, ∂p/∂y, p − p_ref]`
 /// per node, the wind in the mesh axes (unramped).
-type Snapshot = Vec<[f32; 5]>;
+pub type AtmosphereSnapshot = Vec<[f32; 5]>;
+type Snapshot = AtmosphereSnapshot;
+
+/// Adds one regridded snapshot's values at a node to its sum: `sum[q] += w ·
+/// values[q]`, with the snapshot's time weight `w`. The weather at a node is
+/// the sum over the time stencil's snapshots in turn, from zero. Pointwise,
+/// for the CPU and a device.
+#[inline]
+pub fn add_snapshot(sum: &mut [f64; 5], w: f64, values: &[f32; 5]) {
+    sum[0] += w * values[0] as f64;
+    sum[1] += w * values[1] as f64;
+    sum[2] += w * values[2] as f64;
+    sum[3] += w * values[3] as f64;
+    sum[4] += w * values[4] as f64;
+}
+
+/// What the momentum source of a [`GriddedAtmosphere2D`] takes besides the
+/// weather ([`GriddedAtmosphere2D::constants`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AtmosphereConstants {
+    pub drag: DragCoefficient,
+    pub rho_air: f64,
+    pub rho_water: f64,
+    /// Nodes shallower than this are not forced
+    pub h_min: f64,
+}
+
+/// The atmosphere's momentum source `(S_hu, S_hv)` at a node `h` deep, from
+/// its wind `(u, v)` (m/s, mesh axes) and pressure gradient `(∂p/∂x, ∂p/∂y)`,
+/// each already ramped (zero where switched off):
+/// `(τ − h ∇p)/ρ` with `τ = ρ_air C_d(|U|) |U| U`, nothing below `h_min`.
+/// Pointwise, for the CPU and a device.
+#[inline]
+pub fn atmosphere_source(
+    h: f64,
+    (u, v): (f64, f64),
+    (px, py): (f64, f64),
+    c: AtmosphereConstants,
+) -> (f64, f64) {
+    if h < c.h_min {
+        return (0.0, 0.0);
+    }
+    let (tau_x, tau_y) = wind_stress(u, v, c);
+    (
+        (tau_x - h * px) / c.rho_water,
+        (tau_y - h * py) / c.rho_water,
+    )
+}
+
+/// Wind stress `ρ_air C_d(|U|) |U| U` (N/m²) of the wind `(u, v)`.
+#[inline]
+fn wind_stress(u: f64, v: f64, c: AtmosphereConstants) -> (f64, f64) {
+    let speed = u.hypot(v);
+    let stress = c.rho_air * c.drag.compute(speed) * speed;
+    (stress * u, stress * v)
+}
+
+/// The inverse-barometer level (m) of the pressure anomaly `p` (Pa, the
+/// snapshots' `p − p_ref`), ramped by `ramp`: `−ramp p/(ρ g)`. Pointwise,
+/// for the CPU and a device.
+#[inline]
+pub fn inverse_barometer_level(p: f64, ramp: f64, rho_water: f64) -> f64 {
+    -ramp * p / (rho_water * G)
+}
 
 /// Snapshots kept regridded: the bracketing pair and the neighbours a
 /// multirate step may reach.
@@ -447,30 +518,50 @@ impl GriddedAtmosphere2D {
 
     /// Momentum source at depth `h` from wind `(u, v)` and pressure gradient.
     #[inline]
-    fn source(&self, h: f64, (u, v): (f64, f64), (px, py): (f64, f64)) -> (f64, f64) {
-        let inner = &self.inner;
-        if h < inner.h_min {
-            return (0.0, 0.0);
-        }
-        let (tau_x, tau_y) = self.wind_stress(u, v);
-        (
-            (tau_x - h * px) / inner.rho_water,
-            (tau_y - h * py) / inner.rho_water,
-        )
+    fn source(&self, h: f64, wind: (f64, f64), gradient: (f64, f64)) -> (f64, f64) {
+        atmosphere_source(h, wind, gradient, self.constants())
     }
 
     /// Wind stress `ρ_air C_d(|U|) |U| U` (N/m²) of the wind `(u, v)`.
     #[inline]
     fn wind_stress(&self, u: f64, v: f64) -> (f64, f64) {
-        let inner = &self.inner;
-        let speed = u.hypot(v);
-        let stress = inner.rho_air * inner.drag.compute(speed) * speed;
-        (stress * u, stress * v)
+        wind_stress(u, v, self.constants())
     }
 
     /// Whether the source term applies the wind and the pressure gradient.
-    fn switches(&self) -> [bool; 2] {
+    pub fn switches(&self) -> [bool; 2] {
         [self.inner.wind, self.inner.pressure]
+    }
+
+    /// The drag, densities and depth of the momentum source
+    /// ([`atmosphere_source`]).
+    pub fn constants(&self) -> AtmosphereConstants {
+        let inner = &self.inner;
+        AtmosphereConstants {
+            drag: inner.drag,
+            rho_air: inner.rho_air,
+            rho_water: inner.rho_water,
+            h_min: inner.h_min,
+        }
+    }
+
+    /// Whether the inverse-barometer level is the pressure's (else zero):
+    /// the pressure gradient is on and the weather has a pressure field.
+    pub fn has_level(&self) -> bool {
+        self.inner.pressure && self.inner.reader.has(AtmosphereField::Pressure)
+    }
+
+    /// Whether `other` is this atmosphere (a clone shares it, and its
+    /// snapshots).
+    pub fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The snapshots and the ramp at simulation time `t`, as the source and
+    /// the level weigh them: a device's per-stage data, with the snapshots
+    /// of [`Self::regridded`].
+    pub fn moment(&self, t: f64) -> (TimeStencil, f64) {
+        (self.time_stencil(t), tidal_ramp(t, self.inner.ramp))
     }
 
     /// Node sampling at a mesh position, computed on the fly.
@@ -505,8 +596,10 @@ impl GriddedAtmosphere2D {
 }
 
 impl GriddedAtmosphere2D {
-    /// Snapshot `t` on the nodes, from the shared cache or regridded now.
-    fn shared_snapshot(&self, t: usize) -> Arc<Snapshot> {
+    /// Snapshot `t` of the weather on the mesh nodes (`[u, v, ∂p/∂x, ∂p/∂y,
+    /// p − p_ref]` per node, unramped), from the shared cache or regridded
+    /// now.
+    pub fn regridded(&self, t: usize) -> Arc<AtmosphereSnapshot> {
         let inner = &self.inner;
         if let Some((_, s)) = inner.cache.read().unwrap().iter().find(|(k, _)| *k == t) {
             return Arc::clone(s);
@@ -559,7 +652,7 @@ impl GriddedAtmosphere2D {
         for (t, _) in time.terms() {
             let hit = LOCAL_SNAPSHOTS.with_borrow(|l| l.iter().any(|e| e.0 == id && e.1 == t));
             if !hit {
-                let snapshot = self.shared_snapshot(t);
+                let snapshot = self.regridded(t);
                 LOCAL_SNAPSHOTS.with_borrow_mut(|l| {
                     if l.len() >= 2 * CACHED_SNAPSHOTS {
                         l.remove(0);
@@ -585,10 +678,8 @@ impl GriddedAtmosphere2D {
     #[inline]
     fn cached(snapshots: &[(&[[f32; 5]], f64)], node: usize) -> [f64; 5] {
         let mut sum = [0.0; 5];
-        for (s, w) in snapshots {
-            for (x, &v) in sum.iter_mut().zip(&s[node]) {
-                *x += w * v as f64;
-            }
+        for &(s, w) in snapshots {
+            add_snapshot(&mut sum, w, &s[node]);
         }
         sum
     }
@@ -634,6 +725,12 @@ impl SourceTerm2D for GriddedAtmosphere2D {
                 hv[i] += sv;
             }
         });
+    }
+
+    /// The air pressure (and the wind) on a device, from the regridded
+    /// snapshots ([`DeviceSource2D::Atmosphere`]).
+    fn device_form(&self) -> Option<DeviceSource2D<'_>> {
+        Some(DeviceSource2D::Atmosphere(self))
     }
 
     fn is_node_local(&self) -> bool {
@@ -784,12 +881,18 @@ impl BoundaryLevel for GriddedAtmosphere2D {
                 let p = self.with_snapshots(&self.time_stencil(ctx.time), |snapshots| {
                     Self::cached(snapshots, i)[4]
                 });
-                -tidal_ramp(ctx.time, inner.ramp) * p / (inner.rho_water * G)
+                inverse_barometer_level(p, tidal_ramp(ctx.time, inner.ramp), inner.rho_water)
             }
             None => self
                 .node_at(ctx.position)
                 .map_or(0.0, |n| self.inverse_barometer(&n, ctx.time)),
         }
+    }
+
+    /// The level at a face node from the regridded snapshots, as at a node
+    /// of the mesh: a device's ([`DeviceLevel::Atmosphere`]).
+    fn device_form(&self) -> Option<DeviceLevel<'_>> {
+        Some(DeviceLevel::Atmosphere(self))
     }
 }
 
@@ -1279,5 +1382,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The device forms: the source is the atmosphere's; the inverse
+    /// barometer around a provider with a device form is that form, raised
+    /// by this atmosphere's level times its factor; around one raised
+    /// already, or with a level without a device form, it has none.
+    #[test]
+    fn the_inverse_barometer_raises_its_providers_device_form() {
+        use crate::boundary::{
+            DeviceExternal2D, ExternalStateProvider, HarmonicTide, InverseBarometer,
+        };
+        let (_, _, atmosphere) = setup();
+        assert!(matches!(
+            SourceTerm2D::device_form(&atmosphere),
+            Some(DeviceSource2D::Atmosphere(a)) if a.is(&atmosphere)
+        ));
+        assert!(matches!(
+            BoundaryLevel::device_form(&atmosphere),
+            Some(DeviceLevel::Atmosphere(a)) if a.is(&atmosphere)
+        ));
+        let tide = HarmonicTide::m2(0.5, 0.0);
+        let raised = InverseBarometer::new(tide.clone(), atmosphere.clone()).with_factor(0.25);
+        assert!(matches!(
+            raised.device_external(),
+            Some(DeviceExternal2D::Uniform(_))
+        ));
+        let Some((DeviceLevel::Atmosphere(level), factor)) = raised.device_raise() else {
+            panic!("a raise");
+        };
+        assert!(level.is(&atmosphere) && factor == 0.25);
+        // Raised twice: the device adds one level
+        let twice = InverseBarometer::new(raised, atmosphere.clone());
+        assert!(twice.device_external().is_none());
+        // A level without a device form
+        let closure = InverseBarometer::new(tide, |_: f64, _: f64, _: f64| 0.1);
+        assert!(closure.device_external().is_none() && closure.device_raise().is_none());
     }
 }

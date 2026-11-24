@@ -2766,6 +2766,7 @@ impl dgcom::case::CaseDevice for Recorder {
             match source {
                 DeviceSource2D::Coriolis(c) => seen.coriolis_f = Some(c.f0),
                 DeviceSource2D::NestingRelaxation(r) => seen.relaxation_rates.push(r.rate()),
+                DeviceSource2D::Atmosphere(_) => {}
             }
         }
         for (_, boundary) in &form.boundaries {
@@ -2774,6 +2775,7 @@ impl dgcom::case::CaseDevice for Recorder {
                 DeviceBoundary2D::Characteristic {
                     external: DeviceExternal2D::Uniform(provider),
                     elevation_only,
+                    ..
                 } => seen.opens.push((
                     *elevation_only,
                     provider.uniform_state(10_800.0).expect("uniform"),
