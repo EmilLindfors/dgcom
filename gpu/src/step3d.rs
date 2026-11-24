@@ -23,10 +23,12 @@ use std::time::Instant;
 use dgcom::Reflective2D;
 use dgcom::physics::vertical_mixing::Forcing;
 use dgcom::physics::{
-    BottomDrag3D, GlsMixing, Hydrostatic3D, ImplicitVerticalAdvection, LinearEOS,
+    BottomDrag3D, GlsMixing, Hydrostatic3D, ImplicitVerticalAdvection, LinearEOS, TimeStepLimit,
+    TimeStepLimits,
 };
 use dgcom::solver::state::Solution3D;
 use dgcom::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+use dgcom::time::SplitModel;
 use dgcom::time::{ModeSplitIntegrator, SspScheme};
 
 use crate::forcing3d::{cages, coriolis, wind};
@@ -351,6 +353,164 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape, mutants: bool) -> Result<bool
     Ok(same)
 }
 
+/// `limits`' bounds, by name.
+fn named(limits: &TimeStepLimits) -> [(&'static str, TimeStepLimit); 5] {
+    [
+        ("advection", limits.advection),
+        ("vertical", limits.vertical),
+        ("Coriolis", limits.coriolis),
+        ("sloping levels", limits.sloping_levels),
+        ("viscosity", limits.viscosity),
+    ]
+}
+
+/// Whether two sets of limits are the same to the bit, each with its
+/// element; the differences printed under `label` if `print`.
+fn same_limits(label: &str, cpu: &TimeStepLimits, device: &TimeStepLimits, print: bool) -> bool {
+    let mut same = true;
+    for ((what, a), (_, b)) in named(cpu).into_iter().zip(named(device)) {
+        if a.dt.to_bits() != b.dt.to_bits() || a.element != b.element {
+            same = false;
+            if print {
+                println!(
+                    "    {label}: {what} {:e} s at element {} on the CPU, {:e} s at {} on the GPU",
+                    a.dt, a.element, b.dt, b.element
+                );
+            }
+        }
+    }
+    same
+}
+
+/// The step's bound of every state of `states` on the device against
+/// `Hydrostatic3D::time_step_limits` on the CPU, at the case runner's CFL
+/// and at one a hundred times it (more elements' sloping levels measured),
+/// with `physics` on the CPU and `device` on the device; whether all are
+/// the same to the bit, and how many elements had their frequency measured.
+fn bounds_agree(
+    gpu: &Arc<Gpu>,
+    label: &str,
+    physics: &Physics,
+    device: &Physics,
+    states: &[Solution3D],
+    print: bool,
+) -> Result<(bool, usize), Box<dyn Error>> {
+    let mut model = Model3D::new(gpu, device)?;
+    let (mut same, mut measured) = (true, 0);
+    for (n, state) in states.iter().enumerate() {
+        // The state's `w` comes with the work (`new_work`: the host's)
+        model.start_from(state);
+        let s = State3D::upload(gpu, state)?;
+        let mut work = model.new_work(&s);
+        for cfl in [CFL, 100.0 * CFL] {
+            let scheme = SspScheme::Rk43;
+            let cpu = physics.time_step_limits(state, cfl, scheme);
+            let (limits, listed) = model.time_step_limits(&s, &mut work, cfl, scheme);
+            measured += listed;
+            same &= same_limits(
+                &format!("{label}, state {n}, CFL {cfl}"),
+                &cpu,
+                &limits,
+                print,
+            );
+            let explicit = physics.implicit_vertical_advection.is_none();
+            same &= cpu.step(explicit, scheme).to_bits() == limits.step(explicit, scheme).to_bits();
+        }
+    }
+    Ok((same, measured))
+}
+
+/// The bound's gate on one fixture: the start and the CPU's states after
+/// each of the steps, and the mutants (the device's side with another
+/// input); whether all agree to the bit and every mutant is caught.
+fn bound_gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn Error>> {
+    let fx = Fixture::new(shape);
+    let base = Terms::CASE_RUNNER;
+    let physics = physics(&fx, base);
+    let mut state = start_state(&fx);
+    state.tke.clear();
+    state.gls.clear();
+    physics.update_density(&mut state);
+    let dt = physics
+        .compute_dt_ssp(&state, CFL, SspScheme::Rk43)
+        .min(DT_MAX);
+    let mut integrator = Run::CASE_RUNNER.integrator();
+    let mut states = vec![state.clone()];
+    for n in 0..STEPS {
+        physics.update_density(&mut state);
+        integrator.step(&mut state, &physics, dt, n as f64 * dt);
+        physics.post_process(&mut state);
+        states.push(state.clone());
+    }
+    let (mut same, measured) = bounds_agree(gpu, label, &physics, &physics, &states, true)?;
+    println!(
+        "  {label}: the bound of {} states at CFL {CFL} and {}: {} ({measured} sloping-level \
+         frequencies measured)",
+        states.len(),
+        100.0 * CFL,
+        if same { "bit for bit" } else { "DIFFERENT" }
+    );
+    // The mutants: another input on the device's side
+    let mut thicker = self::physics(&fx, base);
+    thicker.min_column_depth *= 1.5;
+    let mutants: [(&str, Physics); 3] = [
+        (
+            "no reference",
+            self::physics(
+                &fx,
+                Terms {
+                    reference: false,
+                    ..base
+                },
+            ),
+        ),
+        (
+            "Smagorinsky 0.12",
+            self::physics(
+                &fx,
+                Terms {
+                    smagorinsky: 0.12,
+                    ..base
+                },
+            ),
+        ),
+        ("thin columns to 1.5× the depth", thicker),
+    ];
+    for (what, mutant) in mutants {
+        let (agree, _) = bounds_agree(gpu, label, &physics, &mutant, &states, false)?;
+        println!(
+            "    mutant {what}: {}",
+            if agree { "NOT CAUGHT" } else { "caught" }
+        );
+        same &= !agree;
+    }
+    // `w` at rest on the device's side
+    let rest: Vec<Solution3D> = states
+        .iter()
+        .map(|s| {
+            let mut s = s.clone();
+            s.w.iter_mut().for_each(|w| *w = 0.0);
+            s
+        })
+        .collect();
+    let mut model = Model3D::new(gpu, &physics)?;
+    let mut agree = true;
+    for (state, at_rest) in states.iter().zip(&rest) {
+        model.start_from(at_rest);
+        let s = State3D::upload(gpu, state)?;
+        let mut work = model.new_work(&s);
+        let cpu = physics.time_step_limits(state, CFL, SspScheme::Rk43);
+        let (limits, _) = model.time_step_limits(&s, &mut work, CFL, SspScheme::Rk43);
+        agree &= same_limits(label, &cpu, &limits, false);
+    }
+    println!(
+        "    mutant w at rest: {}",
+        if agree { "NOT CAUGHT" } else { "caught" }
+    );
+    same &= !agree;
+    Ok(same)
+}
+
 /// Whole steps of the case runner's model on `fx`, after one untimed step
 /// on each side: the CPU's 24 threads against the device.
 fn time(gpu: &Arc<Gpu>, fx: &Fixture, steps: usize) -> Result<(), Box<dyn Error>> {
@@ -414,6 +574,17 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
             ..Shape::BEACH
         },
         false,
+    )?;
+    println!("3D step's bound: the device's against Hydrostatic3D::time_step_limits");
+    same &= bound_gate(gpu, "beach", Shape::BEACH)?;
+    same &= bound_gate(
+        gpu,
+        "beach, jittered and stretched",
+        Shape {
+            jitter: 0.2,
+            stretched: true,
+            ..Shape::BEACH
+        },
     )?;
     // 48,000 elements by default: the model takes ≈ 136 kB an element
     // (6.5 GB at 48,000), and a card that cannot hold it pages to the

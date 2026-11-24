@@ -41,12 +41,27 @@ pub trait RunModel3D: SplitModel {
     fn prepare(&mut self, state: &Self::State);
 
     /// The baroclinic step at Courant number `cfl` in `scheme`
-    /// ([`Hydrostatic3D::compute_dt_ssp`]).
-    fn compute_dt_ssp(&self, state: &Self::State, cfl: f64, scheme: SspScheme) -> f64;
+    /// ([`Hydrostatic3D::compute_dt_ssp`]); `work` is the integrator's (a
+    /// backend's buffers: [`ModeSplitIntegrator::work_for`]).
+    fn compute_dt_ssp(
+        &self,
+        state: &Self::State,
+        cfl: f64,
+        scheme: SspScheme,
+        work: &mut Self::Work,
+    ) -> f64;
 
     /// Every element's own 3D step into `out`, for local time stepping
-    /// ([`Hydrostatic3D::element_steps_into`]).
-    fn element_steps_into(&self, state: &Self::State, cfl: f64, scheme: SspScheme, out: &mut [f64]);
+    /// ([`Hydrostatic3D::element_steps_into`]); `work` as for
+    /// [`Self::compute_dt_ssp`].
+    fn element_steps_into(
+        &self,
+        state: &Self::State,
+        cfl: f64,
+        scheme: SspScheme,
+        out: &mut [f64],
+        work: &mut Self::Work,
+    );
 
     /// What a 3D stage value reads, in turn
     /// ([`ModeSplitPhysics::stage_stencils`]).
@@ -79,11 +94,24 @@ where
         self.ensure_reference_profile(state);
     }
 
-    fn compute_dt_ssp(&self, state: &Solution3D, cfl: f64, scheme: SspScheme) -> f64 {
+    fn compute_dt_ssp(
+        &self,
+        state: &Solution3D,
+        cfl: f64,
+        scheme: SspScheme,
+        _: &mut Self::Work,
+    ) -> f64 {
         Hydrostatic3D::compute_dt_ssp(self, state, cfl, scheme)
     }
 
-    fn element_steps_into(&self, state: &Solution3D, cfl: f64, scheme: SspScheme, out: &mut [f64]) {
+    fn element_steps_into(
+        &self,
+        state: &Solution3D,
+        cfl: f64,
+        scheme: SspScheme,
+        out: &mut [f64],
+        _: &mut Self::Work,
+    ) {
         Hydrostatic3D::element_steps_into(self, state, cfl, scheme, out);
     }
 
@@ -295,8 +323,12 @@ impl<M: RunModel3D> Simulation3D<M> {
             // equal steps to it, each with the levels of its own length
             let scheme = self.integrator.baroclinic_scheme();
             let mut dt = crate::profiling::scope("step: compute_dt", || {
-                if self.integrator.baroclinic_levels() == 0 {
-                    return self.physics.compute_dt_ssp(state, self.config.cfl, scheme);
+                let levels = self.integrator.baroclinic_levels();
+                let work = self.integrator.work_for(&self.physics, state);
+                if levels == 0 {
+                    return self
+                        .physics
+                        .compute_dt_ssp(state, self.config.cfl, scheme, work);
                 }
                 self.element_dt.resize(self.physics.mesh().n_elements, 0.0);
                 self.physics.element_steps_into(
@@ -304,6 +336,7 @@ impl<M: RunModel3D> Simulation3D<M> {
                     self.config.cfl,
                     scheme,
                     &mut self.element_dt,
+                    work,
                 );
                 let stencils = self.physics.stencils();
                 self.integrator.assign_baroclinic_levels(

@@ -47,8 +47,9 @@ pub use device::SWEDeviceForm2D;
 pub use eos::{EquationOfState, LinearEOS, UnescoEOS};
 pub use gls::{GlsMixing, GlsParameters, StabilityFunctions, WaveBreaking};
 pub use hydrostatic_3d::{
-    ElementStep, Hydrostatic3D, ImplicitAdvectionStats, TimeStepLimit, TimeStepLimits,
-    TracerRanges, thin_columns_to_depth_mean, zero_thin_momentum,
+    ColumnState, ElementRates, ElementStep, Hydrostatic3D, ImplicitAdvectionStats, TimeStepLimit,
+    TimeStepLimits, TracerRanges, element_column_rates, inverse_length, sloping_level_limit,
+    sloping_level_step_unmeasured, thin_columns_to_depth_mean, zero_thin_momentum,
 };
 pub use implicit_advection::ImplicitVerticalAdvection;
 pub use surface_fluxes::{SeaSurface, SurfaceFluxFields, SurfaceFluxes3D};

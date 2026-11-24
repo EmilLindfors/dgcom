@@ -2144,6 +2144,8 @@ pub struct Gpu {
     pub(crate) module_pass: crate::pass::kernels_pass::LoadedModule,
     /// The 3D step's combinations, column sums and depth means (`model3d.rs`)
     pub(crate) module_model: crate::model3d::kernels_model::LoadedModule,
+    /// The 3D step's bound (`bound3d.rs`)
+    pub(crate) module_bound: crate::bound3d::kernels_bound::LoadedModule,
     /// The device's name and compute capability
     pub name: String,
     /// Its streaming multiprocessors
@@ -2167,6 +2169,7 @@ impl Gpu {
         let module_forcing = crate::forcing::kernels_forcing::load(&ctx)?;
         let module_pass = crate::pass::kernels_pass::load(&ctx)?;
         let module_model = crate::model3d::kernels_model::load(&ctx)?;
+        let module_bound = crate::bound3d::kernels_bound::load(&ctx)?;
         let sms = ctx.multiprocessor_count()?;
         Ok(Arc::new(Self {
             stream,
@@ -2180,6 +2183,7 @@ impl Gpu {
             module_forcing,
             module_pass,
             module_model,
+            module_bound,
             name,
             sms,
         }))

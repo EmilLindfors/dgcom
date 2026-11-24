@@ -1386,11 +1386,21 @@ pub fn element_dt_viscous_swe_2d(
     cfl: f64,
     k: usize,
 ) -> f64 {
-    /// Real-axis stability limit of the three-stage, third-order RK methods
-    const SSP_RK3_REAL_AXIS: f64 = 2.5127;
     if nu <= 0.0 {
         return f64::INFINITY;
     }
+    viscous_dt(nu, viscous_metric(mesh, ops, geom, k), order, cfl)
+}
+
+/// The metric of [`element_dt_viscous_swe_2d`] on element `k`: the largest
+/// `|∇r|² + |∇s|²` over its own and its face neighbours' nodes. Static: a
+/// device takes it as a table.
+pub fn viscous_metric(
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    k: usize,
+) -> f64 {
     let metric = |j: usize| {
         (0..ops.n_nodes)
             .map(|i| {
@@ -1400,10 +1410,20 @@ pub fn element_dt_viscous_swe_2d(
             .fold(0.0_f64, f64::max)
     };
     let k_idx = ElementIndex::new(k);
-    let largest = (0..4)
+    (0..4)
         .filter_map(|face| mesh.neighbor(k_idx, face))
         .map(|nb| metric(nb.element))
-        .fold(metric(k), f64::max);
+        .fold(metric(k), f64::max)
+}
+
+/// [`element_dt_viscous_swe_2d`] of the viscosity `nu` on an element with
+/// the metric `largest` ([`viscous_metric`]).
+pub fn viscous_dt(nu: f64, largest: f64, order: usize, cfl: f64) -> f64 {
+    /// Real-axis stability limit of the three-stage, third-order RK methods
+    const SSP_RK3_REAL_AXIS: f64 = 2.5127;
+    if nu <= 0.0 {
+        return f64::INFINITY;
+    }
     let rate = 0.0825 * ((order + 1) as f64).powi(4) * nu * largest;
     cfl * SSP_RK3_REAL_AXIS / rate
 }

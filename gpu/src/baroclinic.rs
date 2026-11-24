@@ -96,7 +96,7 @@ fn pair_end(
 #[device]
 #[allow(unused_attributes)]
 #[inline(always)]
-fn pair_at(
+pub(crate) fn pair_at(
     k: usize,
     i: usize,
     j: usize,
