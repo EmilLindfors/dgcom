@@ -58,7 +58,7 @@ use dgcom::time::{
 };
 use dgcom::vertical::SigmaGrid;
 
-use crate::hooks::State3D;
+use crate::hooks::{State3D, StepWater3D};
 use crate::swe2d::{
     Damping, DeviceState, Gpu, GpuSWE2D, N1, NF, NN, PassFluxes, is_subcell_element, item, level_of,
 };
@@ -962,6 +962,35 @@ impl BarotropicPass3D {
             statics,
             gpu: gpu.clone(),
         })
+    }
+
+    /// The mesh as the pass's tables hold it (one σ-level).
+    pub fn statics(&self) -> &Statics3D {
+        &self.statics
+    }
+
+    /// What the pass moved, as `Merged3D::find` reads it (after
+    /// [`Self::finish`]): from the state at the step's start `state` over
+    /// the step `dt`, every element's forward-Euler step `flux.euler_dt` (the
+    /// 3D stages', the driver's to set), with columns shallower than
+    /// `thin_depth` thin.
+    pub fn step_water<'a>(
+        &'a self,
+        state: &'a State3D,
+        dt: f64,
+        thin_depth: f64,
+    ) -> StepWater3D<'a> {
+        let f = &self.flux;
+        StepWater3D {
+            eta: &state.eta,
+            eta_rate: &f.eta_rate,
+            dt,
+            euler_dt: &f.euler_dt,
+            face: &f.face,
+            subcell: &f.subcell,
+            source: &self.column_source,
+            thin_depth,
+        }
     }
 
     /// `to_transport` of `state` into `q`.

@@ -45,8 +45,9 @@
 //!
 //! # The groups
 //!
-//! [`MergedCells::find`] takes them once per step from what the barotropic
-//! pass moved: the mean fluxes through the subcell interfaces and the
+//! [`MergedCells::find`] takes them once per step, element by element
+//! ([`find_element`], which the GPU's kernel calls too), from what the
+//! barotropic pass moved: the mean fluxes through the subcell interfaces and the
 //! element faces, constant over the step, and the water each cell holds at
 //! least (its depth at the step's start or end, whichever is less: the
 //! stage depths lie between). A thin cell with inflow and
@@ -272,7 +273,7 @@ impl MergedCells {
     }
 
     /// Find the step's groups (see the module docs), replacing the last
-    /// step's.
+    /// step's: [`find_element`] of every element.
     pub fn find(&mut self, water: &StepWater) {
         self.clear();
         let StepWater {
@@ -289,153 +290,47 @@ impl MergedCells {
         }
         let n_sub = subcell_interfaces(n1);
         let w = &ops.weights_1d;
-        // Per cell: the water it holds at least (m³ per unit of the
-        // reference element's area), what leaves it and what enters it
-        // through the faces and as a source (m³/s), and its group
-        let mut least = [0.0_f64; MAX_NODES];
-        let mut out = [0.0_f64; MAX_NODES];
-        let mut inflow = [0.0_f64; MAX_NODES];
-        let mut thin = [false; MAX_NODES];
-        let mut group = [0usize; MAX_NODES];
-        // The interfaces: (node a, node b, volume rate from a to b)
-        let mut links: Vec<(usize, usize, f64)> = Vec::with_capacity(2 * n1 * (n1 - 1));
         for k in 0..self.grouped.len() {
             let fluxes = &water.subcell[k * n_sub..(k + 1) * n_sub];
-            if !fluxes.iter().all(|f| f.is_finite()) {
-                continue;
-            }
             let bed = bathymetry.element(ElementIndex::new(k));
-            let mut any_thin = false;
-            for i in 0..nn {
+            let cell = |i: usize| {
                 let idx = k * nn + i;
-                let start = water.eta[idx] - bed[i];
-                let end = start + water.dt * water.eta_rate[idx];
-                thin[i] = start.min(end) < water.thin_depth;
-                any_thin |= thin[i];
-                let mass = geom.node_mass(k, i);
-                least[i] = mass * start.min(end).max(0.0);
-                let source = mass * water.source[idx];
-                out[i] = (-source).max(0.0);
-                inflow[i] = source.max(0.0);
-                group[i] = i;
-            }
-            if !any_thin {
-                continue;
-            }
-            // Through the faces: the element's, for a flushed one
-            let (mut entering, mut leaving) = (0.0, 0.0);
-            for f in 0..4 {
-                for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                    let rate = face_rate(ops, geom, water.face, k, f, fi, node);
-                    out[node] += rate.max(0.0);
-                    inflow[node] += (-rate).max(0.0);
-                    leaving += rate.max(0.0);
-                    entering += (-rate).max(0.0);
+                CellWater {
+                    eta: water.eta[idx],
+                    eta_rate: water.eta_rate[idx],
+                    bed: bed[i],
+                    mass: geom.node_mass(k, i),
+                    source: water.source[idx],
                 }
-            }
-            links.clear();
-            for dir in 0..2 {
-                for line in 0..n1 {
-                    for a in 0..n1 - 1 {
-                        let flux = fluxes[subcell_slot(n1, dir, line, a)];
-                        // Per unit of the reference element's area: the
-                        // line's weight across it
-                        links.push((
-                            line_node(n1, dir, line, a),
-                            line_node(n1, dir, line, a + 1),
-                            flux * w[line],
-                        ));
-                    }
-                }
-            }
-            let euler = water.euler_dt[k];
-            // A thin cell that water passes through faster than the stage
-            let drained = |i: usize| {
-                let (mut o, mut inn) = (out[i], inflow[i]);
-                for &(a, b, rate) in &links {
-                    if a == i {
-                        o += rate.max(0.0);
-                        inn += (-rate).max(0.0);
-                    } else if b == i {
-                        o += (-rate).max(0.0);
-                        inn += rate.max(0.0);
-                    }
-                }
-                thin[i] && inn > 0.0 && euler * o > least[i]
             };
-            let (mut any, mut flushed) = (false, false);
-            for seed in 0..nn {
-                if !drained(seed) {
-                    continue;
-                }
-                any = true;
-                loop {
-                    let root = group[seed];
-                    // What the group holds, loses and takes
-                    let (mut holds, mut loses, mut takes) = (0.0, 0.0, 0.0);
-                    for i in (0..nn).filter(|&i| group[i] == root) {
-                        holds += least[i];
-                        loses += out[i];
-                        takes += inflow[i];
-                    }
-                    // The neighbour it gives the most, the one that gives
-                    // it the most, the deepest beside it
-                    let mut partner: Option<(u8, f64, usize)> = None;
-                    let mut offer = |rank: u8, size: f64, node: usize| {
-                        if partner.is_none_or(|(r, s, _)| (rank, size) > (r, s)) {
-                            partner = Some((rank, size, node));
-                        }
-                    };
-                    for &(a, b, rate) in &links {
-                        let (inside_a, inside_b) = (group[a] == root, group[b] == root);
-                        if inside_a == inside_b {
-                            continue;
-                        }
-                        // From the group to its neighbour
-                        let (given, other) = if inside_a { (rate, b) } else { (-rate, a) };
-                        loses += given.max(0.0);
-                        takes += (-given).max(0.0);
-                        if given > 0.0 {
-                            offer(2, given, other);
-                        } else if given < 0.0 {
-                            offer(1, -given, other);
-                        } else {
-                            offer(0, least[other], other);
-                        }
-                    }
-                    if takes <= 0.0 || euler * loses <= holds {
-                        break;
-                    }
-                    let Some((_, _, other)) = partner else {
-                        // Every cell of the element, and still not enough
-                        flushed = true;
-                        break;
-                    };
-                    let (from, to) = (group[other], root.min(group[other]));
-                    for g in group[..nn].iter_mut() {
-                        if *g == root || *g == from {
-                            *g = to;
-                        }
-                    }
-                }
-                if flushed {
-                    break;
-                }
-            }
-            if !any {
+            let face_rate = |f: usize, fi: usize| {
+                face_rate(ops, geom, water.face, k, f, fi, ops.face_nodes[f][fi])
+            };
+            let Some(found) = find_element::<MAX_NODES>(
+                nn,
+                n1,
+                water.dt,
+                water.euler_dt[k],
+                water.thin_depth,
+                cell,
+                face_rate,
+                |f, fi| ops.face_nodes[f][fi],
+                |slot| fluxes[slot],
+                |line| w[line],
+            ) else {
                 continue;
-            }
-            if flushed {
-                // One group of every cell, and where its water comes from
-                group[..nn].fill(0);
+            };
+            if found.flushed {
+                // Where its water comes from
                 self.flushed[k] = true;
-                self.flushed_elements.push((k as u32, entering, leaving));
+                self.flushed_elements
+                    .push((k as u32, found.entering, found.leaving));
                 for f in 0..4 {
                     let Some(neighbour) = mesh.neighbor(ElementIndex::new(k), f) else {
                         continue;
                     };
-                    for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                        let rate = -face_rate(ops, geom, water.face, k, f, fi, node);
+                    for fi in 0..nfn {
+                        let rate = -face_rate(f, fi);
                         if rate > 0.0 {
                             let from = neighbour.element * nn
                                 + ops.face_nodes[neighbour.face][nfn - 1 - fi];
@@ -446,11 +341,10 @@ impl MergedCells {
             }
             let mut grouped = false;
             for i in 0..nn {
-                let size = group[..nn].iter().filter(|&&g| g == group[i]).count();
-                let joined = size > 1;
-                self.group[k * nn + i] = group[i] as u8;
+                let joined = found.joined[i];
+                self.group[k * nn + i] = found.group[i] as u8;
                 self.joined[k * nn + i] = joined;
-                self.counts[usize::from(flushed)] += usize::from(joined);
+                self.counts[usize::from(found.flushed)] += usize::from(joined);
                 grouped |= joined;
             }
             if grouped {
@@ -652,6 +546,229 @@ pub fn dry_volume_of(area: f64, d_sigma: f64) -> f64 {
     area * d_sigma * MIN_LAYER_THICKNESS
 }
 
+/// What a node's cell holds and gains over a step, as [`find_element`]
+/// reads it.
+#[derive(Clone, Copy, Debug)]
+pub struct CellWater {
+    /// `η` at the step's start
+    pub eta: f64,
+    /// `∂η/∂t` over the step (m/s)
+    pub eta_rate: f64,
+    /// The bed's elevation
+    pub bed: f64,
+    /// The node's mass (`GeometricFactors2D::node_mass`)
+    pub mass: f64,
+    /// The water of the column that no flux carried (m/s)
+    pub source: f64,
+}
+
+/// One element's groups, as [`find_element`] finds them.
+#[derive(Clone, Copy, Debug)]
+pub struct ElementGroups<const M: usize> {
+    /// Every node's group: its first node (its own: on its own)
+    pub group: [usize; M],
+    /// Every node: in a group of two or more
+    pub joined: [bool; M],
+    /// One group of every cell, which still loses more than its water
+    pub flushed: bool,
+    /// The water entering and leaving through the element's faces (m³/s per
+    /// unit of the reference element's area)
+    pub entering: f64,
+    pub leaving: f64,
+}
+
+/// One element's groups (see the module docs), as [`MergedCells::find`]
+/// finds them for each element and the GPU's kernel with a thread per
+/// element: from its `nn` cells' water (`cell(i)`), the volume rates out of
+/// its face nodes (`face_rate(face, fi)`, at its nodes `face_node(face,
+/// fi)`, `n1` per face) and the mass fluxes through its subcell interfaces
+/// (`subcell(slot)`, across lines of GLL weight `weight(line)`), over a step
+/// `dt` whose stages are forward-Euler steps of at most `euler`, with
+/// columns shallower than `thin_depth` thin. `None` where no thin cell
+/// loses more than its water in a stage, or the pass did not move the
+/// element on its subcells throughout (a flux not finite). `M` bounds `nn`.
+#[allow(clippy::too_many_arguments)]
+pub fn find_element<const M: usize>(
+    nn: usize,
+    n1: usize,
+    dt: f64,
+    euler: f64,
+    thin_depth: f64,
+    cell: impl Fn(usize) -> CellWater,
+    face_rate: impl Fn(usize, usize) -> f64,
+    face_node: impl Fn(usize, usize) -> usize,
+    subcell: impl Fn(usize) -> f64,
+    weight: impl Fn(usize) -> f64,
+) -> Option<ElementGroups<M>> {
+    let n_sub = subcell_interfaces(n1);
+    if !(0..n_sub).all(|slot| subcell(slot).is_finite()) {
+        return None;
+    }
+    // Per cell: the water it holds at least (m³ per unit of the reference
+    // element's area), what leaves it and what enters it through the faces
+    // and as a source (m³/s), and its group
+    let mut least = [0.0_f64; M];
+    let mut out = [0.0_f64; M];
+    let mut inflow = [0.0_f64; M];
+    let mut thin = [false; M];
+    let mut group = [0usize; M];
+    let mut any_thin = false;
+    for i in 0..nn {
+        let c = cell(i);
+        let start = c.eta - c.bed;
+        let end = start + dt * c.eta_rate;
+        thin[i] = start.min(end) < thin_depth;
+        any_thin |= thin[i];
+        least[i] = c.mass * start.min(end).max(0.0);
+        let source = c.mass * c.source;
+        out[i] = (-source).max(0.0);
+        inflow[i] = source.max(0.0);
+        group[i] = i;
+    }
+    if !any_thin {
+        return None;
+    }
+    // Through the faces: the element's, for a flushed one
+    let (mut entering, mut leaving) = (0.0, 0.0);
+    for f in 0..4 {
+        for fi in 0..n1 {
+            let node = face_node(f, fi);
+            let rate = face_rate(f, fi);
+            out[node] += rate.max(0.0);
+            inflow[node] += (-rate).max(0.0);
+            leaving += rate.max(0.0);
+            entering += (-rate).max(0.0);
+        }
+    }
+    // A thin cell that water passes through faster than the stage
+    let drained = |i: usize| {
+        let (mut o, mut inn) = (out[i], inflow[i]);
+        for_each_link(n1, &subcell, &weight, |a, b, rate| {
+            if a == i {
+                o += rate.max(0.0);
+                inn += (-rate).max(0.0);
+            } else if b == i {
+                o += (-rate).max(0.0);
+                inn += rate.max(0.0);
+            }
+        });
+        thin[i] && inn > 0.0 && euler * o > least[i]
+    };
+    let (mut any, mut flushed) = (false, false);
+    for seed in 0..nn {
+        if !drained(seed) {
+            continue;
+        }
+        any = true;
+        loop {
+            let root = group[seed];
+            // What the group holds, loses and takes
+            let (mut holds, mut loses, mut takes) = (0.0, 0.0, 0.0);
+            for i in (0..nn).filter(|&i| group[i] == root) {
+                holds += least[i];
+                loses += out[i];
+                takes += inflow[i];
+            }
+            // The neighbour it gives the most, the one that gives it the
+            // most, the deepest beside it
+            let mut partner: Option<(u8, f64, usize)> = None;
+            let mut offer = |rank: u8, size: f64, node: usize| {
+                if partner.is_none_or(|(r, s, _)| (rank, size) > (r, s)) {
+                    partner = Some((rank, size, node));
+                }
+            };
+            for_each_link(n1, &subcell, &weight, |a, b, rate| {
+                let (inside_a, inside_b) = (group[a] == root, group[b] == root);
+                if inside_a == inside_b {
+                    return;
+                }
+                // From the group to its neighbour
+                let (given, other) = if inside_a { (rate, b) } else { (-rate, a) };
+                loses += given.max(0.0);
+                takes += (-given).max(0.0);
+                if given > 0.0 {
+                    offer(2, given, other);
+                } else if given < 0.0 {
+                    offer(1, -given, other);
+                } else {
+                    offer(0, least[other], other);
+                }
+            });
+            if takes <= 0.0 || euler * loses <= holds {
+                break;
+            }
+            let Some((_, _, other)) = partner else {
+                // Every cell of the element, and still not enough
+                flushed = true;
+                break;
+            };
+            let (from, to) = (group[other], root.min(group[other]));
+            for g in group[..nn].iter_mut() {
+                if *g == root || *g == from {
+                    *g = to;
+                }
+            }
+        }
+        if flushed {
+            break;
+        }
+    }
+    if !any {
+        return None;
+    }
+    if flushed {
+        // One group of every cell (a loop: the device has no `fill`)
+        for g in group[..nn].iter_mut() {
+            *g = 0;
+        }
+    }
+    let mut joined = [false; M];
+    for i in 0..nn {
+        joined[i] = group[..nn].iter().filter(|&&g| g == group[i]).count() > 1;
+    }
+    Some(ElementGroups {
+        group,
+        joined,
+        flushed,
+        entering,
+        leaving,
+    })
+}
+
+/// Every subcell interface of an element of `n1` nodes per direction, in
+/// slot order: `visit(a, b, rate)` with its nodes `a`, `b` and the volume
+/// rate from `a` to `b` per unit of the reference element's area (the mass
+/// flux `subcell(slot)` times the line's GLL weight across it).
+#[inline]
+fn for_each_link(
+    n1: usize,
+    subcell: &impl Fn(usize) -> f64,
+    weight: &impl Fn(usize) -> f64,
+    mut visit: impl FnMut(usize, usize, f64),
+) {
+    for dir in 0..2 {
+        for line in 0..n1 {
+            for a in 0..n1 - 1 {
+                let flux = subcell(subcell_slot(n1, dir, line, a));
+                visit(
+                    line_node(n1, dir, line, a),
+                    line_node(n1, dir, line, a + 1),
+                    flux * weight(line),
+                );
+            }
+        }
+    }
+}
+
+/// The volume rate out of a face node per unit of the reference element's
+/// area: the mass flux `flux` out of it times its node's mass `mass`, the
+/// lift's scale `lift_scale` there (`GeometricFactors2D::lift_scale`) and
+/// the lift's entry `lift` (`LIFT[face][(node, fi)]`).
+#[inline]
+pub fn face_volume_rate(mass: f64, lift_scale: f64, lift: f64, flux: f64) -> f64 {
+    mass * lift_scale * lift * flux
+}
+
 /// The volume rate out of element `k` at face node `fi` of `face` (which is
 /// the element's node `node`), per unit of the reference element's area,
 /// from the mass fluxes `fluxes` out of every face node.
@@ -665,10 +782,12 @@ fn face_rate(
     fi: usize,
     node: usize,
 ) -> f64 {
-    geom.node_mass(k, node)
-        * geom.lift_scale(k, face, fi, node)
-        * ops.lift[face][(node, fi)]
-        * fluxes[(k * 4 + face) * ops.n_face_nodes + fi]
+    face_volume_rate(
+        geom.node_mass(k, node),
+        geom.lift_scale(k, face, fi, node),
+        ops.lift[face][(node, fi)],
+        fluxes[(k * 4 + face) * ops.n_face_nodes + fi],
+    )
 }
 
 #[cfg(test)]

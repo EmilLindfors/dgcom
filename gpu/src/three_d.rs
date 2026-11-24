@@ -75,7 +75,7 @@ pub(crate) const OPEN: u32 = u32::MAX - 1;
 const NONE: u32 = u32::MAX;
 
 /// Face-node slots per element.
-const SLOTS: usize = 4 * N1;
+pub(crate) const SLOTS: usize = 4 * N1;
 
 /// Subcell interfaces per element (`subcell_interfaces`).
 pub const NSUB: usize = 2 * N1 * (N1 - 1);
