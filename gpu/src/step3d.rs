@@ -423,9 +423,10 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(48_000);
-    let ny = 300.min(elements / 2).max(1);
+    // The beach's shape at any size (96,000: the other gates' 320 × 300)
+    let ny = ((elements as f64 * 300.0 / 320.0).sqrt().round() as usize).max(4);
     let large = Fixture::new(Shape {
-        nx: elements / ny,
+        nx: (elements / ny).max(4),
         ny,
         jitter: 0.15,
         stretched: true,
