@@ -47,6 +47,7 @@ use dgcom::types::ElementIndex;
 
 use crate::baroclinic::ProfileDevice;
 use crate::hooks::State3D;
+use crate::listed::{On, listed_index};
 use crate::swe2d::{Gpu, N1, NN};
 use crate::three_d::{LEVEL_BLOCK, Statics3D, launch};
 
@@ -209,11 +210,13 @@ pub mod kernels_limiter {
     /// `union_offsets`, `union_elements`), scaled about the element's own
     /// column shifted to keep the inventory (`kuzmin_layer_alpha`). Reads the
     /// pre-passes of the patches' elements and writes the element's own
-    /// nodes of the level; the thin columns are left alone.
+    /// nodes of the level; the thin columns are left alone. Only the
+    /// elements `listed` (empty: every element).
     #[kernel]
     pub fn kuzmin_limit(
         nl: u32,
         n: u32,
+        listed: &[u32],
         relaxation: f64,
         thin_depth: f64,
         eta: &[f64],
@@ -241,6 +244,7 @@ pub mod kernels_limiter {
             return;
         }
         let nl = nl as usize;
+        let t = listed_index(t, listed, nl);
         let (k, level) = (t / nl, t % nl);
         let mut thin = [false; NN];
         let mut all_thin = true;
@@ -396,10 +400,12 @@ pub mod kernels_limiter {
     /// max]`), a layer whose mean is outside them its mean (`enforce`: the
     /// mean clamped into them), else its deviations from it scaled into them
     /// (`compute_theta`); the thin columns left alone, weighing nothing.
+    /// Only the elements `listed` (empty: every element).
     #[kernel]
     pub fn bounds(
         nl: u32,
         n: u32,
+        listed: &[u32],
         thin_depth: f64,
         bounds: &[f64],
         enforce: u32,
@@ -415,6 +421,7 @@ pub mod kernels_limiter {
             return;
         }
         let nl = nl as usize;
+        let t = listed_index(t, listed, nl);
         let (k, level) = (t / nl, t % nl);
         let mut thin = [false; NN];
         for i in 0..NN {
@@ -573,6 +580,8 @@ pub struct Limiter3D {
     /// EnforceBounds`)
     enforce: bool,
     kuzmin: Option<Kuzmin3D>,
+    /// Every element, as a list
+    none_u32: DeviceBuffer<u32>,
 }
 
 impl Limiter3D {
@@ -635,14 +644,17 @@ impl Limiter3D {
             bounds,
             enforce: config.average_policy == TracerAveragePolicy3D::EnforceBounds,
             kuzmin,
+            none_u32: DeviceBuffer::zeroed(st, 0)?,
         })
     }
 
-    /// Limit `values`' T and S (under their `η`) on every element.
+    /// Limit `values`' T and S (under their `η`) on the elements of `on`:
+    /// the Kuzmin limiter's bounds from every element's values as they are.
     pub fn apply(
         &mut self,
         s: &Statics3D,
         values: &mut State3D,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(bounds) = &self.bounds else {
             return Ok(());
@@ -650,6 +662,8 @@ impl Limiter3D {
         let (m, st) = (&self.gpu.module_limiter, &self.gpu.stream);
         let nl = s.n_levels as u32;
         let n_layers = s.n_elements * s.n_levels;
+        let listed = on.listed(&self.none_u32);
+        let n_limited = on.count(s.n_elements) * s.n_levels;
         let State3D {
             eta, temp, salt, ..
         } = values;
@@ -716,9 +730,10 @@ impl Limiter3D {
                 let p = &kz.patches;
                 m.kuzmin_limit(
                     st,
-                    launch(n_layers, LEVEL_BLOCK),
+                    launch(n_limited, LEVEL_BLOCK),
                     nl,
-                    n_layers as u32,
+                    n_limited as u32,
+                    listed,
                     kz.relaxation,
                     self.thin_depth,
                     eta,
@@ -747,9 +762,10 @@ impl Limiter3D {
         unsafe {
             m.bounds(
                 st,
-                launch(n_layers, LEVEL_BLOCK),
+                launch(n_limited, LEVEL_BLOCK),
                 nl,
-                n_layers as u32,
+                n_limited as u32,
+                listed,
                 self.thin_depth,
                 bounds,
                 u32::from(self.enforce),

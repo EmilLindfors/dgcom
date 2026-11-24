@@ -48,6 +48,7 @@ use dgcom::source::CoriolisSource2D;
 use dgcom::types::ElementIndex;
 use dgcom::vertical::SigmaGrid;
 
+use crate::listed::{On, listed_index};
 use crate::swe2d::{Gpu, N1, NN, face_node};
 use crate::three_d::{
     COLUMN_BLOCK, LEVEL_BLOCK, MAX_LEVELS, NSUB, OPEN, POOLING, SUBCELL, Statics3D, Transport3D,
@@ -415,6 +416,7 @@ pub mod kernels_baroclinic {
     pub fn pressure_gradient(
         nl: u32,
         n: u32,
+        listed: &[u32],
         min_column_depth: f64,
         scale: f64,
         rho_ref: f64,
@@ -451,6 +453,7 @@ pub mod kernels_baroclinic {
             return;
         }
         let nl = nl as usize;
+        let t = listed_index(t, listed, nl);
         let (k, l) = (t / nl, t % nl);
         let reference = !density.is_empty();
         let end = |c: usize| {
@@ -587,6 +590,7 @@ pub mod kernels_baroclinic {
     pub fn reference_edges(
         nl: u32,
         n: u32,
+        listed: &[u32],
         min_column_depth: f64,
         kinds: &[u32],
         averaged: &[u32],
@@ -618,6 +622,7 @@ pub mod kernels_baroclinic {
             return;
         }
         let nl = nl as usize;
+        let t = listed_index(t, listed, nl);
         let (k, l) = (t / nl, t % nl);
         let mut e = [0.0; NN];
         let mut depth = [0.0; NN];
@@ -780,6 +785,7 @@ pub mod kernels_baroclinic {
     pub fn reference_totals(
         nl: u32,
         n_elements: u32,
+        listed: &[u32],
         min_column_depth: f64,
         eta: &[f64],
         bed: &[f64],
@@ -795,6 +801,7 @@ pub mod kernels_baroclinic {
         if k >= n_elements as usize {
             return;
         }
+        let k = listed_index(k, listed, 1);
         let nl = nl as usize;
         let made_t = (0..nl).map(|l| made[(k * nl + l) * 2]).sum::<f64>();
         let made_s = (0..nl).map(|l| made[(k * nl + l) * 2 + 1]).sum::<f64>();
@@ -837,6 +844,7 @@ pub mod kernels_baroclinic {
     pub fn reference_correction(
         nl: u32,
         n: u32,
+        listed: &[u32],
         min_column_depth: f64,
         kinds: &[u32],
         eta: &[f64],
@@ -856,6 +864,7 @@ pub mod kernels_baroclinic {
             return;
         }
         let nl = nl as usize;
+        let t = listed_index(t, listed, nl);
         let (k, l) = (t / nl, t % nl);
         let (made_t, made_s, weight, how) = (
             totals[k * 4],
@@ -982,6 +991,8 @@ pub struct Baroclinic3D {
     made: DeviceBuffer<f64>,
     totals: DeviceBuffer<f64>,
     none: DeviceBuffer<f64>,
+    /// Every element, as a list
+    none_u32: DeviceBuffer<u32>,
 }
 
 /// What [`Baroclinic3D::new`] takes of a 3D physics module besides the mesh.
@@ -1059,6 +1070,7 @@ impl Baroclinic3D {
             made: zeros(ne * nl * 2)?,
             totals: zeros(ne * 4)?,
             none: zeros(0)?,
+            none_u32: DeviceBuffer::zeroed(stream, 0)?,
         })
     }
 
@@ -1146,7 +1158,8 @@ impl Baroclinic3D {
     /// `compute_momentum_rhs_3d` of the state `(eta, rho, u, v)`: `rhs_u`,
     /// `rhs_v` overwritten with the baroclinic pressure gradient (σ-pairs,
     /// about the reference of the last [`Self::reference`] if any, else
-    /// about ρ₀), the balanced reference's correction and Coriolis.
+    /// about ρ₀), the balanced reference's correction and Coriolis, on the
+    /// elements of `on` (the columns' pressures of every element).
     pub fn momentum(
         &mut self,
         statics: &Statics3D,
@@ -1156,9 +1169,10 @@ impl Baroclinic3D {
         v: &DeviceBuffer<f64>,
         rhs_u: &mut DeviceBuffer<f64>,
         rhs_v: &mut DeviceBuffer<f64>,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.pressures(statics, eta, rho)?;
-        self.gradient(statics, eta, rho, u, v, rhs_u, rhs_v)
+        self.gradient(statics, eta, rho, u, v, rhs_u, rhs_v, on)
     }
 
     /// The (element, node, level) arrays the reference's fields, or empty
@@ -1241,6 +1255,7 @@ impl Baroclinic3D {
         v: &DeviceBuffer<f64>,
         rhs_u: &mut DeviceBuffer<f64>,
         rhs_v: &mut DeviceBuffer<f64>,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let gpu = &self.gpu;
         let (m, st) = (&gpu.module_baroclinic, &gpu.stream);
@@ -1254,12 +1269,13 @@ impl Baroclinic3D {
         };
         // SAFETY: as in `reference`; `rhs_u`, `rhs_v` are none of the inputs.
         unsafe {
-            let n = s.n_elements * s.n_levels;
+            let n = on.count(s.n_elements) * s.n_levels;
             m.pressure_gradient(
                 st,
                 launch(n, LEVEL_BLOCK),
                 nl,
                 n as u32,
+                on.listed(&self.none_u32),
                 self.min_column_depth,
                 self.scale,
                 self.rho0,
@@ -1310,12 +1326,15 @@ impl Baroclinic3D {
         rhs_t: &mut DeviceBuffer<f64>,
         rhs_s: &mut DeviceBuffer<f64>,
         sources: bool,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let gpu = self.gpu.clone();
         let (m, st) = (&gpu.module_baroclinic, &gpu.stream);
         let s = transport.statics();
         let nl = s.n_levels as u32;
-        let n = s.n_elements * s.n_levels;
+        let n_listed = on.count(s.n_elements);
+        let n = n_listed * s.n_levels;
+        let listed = on.listed(&self.none_u32);
         let Some(fields) = &self.fields else {
             assert!(
                 !sources,
@@ -1331,6 +1350,7 @@ impl Baroclinic3D {
                 launch(n, LEVEL_BLOCK),
                 nl,
                 n as u32,
+                listed,
                 self.min_column_depth,
                 &transport.kinds,
                 &s.averaged,
@@ -1359,9 +1379,10 @@ impl Baroclinic3D {
             )?;
             m.reference_totals(
                 st,
-                launch(s.n_elements, COLUMN_BLOCK),
+                launch(n_listed, COLUMN_BLOCK),
                 nl,
-                s.n_elements as u32,
+                n_listed as u32,
+                listed,
                 self.min_column_depth,
                 eta,
                 &s.bed,
@@ -1378,6 +1399,7 @@ impl Baroclinic3D {
                 launch(n, LEVEL_BLOCK),
                 nl,
                 n as u32,
+                listed,
                 self.min_column_depth,
                 &transport.kinds,
                 eta,

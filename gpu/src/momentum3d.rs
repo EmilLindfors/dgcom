@@ -30,6 +30,7 @@ use dgcom::solver::state::Solution3D;
 use dgcom::source::CoriolisSource2D;
 
 use crate::baroclinic::Baroclinic3D;
+use crate::listed::On;
 use crate::swe2d::{Gpu, NN, ORDER};
 use crate::three_d::Statics3D;
 use crate::transport3d::{Fixture, G, LEVELS, RHO0, Shape, agreement, report, report_reference};
@@ -188,6 +189,7 @@ impl Device {
             &self.v,
             &mut self.rhs_u,
             &mut self.rhs_v,
+            On::ALL,
         )
     }
 
@@ -207,6 +209,7 @@ impl Device {
             &self.v,
             &mut self.rhs_u,
             &mut self.rhs_v,
+            On::ALL,
         )
     }
 
@@ -305,6 +308,7 @@ fn gate(gpu: &Arc<Gpu>, case: Case) -> Result<bool, Box<dyn std::error::Error>> 
             &device.v,
             &mut device.rhs_u,
             &mut device.rhs_v,
+            On::ALL,
         )?;
         same &= report_mutant(gpu, "no displacement term", &rhs.u, &device)?;
         if let Some(fields) = &mut baroclinic.fields {
@@ -323,6 +327,7 @@ fn gate(gpu: &Arc<Gpu>, case: Case) -> Result<bool, Box<dyn std::error::Error>> 
             &device.v,
             &mut device.rhs_u,
             &mut device.rhs_v,
+            On::ALL,
         )?;
         same &= report_mutant(
             gpu,
@@ -402,6 +407,7 @@ fn gate(gpu: &Arc<Gpu>, case: Case) -> Result<bool, Box<dyn std::error::Error>> 
             &device.v,
             &mut device.rhs_u,
             &mut device.rhs_v,
+            On::ALL,
         )?;
         same &= report(gpu, "momentum u", &full.u, &device.rhs_u)?;
         same &= report(gpu, "momentum v", &full.v, &device.rhs_v)?;
@@ -414,6 +420,7 @@ fn gate(gpu: &Arc<Gpu>, case: Case) -> Result<bool, Box<dyn std::error::Error>> 
                 &device.v,
                 &mut device.rhs_u,
                 &mut device.rhs_v,
+                On::ALL,
             )
         };
         device.zero(gpu)?;
@@ -575,10 +582,19 @@ fn time(
             &d.v,
             &mut d.rhs_u,
             &mut d.rhs_v,
+            On::ALL,
         )?;
         gpu.stream.synchronize()?;
         let t2 = Instant::now();
-        device_viscosity.apply(&statics, &d.eta, &d.u, &d.v, &mut d.rhs_u, &mut d.rhs_v)?;
+        device_viscosity.apply(
+            &statics,
+            &d.eta,
+            &d.u,
+            &d.v,
+            &mut d.rhs_u,
+            &mut d.rhs_v,
+            On::ALL,
+        )?;
         gpu.stream.synchronize()?;
         let t3 = Instant::now();
         if it >= 2 {

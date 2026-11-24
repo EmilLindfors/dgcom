@@ -33,6 +33,7 @@ use dgcom::source::{CageDrag2D, NetCage};
 use dgcom::time::StepDrag;
 
 use crate::hooks::State3D;
+use crate::listed::On;
 use crate::stage3d::{Snapshots, report, report_mutant, start_state};
 use crate::swe2d::{Gpu, NN, ORDER};
 use crate::three_d::Statics3D;
@@ -287,7 +288,7 @@ fn on_device(
             ]
         }),
     };
-    vertical.step(statics, &mut state, surface, STEP)?;
+    vertical.step(statics, &mut state, surface, STEP, On::ALL)?;
     let st = &gpu.stream;
     let mut out = Snapshots::new();
     if config.bottom_drag.is_some() {
@@ -570,7 +571,7 @@ fn time(
         gpu.stream.synchronize()?;
         let t0 = Instant::now();
         vertical.drag_rates(&statics, &state)?;
-        vertical.step(&statics, &mut state, surface, STEP)?;
+        vertical.step(&statics, &mut state, surface, STEP, On::ALL)?;
         gpu.stream.synchronize()?;
         if it >= 2 {
             gpu_time += t0.elapsed().as_secs_f64();

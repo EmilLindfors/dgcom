@@ -52,6 +52,7 @@ use dgcom::vertical::{SigmaGrid, depth_average};
 use crate::hooks::{Band3D, Merged3D, N_FIELDS, StageHooks3D, StageValues3D, State3D};
 use crate::limiter::{Limiter3D, VertexPatches};
 use crate::limiter3d::case_runner_config;
+use crate::listed::On;
 use crate::swe2d::{Gpu, NN, ORDER};
 use crate::three_d::Statics3D;
 use crate::transport3d::{DT, Fixture, LEVELS, Shape, agreement};
@@ -464,7 +465,7 @@ impl Device<'_> {
         let mut state = State3D::upload(gpu, start)?;
         hooks.start(s, merged, &mut state)?;
         if mutations.density_everywhere {
-            hooks.density(s, &mut state, None)?;
+            hooks.density(s, &mut state, On::ALL)?;
         }
         take(
             &mut out,
@@ -475,12 +476,21 @@ impl Device<'_> {
         );
         let mut v0 = hooks.values_like(s, start)?;
         v0.values.copy_from(gpu, &state)?;
-        hooks.mask(s, &mut v0)?;
+        hooks.mask(s, &mut v0, On::ALL)?;
         hooks.to_inventories(s, &mut state)?;
         for which in 2..N_FIELDS {
             let q = state.fields()[which];
             let targets = v0.values.fields_mut();
-            hooks.pass_through(s, merged, which, q, &state.eta, &mut *targets[which], false)?;
+            hooks.pass_through(
+                s,
+                merged,
+                which,
+                q,
+                &state.eta,
+                &mut *targets[which],
+                false,
+                On::ALL,
+            )?;
         }
         take(
             &mut out,
@@ -500,7 +510,7 @@ impl Device<'_> {
         if mutations.no_stash {
             v0.stash.forget(gpu)?;
         }
-        hooks.stage_values(s, merged, &mut inv, &mut v1, Some(&v0), false)?;
+        hooks.stage_values(s, merged, &mut inv, &mut v1, Some(&v0), false, On::ALL)?;
         take(
             &mut out,
             "stage values",
@@ -514,7 +524,7 @@ impl Device<'_> {
         // A stage in place, the step's last
         combine(&mut inv_host, &fx.eta_rate, 2.0);
         let mut inv = State3D::upload(gpu, &inv_host)?;
-        hooks.stage_values(s, merged, &mut inv, &mut v1, None, true)?;
+        hooks.stage_values(s, merged, &mut inv, &mut v1, None, true, On::ALL)?;
         take(
             &mut out,
             "in place values",
@@ -536,7 +546,7 @@ impl Device<'_> {
         v1.stash.forget(gpu)?;
         combine(&mut inv_host, &fx.eta_rate, 3.0);
         let inv = State3D::upload(gpu, &inv_host)?;
-        hooks.to_values(s, merged, &inv, &mut v1, None, true)?;
+        hooks.to_values(s, merged, &inv, &mut v1, None, true, On::ALL)?;
         take(
             &mut out,
             "end values",
@@ -857,7 +867,7 @@ fn time(
         groups.n_waves()
     );
     let mut d_v0 = hooks.values_like(&statics, &start)?;
-    hooks.mask(&statics, &mut d_v0)?;
+    hooks.mask(&statics, &mut d_v0, On::ALL)?;
     let mut d_inv = State3D::upload(gpu, &inv_start)?;
     let mut d_v1 = hooks.values_like(&statics, &start)?;
     let gpu_iterations = 5 * iterations;
@@ -865,7 +875,15 @@ fn time(
     let mut gpu_time = 0.0;
     for it in 0..gpu_iterations + 2 {
         let t0 = Instant::now();
-        hooks.stage_values(&statics, &groups, &mut d_inv, &mut d_v1, Some(&d_v0), false)?;
+        hooks.stage_values(
+            &statics,
+            &groups,
+            &mut d_inv,
+            &mut d_v1,
+            Some(&d_v0),
+            false,
+            On::ALL,
+        )?;
         gpu.stream.synchronize()?;
         if it >= 2 {
             gpu_time += t0.elapsed().as_secs_f64();

@@ -29,6 +29,7 @@ use dgcom::solver::rhs::{LayerTransport, MetricForm, to_inventory, w_cell_thickn
 use dgcom::solver::state::Solution3D;
 
 use crate::hooks::State3D;
+use crate::listed::On;
 use crate::stage3d::{Snapshots, report, report_mutant, start_state};
 use crate::swe2d::{Gpu, NN, ORDER};
 use crate::three_d::Statics3D;
@@ -161,7 +162,7 @@ fn on_device(
     implicit.split(statics, eta, &euler_dt, &mut omega)?;
     let mut inventories = State3D::upload(gpu, &stage.inventories)?;
     let dt = DeviceBuffer::from_host(st, run.dt)?;
-    implicit.relax(statics, &mut inventories, &dt)?;
+    implicit.relax(statics, &mut inventories, &dt, On::ALL)?;
     let mut host = stage.inventories.clone();
     inventories.download_into(gpu, &mut host)?;
     let mut out = vec![
@@ -343,7 +344,7 @@ fn time(
         st.synchronize()?;
         let t0 = Instant::now();
         device.split(&statics, &eta, &euler_dt, &mut omega)?;
-        device.relax(&statics, &mut inventories, &dt)?;
+        device.relax(&statics, &mut inventories, &dt, On::ALL)?;
         st.synchronize()?;
         if it >= 2 {
             gpu_time += t0.elapsed().as_secs_f64();

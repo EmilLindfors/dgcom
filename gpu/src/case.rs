@@ -82,13 +82,6 @@ impl CaseDevice for Cuda {
         run: &DeviceRun3D,
         callback: &mut DeviceCallback3D<'_>,
     ) -> Result<DeviceRunReport3D, String> {
-        if integrator.baroclinic_levels() > 0 {
-            return Err(
-                "local time steps of the 3D stages (three_d.levels_lts) are not on the device \
-                 yet (P2.7 4.5d)"
-                    .into(),
-            );
-        }
         let gpu = Gpu::on(ordinal).map_err(|e| e.to_string())?;
         let mut model = Model3D::new(&gpu, physics)?;
         model.start_from(state);
@@ -196,8 +189,22 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
             .unwrap_or_default()
     };
     println!("  CPU: {}; GPU: {}", clips(&cpu), clips(&gpu));
+    // The 3D stages' local time stepping, the same on both sides
+    let stages = |r: &RunReport| {
+        r.notes
+            .iter()
+            .find(|n| n.starts_with("3D stages:"))
+            .cloned()
+            .unwrap_or_default()
+    };
+    if !stages(&gpu).is_empty() {
+        println!("  {}", stages(&gpu));
+    }
 
-    let mut all_identical = same_volume && cpu.n_steps == gpu.n_steps && clips(&cpu) == clips(&gpu);
+    let mut all_identical = same_volume
+        && cpu.n_steps == gpu.n_steps
+        && clips(&cpu) == clips(&gpu)
+        && stages(&cpu) == stages(&gpu);
     for (c, g) in cpu.stations.iter().zip(&gpu.stations) {
         let (identical, n, worst) = compare_station(c, g);
         all_identical &= identical == n;

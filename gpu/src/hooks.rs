@@ -55,6 +55,7 @@ use dgcom::solver::state::Solution3D;
 use dgcom::vertical::depth_average;
 
 use crate::limiter::Limiter3D;
+use crate::listed::{On, is_member, listed_index};
 use crate::swe2d::{Gpu, N1, NN, face_node};
 use crate::three_d::{COLUMN_BLOCK, LEVEL_BLOCK, NSUB, OPEN, SLOTS, Statics3D, WALL, launch};
 
@@ -90,15 +91,17 @@ pub mod kernels_hooks {
         }
     }
 
-    /// `from_inventory_after`'s nodes, one thread per cell: the inventory
-    /// `q` over its cell's thickness under `eta`; at a node shallower than
-    /// `DRY_DEPTH`, or carried with its group (`joined`, empty for none),
-    /// the last value: `last`'s (empty: `out`'s own), or the stash's `kept`
-    /// in a `masked` column (empty: none).
+    /// `from_inventory_after`'s nodes, one thread per cell of the elements
+    /// `listed` (empty: every element): the inventory `q` over its cell's
+    /// thickness under `eta`; at a node shallower than `DRY_DEPTH`, or
+    /// carried with its group (`joined`, empty for none), the last value:
+    /// `last`'s (empty: `out`'s own), or the stash's `kept` in a `masked`
+    /// column (empty: none).
     #[kernel]
     pub fn from_inventory(
         nc: u32,
         n: u32,
+        listed: &[u32],
         eta: &[f64],
         bed: &[f64],
         cells: &[f64],
@@ -114,6 +117,7 @@ pub mod kernels_hooks {
             return;
         }
         let nc = nc as usize;
+        let t = listed_index(t, listed, NN * nc);
         let (col, c) = (t / nc, t % nc);
         let depth = eta[col] - bed[col];
         let carried = !joined.is_empty() && joined[col] != 0;
@@ -135,14 +139,16 @@ pub mod kernels_hooks {
     }
 
     /// `MergedCells::convert_element`, one thread per element with a group
-    /// (`listed`) and cell: every group of two or more (not of a flushed
-    /// element) takes its inventory over its volume, if it holds more than
+    /// (`listed`) and cell, of the elements `member` flags (empty: every
+    /// element): every group of two or more (not of a flushed element) takes
+    /// its inventory over its volume, if it holds more than
     /// `dry_volume_of`'s.
     #[kernel]
     pub fn merged_convert(
         nc: u32,
         n: u32,
         listed: &[u32],
+        member: &[u32],
         group: &[u32],
         joined: &[u32],
         flushed: &[u32],
@@ -160,7 +166,7 @@ pub mod kernels_hooks {
         let nc = nc as usize;
         let (j, c) = (t / nc, t % nc);
         let k = listed[j] as usize;
-        if flushed[k] != 0 {
+        if flushed[k] != 0 || !is_member(member, k) {
             return;
         }
         let dc = cells[c];
@@ -266,13 +272,15 @@ pub mod kernels_hooks {
     /// elements `wave[first..first + n / nc]` (indices into the flushed
     /// list); none of them reads another's nodes, and the waves run in the
     /// order that gives each the values the list's order would
-    /// ([`Merged3D::upload`]).
+    /// ([`Merged3D::upload`]). Only the elements `member` flags (empty:
+    /// every element).
     #[kernel]
     pub fn merged_pass_through(
         nc: u32,
         n: u32,
         first: u32,
         end: u32,
+        member: &[u32],
         wave: &[u32],
         flushed_k: &[u32],
         flushed_io: &[[f64; 2]],
@@ -295,6 +303,9 @@ pub mod kernels_hooks {
         let j = wave[first as usize + w] as usize;
         let dc = cells[c];
         let k = flushed_k[j] as usize;
+        if !is_member(member, k) {
+            return;
+        }
         let [entering, leaving] = flushed_io[j];
         let inflows = inflow_offsets[j] as usize..inflow_offsets[j + 1] as usize;
         // From other elements (`Iterator::sum`, from −0.0)
@@ -344,13 +355,14 @@ pub mod kernels_hooks {
         }
     }
 
-    /// `inventory_of`, one thread per cell: the value times its cell's
-    /// volume under `eta`, but in the elements `flushed` lists (empty:
-    /// none).
+    /// `inventory_of`, one thread per cell of the elements `listed` (empty:
+    /// every element): the value times its cell's volume under `eta`, but in
+    /// the elements `flushed` lists (empty: none).
     #[kernel]
     pub fn inventory_of(
         nc: u32,
         n: u32,
+        listed: &[u32],
         eta: &[f64],
         bed: &[f64],
         cells: &[f64],
@@ -363,6 +375,7 @@ pub mod kernels_hooks {
             return;
         }
         let nc = nc as usize;
+        let t = listed_index(t, listed, NN * nc);
         let (col, c) = (t / nc, t % nc);
         if !flushed.is_empty() && flushed[col / NN] != 0 {
             return;
@@ -373,12 +386,14 @@ pub mod kernels_hooks {
         }
     }
 
-    /// `dry_inventories`, one thread per cell: [`inventory_of`] at the nodes
-    /// shallower than `DRY_DEPTH` only.
+    /// `dry_inventories`, one thread per cell of the elements `listed`
+    /// (empty: every element): [`inventory_of`] at the nodes shallower than
+    /// `DRY_DEPTH` only.
     #[kernel]
     pub fn dry_inventories(
         nc: u32,
         n: u32,
+        listed: &[u32],
         eta: &[f64],
         bed: &[f64],
         cells: &[f64],
@@ -391,6 +406,7 @@ pub mod kernels_hooks {
             return;
         }
         let nc = nc as usize;
+        let t = listed_index(t, listed, NN * nc);
         let (col, c) = (t / nc, t % nc);
         if !flushed.is_empty() && flushed[col / NN] != 0 {
             return;
@@ -401,6 +417,22 @@ pub mod kernels_hooks {
             unsafe {
                 *q.get_unchecked_mut(t) = values[t] * layer_volume_of(depth, cells[c]);
             }
+        }
+    }
+
+    /// `to = from` on the rows of the elements `listed` (empty: every
+    /// element), `per` values an element, one thread per value.
+    #[kernel]
+    pub fn copy_rows(per: u32, n: u32, listed: &[u32], from: &[f64], mut to: DisjointSlice<f64>) {
+        let t = thread::index_1d().get();
+        if t >= n as usize {
+            return;
+        }
+        let i = listed_index(t, listed, per as usize);
+        // SAFETY: thread t alone writes value i (the listed elements are
+        // distinct).
+        unsafe {
+            *to.get_unchecked_mut(i) = from[i];
         }
     }
 
@@ -442,13 +474,15 @@ pub mod kernels_hooks {
     }
 
     /// `StageStash::forget` and `mask` with `Hydrostatic3D::mask_stage`'s
-    /// test, one thread per layer: a column shallower than `thin_depth`
-    /// under `eta` is masked, its `u`, `v` (and, by its bed layer's thread,
-    /// `ū`, `v̄`) kept and set to zero; the others unmasked.
+    /// test, one thread per layer of the elements `listed` (empty: every
+    /// element): a column shallower than `thin_depth` under `eta` is masked,
+    /// its `u`, `v` (and, by its bed layer's thread, `ū`, `v̄`) kept and set
+    /// to zero; the others unmasked.
     #[kernel]
     pub fn mask_thin(
         nl: u32,
         n: u32,
+        listed: &[u32],
         thin_depth: f64,
         eta: &[f64],
         bed: &[f64],
@@ -467,6 +501,7 @@ pub mod kernels_hooks {
             return;
         }
         let nl = nl as usize;
+        let t = listed_index(t, listed, NN * nl);
         let (col, l) = (t / nl, t % nl);
         let thin = eta[col] - bed[col] < thin_depth;
         // SAFETY: thread t alone touches layer t, and the bed layer's
@@ -1627,22 +1662,32 @@ impl StageHooks3D {
                 )?;
             }
         }
-        self.density(s, state, Some(merged))
+        self.density_of(s, state, &merged.elements, merged.n_grouped)
     }
 
     /// The density of `state`'s T and S (`update_density_on`), on the
-    /// elements with a group of `merged` if given, else on every element.
+    /// elements of `on`.
     pub fn density(
         &self,
         s: &Statics3D,
         state: &mut State3D,
-        merged: Option<&Merged3D>,
+        on: On<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listed = on.listed(&self.none_u32);
+        self.density_of(s, state, listed, on.count(s.n_elements))
+    }
+
+    /// The density of `state`'s T and S on the `n_listed` elements `listed`
+    /// (empty: every element).
+    fn density_of(
+        &self,
+        s: &Statics3D,
+        state: &mut State3D,
+        listed: &DeviceBuffer<u32>,
+        n_listed: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let per = NN * s.n_levels;
-        let (listed, n) = match merged {
-            Some(merged) => (&merged.elements, merged.n_grouped * per),
-            None => (&self.none_u32, s.n_elements * per),
-        };
+        let n = n_listed * per;
         if n == 0 {
             return Ok(());
         }
@@ -1664,7 +1709,8 @@ impl StageHooks3D {
     }
 
     /// The flushed elements' values of inventory field `which` (`q` under
-    /// `eta`) into `out` (`MergedCells::pass_through` on every element).
+    /// `eta`) into `out` (`MergedCells::pass_through`), of the elements of
+    /// `on`.
     pub fn pass_through(
         &self,
         s: &Statics3D,
@@ -1674,6 +1720,7 @@ impl StageHooks3D {
         eta: &DeviceBuffer<f64>,
         out: &mut DeviceBuffer<f64>,
         end: bool,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if merged.n_flushed == 0 || q.is_empty() {
             return Ok(());
@@ -1691,6 +1738,7 @@ impl StageHooks3D {
                     n as u32,
                     w[0] as u32,
                     u32::from(end),
+                    on.member(&self.none_u32),
                     &merged.waves,
                     &merged.flushed_k,
                     &merged.flushed_io,
@@ -1713,8 +1761,8 @@ impl StageHooks3D {
     /// last values where a node has no water from `from` (its stash's
     /// velocities in its masked columns), or, without `from`, `out`'s own
     /// (its stash's); the groups as one cell, the flushed elements passed
-    /// through; then `η`, `ū`, `v̄` of `inv`. The density is left to the
-    /// caller.
+    /// through; then `η`, `ū`, `v̄` of `inv`; on the elements of `on`. The
+    /// density is left to the caller.
     pub fn values_of(
         &self,
         s: &Statics3D,
@@ -1722,9 +1770,67 @@ impl StageHooks3D {
         inv: &State3D,
         out: &mut StageValues3D,
         from: Option<&StageValues3D>,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.to_values(s, merged, inv, out, from, false)?;
-        out.values.copy_barotropic(&self.gpu, inv)
+        self.to_values(s, merged, inv, out, from, false, on)?;
+        self.copy_barotropic(s, inv, &mut out.values, on)
+    }
+
+    /// `η`, `ū`, `v̄` of `from` into `to` on the elements of `on`
+    /// (`copy_barotropic_rows`).
+    pub fn copy_barotropic(
+        &self,
+        s: &Statics3D,
+        from: &State3D,
+        to: &mut State3D,
+        on: On<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if on.is_all() {
+            return to.copy_barotropic(&self.gpu, from);
+        }
+        for (from, to) in [
+            (&from.eta, &mut to.eta),
+            (&from.ubar, &mut to.ubar),
+            (&from.vbar, &mut to.vbar),
+        ] {
+            self.copy_rows(s, 1, from, to, on)?;
+        }
+        Ok(())
+    }
+
+    /// `to = from` on the rows of the elements of `on` (`copy_rows`),
+    /// `per_node` values a node.
+    pub fn copy_rows(
+        &self,
+        s: &Statics3D,
+        per_node: usize,
+        from: &DeviceBuffer<f64>,
+        to: &mut DeviceBuffer<f64>,
+        on: On<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if to.is_empty() {
+            return Ok(());
+        }
+        let st = &self.gpu.stream;
+        if on.is_all() {
+            to.copy_from_device_async(from, st)?;
+            return Ok(());
+        }
+        let per = NN * per_node;
+        let n = on.count(s.n_elements) * per;
+        // SAFETY: both hold `per` values of every element.
+        unsafe {
+            self.gpu.module_hooks.copy_rows(
+                st,
+                launch(n, LEVEL_BLOCK),
+                per as u32,
+                n as u32,
+                on.listed(&self.none_u32),
+                from,
+                to,
+            )?;
+        }
+        Ok(())
     }
 
     /// [`Self::values_of`] but `η`, `ū`, `v̄`: at a step's `end` the
@@ -1738,8 +1844,10 @@ impl StageHooks3D {
         out: &mut StageValues3D,
         from: Option<&StageValues3D>,
         end: bool,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (m, st) = (&self.gpu.module_hooks, &self.gpu.stream);
+        let (listed, member) = (on.listed(&self.none_u32), on.member(&self.none_u32));
         let StageValues3D { values, stash } = out;
         let stash = match from {
             Some(from) => &from.stash,
@@ -1755,7 +1863,7 @@ impl StageHooks3D {
                 continue;
             }
             let (cells, nc) = Self::cells_of(s, which);
-            let n = s.n_columns() * nc;
+            let n = on.count(s.n_elements) * NN * nc;
             let last = from.map_or(&self.none, |from| from.values.fields()[which]);
             let (masked, kept) = match which {
                 0 => (&stash.masked, &stash.u),
@@ -1776,6 +1884,7 @@ impl StageHooks3D {
                     launch(n, LEVEL_BLOCK),
                     nc as u32,
                     n as u32,
+                    listed,
                     &inv.eta,
                     &s.bed,
                     cells,
@@ -1794,6 +1903,7 @@ impl StageHooks3D {
                         nc as u32,
                         n as u32,
                         &merged.elements,
+                        member,
                         &merged.group,
                         &merged.joined,
                         &merged.flushed,
@@ -1807,15 +1917,15 @@ impl StageHooks3D {
                 }
             }
             if grouped {
-                self.pass_through(s, merged, which, q, &inv.eta, out_field, end)?;
+                self.pass_through(s, merged, which, q, &inv.eta, out_field, end, on)?;
             }
         }
         Ok(())
     }
 
     /// `inventory_of` (`all`: every inventory field, else T and S) of
-    /// `values` into `inv` under `inv`'s `η`: not the flushed elements' of
-    /// the fields with groups.
+    /// `values` into `inv` under `inv`'s `η`, on the elements of `on`: not
+    /// the flushed elements' of the fields with groups.
     pub fn inventories_of(
         &self,
         s: &Statics3D,
@@ -1823,6 +1933,7 @@ impl StageHooks3D {
         values: &State3D,
         inv: &mut State3D,
         all: bool,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.inventories(
             s,
@@ -1831,19 +1942,22 @@ impl StageHooks3D {
             inv,
             if all { 0..N_FIELDS } else { 2..4 },
             false,
+            on,
         )
     }
 
-    /// `dry_inventories` of `values` into `inv` (u, v, k, ψ).
+    /// `dry_inventories` of `values` into `inv` (u, v, k, ψ), on the
+    /// elements of `on`.
     pub fn dry_inventories(
         &self,
         s: &Statics3D,
         merged: &Merged3D,
         values: &State3D,
         inv: &mut State3D,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.inventories(s, merged, values, inv, 0..2, true)?;
-        self.inventories(s, merged, values, inv, 4..N_FIELDS, true)
+        self.inventories(s, merged, values, inv, 0..2, true, on)?;
+        self.inventories(s, merged, values, inv, 4..N_FIELDS, true, on)
     }
 
     fn inventories(
@@ -1854,8 +1968,10 @@ impl StageHooks3D {
         inv: &mut State3D,
         fields: std::ops::Range<usize>,
         dry: bool,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (m, st) = (&self.gpu.module_hooks, &self.gpu.stream);
+        let listed = on.listed(&self.none_u32);
         let State3D {
             eta,
             u,
@@ -1875,7 +1991,7 @@ impl StageHooks3D {
             }
             let c = values.fields()[which];
             let (cells, nc) = Self::cells_of(s, which);
-            let n = s.n_columns() * nc;
+            let n = on.count(s.n_elements) * NN * nc;
             let flushed = if which >= N_MOMENTUM_FIELDS {
                 &merged.flushed
             } else {
@@ -1884,14 +2000,13 @@ impl StageHooks3D {
             // SAFETY: the buffers are sized for this mesh and these levels.
             unsafe {
                 let config = launch(n, LEVEL_BLOCK);
+                let (nc, n) = (nc as u32, n as u32);
                 if dry {
                     m.dry_inventories(
-                        st, config, nc as u32, n as u32, eta, &s.bed, cells, c, flushed, q,
+                        st, config, nc, n, listed, eta, &s.bed, cells, c, flushed, q,
                     )?;
                 } else {
-                    m.inventory_of(
-                        st, config, nc as u32, n as u32, eta, &s.bed, cells, c, flushed, q,
-                    )?;
+                    m.inventory_of(st, config, nc, n, listed, eta, &s.bed, cells, c, flushed, q)?;
                 }
             }
         }
@@ -1899,13 +2014,15 @@ impl StageHooks3D {
     }
 
     /// The thin columns of `out`'s values at rest, what they held into its
-    /// stash (`StageStash::forget`, then `Hydrostatic3D::mask_stage`).
+    /// stash (`StageStash::forget`, then `Hydrostatic3D::mask_stage`), on
+    /// the elements of `on`.
     pub fn mask(
         &self,
         s: &Statics3D,
         out: &mut StageValues3D,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let n = s.n_columns() * s.n_levels;
+        let n = on.count(s.n_elements) * NN * s.n_levels;
         let StageValues3D { values, stash } = out;
         // SAFETY: the buffers are sized for this mesh and these levels.
         unsafe {
@@ -1914,6 +2031,7 @@ impl StageHooks3D {
                 launch(n, LEVEL_BLOCK),
                 s.n_levels as u32,
                 n as u32,
+                on.listed(&self.none_u32),
                 self.min_column_depth,
                 &values.eta,
                 &s.bed,
@@ -1966,7 +2084,7 @@ impl StageHooks3D {
     /// the tracer limiter (`post_stage`, but at the step's `end`: then
     /// `end_density`), the density, the limited T and S back into `inv`,
     /// the dry nodes' inventories of u, v, k, ψ from their last values, and
-    /// the thin columns masked for the next RHS.
+    /// the thin columns masked for the next RHS; on the elements of `on`.
     pub fn stage_values(
         &mut self,
         s: &Statics3D,
@@ -1975,15 +2093,31 @@ impl StageHooks3D {
         out: &mut StageValues3D,
         from: Option<&StageValues3D>,
         end: bool,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.values_of(s, merged, inv, out, from)?;
-        if let (false, Some(limiter)) = (end, &mut self.limiter) {
-            limiter.apply(s, &mut out.values)?;
+        self.values_of(s, merged, inv, out, from, on)?;
+        if end {
+            self.density(s, &mut out.values, on)?;
+        } else {
+            self.post_stage(s, &mut out.values, on)?;
         }
-        self.density(s, &mut out.values, None)?;
-        self.inventories_of(s, merged, &out.values, inv, false)?;
-        self.dry_inventories(s, merged, &out.values, inv)?;
-        self.mask(s, out)
+        self.inventories_of(s, merged, &out.values, inv, false, on)?;
+        self.dry_inventories(s, merged, &out.values, inv, on)?;
+        self.mask(s, out, on)
+    }
+
+    /// `Hydrostatic3D::post_stage` of `values` on the elements of `on`: the
+    /// tracer limiter, then the density.
+    pub fn post_stage(
+        &mut self,
+        s: &Statics3D,
+        values: &mut State3D,
+        on: On<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(limiter) = &mut self.limiter {
+            limiter.apply(s, values, on)?;
+        }
+        self.density(s, values, on)
     }
 
     /// `Hydrostatic3D::post_process`'s tracer limiter and density of a
@@ -1993,10 +2127,7 @@ impl StageHooks3D {
         s: &Statics3D,
         values: &mut State3D,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(limiter) = &mut self.limiter {
-            limiter.apply(s, values)?;
-        }
-        self.density(s, values, None)
+        self.post_stage(s, values, On::ALL)
     }
 
     /// The momentum tendencies `rhs_u`, `rhs_v` of the columns thin under
