@@ -5,7 +5,8 @@
 //!
 //! The model has the case runner's terms: the wet/dry 2D module of a 3D run
 //! (Coriolis on a β-plane, walls), k-ε, the log-layer bottom drag, a farm
-//! of net cages, uniform surface stresses and a wind stress field, rivers,
+//! of net cages, uniform surface stresses and a wind stress field, surface
+//! heat and fresh-water fluxes over each column's sea surface, rivers,
 //! the reference stratification with its pressure gradient, its advection
 //! and the Kuzmin limiter about it, implicit vertical advection, the
 //! shear's Smagorinsky viscosity. The integrator is the case runner's: the
@@ -23,8 +24,8 @@ use std::time::Instant;
 use dgcom::Reflective2D;
 use dgcom::physics::vertical_mixing::Forcing;
 use dgcom::physics::{
-    BottomDrag3D, GlsMixing, Hydrostatic3D, ImplicitVerticalAdvection, LinearEOS, TimeStepLimit,
-    TimeStepLimits,
+    BottomDrag3D, GlsMixing, Hydrostatic3D, ImplicitVerticalAdvection, JerlovWater, LinearEOS,
+    SeaSurface, SurfaceFluxFields, SurfaceFluxes3D, TimeStepLimit, TimeStepLimits,
 };
 use dgcom::simulation::{NonFinite, RunModel3D, non_finite_field};
 use dgcom::solver::state::Solution3D;
@@ -59,6 +60,10 @@ struct Terms {
     reference: bool,
     smagorinsky: f64,
     roughness: f64,
+    /// The surface heat and fresh-water fluxes with their shortwave's water,
+    /// and whether they read the sea surface's T
+    fluxes: Option<JerlovWater>,
+    flux_sst: bool,
 }
 
 impl Terms {
@@ -71,7 +76,31 @@ impl Terms {
         reference: true,
         smagorinsky: 0.1,
         roughness: 0.003,
+        fluxes: Some(JerlovWater::III),
+        flux_sst: true,
     };
+}
+
+/// Surface fluxes of each column's own sea surface and the time, as a
+/// weather model's heat budget (`GriddedSurfaceFluxes`) depends on them: a
+/// non-solar loss growing with the SST, a shortwave varying from node to
+/// node, an E − P growing with the SSS. A device that evaluated them over
+/// another surface or at another time would give other values. Without
+/// `sst`, the non-solar flux is a uniform 10 °C surface's.
+struct SeaSurfaceFluxes {
+    sst: bool,
+}
+
+impl SurfaceFluxes3D for SeaSurfaceFluxes {
+    fn surface_fluxes_into(&self, t: f64, surface: SeaSurface<'_>, fluxes: SurfaceFluxFields<'_>) {
+        let hour = (t / 3600.0).sin();
+        for (i, (&sst, sss)) in surface.temperature.iter().zip(surface.salinity).enumerate() {
+            let sst = if self.sst { sst } else { 10.0 };
+            fluxes.nonsolar[i] = -80.0 - 15.0 * (sst - 10.0) + 20.0 * hour;
+            fluxes.shortwave[i] = 300.0 * (1.0 + hour) * (i % 9) as f64 / 8.0;
+            fluxes.freshwater[i] = 2e-5 * (sss - 33.0);
+        }
+    }
 }
 
 /// A `Hydrostatic3D` of `fx` with `terms` (its boundaries the fixture's).
@@ -119,6 +148,13 @@ fn physics(fx: &Fixture, terms: Terms) -> Physics {
     }
     if terms.implicit {
         physics = physics.with_implicit_vertical_advection(ImplicitVerticalAdvection::default());
+    }
+    if let Some(water) = terms.fluxes {
+        physics = physics
+            .with_surface_fluxes(SeaSurfaceFluxes {
+                sst: terms.flux_sst,
+            })
+            .with_shortwave_absorption(water);
     }
     physics.boundaries = fx.boundaries.clone();
     match &fx.profile {
@@ -262,7 +298,7 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape, mutants: bool) -> Result<bool
     if !mutants {
         return Ok(same);
     }
-    let terms: [(&str, Terms); 8] = [
+    let terms: [(&str, Terms); 11] = [
         (
             "no wind stress field",
             Terms {
@@ -316,6 +352,27 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape, mutants: bool) -> Result<bool
             "bed roughness 4 mm",
             Terms {
                 roughness: 0.004,
+                ..base
+            },
+        ),
+        (
+            "no surface fluxes",
+            Terms {
+                fluxes: None,
+                ..base
+            },
+        ),
+        (
+            "Jerlov I's shortwave",
+            Terms {
+                fluxes: Some(JerlovWater::I),
+                ..base
+            },
+        ),
+        (
+            "the fluxes of a 10 °C sea surface",
+            Terms {
+                flux_sst: false,
                 ..base
             },
         ),
