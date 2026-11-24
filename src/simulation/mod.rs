@@ -25,4 +25,6 @@ pub(crate) mod runner;
 mod simulation_3d;
 
 pub use runner::{Simulation, SimulationConfig, SimulationResult};
-pub use simulation_3d::{RunContext3D, Simulation3D};
+pub use simulation_3d::{
+    NonFinite, RunContext3D, RunModel3D, Simulation3D, non_finite_field, restart_of, resume_into,
+};

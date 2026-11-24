@@ -11,7 +11,8 @@
 # 1. The gates, built with --no-fmad, against the SIMD batch: the RHS and
 #    Simulation runs and the nested runs (`all`), the drying beach (`beach`) and
 #    cases/tidal_channel through the case runner (`case`), also with local
-#    time stepping (`case_lts`) and forced by a tidal atlas (`case_atlas`).
+#    time stepping (`case_lts`), forced by a tidal atlas (`case_atlas`) and
+#    in 3D (`case_3d`: 25 h, its snapshot too).
 #    On any card each must be the CPU's bit for bit.
 # 2. The timing, built with FMA: the refined tidal channel at each size, on
 #    the CPU and on the GPU, REPEATS times; and the 3D transport, momentum
@@ -35,6 +36,7 @@ gpu_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(dirname "$gpu_dir")
 case_file="$repo/cases/tidal_channel/case.toml"
 atlas_file="$repo/cases/tidal_channel/atlas.toml"
+three_d_file="$repo/cases/tidal_channel/three_d.toml"
 exe="$gpu_dir/target/release/dgcom-gpu"
 case $(uname -s) in MINGW* | MSYS*) exe+=".exe" ;; esac
 
@@ -112,13 +114,15 @@ if ((SKIP_GATES == 0)); then
     say ""
     say "| gate | result |"
     say "|---|---|"
-    for gate in all beach case case_lts case_atlas; do
+    for gate in all beach case case_lts case_atlas case_3d; do
         if [[ $gate == case ]]; then
             run_logged "gate_$gate" "$exe" case "$case_file"
         elif [[ $gate == case_lts ]]; then
             run_logged "gate_$gate" "$exe" case "$case_file" --set numerics.local_time_stepping_levels=3
         elif [[ $gate == case_atlas ]]; then
             run_logged "gate_$gate" "$exe" case "$atlas_file"
+        elif [[ $gate == case_3d ]]; then
+            run_logged "gate_$gate" "$exe" case "$three_d_file"
         else
             run_logged "gate_$gate" "$exe" "$gate"
         fi
@@ -136,6 +140,8 @@ if ((SKIP_GATES == 0)); then
             what="the same with local time stepping (3 levels)"
         elif [[ $gate == case_atlas ]]; then
             what="the same forced by a tidal atlas node by node"
+        elif [[ $gate == case_3d ]]; then
+            what="the 3D channel: steps, volume, station records and the 3D snapshot"
         else
             what="every node of $compared state$( ((compared == 1)) || echo s)"
         fi

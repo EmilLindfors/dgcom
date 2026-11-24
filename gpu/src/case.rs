@@ -1,24 +1,34 @@
 //! A case file on the GPU: dgcom's case runner with the CUDA backend
-//! ([`Cuda`], `[compute] device`), and the gate of a whole case: the same
-//! case run on the CPU and on the GPU, the stations' records compared bit
-//! for bit.
+//! ([`Cuda`], `[compute] device`; a 2D run and, since Phase 4.5c, a 3D
+//! one), and the gate of a whole case: the same case run on the CPU and on
+//! the GPU, the stations' records and the 3D snapshots compared bit for
+//! bit.
 
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use dgcom::case::{CaseDevice, CaseFile, DeviceRun, DeviceRunReport, RunReport, StationSeries};
-use dgcom::physics::SWEDeviceForm2D;
-use dgcom::simulation::{Simulation, SimulationResult};
+use dgcom::boundary::MultiBoundaryCondition2D;
+use dgcom::case::{
+    CaseDevice, CaseFile, DeviceCallback3D, DeviceRun, DeviceRun3D, DeviceRunReport,
+    DeviceRunReport3D, RunReport, StationSeries,
+};
+use dgcom::physics::{GlsMixing, Hydrostatic3D, LinearEOS, SWEDeviceForm2D};
+use dgcom::simulation::{Simulation, Simulation3D, SimulationResult};
 use dgcom::solver::SWESolution2D;
-use dgcom::time::{IntegratorInfo, Multirate, TimeIntegrator};
+use dgcom::solver::state::Solution3D;
+use dgcom::time::{IntegratorInfo, ModeSplitIntegrator, Multirate, TimeIntegrator};
 
+use crate::hooks::State3D;
+use crate::model3d::{Model3D, Work3D};
 use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, MAX_DEVICE_LEVELS};
 
 /// The CUDA backend of the case runner: a 2D run's state and physics on a
-/// CUDA GPU, stepped by dgcom's own `Simulation`; the state comes back to
-/// the host at every output.
+/// CUDA GPU, stepped by dgcom's own `Simulation`, the state back on the host
+/// at every output; a 3D run's on the device as [`Model3D`], stepped by
+/// dgcom's own `Simulation3D`, the state back on the host after every step
+/// (its bound is the CPU's of that copy).
 pub struct Cuda;
 
 impl CaseDevice for Cuda {
@@ -62,6 +72,51 @@ impl CaseDevice for Cuda {
             device: gpu.name.clone(),
         })
     }
+
+    fn run_3d(
+        &self,
+        ordinal: usize,
+        physics: &Hydrostatic3D<LinearEOS, GlsMixing, MultiBoundaryCondition2D<'_>>,
+        integrator: ModeSplitIntegrator,
+        state: &mut Solution3D,
+        run: &DeviceRun3D,
+        callback: &mut DeviceCallback3D<'_>,
+    ) -> Result<DeviceRunReport3D, String> {
+        if integrator.baroclinic_levels() > 0 {
+            return Err(
+                "local time steps of the 3D stages (three_d.levels_lts) are not on the device \
+                 yet (P2.7 4.5d)"
+                    .into(),
+            );
+        }
+        let gpu = Gpu::on(ordinal).map_err(|e| e.to_string())?;
+        let mut model = Model3D::new(&gpu, physics)?;
+        model.start_from(state);
+        let mut device = State3D::upload(&gpu, state).map_err(|e| e.to_string())?;
+        let mut sim = Simulation3D::new(model, integrator.on::<Work3D>())
+            .with_cfl(run.cfl)
+            .with_dt_max(run.dt_max)
+            .with_landing_interval(run.landing_interval);
+        let (t_start, t_end) = run.span;
+        let result = sim.run_with_context_callback(&mut device, t_start, t_end, |_, t, context| {
+            let host = context.physics.host();
+            callback(&host, t, &|| context.integrator().slow_forcing_record());
+        });
+        // The end state, with the vertical terms' eddy coefficients
+        *state = sim.physics().host().clone();
+        if let Some(work) = sim.integrator().work() {
+            work.eddy_coefficients_into(state);
+        }
+        let integrator = sim.integrator();
+        Ok(DeviceRunReport3D {
+            result,
+            last_substeps: integrator.last_substeps(),
+            negative_depth_clips: sim.physics().negative_depth_clips(),
+            barotropic: integrator.barotropic_multirate_stats(),
+            baroclinic: integrator.baroclinic_multirate_stats(),
+            device: gpu.name.clone(),
+        })
+    }
 }
 
 /// `sim` from the state over the run's span with its settings, the state to
@@ -87,10 +142,11 @@ fn drive<I: TimeIntegrator<DeviceState> + IntegratorInfo>(
 
 /// The case gate: the case at `path` (with `overrides`) on the CPU and on
 /// CUDA device 0, each into its own directory under `output/gpu_gate/`,
-/// their steps, volumes, clips and every station's every record compared
-/// bit for bit (a build without multiply–add contraction).
+/// their steps, volumes, clips, every station's every record and a 3D
+/// run's snapshot compared bit for bit (a build without multiply–add
+/// contraction).
 pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
-    let run = |device: &str| -> Result<(RunReport, f64), Box<dyn Error>> {
+    let run = |device: &str| -> Result<(RunReport, f64, std::path::PathBuf), Box<dyn Error>> {
         let mut all = overrides.to_vec();
         all.push(format!("compute.device={device}"));
         all.push(format!(
@@ -101,10 +157,14 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
         let domain = file.build_domain()?;
         let start = Instant::now();
         let report = file.run_on_with(&domain, Some(&Cuda), &mut |_| {})?;
-        Ok((report, start.elapsed().as_secs_f64()))
+        // The run's own snapshot (other runs' share the directory)
+        let snapshot = file
+            .output_dir()
+            .join(format!("{}.dgsnap", file.case.run.name));
+        Ok((report, start.elapsed().as_secs_f64(), snapshot))
     };
-    let (cpu, cpu_seconds) = run("cpu")?;
-    let (gpu, gpu_seconds) = run("cuda:0")?;
+    let (cpu, cpu_seconds, cpu_snapshot) = run("cpu")?;
+    let (gpu, gpu_seconds, gpu_snapshot) = run("cuda:0")?;
 
     println!(
         "{}: {} steps on the CPU ({cpu_seconds:.1} s) and {} on the GPU ({gpu_seconds:.1} s), \
@@ -143,6 +203,19 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
         println!(
             "  station {}: {identical} of {n} records bit-identical, largest difference {worst:.1e}",
             c.name
+        );
+    }
+    // A 3D run's snapshot (written by the same build: the same stamp)
+    if let (Ok(a), Ok(b)) = (std::fs::read(&cpu_snapshot), std::fs::read(&gpu_snapshot)) {
+        let differ = a.len().max(b.len()) - a.iter().zip(&b).filter(|(x, y)| x == y).count();
+        all_identical &= differ == 0;
+        println!(
+            "  snapshot {}: {differ} of {} bytes differ",
+            cpu_snapshot
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            a.len().max(b.len())
         );
     }
     if all_identical {

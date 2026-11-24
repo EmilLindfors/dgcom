@@ -336,17 +336,11 @@ impl SlowForcing3D {
         })
     }
 
-    /// `slow_forcing_into` of `state` with the momentum RHS `(rhs_u, rhs_v)`
-    /// of it, the surface stress field `stress` (`[τ_x, τ_y]` per node at
-    /// the step's time, if any) and the step's drag rates of `vertical`
-    /// (its cages' if `caged`, the columns under a cage): into [`Self::g`].
-    pub fn compute(
-        &mut self,
-        state: &State3D,
-        rhs: [&DeviceBuffer<f64>; 2],
-        stress: Option<[&DeviceBuffer<f64>; 2]>,
-        cages: Option<(&Vertical3D, &DeviceBuffer<u32>)>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    /// The layer transports of `state` by its own flow, its thin columns at
+    /// rest, without a barotropic flux (`Hydrostatic3D::layer_advection`'s,
+    /// which `update_vertical_velocity` takes Ω from): into
+    /// [`Self::layers`], and the masked flow into the slow forcing's buffers.
+    pub fn layer_transports(&mut self, state: &State3D) -> Result<(), Box<dyn std::error::Error>> {
         let gpu = self.gpu.clone();
         let (m, st) = (&gpu.module_forcing, &gpu.stream);
         let s = self.layers.statics();
@@ -372,10 +366,28 @@ impl SlowForcing3D {
                 &mut self.bar_v,
             )?;
         }
+        self.layers
+            .compute(&state.eta, &self.masked_u, &self.masked_v, None, None)
+    }
+
+    /// `slow_forcing_into` of `state` with the momentum RHS `(rhs_u, rhs_v)`
+    /// of it, the surface stress field `stress` (`[τ_x, τ_y]` per node at
+    /// the step's time, if any) and the step's drag rates of `vertical`
+    /// (its cages' if `caged`, the columns under a cage): into [`Self::g`].
+    pub fn compute(
+        &mut self,
+        state: &State3D,
+        rhs: [&DeviceBuffer<f64>; 2],
+        stress: Option<[&DeviceBuffer<f64>; 2]>,
+        cages: Option<(&Vertical3D, &DeviceBuffer<u32>)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let gpu = self.gpu.clone();
+        let (m, st) = (&gpu.module_forcing, &gpu.stream);
         // Σ_l A_l(u): the layers' advection by their own transports, from
         // zero
-        self.layers
-            .compute(&state.eta, &self.masked_u, &self.masked_v, None, None)?;
+        self.layer_transports(state)?;
+        let s = self.layers.statics();
+        let (nl, n) = (s.n_levels, s.n_columns());
         self.advection_u.zero_async(st)?;
         self.advection_v.zero_async(st)?;
         let velocity = |field| Advected {
