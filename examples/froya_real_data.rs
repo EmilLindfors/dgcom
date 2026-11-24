@@ -4310,279 +4310,278 @@ fn tidal_run_3d<'a>(
     let mut restarts = RestartSchedule::new(&output_dir, domain, opts, t_start);
     let command = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     let land_on_samples = record.is_some();
-    let callback =
-        |s: &Solution3D,
-         t: f64,
-         run: &RunContext3D<LinearEOS, Box<dyn VerticalMixing + Send + Sync>, _>| {
-            let physics = run.physics;
-            if last_t.is_finite() {
-                steps += 1;
-                if t - last_t < dt_lo {
-                    dt_lo = t - last_t;
-                    binding = physics.last_time_step_limits().map(|limits| {
-                        let mut bounds = vec![
-                            ("advection and internal waves", limits.advection),
-                            ("Coriolis", limits.coriolis),
-                            (
-                                "the reference's waves along sloping levels",
-                                limits.sloping_levels,
-                            ),
-                            ("viscosity", limits.viscosity),
-                        ];
-                        if physics.implicit_vertical_advection.is_none() {
-                            bounds.push(("vertical advection", limits.vertical));
-                        }
-                        bounds
-                            .into_iter()
-                            .min_by(|a, b| a.1.dt.total_cmp(&b.1.dt))
-                            .expect("bounds")
-                    });
-                }
-            }
-            last_t = t;
-            // A resumed run's first callback is at the restart's time, which
-            // the stopped run sampled; only the farm (not in the restart)
-            // records from it
-            if std::mem::take(&mut at_restart)
-                && let Some(record) = record.as_mut()
-            {
-                barotropic(s, &mut q);
-                record.sample_3d(&q, s, &sigma, bed, t);
-            }
-            if t < next_sample - 1e-6 {
-                return;
-            }
-            while next_sample <= t + 1e-6 {
-                next_sample += interval;
-            }
-            barotropic(s, &mut q);
-            if let Some(record) = record.as_mut() {
-                record.sample_3d(&q, s, &sigma, bed, t);
-            }
-            for station in &mut stations {
-                station.sample(&q, &domain.bathymetry, clock.unix(t));
-            }
-            n_callbacks += 1;
-            if let (Some(writer), Some(every)) = (snapshot.as_mut(), snapshot_every)
-                && (n_callbacks - 1) % every == 0
-                && let Err(e) = writer.write_solution_3d(t, s)
-            {
-                write_error.get_or_insert(e.to_string());
-            }
-            if (n_callbacks - 1) % output_every != 0 {
-                return;
-            }
-            // What set the shortest step, and the vertical bound now
-            let element_place = |k: usize| {
-                let (mut x, mut y, mut depth) = (0.0, 0.0, 0.0);
-                for i in 0..nn {
-                    let [px, py] = domain.mesh.reference_to_physical(
-                        ElementIndex::new(k),
-                        domain.ops.nodes_r[i],
-                        domain.ops.nodes_s[i],
-                    );
-                    x += px / nn as f64;
-                    y += py / nn as f64;
-                    depth += (s.eta.data[k * nn + i] - bed[k * nn + i]) / nn as f64;
-                }
-                (x / 1e3, y / 1e3, depth)
-            };
-            if steps > 0 {
-                let set_by = match binding {
-                    Some((name, limit)) if limit.element < ne => {
-                        let (x, y, d) = element_place(limit.element);
-                        // The shallowest column too: an element with a thin
-                        // one has its sloping levels' bound from the subcell
-                        // interfaces, not from the pairs' measured frequency
-                        let shallowest = (0..nn)
-                            .map(|i| {
-                                s.eta.data[limit.element * nn + i] - bed[limit.element * nn + i]
-                            })
-                            .fold(f64::INFINITY, f64::min);
-                        format!(
-                            "; the shortest set by {name} in element {} at ({x:.1}, {y:.1}) km, {d:.1} m mean depth ({shallowest:.2} m at its shallowest node)",
-                            limit.element
-                        )
+    let callback = |s: &Solution3D,
+                    t: f64,
+                    run: &RunContext3D<
+        Hydrostatic3D<LinearEOS, Box<dyn VerticalMixing + Send + Sync>, _>,
+    >| {
+        let physics = run.physics;
+        if last_t.is_finite() {
+            steps += 1;
+            if t - last_t < dt_lo {
+                dt_lo = t - last_t;
+                binding = physics.last_time_step_limits().map(|limits| {
+                    let mut bounds = vec![
+                        ("advection and internal waves", limits.advection),
+                        ("Coriolis", limits.coriolis),
+                        (
+                            "the reference's waves along sloping levels",
+                            limits.sloping_levels,
+                        ),
+                        ("viscosity", limits.viscosity),
+                    ];
+                    if physics.implicit_vertical_advection.is_none() {
+                        bounds.push(("vertical advection", limits.vertical));
                     }
-                    _ => String::new(),
-                };
-                let vertical = physics
-                    .last_time_step_limits()
-                    .map_or(f64::NAN, |l| l.vertical.dt);
-                let implicit = if physics.implicit_vertical_advection.is_some() {
-                    let stats = physics.take_implicit_advection_stats();
+                    bounds
+                        .into_iter()
+                        .min_by(|a, b| a.1.dt.total_cmp(&b.1.dt))
+                        .expect("bounds")
+                });
+            }
+        }
+        last_t = t;
+        // A resumed run's first callback is at the restart's time, which
+        // the stopped run sampled; only the farm (not in the restart)
+        // records from it
+        if std::mem::take(&mut at_restart)
+            && let Some(record) = record.as_mut()
+        {
+            barotropic(s, &mut q);
+            record.sample_3d(&q, s, &sigma, bed, t);
+        }
+        if t < next_sample - 1e-6 {
+            return;
+        }
+        while next_sample <= t + 1e-6 {
+            next_sample += interval;
+        }
+        barotropic(s, &mut q);
+        if let Some(record) = record.as_mut() {
+            record.sample_3d(&q, s, &sigma, bed, t);
+        }
+        for station in &mut stations {
+            station.sample(&q, &domain.bathymetry, clock.unix(t));
+        }
+        n_callbacks += 1;
+        if let (Some(writer), Some(every)) = (snapshot.as_mut(), snapshot_every)
+            && (n_callbacks - 1) % every == 0
+            && let Err(e) = writer.write_solution_3d(t, s)
+        {
+            write_error.get_or_insert(e.to_string());
+        }
+        if (n_callbacks - 1) % output_every != 0 {
+            return;
+        }
+        // What set the shortest step, and the vertical bound now
+        let element_place = |k: usize| {
+            let (mut x, mut y, mut depth) = (0.0, 0.0, 0.0);
+            for i in 0..nn {
+                let [px, py] = domain.mesh.reference_to_physical(
+                    ElementIndex::new(k),
+                    domain.ops.nodes_r[i],
+                    domain.ops.nodes_s[i],
+                );
+                x += px / nn as f64;
+                y += py / nn as f64;
+                depth += (s.eta.data[k * nn + i] - bed[k * nn + i]) / nn as f64;
+            }
+            (x / 1e3, y / 1e3, depth)
+        };
+        if steps > 0 {
+            let set_by = match binding {
+                Some((name, limit)) if limit.element < ne => {
+                    let (x, y, d) = element_place(limit.element);
+                    // The shallowest column too: an element with a thin
+                    // one has its sloping levels' bound from the subcell
+                    // interfaces, not from the pairs' measured frequency
+                    let shallowest = (0..nn)
+                        .map(|i| s.eta.data[limit.element * nn + i] - bed[limit.element * nn + i])
+                        .fold(f64::INFINITY, f64::min);
                     format!(
-                        "; implicit vertical advection in up to {} columns, outflow Courant number ≤ {:.2}",
-                        stats.columns, stats.largest_courant
+                        "; the shortest set by {name} in element {} at ({x:.1}, {y:.1}) km, {d:.1} m mean depth ({shallowest:.2} m at its shallowest node)",
+                        limit.element
                     )
-                } else {
-                    String::new()
+                }
+                _ => String::new(),
+            };
+            let vertical = physics
+                .last_time_step_limits()
+                .map_or(f64::NAN, |l| l.vertical.dt);
+            let implicit = if physics.implicit_vertical_advection.is_some() {
+                let stats = physics.take_implicit_advection_stats();
+                format!(
+                    "; implicit vertical advection in up to {} columns, outflow Courant number ≤ {:.2}",
+                    stats.columns, stats.largest_courant
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "         steps {steps}: dt {dt_lo:.2}–{:.2} s{set_by}; |Ω|/H_z bound now {vertical:.2} s{implicit}",
+                (t - since) / steps as f64,
+            );
+            if dbg("dt_dist") {
+                // Every element's own advective step now: what local time
+                // stepping in 3D could save, and who sets it
+                let mut own = physics.element_advection_steps(s, opts.cfl_3d);
+                own.retain(|e| e.dt.is_finite());
+                own.sort_by(|a, b| a.dt.total_cmp(&b.dt));
+                let smallest = own.first().map_or(f64::NAN, |e| e.dt);
+                let quantile = |q: f64| {
+                    let i = (own.len().saturating_sub(1) as f64 * q) as usize;
+                    own.get(i).map_or(f64::NAN, |e| e.dt)
+                };
+                let gain = |levels: u32| {
+                    let work: f64 = own
+                        .iter()
+                        .map(|e| {
+                            let l = ((e.dt / smallest).log2().floor() as u32).min(levels);
+                            0.5_f64.powi(l as i32)
+                        })
+                        .sum();
+                    own.len() as f64 / work
+                };
+                let without = |depth: f64| {
+                    own.iter()
+                        .find(|e| e.depth >= depth)
+                        .map_or(f64::NAN, |e| e.dt)
                 };
                 println!(
-                    "         steps {steps}: dt {dt_lo:.2}–{:.2} s{set_by}; |Ω|/H_z bound now {vertical:.2} s{implicit}",
-                    (t - since) / steps as f64,
+                    "         own steps: min {smallest:.2}, p0.1 {:.2}, p1 {:.2}, p5 {:.2}, median {:.2} s; LTS gain L=1 {:.2}, 2 {:.2}, 3 {:.2}, 4 {:.2}; min over binding depth ≥ 2 m {:.2}, ≥ 5 m {:.2}",
+                    quantile(0.001),
+                    quantile(0.01),
+                    quantile(0.05),
+                    quantile(0.5),
+                    gain(1),
+                    gain(2),
+                    gain(3),
+                    gain(4),
+                    without(2.0),
+                    without(5.0),
                 );
-                if dbg("dt_dist") {
-                    // Every element's own advective step now: what local time
-                    // stepping in 3D could save, and who sets it
-                    let mut own = physics.element_advection_steps(s, opts.cfl_3d);
-                    own.retain(|e| e.dt.is_finite());
-                    own.sort_by(|a, b| a.dt.total_cmp(&b.dt));
-                    let smallest = own.first().map_or(f64::NAN, |e| e.dt);
-                    let quantile = |q: f64| {
-                        let i = (own.len().saturating_sub(1) as f64 * q) as usize;
-                        own.get(i).map_or(f64::NAN, |e| e.dt)
-                    };
-                    let gain = |levels: u32| {
-                        let work: f64 = own
-                            .iter()
-                            .map(|e| {
-                                let l = ((e.dt / smallest).log2().floor() as u32).min(levels);
-                                0.5_f64.powi(l as i32)
+                // What the multirate schedule would save, with its level
+                // jumps of one and each stage's rate spread over what a
+                // stage value reads: the transport's faces, the
+                // viscosity's corners, then the Kuzmin limiter's vertex
+                // patches
+                let mut element_dt = vec![0.0; s.n_elements];
+                physics.element_steps_into(s, opts.cfl_3d, opts.rk_3d, &mut element_dt);
+                use dgcom::time::multirate::{MultirateStepper, RhsStencil};
+                let reads: [(&str, &[RhsStencil]); 3] = [
+                    ("faces", &[RhsStencil::Faces]),
+                    ("corners", &[RhsStencil::FacesAndCorners]),
+                    (
+                        "corners + vertex patches",
+                        &[RhsStencil::FacesAndCorners, RhsStencil::VertexPatches],
+                    ),
+                ];
+                let planned: Vec<String> = reads
+                    .iter()
+                    .map(|(name, stencils)| {
+                        let speedups: Vec<String> = (1..=4)
+                            .map(|levels| {
+                                let mut stepper =
+                                    MultirateStepper::<Solution3D>::new(levels, opts.rk_3d);
+                                stepper.assign_levels_from(
+                                    &element_dt,
+                                    &domain.mesh,
+                                    stencils,
+                                    None,
+                                    None,
+                                );
+                                format!("{:.2}", stepper.planned_speedup())
                             })
-                            .sum();
-                        own.len() as f64 / work
-                    };
-                    let without = |depth: f64| {
-                        own.iter()
-                            .find(|e| e.depth >= depth)
-                            .map_or(f64::NAN, |e| e.dt)
-                    };
+                            .collect();
+                        format!("{name} {}", speedups.join("/"))
+                    })
+                    .collect();
+                println!(
+                    "           scheduled gain at L = 1/2/3/4, stage values reading {}",
+                    planned.join("; ")
+                );
+                let limits = physics.time_step_limits(s, opts.cfl_3d, opts.rk_3d);
+                println!(
+                    "           limits now: advection {:.2} (element {}), viscosity {:.2} (element {}), coriolis {:.0}, vertical {:.2}, sloping levels {:.2} (element {}); last compute_dt's advection {:.2}",
+                    limits.advection.dt,
+                    limits.advection.element,
+                    limits.viscosity.dt,
+                    limits.viscosity.element,
+                    limits.coriolis.dt,
+                    limits.vertical.dt,
+                    limits.sloping_levels.dt,
+                    limits.sloping_levels.element,
+                    physics
+                        .last_time_step_limits()
+                        .map_or(f64::NAN, |l| l.advection.dt),
+                );
+                for e in own.iter().take(5) {
                     println!(
-                        "         own steps: min {smallest:.2}, p0.1 {:.2}, p1 {:.2}, p5 {:.2}, median {:.2} s; LTS gain L=1 {:.2}, 2 {:.2}, 3 {:.2}, 4 {:.2}; min over binding depth ≥ 2 m {:.2}, ≥ 5 m {:.2}",
-                        quantile(0.001),
-                        quantile(0.01),
-                        quantile(0.05),
-                        quantile(0.5),
-                        gain(1),
-                        gain(2),
-                        gain(3),
-                        gain(4),
-                        without(2.0),
-                        without(5.0),
+                        "           dt {:.2} s: |u| {:.2} m/s, c1 {:.2} m/s, h {:.1} m, depth {:.2} m",
+                        e.dt, e.speed, e.c1, e.length, e.depth
                     );
-                    // What the multirate schedule would save, with its level
-                    // jumps of one and each stage's rate spread over what a
-                    // stage value reads: the transport's faces, the
-                    // viscosity's corners, then the Kuzmin limiter's vertex
-                    // patches
-                    let mut element_dt = vec![0.0; s.n_elements];
-                    physics.element_steps_into(s, opts.cfl_3d, opts.rk_3d, &mut element_dt);
-                    use dgcom::time::multirate::{MultirateStepper, RhsStencil};
-                    let reads: [(&str, &[RhsStencil]); 3] = [
-                        ("faces", &[RhsStencil::Faces]),
-                        ("corners", &[RhsStencil::FacesAndCorners]),
-                        (
-                            "corners + vertex patches",
-                            &[RhsStencil::FacesAndCorners, RhsStencil::VertexPatches],
-                        ),
-                    ];
-                    let planned: Vec<String> = reads
-                        .iter()
-                        .map(|(name, stencils)| {
-                            let speedups: Vec<String> = (1..=4)
-                                .map(|levels| {
-                                    let mut stepper =
-                                        MultirateStepper::<Solution3D>::new(levels, opts.rk_3d);
-                                    stepper.assign_levels_from(
-                                        &element_dt,
-                                        &domain.mesh,
-                                        stencils,
-                                        None,
-                                        None,
-                                    );
-                                    format!("{:.2}", stepper.planned_speedup())
-                                })
-                                .collect();
-                            format!("{name} {}", speedups.join("/"))
-                        })
-                        .collect();
-                    println!(
-                        "           scheduled gain at L = 1/2/3/4, stage values reading {}",
-                        planned.join("; ")
-                    );
-                    let limits = physics.time_step_limits(s, opts.cfl_3d, opts.rk_3d);
-                    println!(
-                        "           limits now: advection {:.2} (element {}), viscosity {:.2} (element {}), coriolis {:.0}, vertical {:.2}, sloping levels {:.2} (element {}); last compute_dt's advection {:.2}",
-                        limits.advection.dt,
-                        limits.advection.element,
-                        limits.viscosity.dt,
-                        limits.viscosity.element,
-                        limits.coriolis.dt,
-                        limits.vertical.dt,
-                        limits.sloping_levels.dt,
-                        limits.sloping_levels.element,
-                        physics
-                            .last_time_step_limits()
-                            .map_or(f64::NAN, |l| l.advection.dt),
-                    );
-                    for e in own.iter().take(5) {
-                        println!(
-                            "           dt {:.2} s: |u| {:.2} m/s, c1 {:.2} m/s, h {:.1} m, depth {:.2} m",
-                            e.dt, e.speed, e.c1, e.length, e.depth
-                        );
-                    }
                 }
             }
-            binding = None;
-            (steps, dt_lo, since) = (0, f64::INFINITY, t);
-            let stats = domain.stats(&q);
-            let (x, y, h) = stats.fastest;
-            // The fastest layer of a column at least the thin depth deep
-            let (mut fastest, mut level, mut column) = (0.0_f64, 0, 0);
-            for (idx, &b) in bed.iter().enumerate() {
-                if s.eta.data[idx] - b < opts.thin_depth() {
-                    continue;
-                }
-                for l in 0..nl {
-                    let j = idx * nl + l;
-                    let speed = s.u[j].hypot(s.v[j]);
-                    if speed.is_nan() || speed > fastest {
-                        (fastest, level, column) = (speed, l, idx);
-                    }
+        }
+        binding = None;
+        (steps, dt_lo, since) = (0, f64::INFINITY, t);
+        let stats = domain.stats(&q);
+        let (x, y, h) = stats.fastest;
+        // The fastest layer of a column at least the thin depth deep
+        let (mut fastest, mut level, mut column) = (0.0_f64, 0, 0);
+        for (idx, &b) in bed.iter().enumerate() {
+            if s.eta.data[idx] - b < opts.thin_depth() {
+                continue;
+            }
+            for l in 0..nl {
+                let j = idx * nl + l;
+                let speed = s.u[j].hypot(s.v[j]);
+                if speed.is_nan() || speed > fastest {
+                    (fastest, level, column) = (speed, l, idx);
                 }
             }
-            // T and S in the thin (shore) columns too, the dry nodes with
-            // them: they lie within what the other columns have had (a thin
-            // column takes no surface flux, and its transport makes no new
-            // extreme: TODO P4.5)
-            let ranges = physics.tracer_ranges(s);
-            let pair = |ranges: Option<[(f64, f64); 2]>, j: usize| match ranges {
-                Some(r) => format!("{:5.2}–{:5.2}", r[j].0, r[j].1),
-                None => "none".to_string(),
-            };
-            let [fx, fy] = domain.mesh.reference_to_physical(
-                ElementIndex::new(column / nn),
-                domain.ops.nodes_r[column % nn],
-                domain.ops.nodes_s[column % nn],
-            );
-            println!(
-                "{:6.2} h | [{:+.3}, {:+.3}] | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {fastest:5.2}, level {level:2} at ({:6.1}, {:6.1}; {:5.1} m, element {}) | {}, {} | {}, {} | {:.0} s",
-                t / 3600.0,
-                stats.eta.0,
-                stats.eta.1,
-                stats.speed,
-                x / 1e3,
-                y / 1e3,
-                fx / 1e3,
-                fy / 1e3,
-                s.eta.data[column] - bed[column],
-                column / nn,
-                pair(ranges.resolved, 0),
-                pair(ranges.thin, 0),
-                pair(ranges.resolved, 1),
-                pair(ranges.thin, 1),
-                start.elapsed().as_secs_f64()
-            );
-            if let Some(restarts) = restarts.as_mut().filter(|r| r.due(t)) {
-                let mut restart = run.restart(s, t);
-                let driver = &mut restart.driver;
-                driver.set_metadata("command", command.as_str());
-                save_stations(&stations, driver);
-                driver.set_extra("driver.counters", vec![n_callbacks as f64, next_sample]);
-                restarts.write(t, |path| restart.write(path));
-            }
+        }
+        // T and S in the thin (shore) columns too, the dry nodes with
+        // them: they lie within what the other columns have had (a thin
+        // column takes no surface flux, and its transport makes no new
+        // extreme: TODO P4.5)
+        let ranges = physics.tracer_ranges(s);
+        let pair = |ranges: Option<[(f64, f64); 2]>, j: usize| match ranges {
+            Some(r) => format!("{:5.2}–{:5.2}", r[j].0, r[j].1),
+            None => "none".to_string(),
         };
+        let [fx, fy] = domain.mesh.reference_to_physical(
+            ElementIndex::new(column / nn),
+            domain.ops.nodes_r[column % nn],
+            domain.ops.nodes_s[column % nn],
+        );
+        println!(
+            "{:6.2} h | [{:+.3}, {:+.3}] | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {fastest:5.2}, level {level:2} at ({:6.1}, {:6.1}; {:5.1} m, element {}) | {}, {} | {}, {} | {:.0} s",
+            t / 3600.0,
+            stats.eta.0,
+            stats.eta.1,
+            stats.speed,
+            x / 1e3,
+            y / 1e3,
+            fx / 1e3,
+            fy / 1e3,
+            s.eta.data[column] - bed[column],
+            column / nn,
+            pair(ranges.resolved, 0),
+            pair(ranges.thin, 0),
+            pair(ranges.resolved, 1),
+            pair(ranges.thin, 1),
+            start.elapsed().as_secs_f64()
+        );
+        if let Some(restarts) = restarts.as_mut().filter(|r| r.due(t)) {
+            let mut restart = run.restart(s, t);
+            let driver = &mut restart.driver;
+            driver.set_metadata("command", command.as_str());
+            save_stations(&stations, driver);
+            driver.set_extra("driver.counters", vec![n_callbacks as f64, next_sample]);
+            restarts.write(t, |path| restart.write(path));
+        }
+    };
     let integrator = ModeSplitIntegrator::new()
         .with_barotropic_cfl(opts.cfl_bt)
         .with_barotropic_scheme(opts.rk_bt)

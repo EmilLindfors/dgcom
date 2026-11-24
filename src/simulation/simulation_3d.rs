@@ -1,6 +1,8 @@
 //! 3D Simulation Runner.
 //!
-//! Specialized runner for 3D hydrostatic simulations using mode splitting.
+//! Specialized runner for 3D hydrostatic simulations using mode splitting,
+//! on the CPU ([`Hydrostatic3D`]) or on a device's model ([`RunModel3D`]:
+//! `gpu/`'s CUDA model, P2.7).
 //!
 //! # Restarts
 //!
@@ -16,23 +18,100 @@
 
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::io::{DriverData, Restart3D, RestartError, domain_fingerprint_3d};
+use crate::mesh::Mesh2D;
 use crate::physics::eos::EquationOfState;
 use crate::physics::hydrostatic_3d::Hydrostatic3D;
 use crate::physics::traits::PhysicsModule; // For 2D trait bounds
 use crate::physics::vertical_mixing::VerticalMixing;
 use crate::simulation::{SimulationConfig, SimulationResult};
 use crate::solver::state::Solution3D;
-use crate::time::mode_split::{ModeSplitIntegrator, ModeSplitPhysics};
+use crate::time::mode_split::{
+    ModeSplitIntegrator, ModeSplitPhysics, SlowForcingRecord, SplitModel,
+};
+use crate::time::{RhsStencil, SspScheme};
 
-/// High-level simulation runner for 3D models.
-pub struct Simulation3D<EOS, MIX, BC>
+/// A 3D model as [`Simulation3D`] runs it, on some backend: besides the
+/// steps ([`SplitModel`], which the mode splitter takes), what the run does
+/// around them. Every [`Hydrostatic3D`] on the CPU; a device's model (`gpu/`)
+/// on its own state.
+pub trait RunModel3D: SplitModel {
+    /// Before the run, from its start state: the reference stratification,
+    /// if the model takes it from the state
+    /// ([`Hydrostatic3D::ensure_reference_profile`]).
+    fn prepare(&mut self, state: &Self::State);
+
+    /// The baroclinic step at Courant number `cfl` in `scheme`
+    /// ([`Hydrostatic3D::compute_dt_ssp`]).
+    fn compute_dt_ssp(&self, state: &Self::State, cfl: f64, scheme: SspScheme) -> f64;
+
+    /// Every element's own 3D step into `out`, for local time stepping
+    /// ([`Hydrostatic3D::element_steps_into`]).
+    fn element_steps_into(&self, state: &Self::State, cfl: f64, scheme: SspScheme, out: &mut [f64]);
+
+    /// What a 3D stage value reads, in turn
+    /// ([`ModeSplitPhysics::stage_stencils`]).
+    fn stencils(&self) -> Vec<RhsStencil>;
+
+    /// The horizontal mesh.
+    fn mesh(&self) -> &Mesh2D;
+
+    /// The density of `state`'s T and S, before every step.
+    fn update_density(&self, state: &mut Self::State);
+
+    /// After every step ([`Hydrostatic3D::post_process`]): the tracer
+    /// limiters, the density, the diagnostics; `work` is the integrator's
+    /// (its buffers, for a backend that keeps its modules there).
+    fn post_process(&self, state: &mut Self::State, work: &mut Self::Work);
+
+    /// The prognostic field with values that are not finite in the fewest
+    /// elements, if any.
+    fn non_finite(&self, state: &Self::State) -> Option<NonFinite>;
+}
+
+impl<EOS, MIX, BC> RunModel3D for Hydrostatic3D<EOS, MIX, BC>
 where
     EOS: EquationOfState,
     MIX: VerticalMixing,
-    BC: SWEBoundaryCondition2D,
+    crate::physics::SWEPhysics2D<BC>: PhysicsModule<crate::solver::SWESolution2D>,
+    BC: Clone + Send + Sync + SWEBoundaryCondition2D,
 {
-    physics: Hydrostatic3D<EOS, MIX, BC>,
-    integrator: ModeSplitIntegrator,
+    fn prepare(&mut self, state: &Solution3D) {
+        self.ensure_reference_profile(state);
+    }
+
+    fn compute_dt_ssp(&self, state: &Solution3D, cfl: f64, scheme: SspScheme) -> f64 {
+        Hydrostatic3D::compute_dt_ssp(self, state, cfl, scheme)
+    }
+
+    fn element_steps_into(&self, state: &Solution3D, cfl: f64, scheme: SspScheme, out: &mut [f64]) {
+        Hydrostatic3D::element_steps_into(self, state, cfl, scheme, out);
+    }
+
+    fn stencils(&self) -> Vec<RhsStencil> {
+        ModeSplitPhysics::stage_stencils(self)
+    }
+
+    fn mesh(&self) -> &Mesh2D {
+        &self.mesh
+    }
+
+    fn update_density(&self, state: &mut Solution3D) {
+        Hydrostatic3D::update_density(self, state);
+    }
+
+    fn post_process(&self, state: &mut Solution3D, _work: &mut Self::Work) {
+        Hydrostatic3D::post_process(self, state);
+    }
+
+    fn non_finite(&self, state: &Solution3D) -> Option<NonFinite> {
+        non_finite_field(state)
+    }
+}
+
+/// High-level simulation runner for 3D models.
+pub struct Simulation3D<M: RunModel3D> {
+    physics: M,
+    integrator: ModeSplitIntegrator<M::Work>,
     config: SimulationConfig,
     /// The steps land on every multiple of this time (s), if set.
     landing_interval: Option<f64>,
@@ -40,15 +119,9 @@ where
     element_dt: Vec<f64>,
 }
 
-impl<EOS, MIX, BC> Simulation3D<EOS, MIX, BC>
-where
-    EOS: EquationOfState,
-    MIX: VerticalMixing,
-    crate::physics::SWEPhysics2D<BC>: PhysicsModule<crate::solver::SWESolution2D>,
-    BC: Clone + Send + Sync + SWEBoundaryCondition2D,
-{
+impl<M: RunModel3D> Simulation3D<M> {
     /// Create a new 3D simulation.
-    pub fn new(physics: Hydrostatic3D<EOS, MIX, BC>, integrator: ModeSplitIntegrator) -> Self {
+    pub fn new(physics: M, integrator: ModeSplitIntegrator<M::Work>) -> Self {
         Self {
             physics,
             integrator,
@@ -117,70 +190,31 @@ where
 
     /// The mode-split integrator (e.g. for
     /// [`ModeSplitIntegrator::last_substeps`]).
-    pub fn integrator(&self) -> &ModeSplitIntegrator {
+    pub fn integrator(&self) -> &ModeSplitIntegrator<M::Work> {
         &self.integrator
     }
 
     /// The physics (e.g. for
     /// [`Hydrostatic3D::take_implicit_advection_stats`] after a run).
-    pub fn physics(&self) -> &Hydrostatic3D<EOS, MIX, BC> {
+    pub fn physics(&self) -> &M {
         &self.physics
     }
 
-    /// The run's state between two steps, at time `t`, to save with
-    /// [`Restart3D::write`] (see the [module docs](self)).
-    pub fn restart(&self, state: &Solution3D, t: f64) -> Restart3D {
-        capture_restart(&self.physics, &self.integrator, state, t)
-    }
-
-    /// Continue the run `restart` holds: check that it is of this domain
-    /// (mesh, bed, σ-grid), and take its slow-forcing history and vertical
-    /// reference. Then run from [`Restart3D::time`] with [`Restart3D::state`].
-    /// The physics must be built as the restarted run's was: its forcing,
-    /// boundaries and options are not in the file.
-    pub fn resume(&mut self, restart: &Restart3D) -> Result<(), RestartError> {
-        let physics = &self.physics;
-        let s = &restart.state;
-        let expected = (
-            physics.mesh.n_elements,
-            physics.ops.n_nodes,
-            physics.sigma.n_levels(),
-        );
-        if (s.n_elements, s.n_nodes, s.n_levels) != expected {
-            return Err(RestartError::Domain(format!(
-                "{} elements × {} nodes × {} levels, this run has {} × {} × {}",
-                s.n_elements, s.n_nodes, s.n_levels, expected.0, expected.1, expected.2
-            )));
-        }
-        let domain = domain_fingerprint_3d(&physics.mesh, &physics.bathymetry.data, &physics.sigma);
-        if restart.domain != domain {
-            return Err(RestartError::Domain(format!(
-                "its mesh, bed or σ-grid differ (fingerprint {:016x}, this run {domain:016x})",
-                restart.domain
-            )));
-        }
-        self.physics
-            .set_reference_profile(restart.reference_profile.clone());
-        self.integrator
-            .restore_slow_forcing(restart.slow_forcing.clone());
-        Ok(())
-    }
-
     /// Run the simulation.
-    pub fn run(&mut self, state: &mut Solution3D, t_start: f64, t_end: f64) -> SimulationResult {
+    pub fn run(&mut self, state: &mut M::State, t_start: f64, t_end: f64) -> SimulationResult {
         self.run_with_callback(state, t_start, t_end, |_, _| {})
     }
 
     /// Run with callback.
     pub fn run_with_callback<F>(
         &mut self,
-        state: &mut Solution3D,
+        state: &mut M::State,
         t_start: f64,
         t_end: f64,
         mut callback: F,
     ) -> SimulationResult
     where
-        F: FnMut(&Solution3D, f64),
+        F: FnMut(&M::State, f64),
     {
         self.run_with_physics_callback(state, t_start, t_end, |s, t, _| callback(s, t))
     }
@@ -190,13 +224,13 @@ where
     /// [`Hydrostatic3D::take_implicit_advection_stats`] during a run).
     pub fn run_with_physics_callback<F>(
         &mut self,
-        state: &mut Solution3D,
+        state: &mut M::State,
         t_start: f64,
         t_end: f64,
         mut callback: F,
     ) -> SimulationResult
     where
-        F: FnMut(&Solution3D, f64, &Hydrostatic3D<EOS, MIX, BC>),
+        F: FnMut(&M::State, f64, &M),
     {
         self.run_with_context_callback(state, t_start, t_end, |s, t, context| {
             callback(s, t, context.physics)
@@ -208,18 +242,18 @@ where
     /// ([`RunContext3D::restart`]).
     pub fn run_with_context_callback<F>(
         &mut self,
-        state: &mut Solution3D,
+        state: &mut M::State,
         t_start: f64,
         t_end: f64,
         mut callback: F,
     ) -> SimulationResult
     where
-        F: FnMut(&Solution3D, f64, &RunContext3D<'_, EOS, MIX, BC>),
+        F: FnMut(&M::State, f64, &RunContext3D<'_, M>),
     {
         let start_wall = std::time::Instant::now();
         // The initial stratification's mean profile as the reference,
         // unless the physics has its own or opted out
-        self.physics.ensure_reference_profile(state);
+        self.physics.prepare(state);
         let mut t = t_start;
         let mut n_steps = 0;
         let mut dt_min_used = f64::INFINITY;
@@ -264,17 +298,17 @@ where
                 if self.integrator.baroclinic_levels() == 0 {
                     return self.physics.compute_dt_ssp(state, self.config.cfl, scheme);
                 }
-                self.element_dt.resize(state.n_elements, 0.0);
+                self.element_dt.resize(self.physics.mesh().n_elements, 0.0);
                 self.physics.element_steps_into(
                     state,
                     self.config.cfl,
                     scheme,
                     &mut self.element_dt,
                 );
-                let stencils = self.physics.stage_stencils();
+                let stencils = self.physics.stencils();
                 self.integrator.assign_baroclinic_levels(
                     &self.element_dt,
-                    &self.physics.mesh,
+                    self.physics.mesh(),
                     &stencils,
                     self.config.dt_max,
                     Some(target - t),
@@ -332,14 +366,20 @@ where
             n_steps += 1;
 
             // Post-process
-            crate::profiling::scope("step: post_process", || self.physics.post_process(state));
+            crate::profiling::scope("step: post_process", || {
+                let work = self
+                    .integrator
+                    .work_mut()
+                    .expect("the integrator's buffers after a step");
+                self.physics.post_process(state, work)
+            });
             // A blown-up step leaves NaN or infinities, which every later
-            // step would carry on to `t_end` (the step's bound skips NaN)
-            if let Some(bad) = non_finite_field(state) {
+            // step would carry on to `t_end` (the step bounds skip NaN)
+            if let Some(bad) = self.physics.non_finite(state) {
                 // Where: the elements it has reached, and the first of them
                 let corners = self
                     .physics
-                    .mesh
+                    .mesh()
                     .element_vertices(crate::types::ElementIndex::new(bad.first));
                 let [x, y] = corners
                     .iter()
@@ -349,7 +389,10 @@ where
                     n_steps,
                     format!(
                         "{} is not finite at t = {t:.1} s in {} of {} elements, the first element {} at ({x:.0}, {y:.0}) m: the state has blown up",
-                        bad.field, bad.elements, state.n_elements, bad.first
+                        bad.field,
+                        bad.elements,
+                        self.physics.mesh().n_elements,
+                        bad.first
                     ),
                 );
             }
@@ -381,7 +424,7 @@ where
         SimulationResult::success(t, n_steps, dt_min_used, dt_max_used, wall_time)
     }
 
-    fn context(&self) -> RunContext3D<'_, EOS, MIX, BC> {
+    fn context(&self) -> RunContext3D<'_, M> {
         RunContext3D {
             physics: &self.physics,
             integrator: &self.integrator,
@@ -389,20 +432,88 @@ where
     }
 }
 
+impl<EOS, MIX, BC> Simulation3D<Hydrostatic3D<EOS, MIX, BC>>
+where
+    EOS: EquationOfState,
+    MIX: VerticalMixing,
+    crate::physics::SWEPhysics2D<BC>: PhysicsModule<crate::solver::SWESolution2D>,
+    BC: Clone + Send + Sync + SWEBoundaryCondition2D,
+{
+    /// The run's state between steps, at time `t`, to save with
+    /// [`Restart3D::write`] (see the [module docs](self)).
+    pub fn restart(&self, state: &Solution3D, t: f64) -> Restart3D {
+        restart_of(
+            &self.physics,
+            self.integrator.slow_forcing_record(),
+            state,
+            t,
+        )
+    }
+
+    /// Continue the run `restart` holds: check that it is of this domain
+    /// (mesh, bed, σ-grid), and take its slow-forcing history and vertical
+    /// reference. Then run from [`Restart3D::time`] with [`Restart3D::state`].
+    /// The physics must be built as the restarted run's was: its forcing,
+    /// boundaries and options are not in the file.
+    pub fn resume(&mut self, restart: &Restart3D) -> Result<(), RestartError> {
+        resume_into(&mut self.physics, &mut self.integrator, restart)
+    }
+}
+
+/// [`Simulation3D::resume`] on its parts: the physics and the integrator
+/// (which a device run then takes).
+pub fn resume_into<EOS, MIX, BC, W>(
+    physics: &mut Hydrostatic3D<EOS, MIX, BC>,
+    integrator: &mut ModeSplitIntegrator<W>,
+    restart: &Restart3D,
+) -> Result<(), RestartError>
+where
+    EOS: EquationOfState,
+    MIX: VerticalMixing,
+    crate::physics::SWEPhysics2D<BC>: PhysicsModule<crate::solver::SWESolution2D>,
+    BC: Clone + Send + Sync + SWEBoundaryCondition2D,
+    W: crate::time::SplitWork,
+{
+    let s = &restart.state;
+    let expected = (
+        physics.mesh.n_elements,
+        physics.ops.n_nodes,
+        physics.sigma.n_levels(),
+    );
+    if (s.n_elements, s.n_nodes, s.n_levels) != expected {
+        return Err(RestartError::Domain(format!(
+            "{} elements × {} nodes × {} levels, this run has {} × {} × {}",
+            s.n_elements, s.n_nodes, s.n_levels, expected.0, expected.1, expected.2
+        )));
+    }
+    let domain = domain_fingerprint_3d(&physics.mesh, &physics.bathymetry.data, &physics.sigma);
+    if restart.domain != domain {
+        return Err(RestartError::Domain(format!(
+            "its mesh, bed or σ-grid differ (fingerprint {:016x}, this run {domain:016x})",
+            restart.domain
+        )));
+    }
+    physics.set_reference_profile(restart.reference_profile.clone());
+    integrator.restore_slow_forcing(restart.slow_forcing.clone());
+    Ok(())
+}
+
 /// A prognostic field with values that are not finite, and where.
-struct NonFinite {
-    field: &'static str,
+#[derive(Clone, Debug)]
+pub struct NonFinite {
+    /// The field's name
+    pub field: &'static str,
     /// The first element with one
-    first: usize,
+    pub first: usize,
     /// Elements with one
-    elements: usize,
+    pub elements: usize,
 }
 
 /// The prognostic field (η, u, v, T, S) with values that are not finite in
 /// the fewest elements, the nearest to where the blow-up began (a value that
 /// every element uses, as the barotropic step, spreads it everywhere in a
 /// step), if any.
-fn non_finite_field(state: &Solution3D) -> Option<NonFinite> {
+pub fn non_finite_field(state: &Solution3D) -> Option<NonFinite> {
     let layer = state.n_nodes * state.n_levels;
     let fields: [(&'static str, &[f64], usize); 5] = [
         ("η", &state.eta.data, state.n_nodes),
@@ -445,18 +556,21 @@ fn non_finite_field(state: &Solution3D) -> Option<NonFinite> {
 
 /// What a callback of [`Simulation3D::run_with_context_callback`] sees
 /// besides the state: the physics, and the run between steps for a restart.
-pub struct RunContext3D<'a, EOS, MIX, BC>
-where
-    EOS: EquationOfState,
-    MIX: VerticalMixing,
-    BC: SWEBoundaryCondition2D,
-{
+pub struct RunContext3D<'a, M: RunModel3D> {
     /// The run's physics.
-    pub physics: &'a Hydrostatic3D<EOS, MIX, BC>,
-    integrator: &'a ModeSplitIntegrator,
+    pub physics: &'a M,
+    integrator: &'a ModeSplitIntegrator<M::Work>,
 }
 
-impl<EOS, MIX, BC> RunContext3D<'_, EOS, MIX, BC>
+impl<M: RunModel3D> RunContext3D<'_, M> {
+    /// The mode-split integrator (e.g. for
+    /// [`ModeSplitIntegrator::last_substeps`]).
+    pub fn integrator(&self) -> &ModeSplitIntegrator<M::Work> {
+        self.integrator
+    }
+}
+
+impl<EOS, MIX, BC> RunContext3D<'_, Hydrostatic3D<EOS, MIX, BC>>
 where
     EOS: EquationOfState,
     MIX: VerticalMixing,
@@ -467,19 +581,22 @@ where
     /// arguments), to save with [`Restart3D::write`] and continue with
     /// [`Simulation3D::resume`].
     pub fn restart(&self, state: &Solution3D, t: f64) -> Restart3D {
-        capture_restart(self.physics, self.integrator, state, t)
-    }
-
-    /// The mode-split integrator (e.g. for
-    /// [`ModeSplitIntegrator::last_substeps`]).
-    pub fn integrator(&self) -> &ModeSplitIntegrator {
-        self.integrator
+        restart_of(
+            self.physics,
+            self.integrator.slow_forcing_record(),
+            state,
+            t,
+        )
     }
 }
 
-fn capture_restart<EOS, MIX, BC>(
+/// The restart of a run of `physics` at `state` and time `t`, with the
+/// integrator's slow forcing `slow_forcing`
+/// ([`ModeSplitIntegrator::slow_forcing_record`]): what
+/// [`Simulation3D::restart`] captures, for a device run too.
+pub fn restart_of<EOS, MIX, BC>(
     physics: &Hydrostatic3D<EOS, MIX, BC>,
-    integrator: &ModeSplitIntegrator,
+    slow_forcing: SlowForcingRecord,
     state: &Solution3D,
     t: f64,
 ) -> Restart3D
@@ -493,7 +610,7 @@ where
         time: t,
         domain: domain_fingerprint_3d(&physics.mesh, &physics.bathymetry.data, &physics.sigma),
         state: state.clone(),
-        slow_forcing: integrator.slow_forcing_record(),
+        slow_forcing,
         reference_profile: physics.reference_profile().cloned(),
         driver: DriverData::default(),
     }

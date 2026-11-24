@@ -30,8 +30,11 @@ use crate::boundary::{
 };
 use crate::equations::ShallowWater2D;
 use crate::io::{Restart2D, SnapshotWriter, write_vtk_swe};
-use crate::physics::{PhysicsBuilder, SWEPhysics2D, SWEPhysics2DBuilder};
+use crate::physics::{
+    GlsMixing, Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D, SWEPhysics2DBuilder,
+};
 use crate::simulation::{Simulation, SimulationResult};
+use crate::solver::state::Solution3D;
 use crate::solver::{
     SWEPointSample, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, total_mass_2d,
 };
@@ -39,7 +42,9 @@ use crate::source::{
     CageDrag2D, ChezyFriction2D, GriddedAtmosphere2D, HorizontalViscosity2D, ManningFriction2D,
 };
 use crate::tides::{canonical_name, constituent_period};
-use crate::time::{Multirate, StandardIntegrator, TimeIntegrator};
+use crate::time::{
+    ModeSplitIntegrator, Multirate, SlowForcingRecord, StandardIntegrator, TimeIntegrator,
+};
 use crate::types::ElementIndex;
 
 /// Depth below which the velocity is reported as 0 (m).
@@ -185,6 +190,56 @@ pub trait CaseDevice {
         run: &DeviceRun<'_>,
         callback: &mut dyn FnMut(&SWESolution2D, f64),
     ) -> Result<DeviceRunReport, String>;
+
+    /// Step the case's 3D `physics` on CUDA device `ordinal` from `state`
+    /// over `run.span` with `integrator` (configured, and resumed if the run
+    /// is), as `Simulation3D::run_with_context_callback` with `run`'s CFL
+    /// number, largest step and landing interval, calling `callback` with
+    /// the state on the host (its `w` the device's) at the start and after
+    /// every step, and the integrator's slow-forcing record for a restart;
+    /// `state` is left with the state at the end.
+    fn run_3d(
+        &self,
+        ordinal: usize,
+        physics: &Hydrostatic3D<LinearEOS, GlsMixing, MultiBoundaryCondition2D<'_>>,
+        integrator: ModeSplitIntegrator,
+        state: &mut Solution3D,
+        run: &DeviceRun3D,
+        callback: &mut DeviceCallback3D<'_>,
+    ) -> Result<DeviceRunReport3D, String>;
+}
+
+/// A 3D device run's callback: the state on the host, its time, and the
+/// integrator's slow-forcing record for a restart.
+pub type DeviceCallback3D<'a> = dyn FnMut(&Solution3D, f64, &dyn Fn() -> SlowForcingRecord) + 'a;
+
+/// The settings of a 3D run on a device, as the CPU's `Simulation3D` takes
+/// them.
+pub struct DeviceRun3D {
+    /// The 3D CFL number
+    pub cfl: f64,
+    /// Upper bound of the 3D step (s)
+    pub dt_max: f64,
+    /// The steps land on every multiple of this time (s)
+    pub landing_interval: f64,
+    /// Start and end (s)
+    pub span: (f64, f64),
+}
+
+/// What a 3D run on a device reports.
+pub struct DeviceRunReport3D {
+    /// The `Simulation3D`'s result
+    pub result: SimulationResult,
+    /// Barotropic substeps in the last step
+    pub last_substeps: usize,
+    /// The 2D module's negative-depth clips
+    pub negative_depth_clips: usize,
+    /// The work counts of the local time stepping of the barotropic pass
+    /// and of the 3D stages, if they ran on it
+    pub barotropic: Option<crate::time::MultirateStats>,
+    pub baroclinic: Option<crate::time::MultirateStats>,
+    /// The device, for the run's notes
+    pub device: String,
 }
 
 /// The settings of a run on a device, as the CPU's `Simulation` takes them.
@@ -282,10 +337,7 @@ impl CaseFile {
             }
         };
         if self.case.three_d.is_some() {
-            if device.is_some() {
-                return refuse("a 3D run");
-            }
-            return self.run_3d(domain, progress);
+            return self.run_3d(domain, device, progress);
         }
         if device.is_some() && self.case.waves.is_some() {
             return refuse("waves");

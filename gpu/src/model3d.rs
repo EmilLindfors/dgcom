@@ -25,39 +25,50 @@
 //!
 //! The device takes global 3D steps (the case runner's default; local time
 //! steps of the 3D stages are 4.5d). The forcing a trait object evaluates
-//! on the host (a surface stress field, the rivers' tracers) is evaluated
-//! there at the CPU's times and uploaded. Not yet on the device: a nesting
-//! band and the surface heat and fresh-water fluxes (4.5c), the viscosity
-//! once per step; [`Model3D::new`] refuses them by name.
+//! on the host is evaluated there at the CPU's times and uploaded: a
+//! surface stress field, the rivers' tracers, and a nesting band's columns
+//! (`Nesting3D::columns` on the band's nodes, gathered from the device, its
+//! cache the CPU's). Not yet on the device: the surface heat and fresh-water
+//! fluxes, the viscosity once per step; [`Model3D::new`] refuses them by
+//! name.
+//!
+//! As `Simulation3D`'s model ([`RunModel3D`], 4.5c) it keeps a copy of the
+//! state on the host, downloaded after every step's `post_process` (its
+//! tracer limiter, density and `w` on the device): the step's bound is the
+//! CPU's own `compute_dt_ssp` of that copy, and a run's callbacks read it.
 
 // As `three_d.rs`: the device loops index arrays by the loop variable.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use cuda_core::DeviceBuffer;
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
-use dgcom::boundary::SWEBoundaryCondition2D;
+use dgcom::boundary::{NestingSlots, SWEBoundaryCondition2D, Supplied};
+use dgcom::mesh::Mesh2D;
 use dgcom::physics::{
     GlsMixing, Hydrostatic3D, LinearEOS, PhysicsModule, SWEPhysics2D, VerticalMixing,
 };
+use dgcom::simulation::{NonFinite, RunModel3D, non_finite_field};
 use dgcom::solver::rhs::{MomentumAdvectionForm, PressureGradientForm};
+use dgcom::solver::state::Solution3D;
 use dgcom::solver::{Blocks, SWESolution2D};
 use dgcom::time::{
-    Columns, DragKinds, Integrable, MultirateStats, SplitModel, SplitPass, SplitWork, SspScheme,
-    StageElements, StagePlan, StageRhs, StageSlots, filtered_state, shu_osher,
+    Columns, DragKinds, Integrable, ModeSplitPhysics, MultirateStats, RhsStencil, SplitModel,
+    SplitPass, SplitWork, SspScheme, StageElements, StagePlan, StageRhs, StageSlots, StageTime,
+    filtered_state, shu_osher,
 };
 use dgcom::vertical::{SigmaGrid, depth_average};
 
 use crate::baroclinic::{Baroclinic3D, BaroclinicSetup};
 use crate::forcing::{ForcingSetup, SlowForcing3D};
-use crate::hooks::{Merged3D, StageHooks3D, StageValues3D, Stash3D, State3D};
+use crate::hooks::{Band3D, Merged3D, StageHooks3D, StageValues3D, Stash3D, State3D};
 use crate::limiter::{Limiter3D, VertexPatches};
 use crate::pass::{BarotropicPass3D, DevicePass, LocalPass3D};
 use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, NN};
 use crate::three_d::{
-    Advected, COLUMN_BLOCK, Interface, RiversDevice, Statics3D, Transport3D, launch,
+    Advected, COLUMN_BLOCK, ExteriorDevice, Interface, RiversDevice, Statics3D, Transport3D, launch,
 };
 use crate::vertical::{Implicit3D, SurfaceDevice, Vertical3D, VerticalSetup, caged_columns};
 use crate::viscosity::Viscosity3D;
@@ -198,6 +209,61 @@ pub mod kernels_model {
         }
     }
 
+    /// The nesting band's columns (`η`, and u, v, T, S at its levels) at its
+    /// slots' nodes `nodes`, a thread per slot.
+    #[kernel]
+    pub fn gather_band(
+        nl: u32,
+        n: u32,
+        nodes: &[u32],
+        eta: &[f64],
+        u: &[f64],
+        v: &[f64],
+        temp: &[f64],
+        salt: &[f64],
+        mut out_eta: DisjointSlice<f64>,
+        mut out_u: DisjointSlice<f64>,
+        mut out_v: DisjointSlice<f64>,
+        mut out_t: DisjointSlice<f64>,
+        mut out_s: DisjointSlice<f64>,
+    ) {
+        let slot = thread::index_1d().get();
+        if slot >= n as usize {
+            return;
+        }
+        let (nl, node) = (nl as usize, nodes[slot] as usize);
+        // SAFETY: thread slot alone writes slot `slot` (slot < n).
+        unsafe {
+            *out_eta.get_unchecked_mut(slot) = eta[node];
+            for l in 0..nl {
+                let (to, from) = (slot * nl + l, node * nl + l);
+                *out_u.get_unchecked_mut(to) = u[from];
+                *out_v.get_unchecked_mut(to) = v[from];
+                *out_t.get_unchecked_mut(to) = temp[from];
+                *out_s.get_unchecked_mut(to) = salt[from];
+            }
+        }
+    }
+
+    /// `w` at the layer centres from Ω at the σ-surfaces
+    /// (`update_vertical_velocity`: the mean of the two), a thread per
+    /// column.
+    #[kernel]
+    pub fn w_of_omega(nl: u32, n: u32, omega: &[f64], mut w: DisjointSlice<f64>) {
+        let idx = thread::index_1d().get();
+        if idx >= n as usize {
+            return;
+        }
+        let nl = nl as usize;
+        for l in 0..nl {
+            let (lo, hi) = (omega[idx * (nl + 1) + l], omega[idx * (nl + 1) + l + 1]);
+            // SAFETY: thread idx alone writes column idx (idx < n).
+            unsafe {
+                *w.get_unchecked_mut(idx * nl + l) = 0.5 * (lo + hi);
+            }
+        }
+    }
+
     /// `shift_columns` of `u` and `v` from their depth means to `ū`, `v̄`, a
     /// thread per column.
     #[kernel]
@@ -283,6 +349,168 @@ struct Stages3D {
     rate: State3D,
 }
 
+/// A nesting band on the device: its slots' columns gathered from a state,
+/// the parent's evaluated on the host by the physics' own `Nesting3D`
+/// (`columns`, whose cache by time and `η` is then the CPU's), uploaded to
+/// the band's relaxation ([`Band3D`]) and the open faces' exterior values.
+struct Nest3D {
+    band: Band3D,
+    supplied: Supplied,
+    /// Every slot's node
+    nodes: DeviceBuffer<u32>,
+    /// The gathered `η` (a value a slot) and u, v, T, S (`[slot][level]`)
+    gathered: [DeviceBuffer<f64>; 5],
+    /// The same on the host, and a state holding them at their nodes (the
+    /// rest unread: `columns` reads the slots' nodes only)
+    host: [Vec<f64>; 5],
+    state: Solution3D,
+    /// The exterior values of u, v, T, S, from the first evaluation on
+    exterior: Option<[ExteriorDevice; 4]>,
+}
+
+impl Nest3D {
+    fn new(gpu: &Gpu, s: &Statics3D, slots: NestingSlots, n_nodes: usize) -> Self {
+        let st = &gpu.stream;
+        let nodes: Vec<u32> = slots.nodes.iter().map(|&n| n as u32).collect();
+        let (n, nl) = (nodes.len(), s.n_levels);
+        let zeros = |n: usize| cuda(DeviceBuffer::<f64>::zeroed(st, n).map_err(Into::into));
+        Self {
+            band: cuda(Band3D::new(gpu, s, slots)),
+            supplied: slots.supplied,
+            nodes: cuda(DeviceBuffer::from_host(st, &nodes).map_err(Into::into)),
+            gathered: [
+                zeros(n),
+                zeros(n * nl),
+                zeros(n * nl),
+                zeros(n * nl),
+                zeros(n * nl),
+            ],
+            host: [
+                vec![0.0; n],
+                vec![0.0; n * nl],
+                vec![0.0; n * nl],
+                vec![0.0; n * nl],
+                vec![0.0; n * nl],
+            ],
+            state: Solution3D::new(s.n_elements, n_nodes, nl),
+            exterior: None,
+        }
+    }
+
+    /// The parent's columns at the band's slots for `values` at `time`
+    /// (`Nesting3D::columns`), on the device.
+    fn evaluate<BC>(
+        &mut self,
+        gpu: &Gpu,
+        s: &Statics3D,
+        physics: &Hydrostatic3D<LinearEOS, GlsMixing, BC>,
+        values: &State3D,
+        time: f64,
+    ) where
+        BC: SWEBoundaryCondition2D + Clone + Send + Sync,
+        SWEPhysics2D<BC>: PhysicsModule<SWESolution2D>,
+    {
+        let nesting = physics.nesting.as_ref().expect("a nested model");
+        let (st, nl) = (&gpu.stream, s.n_levels);
+        let n = self.host[0].len();
+        if n > 0 {
+            let [eta, u, v, t, sa] = &mut self.gathered;
+            // SAFETY: the gathered buffers hold the slots' values; the nodes
+            // are the mesh's.
+            unsafe {
+                cuda(
+                    gpu.module_model
+                        .gather_band(
+                            st,
+                            launch(n, COLUMN_BLOCK),
+                            nl as u32,
+                            n as u32,
+                            &self.nodes,
+                            &values.eta,
+                            &values.u,
+                            &values.v,
+                            &values.temp,
+                            &values.salt,
+                            eta,
+                            u,
+                            v,
+                            t,
+                            sa,
+                        )
+                        .map_err(Into::into),
+                );
+            }
+            for (to, from) in self.host.iter_mut().zip(&self.gathered) {
+                cuda(from.copy_to_host(st, to).map_err(Into::into));
+            }
+        }
+        // The gathered columns at their nodes
+        let state = &mut self.state;
+        let [eta, u, v, t, sa] = &self.host;
+        for (slot, &node) in nesting.slots().nodes.iter().enumerate() {
+            state.eta.data[node] = eta[slot];
+            let (to, from) = (node * nl..(node + 1) * nl, slot * nl..(slot + 1) * nl);
+            state.u[to.clone()].copy_from_slice(&u[from.clone()]);
+            state.v[to.clone()].copy_from_slice(&v[from.clone()]);
+            state.temp[to.clone()].copy_from_slice(&t[from.clone()]);
+            state.salt[to].copy_from_slice(&sa[from]);
+        }
+        let columns = nesting.columns(
+            state,
+            &physics.bathymetry,
+            &physics.sigma,
+            StageTime::Uniform(time),
+            Blocks::All(s.n_elements),
+            physics.min_column_depth,
+        );
+        cuda(self.band.set_columns(gpu, columns.values()));
+        let exterior = columns.exterior();
+        let fields = [
+            exterior.velocity.as_ref().map(|[u, _]| u),
+            exterior.velocity.as_ref().map(|[_, v]| v),
+            exterior.temp.as_ref(),
+            exterior.salt.as_ref(),
+        ];
+        match &mut self.exterior {
+            None => {
+                // Every field's slots are the band's: build each from the
+                // first field supplied (a field not supplied is never read)
+                let any = fields.iter().flatten().next().copied();
+                if let Some(any) = any {
+                    self.exterior = Some(
+                        fields.map(|field| cuda(ExteriorDevice::new(gpu, s, field.unwrap_or(any)))),
+                    );
+                }
+            }
+            Some(devices) => {
+                for (device, field) in devices.iter_mut().zip(fields) {
+                    if let Some(field) = field {
+                        cuda(
+                            device
+                                .values
+                                .copy_from_host(st, field.values)
+                                .map_err(Into::into),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The exterior values of u and v (if the parent supplies a velocity)
+    /// and of T and S (if it supplies tracers).
+    #[allow(clippy::type_complexity)]
+    fn exterior(&self) -> ([Option<&ExteriorDevice>; 2], [Option<&ExteriorDevice>; 2]) {
+        match &self.exterior {
+            Some([u, v, t, s]) => (
+                [u, v].map(|e| self.supplied.velocity.then_some(e)),
+                [t, s].map(|e| self.supplied.tracers.then_some(e)),
+            ),
+            None => ([None; 2], [None; 2]),
+        }
+    }
+}
+
 /// The step's buffers and the device modules ([`SplitModel::Work`] of
 /// [`Model3D`]).
 pub struct Work3D {
@@ -321,9 +549,26 @@ pub struct Work3D {
     stress: Option<[DeviceBuffer<f64>; 2]>,
     river_conc: Option<[DeviceBuffer<f64>; 2]>,
     roughness: Option<DeviceBuffer<f64>>,
+    /// The nesting band, if the model is nested
+    nest: Option<Nest3D>,
+    /// `w` of the end state (`post_process`)
+    w: DeviceBuffer<f64>,
 }
 
 impl Work3D {
+    /// The vertical terms' eddy viscosity and diffusivity into `host` (the
+    /// device's, as of the last step).
+    pub fn eddy_coefficients_into(&self, host: &mut Solution3D) {
+        let st = &self.gpu.stream;
+        for (to, from) in [
+            (&mut host.eddy_viscosity, &self.vertical.eddy_viscosity),
+            (&mut host.eddy_diffusivity, &self.vertical.eddy_diffusivity),
+        ] {
+            to.resize(from.len(), 0.0);
+            cuda(from.copy_to_host(st, to).map_err(Into::into));
+        }
+    }
+
     fn stages(&mut self) -> &mut Stages3D {
         self.stages
             .as_mut()
@@ -369,6 +614,9 @@ pub struct Model3D<'a, BC: SWEBoundaryCondition2D> {
     /// density between steps
     statics: Statics3D,
     density: StageHooks3D,
+    /// The state on the host as of the last `post_process` (or the start):
+    /// the step's bound and a run's callbacks read it
+    host: Mutex<Solution3D>,
 }
 
 impl<'a, BC> Model3D<'a, BC>
@@ -383,11 +631,8 @@ where
         physics: &'a Hydrostatic3D<LinearEOS, GlsMixing, BC>,
     ) -> Result<Self, String> {
         let refuse = |what: &str| Err(format!("{what} is not on the device yet"));
-        if physics.nesting.is_some() {
-            return refuse("a nesting band (P2.7 4.5c)");
-        }
         if physics.surface_fluxes.is_some() {
-            return refuse("the surface heat and fresh-water fluxes (P2.7 4.5c)");
+            return refuse("the surface heat and fresh-water fluxes");
         }
         if physics.viscosity_once_per_step() {
             return refuse("the viscosity once per step");
@@ -424,6 +669,7 @@ where
         .map_err(|e| e.to_string())?;
         let density =
             StageHooks3D::new(gpu, p.eos, p.min_column_depth).map_err(|e| e.to_string())?;
+        let (ne, nn, nl) = (p.mesh.n_elements, p.ops.n_nodes, p.sigma.n_levels());
         Ok(Self {
             gpu: gpu.clone(),
             physics,
@@ -431,7 +677,25 @@ where
             element_local,
             statics,
             density,
+            host: Mutex::new(Solution3D::new(ne, nn, nl)),
         })
+    }
+
+    /// Start a run from `state` (the host's copy, its `w` and eddy
+    /// coefficients included, which the device does not hold).
+    pub fn start_from(&mut self, state: &Solution3D) {
+        *self.host.lock().expect("the host's copy") = state.clone();
+    }
+
+    /// The state on the host as of the last step's `post_process` (or the
+    /// run's start).
+    pub fn host(&self) -> MutexGuard<'_, Solution3D> {
+        self.host.lock().expect("the host's copy")
+    }
+
+    /// The 2D module's negative-depth clips.
+    pub fn negative_depth_clips(&self) -> usize {
+        self.module.negative_depth_clips()
     }
 
     /// The density of `state`'s T and S (`Hydrostatic3D::update_density`,
@@ -474,12 +738,14 @@ where
 
 /// `Hydrostatic3D::momentum_rhs` of `values` on every element into `rhs_u`,
 /// `rhs_v`: the reference at their levels, the pressure gradient and
-/// Coriolis, the shear's viscosity, the thin columns' tendencies zero.
+/// Coriolis, the shear's viscosity, the nesting band's relaxation of the
+/// shear, the thin columns' tendencies zero.
 fn momentum(
     s: &Statics3D,
     baroclinic: &mut Baroclinic3D,
     viscosity: &mut Viscosity3D,
     hooks: &StageHooks3D,
+    band: Option<&Band3D>,
     values: &State3D,
     rhs_u: &mut DeviceBuffer<f64>,
     rhs_v: &mut DeviceBuffer<f64>,
@@ -495,6 +761,11 @@ fn momentum(
         rhs_v,
     ));
     cuda(viscosity.apply(s, &values.eta, &values.u, &values.v, rhs_u, rhs_v));
+    // The nesting band's relaxation of the shear (its columns evaluated
+    // for these values: `Nest3D::evaluate`)
+    if let Some(band) = band {
+        cuda(hooks.relax_shear(s, band, &values.eta, &values.u, &values.v, rhs_u, rhs_v));
+    }
     cuda(hooks.zero_thin_momentum(s, &values.eta, rhs_u, rhs_v));
 }
 
@@ -650,6 +921,11 @@ where
             stress: None,
             river_conc: rivers.map(|r| [zeros(r.len()), zeros(r.len())]),
             roughness: p.surface_roughness.as_deref().map(up),
+            nest: p
+                .nesting
+                .as_ref()
+                .map(|nesting| Nest3D::new(gpu, &statics, nesting.slots(), NN)),
+            w: zeros(n),
             statics,
         }
     }
@@ -681,14 +957,23 @@ where
         work.history.rotate_right(1);
         {
             let Work3D {
+                gpu,
                 statics,
                 baroclinic,
                 viscosity,
                 hooks,
+                nest,
                 rhs_n: [rhs_u, rhs_v],
                 ..
             } = work;
-            momentum(statics, baroclinic, viscosity, hooks, state, rhs_u, rhs_v);
+            // The nesting band's columns of the step's start at `t`
+            if let Some(nest) = nest.as_mut() {
+                nest.evaluate(gpu, statics, self.physics, state, t);
+            }
+            let band = nest.as_ref().map(|nest| &nest.band);
+            momentum(
+                statics, baroclinic, viscosity, hooks, band, state, rhs_u, rhs_v,
+            );
         }
         self.stress_at(t, work);
         let Work3D {
@@ -908,11 +1193,13 @@ where
             }
             None => {
                 let Work3D {
+                    gpu,
                     statics,
                     baroclinic,
                     viscosity,
                     hooks,
                     stages,
+                    nest,
                     ..
                 } = work;
                 let Stages3D {
@@ -921,8 +1208,13 @@ where
                     ..
                 } = stages.as_mut().expect("sized");
                 let values = &all_values[values].values;
+                // The nesting band's columns of the stage's values
+                if let Some(nest) = nest.as_mut() {
+                    nest.evaluate(gpu, statics, self.physics, values, on.time.at(0));
+                }
+                let band = nest.as_ref().map(|nest| &nest.band);
                 let (u, v) = (&mut rate.u, &mut rate.v);
-                momentum(statics, baroclinic, viscosity, hooks, values, u, v);
+                momentum(statics, baroclinic, viscosity, hooks, band, values, u, v);
             }
         }
     }
@@ -955,6 +1247,7 @@ where
             sums,
             river_conc,
             gpu,
+            nest,
             ..
         } = work;
         let Stages3D {
@@ -974,21 +1267,33 @@ where
         // rest: masked), the implicit part of Ω split off, the reference at
         // their levels
         let vals = &values[rhs.values].values;
-        cuda(transport.compute(&vals.eta, &vals.u, &vals.v, Some(&pass.flux), None));
+        // The nesting parent's columns of the values: its values outside the
+        // open faces it covers, its relaxation of the tracers below
+        if let Some(nest) = nest.as_mut() {
+            nest.evaluate(gpu, s, p, vals, time);
+        }
+        let (ext_velocity, ext_tracers) = nest
+            .as_ref()
+            .map_or(([None; 2], [None; 2]), Nest3D::exterior);
+        let parent = ext_velocity[0].zip(ext_velocity[1]).map(|(u, v)| [u, v]);
+        cuda(transport.compute(&vals.eta, &vals.u, &vals.v, Some(&pass.flux), parent));
         if let Some(implicit) = implicit {
             cuda(implicit.split(s, &vals.eta, &pass.flux.euler_dt, &mut transport.omega));
         }
         cuda(baroclinic.reference(s, &vals.eta, &vals.rho));
         // The advection with the water no transport carried, field by field
-        let velocity = |field| Advected {
+        let velocity = |field, exterior| Advected {
             field,
             reference: None,
             range: dgcom::solver::rhs::UNBOUNDED,
-            exterior: None,
+            exterior,
             bc: dgcom::solver::rhs::DeviceTracerBC3D::Extrapolation,
         };
         cuda(transport.advect(
-            [&velocity(&vals.u), &velocity(&vals.v)],
+            [
+                &velocity(&vals.u, ext_velocity[0]),
+                &velocity(&vals.v, ext_velocity[1]),
+            ],
             [&mut rate.u, &mut rate.v],
             p.momentum_vertical_advection,
             Interface::Central,
@@ -1008,14 +1313,14 @@ where
                         field: &vals.temp,
                         reference: reference(0),
                         range: ranges[0],
-                        exterior: None,
+                        exterior: ext_tracers[0],
                         bc: form(&*p.temp_bc),
                     },
                     &Advected {
                         field: &vals.salt,
                         reference: reference(1),
                         range: ranges[1],
-                        exterior: None,
+                        exterior: ext_tracers[1],
                         bc: form(&*p.salt_bc),
                     },
                 ],
@@ -1056,6 +1361,18 @@ where
         if let Some([conc_t, conc_s]) = river_conc {
             cuda(transport.river_sources(&mut rate.temp, conc_t));
             cuda(transport.river_sources(&mut rate.salt, conc_s));
+        }
+        // The nesting band's relaxation of the tracers
+        if let Some(nest) = nest.as_ref() {
+            cuda(hooks.relax_tracers(
+                s,
+                &nest.band,
+                &vals.eta,
+                &vals.temp,
+                &vals.salt,
+                &mut rate.temp,
+                &mut rate.salt,
+            ));
         }
         cuda(hooks.zero_thin_momentum(s, &vals.eta, &mut rate.u, &mut rate.v));
         // The column sums of the momentum the barotropic transport's rate,
@@ -1409,5 +1726,81 @@ where
                 .map_err(Into::into),
             );
         }
+    }
+}
+
+/// The device's model as `Simulation3D` runs it (4.5c): the step's bound,
+/// the blow-up check and a run's callbacks on the host's copy of the state,
+/// downloaded after every step's `post_process`; the density and the end
+/// state's tracer limiter, density and `w` on the device.
+impl<'a, BC> RunModel3D for Model3D<'a, BC>
+where
+    BC: SWEBoundaryCondition2D + Clone + Send + Sync,
+    SWEPhysics2D<BC>: PhysicsModule<SWESolution2D>,
+{
+    /// The start on the host (its `w` and eddy coefficients the host's,
+    /// [`Model3D::start_from`]); the reference is the physics' own, set
+    /// before the model was built.
+    fn prepare(&mut self, state: &State3D) {
+        let mut host = self.host.lock().expect("the host's copy");
+        cuda(state.download_into(&self.gpu, &mut host));
+    }
+
+    fn compute_dt_ssp(&self, _state: &State3D, cfl: f64, scheme: SspScheme) -> f64 {
+        self.physics.compute_dt_ssp(&self.host(), cfl, scheme)
+    }
+
+    fn element_steps_into(&self, _state: &State3D, cfl: f64, scheme: SspScheme, out: &mut [f64]) {
+        self.physics
+            .element_steps_into(&self.host(), cfl, scheme, out);
+    }
+
+    fn stencils(&self) -> Vec<RhsStencil> {
+        ModeSplitPhysics::stage_stencils(self.physics)
+    }
+
+    fn mesh(&self) -> &Mesh2D {
+        &self.physics.mesh
+    }
+
+    fn update_density(&self, state: &mut State3D) {
+        Model3D::update_density(self, state);
+    }
+
+    /// `Hydrostatic3D::post_process` on the device: the tracer limiter and
+    /// the density; `w` from the state's own layer transports, their thin
+    /// columns at rest (`update_vertical_velocity`); then the state to the
+    /// host.
+    fn post_process(&self, state: &mut State3D, work: &mut Work3D) {
+        cuda(work.hooks.post_process(&work.statics, state));
+        cuda(work.forcing.layer_transports(state));
+        let (gpu, s) = (&self.gpu, &work.statics);
+        let (nl, n) = (s.n_levels as u32, s.n_columns());
+        // SAFETY: Ω holds every column's σ-surfaces, `w` its layers.
+        unsafe {
+            cuda(
+                gpu.module_model
+                    .w_of_omega(
+                        &gpu.stream,
+                        launch(n, COLUMN_BLOCK),
+                        nl,
+                        n as u32,
+                        &work.forcing.layers.omega,
+                        &mut work.w,
+                    )
+                    .map_err(Into::into),
+            );
+        }
+        let mut host = self.host();
+        cuda(state.download_into(gpu, &mut host));
+        cuda(
+            work.w
+                .copy_to_host(&gpu.stream, &mut host.w)
+                .map_err(Into::into),
+        );
+    }
+
+    fn non_finite(&self, _state: &State3D) -> Option<NonFinite> {
+        non_finite_field(&self.host())
     }
 }

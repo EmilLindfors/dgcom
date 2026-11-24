@@ -2402,6 +2402,17 @@ impl<W: SplitWork> ModeSplitIntegrator<W> {
         self.work.as_ref().map_or([0; 2], SplitWork::merged_cells)
     }
 
+    /// The backend's buffers, once a step has made them (a run's
+    /// `post_process` on a backend that keeps its modules there).
+    pub fn work_mut(&mut self) -> Option<&mut W> {
+        self.work.as_mut()
+    }
+
+    /// The backend's buffers, once a step has made them.
+    pub fn work(&self) -> Option<&W> {
+        self.work.as_ref()
+    }
+
     /// Barotropic substeps per baroclinic step used by the last step (0 before
     /// the first step).
     pub fn last_substeps(&self) -> usize {

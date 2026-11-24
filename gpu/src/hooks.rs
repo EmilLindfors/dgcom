@@ -1986,6 +1986,19 @@ impl StageHooks3D {
         self.mask(s, out)
     }
 
+    /// `Hydrostatic3D::post_process`'s tracer limiter and density of a
+    /// step's end state `values` (its `w` is the caller's).
+    pub fn post_process(
+        &mut self,
+        s: &Statics3D,
+        values: &mut State3D,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(limiter) = &mut self.limiter {
+            limiter.apply(s, values)?;
+        }
+        self.density(s, values, None)
+    }
+
     /// The momentum tendencies `rhs_u`, `rhs_v` of the columns thin under
     /// `eta` to zero (`zero_thin_momentum`).
     pub fn zero_thin_momentum(

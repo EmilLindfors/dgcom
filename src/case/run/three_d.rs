@@ -26,8 +26,8 @@
 use std::sync::Arc;
 
 use super::{
-    H_VELOCITY, Output, Progress, RunReport, StationSample, boundary_conditions, restart,
-    score_gauges, summarize, volume,
+    CaseDevice, DeviceRun3D, H_VELOCITY, Output, Progress, RunReport, StationSample,
+    boundary_conditions, restart, score_gauges, summarize, volume,
 };
 use crate::boundary::{
     DeepReference, Nesting3D, NestingBand3D, OceanColumnsOptions, OceanModelColumns,
@@ -40,7 +40,7 @@ use crate::physics::{
     BottomDrag3D, EquationOfState, Forcing, GlsMixing, Hydrostatic3D, ImplicitVerticalAdvection,
     JerlovWater, LinearEOS,
 };
-use crate::simulation::Simulation3D;
+use crate::simulation::{Simulation3D, restart_of, resume_into};
 use crate::solver::state::Solution3D;
 use crate::solver::{
     Probe2D, SWEPointSample, SWESolution2D, SWEState2D, TracerLimiter3DConfig, TracerLimiterType3D,
@@ -64,10 +64,12 @@ fn ssp(integrator: Integrator) -> SspScheme {
 }
 
 impl CaseFile {
-    /// Run the 3D case on `domain` (see the module docs).
+    /// Run the 3D case on `domain` (see the module docs), on `device` (its
+    /// ordinal and backend) if given.
     pub(super) fn run_3d(
         &self,
         domain: &Domain,
+        device: Option<(usize, &dyn CaseDevice)>,
         progress: &mut dyn FnMut(&Progress),
     ) -> Result<RunReport, CaseError> {
         let case = &self.case;
@@ -284,7 +286,7 @@ impl CaseFile {
         physics.update_density(&mut state);
         // The anomalies about the mean profile: its pressure gradient
         // (Mellor et al. 1998) and the advection that is its adjoint
-        let physics = physics.with_reference_profile(reference);
+        let mut physics = physics.with_reference_profile(reference);
 
         // A resumed run: the restart's state, time, history and records
         let restart = match self.resume_path() {
@@ -428,27 +430,81 @@ impl CaseFile {
                 Err(e) => failure = Some(e),
             }
         };
-        let integrator = ModeSplitIntegrator::new()
+        let mut integrator = ModeSplitIntegrator::new()
             .with_barotropic_cfl(d.barotropic_cfl)
             .with_barotropic_scheme(ssp(d.barotropic_scheme))
             .with_baroclinic_scheme(ssp(d.scheme))
             .with_barotropic_levels(d.barotropic_levels)
             .with_baroclinic_levels(d.levels_lts);
-        let mut sim = Simulation3D::new(physics, integrator)
-            .with_cfl(d.cfl())
-            .with_dt_max(d.dt_max_s)
-            .with_landing_interval(field_every);
         if let Some((path, restart)) = restart {
-            sim.resume(&restart).map_err(|e| {
+            resume_into(&mut physics, &mut integrator, &restart).map_err(|e| {
                 CaseError::Invalid(format!("cannot resume from {}: {e}", path.display()))
             })?;
             state = restart.state;
         }
-        let result = sim.run_with_context_callback(&mut state, t_start, t_end, |s, t, context| {
-            on_step(s, t, &|| context.physics.tracer_ranges(s), &|| {
-                context.restart(s, t)
-            })
-        });
+        // On the CPU, or on the device (whose callbacks see the state on the
+        // host)
+        let ran = match device {
+            None => {
+                let mut sim = Simulation3D::new(physics, integrator)
+                    .with_cfl(d.cfl())
+                    .with_dt_max(d.dt_max_s)
+                    .with_landing_interval(field_every);
+                let result =
+                    sim.run_with_context_callback(&mut state, t_start, t_end, |s, t, context| {
+                        on_step(s, t, &|| context.physics.tracer_ranges(s), &|| {
+                            context.restart(s, t)
+                        })
+                    });
+                let integrator = sim.integrator();
+                let mut steps = vec![0.0; domain.mesh.n_elements];
+                sim.physics()
+                    .element_steps_into(&state, d.cfl(), ssp(d.scheme), &mut steps);
+                Ran3D {
+                    last_substeps: integrator.last_substeps(),
+                    clips: sim.physics().swe_physics.negative_depth_clips(),
+                    barotropic: integrator.barotropic_multirate_stats(),
+                    baroclinic: integrator.baroclinic_multirate_stats(),
+                    steps,
+                    result,
+                }
+            }
+            Some((ordinal, device)) => {
+                let run = DeviceRun3D {
+                    cfl: d.cfl(),
+                    dt_max: d.dt_max_s,
+                    landing_interval: field_every,
+                    span: (t_start, t_end),
+                };
+                let physics = &physics;
+                let report = device
+                    .run_3d(
+                        ordinal,
+                        physics,
+                        integrator,
+                        &mut state,
+                        &run,
+                        &mut |s, t, record| {
+                            on_step(s, t, &|| physics.tracer_ranges(s), &|| {
+                                restart_of(physics, record(), s, t)
+                            })
+                        },
+                    )
+                    .map_err(|e| CaseError::Invalid(format!("the 3D run on the device: {e}")))?;
+                notes.push(format!("computed on cuda:{ordinal}, {}", report.device));
+                let mut steps = vec![0.0; domain.mesh.n_elements];
+                physics.element_steps_into(&state, d.cfl(), ssp(d.scheme), &mut steps);
+                Ran3D {
+                    last_substeps: report.last_substeps,
+                    clips: report.negative_depth_clips,
+                    barotropic: report.barotropic,
+                    baroclinic: report.baroclinic,
+                    steps,
+                    result: report.result,
+                }
+            }
+        };
+        let result = &ran.result;
         if let Some(e) = failure {
             return Err(e);
         }
@@ -476,29 +532,25 @@ impl CaseFile {
         }
         notes.push(format!(
             "{} barotropic substeps in the last step, {} negative-depth clips",
-            sim.integrator().last_substeps(),
-            sim.physics().swe_physics.negative_depth_clips()
+            ran.last_substeps, ran.clips
         ));
         // The work of the barotropic pass and of the 3D stages on local time
         // steps, and the steps the elements could take at the end: what
         // global steps, more levels or another cap would cost
-        if let Some(stats) = sim.integrator().barotropic_multirate_stats() {
+        if let Some(stats) = ran.barotropic {
             notes.push(format!(
                 "barotropic pass: {}",
                 stats.describe(domain.mesh.n_elements)
             ));
         }
-        if let Some(stats) = sim.integrator().baroclinic_multirate_stats() {
+        if let Some(stats) = ran.baroclinic {
             notes.push(format!(
                 "3D stages: {}",
                 stats.describe(domain.mesh.n_elements)
             ));
         }
-        let mut steps = vec![0.0; domain.mesh.n_elements];
-        let scheme = ssp(d.scheme);
-        sim.physics()
-            .element_steps_into(&state, d.cfl(), scheme, &mut steps);
-        notes.extend(describe_element_steps(&steps, d.dt_max_s).map(|steps| {
+        let steps = &ran.steps;
+        notes.extend(describe_element_steps(steps, d.dt_max_s).map(|steps| {
             format!(
                 "3D element steps at {:.2} h: {steps}",
                 result.final_time / 3600.0
@@ -514,6 +566,17 @@ impl CaseFile {
             notes,
         })
     }
+}
+
+/// What a 3D run leaves for its report, on the CPU or a device.
+struct Ran3D {
+    result: crate::simulation::SimulationResult,
+    last_substeps: usize,
+    clips: usize,
+    barotropic: Option<crate::time::MultirateStats>,
+    baroclinic: Option<crate::time::MultirateStats>,
+    /// Every element's own 3D step at the end
+    steps: Vec<f64>,
 }
 
 /// The elements' own 3D steps `steps` (s; infinite where nothing bounds

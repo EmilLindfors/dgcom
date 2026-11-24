@@ -46,8 +46,8 @@ use std::path::{Path, PathBuf};
 
 pub use domain::{Domain, ParentWavePoints, StationProbe, WaveDomain};
 pub use run::{
-    CaseDevice, DeviceRun, DeviceRunReport, MeshReport, Progress, RunReport, ScoreReport,
-    StationSeries,
+    CaseDevice, DeviceCallback3D, DeviceRun, DeviceRun3D, DeviceRunReport, DeviceRunReport3D,
+    MeshReport, Progress, RunReport, ScoreReport, StationSeries,
 };
 pub use schema::*;
 

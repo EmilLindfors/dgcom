@@ -2699,6 +2699,10 @@ fn a_rivers_water_fills_a_closed_3d_basin() {
     assert!(domain.notes.iter().any(|n| n.contains("left out: river 2")));
 }
 
+/// A 3D run handed to a device: ordinal, span, CFL number, cap, landing
+/// interval, levels of the 3D stages.
+type Seen3D = (usize, (f64, f64), f64, f64, f64, usize);
+
 /// What [`Recorder`] saw of a run handed to a device.
 #[derive(Debug, Default)]
 struct Recorded {
@@ -2729,6 +2733,9 @@ struct Recorded {
     levels: usize,
     line_local_depth: Option<f64>,
     positivity_h_dry: Option<f64>,
+    /// A 3D run: its ordinal, span, 3D CFL number, cap and landing
+    /// interval, the integrator's levels of the 3D stages
+    three_d: Option<Seen3D>,
 }
 
 /// A device that records the run it is handed (`CaseDevice`) and refuses
@@ -2792,6 +2799,61 @@ impl dgcom::case::CaseDevice for Recorder {
         seen.positivity_h_dry = form.positivity_h_dry;
         Err("the recorder does not step".into())
     }
+
+    fn run_3d(
+        &self,
+        ordinal: usize,
+        _physics: &dgcom::physics::Hydrostatic3D<
+            dgcom::physics::LinearEOS,
+            dgcom::physics::GlsMixing,
+            dgcom::boundary::MultiBoundaryCondition2D<'_>,
+        >,
+        integrator: dgcom::time::ModeSplitIntegrator,
+        _state: &mut dgcom::solver::state::Solution3D,
+        run: &dgcom::case::DeviceRun3D,
+        _callback: &mut dgcom::case::DeviceCallback3D<'_>,
+    ) -> Result<dgcom::case::DeviceRunReport3D, String> {
+        self.0.borrow_mut().three_d = Some((
+            ordinal,
+            run.span,
+            run.cfl,
+            run.dt_max,
+            run.landing_interval,
+            integrator.baroclinic_levels(),
+        ));
+        Err("the recorder does not step".into())
+    }
+}
+
+/// A 3D case on a device is handed to its `run_3d` with the case's
+/// settings: the 3D CFL number, the cap, the steps landing on the field
+/// outputs, the span.
+#[test]
+fn a_3d_device_run_is_handed_its_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let three_d = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/cases/tidal_channel/three_d.toml"
+    );
+    let overrides = [
+        "run.duration_hours=1.0".to_string(),
+        format!("output.directory={:?}", dir.path().display().to_string()),
+        "compute.device=cuda:2".to_string(),
+        "three_d.dt_max_s=45".to_string(),
+    ];
+    let file = CaseFile::read(Path::new(three_d), &overrides).unwrap();
+    let domain = file.build_domain().unwrap();
+    let recorder = Recorder::default();
+    let stopped = file
+        .run_on_with(&domain, Some(&recorder), &mut |_| {})
+        .unwrap_err();
+    assert!(
+        matches!(&stopped, CaseError::Invalid(e) if e.contains("the recorder does not step")),
+        "{stopped}"
+    );
+    let seen = recorder.0.into_inner();
+    // SSP-RK(4,3)'s CFL number 4, the outputs every 30 minutes
+    assert_eq!(seen.three_d, Some((2, (0.0, 3600.0), 4.0, 45.0, 1800.0, 0)));
 }
 
 /// `[compute] device`: the runner hands a device the case's physics as data
