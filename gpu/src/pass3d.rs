@@ -15,8 +15,10 @@
 //!   sources, its drying flats and Manning friction.
 //!
 //! The slow forcing `G` and the drag rates are made up (4.4c1 and 4.4a gate
-//! them). Mutants it must catch, and timed at Chiloé's size (96,000 P2
-//! elements).
+//! them). Then the step's merged cells from what each side's pass moved
+//! (Phase 4.4d: [`Merged3D::find`] against `MergedCells::find`), with
+//! made-up forward-Euler steps of the 3D stages. Mutants it must catch, and
+//! timed at Chiloé's size (96,000 P2 elements).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,7 +30,7 @@ use dgcom::boundary::{
 use dgcom::equations::ShallowWater2D;
 use dgcom::mesh::Bathymetry2D;
 use dgcom::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D};
-use dgcom::solver::rhs::{face_mass_len, subcell_mass_len};
+use dgcom::solver::rhs::{MergedCells, StepWater, face_mass_len, subcell_mass_len};
 use dgcom::solver::state::Solution3D;
 use dgcom::solver::{DGSolution2D, SWESolution2D, StandardLimiter2D, WetDryConfig};
 use dgcom::source::{CoriolisSource2D, River, RiverInflow, RiverSeries, RiverSources};
@@ -40,12 +42,13 @@ use dgcom::time::{
 use dgcom::types::ElementIndex;
 use dgcom::vertical::SigmaGrid;
 
-use crate::hooks::State3D;
+use crate::hooks::{Merged3D, MergedLists, State3D};
 use crate::nest::{Domain, Nest};
 use crate::pass::{BarotropicPass3D, DevicePass, LocalPass3D};
 use crate::phase0::DX;
 use crate::stage3d::{Snapshots, report, report_mutant, start_state};
-use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, NN, ORDER};
+use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, N1, NN, ORDER};
+use crate::three_d::SLOTS;
 use crate::transport3d::{Fixture, G, LEVELS, Shape};
 
 /// What the pass takes besides the 2D module and the case (a mutant changes
@@ -63,7 +66,53 @@ struct Run {
     bottom: bool,
     layers: bool,
     rivers: bool,
+    /// A change to the merged cells' search on the device
+    find: Find,
 }
+
+/// What a mutant changes in the merged cells' search on the device.
+#[derive(Clone, Copy, PartialEq)]
+enum Find {
+    /// Nothing
+    Same,
+    /// The cells' water without the face fluxes, the subcell fluxes, the
+    /// column sources
+    NoFaces,
+    NoSubcells,
+    NoSources,
+    /// No column thin (a thin depth of zero)
+    NoneThin,
+    /// Every element at the coarse level's forward-Euler step
+    CoarseEuler,
+    /// The forward-Euler steps halved
+    HalfEuler,
+    /// The cells' water without `∂η/∂t`
+    NoRate,
+}
+
+/// The merged cells' mutants. The thin depth itself moves no group on these
+/// fixtures (a hundredth of it neither): a cell drains as a film, or dries
+/// within the step, where any depth is thin. Only the beach's groups move
+/// with the forward-Euler steps and `∂η/∂t` (the last three): the nested
+/// channel's few drain many times over within any of these steps.
+const FIND_MUTANTS: [(&str, Find); 7] = [
+    ("the cells' water without the face fluxes", Find::NoFaces),
+    (
+        "the cells' water without the subcell fluxes",
+        Find::NoSubcells,
+    ),
+    (
+        "the cells' water without the column sources",
+        Find::NoSources,
+    ),
+    ("no column thin", Find::NoneThin),
+    (
+        "every element at the coarse forward-Euler step",
+        Find::CoarseEuler,
+    ),
+    ("the forward-Euler steps halved", Find::HalfEuler),
+    ("the cells' water without ∂η/∂t", Find::NoRate),
+];
 
 impl Run {
     /// Global substeps of `scheme` at CFL 0.5.
@@ -77,6 +126,7 @@ impl Run {
             bottom: true,
             layers: true,
             rivers: true,
+            find: Find::Same,
         }
     }
 
@@ -90,7 +140,9 @@ impl Run {
 }
 
 /// One fixture's pass: the 3D state at the step's start (its `η`, `ū`,
-/// `v̄`), the bed, the rivers, the step, the made-up `G` and drag rates.
+/// `v̄`), the bed, the rivers, the step, the made-up `G` and drag rates; the
+/// 3D stages' forward-Euler steps and the thin depth of the merged cells'
+/// search.
 struct Case<'a> {
     state: Solution3D,
     bed: &'a Bathymetry2D,
@@ -101,16 +153,21 @@ struct Case<'a> {
     bottom: Vec<f64>,
     d_sigma: Vec<f64>,
     layers: Vec<f64>,
+    euler_dt: Vec<f64>,
+    thin_depth: f64,
 }
 
 impl<'a> Case<'a> {
-    /// `state` over `bed` with made-up `G` and drags.
+    /// `state` over `bed` with made-up `G` and drags; columns shallower than
+    /// `thin_depth` thin, and the 3D stages those of SSP-RK3 on two levels
+    /// (every other element's step halved: its forward-Euler step).
     fn new(
         state: Solution3D,
         bed: &'a Bathymetry2D,
         rivers: Option<RiverSources>,
         t: f64,
         dt: f64,
+        thin_depth: f64,
     ) -> Self {
         let n = state.eta.data.len();
         let mut g = SWESolution2D::new(n / NN, NN);
@@ -131,6 +188,7 @@ impl<'a> Case<'a> {
                 layers[idx * LEVELS + l] = 4e-4 * (1.0 + 0.3 * (0.7 * (idx + l) as f64).cos());
             }
         }
+        let euler_dt = (0..n / NN).map(|k| dt / (1 + k % 2) as f64).collect();
         Self {
             state,
             bed,
@@ -141,6 +199,8 @@ impl<'a> Case<'a> {
             bottom,
             d_sigma: sigma.d_sigma().to_vec(),
             layers,
+            euler_dt,
+            thin_depth,
         }
     }
 
@@ -158,11 +218,13 @@ fn canonical(v: Vec<f64>) -> Vec<f64> {
         .collect()
 }
 
-/// The CPU's pass of `case` with `physics`, and what follows it.
+/// The CPU's pass of `case` with `physics`, and what follows it to the
+/// step's merged cells (their search's time added to `find_time`).
 fn on_cpu<BC: SWEBoundaryCondition2D + Sync>(
     physics: &SWEPhysics2D<BC>,
     case: &Case,
     run: Run,
+    find_time: &mut f64,
 ) -> Snapshots {
     let (mesh, ops, geom) = (physics.mesh(), physics.operators(), physics.geometry());
     let (ne, nn) = (mesh.n_elements, ops.n_nodes);
@@ -255,11 +317,34 @@ fn on_cpu<BC: SWEBoundaryCondition2D + Sync>(
         &mut column_source,
         &mut pooled,
     );
+    // The thin cells that lose more than their water in a stage
+    let t0 = Instant::now();
+    let mut merged = MergedCells::new(ne, nn);
+    merged.find(&StepWater {
+        mesh,
+        ops,
+        geom,
+        bathymetry: case.bed,
+        eta: &case.state.eta.data,
+        eta_rate: &rates[0].data,
+        dt: case.dt,
+        euler_dt: &case.euler_dt,
+        face: &transport.face,
+        subcell: &transport.subcell,
+        source: &column_source,
+        thin_depth: case.thin_depth,
+    });
+    *find_time += t0.elapsed().as_secs_f64();
+    let merged_cells = merged_snapshots(
+        &MergedLists::from_tables(merged.tables()),
+        merged.counts(),
+        ne,
+    );
     let clips = physics.negative_depth_clips() - clips_before;
     let [h, hu, hv] = q.data;
     let [ah, ahu, ahv] = q_avg.data;
     let [r_eta, r_u, r_v, r_hu, r_hv] = rates.map(|r| r.data);
-    vec![
+    let mut snapshots: Snapshots = vec![
         (
             "pass substeps/clips".into(),
             vec![n_bt as f64, clips as f64],
@@ -288,6 +373,51 @@ fn on_cpu<BC: SWEBoundaryCondition2D + Sync>(
             "balance pooled".into(),
             pooled.iter().map(|&p| f64::from(u8::from(p))).collect(),
         ),
+    ];
+    snapshots.extend(merged_cells);
+    snapshots
+}
+
+/// The step's merged cells as snapshots of fixed lengths (so that a
+/// mutant's other lists compare too): every node's group and whether it is
+/// joined; every element's group (whether it has one), whether it is
+/// flushed, its place in the flushed list (from 1; 0: not flushed), the
+/// water entering and leaving it, and its inflows in order (from `k·SLOTS`:
+/// the node the water comes from plus 1, the rate); the cells merged and
+/// flushed.
+fn merged_snapshots(lists: &MergedLists, counts: [usize; 2], ne: usize) -> Snapshots {
+    let as_f64 = |v: &[u32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<f64>>();
+    let mut grouped = vec![0.0; ne];
+    for &k in &lists.elements {
+        grouped[k as usize] = 1.0;
+    }
+    let (mut order, mut entering, mut leaving) = (vec![0.0; ne], vec![0.0; ne], vec![0.0; ne]);
+    for (j, &(k, i, o)) in lists.flushed_elements.iter().enumerate() {
+        let k = k as usize;
+        order[k] = (j + 1) as f64;
+        entering[k] = i;
+        leaving[k] = o;
+    }
+    let (mut from, mut rate) = (vec![0.0; ne * SLOTS], vec![0.0; ne * SLOTS]);
+    let mut seen = vec![0; ne];
+    for &(k, node, r) in &lists.inflows {
+        let k = k as usize;
+        let at = k * SLOTS + seen[k];
+        seen[k] += 1;
+        from[at] = f64::from(node) + 1.0;
+        rate[at] = r;
+    }
+    vec![
+        ("merged group".into(), as_f64(&lists.group)),
+        ("merged joined".into(), as_f64(&lists.joined)),
+        ("merged grouped".into(), grouped),
+        ("merged flushed".into(), as_f64(&lists.flushed)),
+        ("merged order".into(), order),
+        ("merged entering".into(), entering),
+        ("merged leaving".into(), leaving),
+        ("merged inflow-from".into(), from),
+        ("merged inflow-rate".into(), rate),
+        ("merged cells".into(), counts.map(|c| c as f64).to_vec()),
     ]
 }
 
@@ -301,12 +431,14 @@ fn on_device<BC: SWEBoundaryCondition2D + Sync>(
     let form = physics.device_form()?;
     let module = GpuSWE2D::from_form(gpu, &form)?;
     let mut device = Device::new(gpu, &module, physics.metric_form(), case)?;
-    device.snapshots(gpu, &module, case, run)
+    device.snapshots(&module, case, run)
 }
 
-/// The device's side of a case: the pass and the uploads.
+/// The device's side of a case: the pass, the merged cells and the uploads.
 struct Device {
+    gpu: Arc<Gpu>,
     pass: BarotropicPass3D,
+    merged: Merged3D,
     state: State3D,
     q: DeviceState,
     g: DeviceState,
@@ -315,8 +447,15 @@ struct Device {
     d_sigma: DeviceBuffer<f64>,
     layers: DeviceBuffer<f64>,
     column: DeviceBuffer<f64>,
+    /// Zeros in place of the face fluxes, the subcell fluxes, and a value
+    /// per node (mutants)
+    zero_faces: DeviceBuffer<f64>,
+    zero_subcells: DeviceBuffer<f64>,
+    zero_nodes: DeviceBuffer<f64>,
     /// The pass on local time steps, from the first step that takes it
     local: Option<LocalPass3D>,
+    /// The merged cells' search's time, summed (s)
+    find_time: f64,
 }
 
 impl Device {
@@ -328,8 +467,10 @@ impl Device {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let st = &gpu.stream;
         let ne = case.state.n_elements;
+        let pass = BarotropicPass3D::new(gpu, module, case.bed, metric, case.rivers.as_ref())?;
         Ok(Self {
-            pass: BarotropicPass3D::new(gpu, module, case.bed, metric, case.rivers.as_ref())?,
+            merged: Merged3D::none(gpu, pass.statics())?,
+            pass,
             state: State3D::upload(gpu, &case.state)?,
             q: DeviceState::upload(gpu, &SWESolution2D::new(ne, NN)),
             g: DeviceState::upload(gpu, &case.g),
@@ -338,22 +479,32 @@ impl Device {
             d_sigma: DeviceBuffer::from_host(st, &case.d_sigma)?,
             layers: DeviceBuffer::from_host(st, &case.layers)?,
             column: DeviceBuffer::zeroed(st, ne * NN)?,
+            zero_faces: DeviceBuffer::zeroed(st, ne * 4 * N1)?,
+            zero_subcells: DeviceBuffer::zeroed(st, ne * NSUB_OF_P2)?,
+            zero_nodes: DeviceBuffer::zeroed(st, ne * NN)?,
             local: None,
+            find_time: 0.0,
+            gpu: gpu.clone(),
         })
     }
 
-    /// The pass with `run`, and its snapshots.
+    /// The pass with `run` and the merged cells, and their snapshots.
     fn snapshots(
         &mut self,
-        gpu: &Gpu,
         module: &GpuSWE2D,
         case: &Case,
         run: Run,
     ) -> Result<Snapshots, Box<dyn std::error::Error>> {
+        let gpu = self.gpu.clone();
         let st = &gpu.stream;
         let clips_before = module.negative_depth_clips();
         let (n_bt, levels) = self.step(module, case, run)?;
         let clips = module.negative_depth_clips() - clips_before;
+        let merged_cells = merged_snapshots(
+            &self.merged.download(&gpu)?,
+            self.merged.counts(),
+            case.state.n_elements,
+        );
         let pass = &self.pass;
         let down = |b: &DeviceBuffer<f64>| b.to_host_vec(st);
         let q = self.q.download();
@@ -363,7 +514,7 @@ impl Device {
         let f = &pass.flux;
         let [r_u, r_v, r_hu, r_hv] = &pass.rates;
         let pooled = f.pooled.to_host_vec(st)?;
-        Ok(vec![
+        let mut snapshots: Snapshots = vec![
             (
                 "pass substeps/clips".into(),
                 vec![n_bt as f64, clips as f64],
@@ -395,12 +546,15 @@ impl Device {
                     .map(|&p| f64::from(u8::from(p != 0)))
                     .collect(),
             ),
-        ])
+        ];
+        snapshots.extend(merged_cells);
+        Ok(snapshots)
     }
 
     /// One step's pass on the device: the transport of the state, the
-    /// substeps (and the levels), `Λ̄`, the pass and what follows it. Its
-    /// substeps and every element's level (0 on global substeps).
+    /// substeps (and the levels), `Λ̄`, the pass and what follows it to the
+    /// step's merged cells. Its substeps and every element's level (0 on
+    /// global substeps).
     fn step(
         &mut self,
         module: &GpuSWE2D,
@@ -408,7 +562,9 @@ impl Device {
         run: Run,
     ) -> Result<(usize, Vec<f64>), Box<dyn std::error::Error>> {
         let Self {
+            gpu,
             pass,
+            merged,
             state,
             q,
             g,
@@ -417,7 +573,11 @@ impl Device {
             d_sigma,
             layers,
             column,
+            zero_faces,
+            zero_subcells,
+            zero_nodes,
             local,
+            find_time,
         } = self;
         pass.to_transport(state, q)?;
         let mut local = (run.levels > 0)
@@ -454,13 +614,39 @@ impl Device {
             }
         };
         pass.finish(module, state, case.dt)?;
+        // The thin cells that lose more than their water in a stage, at the
+        // 3D stages' forward-Euler steps (the driver's to set)
+        let st = &gpu.stream;
+        let euler: Vec<f64> = match run.find {
+            Find::CoarseEuler => vec![case.dt; case.euler_dt.len()],
+            Find::HalfEuler => case.euler_dt.iter().map(|&e| 0.5 * e).collect(),
+            _ => case.euler_dt.clone(),
+        };
+        pass.flux.euler_dt.copy_from_host(st, &euler)?;
+        let thin_depth = match run.find {
+            Find::NoneThin => 0.0,
+            _ => case.thin_depth,
+        };
+        let mut water = pass.step_water(state, case.dt, thin_depth);
+        match run.find {
+            Find::NoFaces => water.face = zero_faces,
+            Find::NoSubcells => water.subcell = zero_subcells,
+            Find::NoSources => water.source = zero_nodes,
+            Find::NoRate => water.eta_rate = zero_nodes,
+            _ => {}
+        }
+        st.synchronize()?;
+        let t0 = Instant::now();
+        merged.find(gpu, pass.statics(), &water)?;
+        *find_time += t0.elapsed().as_secs_f64();
         Ok((n_bt, levels))
     }
 }
 
 /// One case on both sides with `base`, and (if `mutants`) the mutants:
-/// `others` are the mutants of a changed 2D module. Whether all are the same
-/// to the bit (and every mutant caught).
+/// `others` are the mutants of a changed 2D module, `finds` those of the
+/// merged cells' search. Whether all are the same to the bit (and every
+/// mutant caught).
 fn gate<BC: SWEBoundaryCondition2D + Sync>(
     gpu: &Arc<Gpu>,
     physics: &SWEPhysics2D<BC>,
@@ -468,8 +654,9 @@ fn gate<BC: SWEBoundaryCondition2D + Sync>(
     base: Run,
     mutants: bool,
     others: &[(&str, &SWEPhysics2D<BC>)],
+    finds: &[(&'static str, Find)],
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let cpu = on_cpu(physics, case, base);
+    let cpu = on_cpu(physics, case, base, &mut 0.0);
     let device = on_device(gpu, physics, case, base)?;
     let ne = case.state.n_elements;
     let field = |name: &str| {
@@ -509,6 +696,20 @@ fn gate<BC: SWEBoundaryCondition2D + Sync>(
             SspScheme::Rk43 => "(4,3)",
         },
         counts[1],
+    );
+    let count = |name: &str| field(name).iter().filter(|&&x| x != 0.0).count();
+    let cells = field("merged cells");
+    println!(
+        "  merged cells at forward-Euler steps of {}–{} s, thin below {} m: {} elements with a \
+         group ({} cells), {} flushed ({} cells, {} inflows)",
+        case.dt / 2.0,
+        case.dt,
+        case.thin_depth,
+        count("merged grouped"),
+        cells[0],
+        count("merged flushed"),
+        cells[1],
+        count("merged inflow-rate"),
     );
     let mut same = report(&cpu, &device);
     if mutants {
@@ -558,6 +759,10 @@ fn gate<BC: SWEBoundaryCondition2D + Sync>(
         }
         if base.levels > 0 {
             runs.push(("global substeps", Run { levels: 0, ..base }));
+        }
+        // The merged cells' search
+        for &(what, find) in finds {
+            runs.push((what, Run { find, ..base }));
         }
         for (what, run) in runs {
             same &= report_mutant(what, &cpu, &on_device(gpu, physics, case, run)?);
@@ -627,6 +832,7 @@ fn beach_case(fx: &Fixture, rivers: bool) -> Case<'_> {
         rivers.then(|| beach_rivers(fx)),
         120.0,
         20.0,
+        fx.min_column_depth,
     )
 }
 
@@ -661,29 +867,40 @@ fn time(
     let ne = fx.n_elements();
     let mut n_bt = 0.0;
     let mut levels = Vec::new();
-    let mut cpu_time = 0.0;
+    let mut merged = Vec::new();
+    let (mut cpu_time, mut cpu_find) = (0.0, 0.0);
     for it in 0..iterations + 1 {
         let t0 = Instant::now();
-        let snapshots = on_cpu(&physics, &case, run);
+        let mut find = 0.0;
+        let snapshots = on_cpu(&physics, &case, run, &mut find);
         if it >= 1 {
             cpu_time += t0.elapsed().as_secs_f64();
+            cpu_find += find;
         }
         n_bt = snapshots[0].1[0];
         levels = snapshots[1].1.clone();
+        merged = snapshots
+            .iter()
+            .find(|(name, _)| name == "merged cells")
+            .expect("the merged cells")
+            .1
+            .clone();
     }
     let form = physics.device_form()?;
     let module = GpuSWE2D::from_form(gpu, &form)?;
     let mut device = Device::new(gpu, &module, physics.metric_form(), &case)?;
     let gpu_iterations = 3 * iterations;
-    let mut gpu_time = 0.0;
+    let (mut gpu_time, mut gpu_find) = (0.0, 0.0);
     let st = &gpu.stream;
     for it in 0..gpu_iterations + 1 {
         st.synchronize()?;
         let t0 = Instant::now();
+        let find_before = device.find_time;
         device.step(&module, &case, run)?;
         st.synchronize()?;
         if it >= 1 {
             gpu_time += t0.elapsed().as_secs_f64();
+            gpu_find += device.find_time - find_before;
         }
     }
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -729,12 +946,25 @@ fn time(
             c / g,
         );
     }
+    let (c, g) = (
+        cpu_find / iterations as f64,
+        gpu_find / gpu_iterations as f64,
+    );
+    println!(
+        "  of which the merged cells ({} merged, {} flushed): CPU (one thread) {:.2} ms | GPU \
+         {:.2} ms ({:.1}×)",
+        merged[0],
+        merged[1],
+        c * 1e3,
+        g * 1e3,
+        c / g,
+    );
     Ok(())
 }
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "== The barotropic pass, global substeps and local time steps: G, the drags, DU_avg2, the filter, the rivers, the band's sources (Phase 4.4c2–c3) =="
+        "== The barotropic pass, global substeps and local time steps: G, the drags, DU_avg2, the filter, the rivers, the band's sources; the step's merged cells (Phase 4.4c2–d) =="
     );
     let mut failed = Vec::new();
     let fx = Fixture::new(Shape::BEACH);
@@ -763,7 +993,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     for (label, run, mutants) in beach_runs {
         println!("{label}: {} P{ORDER} elements", fx.n_elements());
         let case = beach_case(&fx, true);
-        if !gate(gpu, &physics, &case, run, mutants, &[])? {
+        if !gate(gpu, &physics, &case, run, mutants, &[], &FIND_MUTANTS)? {
             failed.push(label);
         }
     }
@@ -781,7 +1011,8 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     };
     let other = domain.physics(&momentum_only, bc());
     let state = nest_state(&domain);
-    let case = Case::new(state, &domain.bed, None, 7200.0, 60.0);
+    // Thin below the case runner's 1 m (`[three_d] thin_depth_m`)
+    let case = Case::new(state, &domain.bed, None, 7200.0, 60.0, 1.0);
     let others = [("the band relaxing the momentum alone", &other)];
     for (label, run) in [
         (
@@ -797,7 +1028,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             "{label}: {} P{ORDER} elements, the band's level relaxed",
             domain.mesh.n_elements
         );
-        if !gate(gpu, &physics, &case, run, true, &others)? {
+        if !gate(gpu, &physics, &case, run, true, &others, &FIND_MUTANTS[..4])? {
             failed.push(label);
         }
     }

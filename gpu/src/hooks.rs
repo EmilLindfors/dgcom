@@ -6,11 +6,14 @@
 //! - inventories ↔ values: dgcom's `to_inventory`, `from_inventory_after`
 //!   (the last values where a node has no water, the stash's velocities in
 //!   the masked columns), `inventory_of`, `dry_inventories`;
-//! - the step's merged cells (`MergedCells`): their groups, found on the
-//!   host once per step by `MergedCells::find` and uploaded
-//!   ([`Merged3D::upload`]), set to their means at the step's start
-//!   (`MergedCells::start`), converted as one cell (`convert_element`), and
-//!   the flushed elements' values passed through (`pass_through`);
+//! - the step's merged cells (`MergedCells`): their groups, found once per
+//!   step from the pass's water on the device ([`Merged3D::find`], Phase
+//!   4.4d: dgcom's `find_element`, a thread per element; the flushed
+//!   elements put in the CPU's order and in waves on the host) or uploaded
+//!   from the host's `MergedCells::find` ([`Merged3D::upload`]), set to
+//!   their means at the step's start (`MergedCells::start`), converted as
+//!   one cell (`convert_element`), and the flushed elements' values passed
+//!   through (`pass_through`);
 //! - the thin columns at rest in a stage's values and back
 //!   (`Hydrostatic3D::mask_stage` with `StageStash::mask`, `forget`,
 //!   `restore_into`), their momentum tendencies zeroed
@@ -40,19 +43,20 @@
 use std::sync::Arc;
 
 use cuda_core::DeviceBuffer;
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+use cuda_device::{DisjointSlice, kernel, thread, warp};
 use cuda_host::cuda_module;
 use dgcom::boundary::{NestingSlots, Supplied};
 use dgcom::physics::{EquationOfState, LinearEOS};
-use dgcom::solver::rhs::MergedTables;
 use dgcom::solver::rhs::merged_cells::dry_volume_of;
 use dgcom::solver::rhs::transport_3d::{DRY_DEPTH, layer_thickness_of, layer_volume_of};
+use dgcom::solver::rhs::{CellWater, MergedTables, face_volume_rate, find_element};
 use dgcom::solver::state::Solution3D;
 use dgcom::vertical::depth_average;
 
 use crate::limiter::Limiter3D;
-use crate::swe2d::{Gpu, NN};
-use crate::three_d::{LEVEL_BLOCK, Statics3D, launch};
+use crate::swe2d::{Gpu, N1, NN, face_node};
+use crate::three_d::{COLUMN_BLOCK, LEVEL_BLOCK, NSUB, OPEN, SLOTS, Statics3D, WALL, launch};
 
 // =============================================================================
 // Kernels
@@ -645,6 +649,167 @@ pub mod kernels_hooks {
             }
         }
     }
+
+    /// A slot for every lane that `takes` one in the list counted at
+    /// `count`: one atomic per warp, the slots in lane order within it.
+    /// Every lane of the warp calls it.
+    ///
+    /// # Safety
+    ///
+    /// `count` points to a u32 that only atomics touch while the kernel runs.
+    #[inline]
+    unsafe fn warp_slot(takes: bool, count: *mut u32) -> usize {
+        let mask = warp::ballot(takes);
+        let lane = warp::lane_id();
+        let mut base = 0u32;
+        if mask != 0 && lane == mask.trailing_zeros() {
+            // SAFETY: the caller's.
+            let count = unsafe { DeviceAtomicU32::from_ptr(count) };
+            base = count.fetch_add(mask.count_ones(), AtomicOrdering::Relaxed);
+        }
+        let base = warp::shuffle(base, mask.trailing_zeros() & 31);
+        (base + (mask & warp::lanemask_lt()).count_ones()) as usize
+    }
+
+    /// `MergedCells::find`, a thread per element: dgcom's `find_element` of
+    /// its cells (`eta` at the step's start and its rate `eta_rate` over the
+    /// step `dt`, `source` the water no flux carried, over `bed`), the
+    /// pass's mean mass fluxes out of its face nodes (`face`) and through its
+    /// subcell interfaces (`subcell`), its stages' forward-Euler step
+    /// `euler_dt`, with columns shallower than `thin_depth` thin. Every
+    /// node's `group` and `joined` and every element's `flushed`; the
+    /// elements with a group listed in `elements` (`counts[0]` of them), the
+    /// flushed ones in `flushed_k` with the water entering and leaving
+    /// (`flushed_io`, `counts[1]` of them) and their inflows from other
+    /// elements (flushed element `j`'s `inflow_n[j]` from `j·SLOTS` in
+    /// `inflow_from`, `inflow_rate`, in the CPU's order); the cells merged
+    /// and flushed summed in `counts[2]`, `counts[3]`. `counts` zeroed
+    /// before: one atomic per warp and list, the lists' order the atomics'
+    /// (the host sorts the flushed one; no result depends on the other's).
+    #[kernel]
+    pub fn merged_find(
+        ne: u32,
+        dt: f64,
+        thin_depth: f64,
+        eta: &[f64],
+        bed: &[f64],
+        eta_rate: &[f64],
+        source: &[f64],
+        euler_dt: &[f64],
+        mass: &[f64],
+        fnode: &[[f64; 3]],
+        lift: &[f64],
+        w: &[f64],
+        face: &[f64],
+        subcell: &[f64],
+        across: &[u32],
+        counts: *mut u32,
+        mut group: DisjointSlice<u32>,
+        mut joined: DisjointSlice<u32>,
+        mut flushed: DisjointSlice<u32>,
+        mut elements: DisjointSlice<u32>,
+        mut flushed_k: DisjointSlice<u32>,
+        mut flushed_io: DisjointSlice<[f64; 2]>,
+        mut inflow_n: DisjointSlice<u32>,
+        mut inflow_from: DisjointSlice<u32>,
+        mut inflow_rate: DisjointSlice<f64>,
+    ) {
+        // Every lane reaches the votes: no early return
+        let k = thread::index_1d().get();
+        // The volume rate out of face node `fi` of face `f`
+        let face_rate = |f: usize, fi: usize| {
+            let (node, s) = (face_node(f, fi), (k * 4 + f) * N1 + fi);
+            face_volume_rate(
+                mass[k * NN + node],
+                fnode[s][2],
+                lift[(f * NN + node) * N1 + fi],
+                face[s],
+            )
+        };
+        let mut found = None;
+        if k < ne as usize {
+            found = find_element::<NN>(
+                NN,
+                N1,
+                dt,
+                euler_dt[k],
+                thin_depth,
+                |i| {
+                    let idx = k * NN + i;
+                    CellWater {
+                        eta: eta[idx],
+                        eta_rate: eta_rate[idx],
+                        bed: bed[idx],
+                        mass: mass[idx],
+                        source: source[idx],
+                    }
+                },
+                &face_rate,
+                face_node,
+                |slot| subcell[k * NSUB + slot],
+                |line| w[line],
+            );
+            for i in 0..NN {
+                let (g, j) = match &found {
+                    Some(found) => (found.group[i] as u32, u32::from(found.joined[i])),
+                    None => (i as u32, 0),
+                };
+                // SAFETY: thread k alone touches element k's nodes.
+                unsafe {
+                    *group.get_unchecked_mut(k * NN + i) = g;
+                    *joined.get_unchecked_mut(k * NN + i) = j;
+                }
+            }
+            // SAFETY: as above.
+            unsafe {
+                *flushed.get_unchecked_mut(k) = u32::from(found.is_some_and(|f| f.flushed));
+            }
+        }
+        let (n_joined, is_flushed, entering, leaving) = match &found {
+            Some(found) => (
+                found.joined.iter().filter(|&&j| j).count() as u32,
+                found.flushed,
+                found.entering,
+                found.leaving,
+            ),
+            None => (0, false, 0.0, 0.0),
+        };
+        if n_joined > 0 {
+            // SAFETY: `counts` holds four u32 that only atomics touch here.
+            let cells =
+                unsafe { DeviceAtomicU32::from_ptr(counts.add(2 + usize::from(is_flushed))) };
+            cells.fetch_add(n_joined, AtomicOrdering::Relaxed);
+        }
+        // SAFETY: as above; each lane that takes a slot writes it alone.
+        unsafe {
+            let at = warp_slot(n_joined > 0, counts);
+            if n_joined > 0 {
+                *elements.get_unchecked_mut(at) = k as u32;
+            }
+            let j = warp_slot(is_flushed, counts.add(1));
+            if is_flushed {
+                *flushed_k.get_unchecked_mut(j) = k as u32;
+                *flushed_io.get_unchecked_mut(j) = [entering, leaving];
+                // What flows in from other elements, face by face
+                let mut n = 0;
+                for f in 0..4 {
+                    for fi in 0..N1 {
+                        let from = across[(k * 4 + f) * N1 + fi];
+                        if from == WALL || from == OPEN {
+                            continue;
+                        }
+                        let rate = -face_rate(f, fi);
+                        if rate > 0.0 {
+                            *inflow_from.get_unchecked_mut(j * SLOTS + n) = from;
+                            *inflow_rate.get_unchecked_mut(j * SLOTS + n) = rate;
+                            n += 1;
+                        }
+                    }
+                }
+                *inflow_n.get_unchecked_mut(j) = n as u32;
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -805,10 +970,36 @@ pub struct StageValues3D {
     pub stash: Stash3D,
 }
 
-/// The step's merged cells on the device (dgcom's `MergedCells`, from
-/// [`MergedCells::tables`](dgcom::solver::rhs::MergedCells::tables)).
+/// What the barotropic pass of a step moved, as [`Merged3D::find`] reads it
+/// (dgcom's `StepWater`, on the device).
+pub struct StepWater3D<'a> {
+    /// `η` at the step's start
+    pub eta: &'a DeviceBuffer<f64>,
+    /// `∂η/∂t` over the step
+    pub eta_rate: &'a DeviceBuffer<f64>,
+    /// The step (s)
+    pub dt: f64,
+    /// Every element's longest forward-Euler step in the stages (s)
+    pub euler_dt: &'a DeviceBuffer<f64>,
+    /// The mean mass flux out of every face node, `(k·4 + face)·N1 + fi`
+    pub face: &'a DeviceBuffer<f64>,
+    /// The mean mass flux through every subcell interface, `k·NSUB + slot`;
+    /// NaN where the pass did not move the element on its subcells
+    /// throughout
+    pub subcell: &'a DeviceBuffer<f64>,
+    /// The water of every column that no flux carried (m/s)
+    pub source: &'a DeviceBuffer<f64>,
+    /// Columns shallower than this are thin (m)
+    pub thin_depth: f64,
+}
+
+/// The step's merged cells on the device (dgcom's `MergedCells`): found
+/// there from the pass's water ([`Merged3D::find`]), or uploaded from
+/// [`MergedCells::tables`](dgcom::solver::rhs::MergedCells::tables)
+/// ([`Merged3D::upload`]).
 pub struct Merged3D {
-    /// The elements with a group, and how many
+    /// The elements with a group (found on the device: in the atomics'
+    /// order), and how many
     elements: DeviceBuffer<u32>,
     n_grouped: usize,
     /// Per node: its group's first node, and whether it is in a group of two
@@ -829,6 +1020,82 @@ pub struct Merged3D {
     /// where each wave starts in it
     waves: DeviceBuffer<u32>,
     wave_offsets: Vec<usize>,
+    /// [`Self::find`]'s lists as its kernel leaves them
+    found: Option<Found>,
+    /// Cells merged and flushed, summed over the steps found on the device
+    counts: [usize; 2],
+}
+
+/// `merged_find`'s lists: its counts (the elements with a group, the
+/// flushed ones, the cells merged and flushed), and the flushed elements in
+/// the atomics' order with the water entering and leaving and their inflows
+/// (`n` of them from `j·SLOTS` in `from`, `rate`).
+struct Found {
+    counts: DeviceBuffer<u32>,
+    k: DeviceBuffer<u32>,
+    io: DeviceBuffer<[f64; 2]>,
+    n: DeviceBuffer<u32>,
+    from: DeviceBuffer<u32>,
+    rate: DeviceBuffer<f64>,
+}
+
+/// A step's groups on the host, as [`MergedTables`] holds them (the
+/// elements with a group in order): what [`Merged3D::download`] gives.
+pub struct MergedLists {
+    pub group: Vec<u32>,
+    pub joined: Vec<u32>,
+    pub flushed: Vec<u32>,
+    pub elements: Vec<u32>,
+    pub flushed_elements: Vec<(u32, f64, f64)>,
+    pub inflows: Vec<(u32, u32, f64)>,
+}
+
+impl MergedLists {
+    /// The CPU's groups `tables`.
+    pub fn from_tables(tables: MergedTables) -> Self {
+        let flags = |v: &[bool]| v.iter().map(|&b| u32::from(b)).collect();
+        Self {
+            group: tables.group.iter().map(|&g| u32::from(g)).collect(),
+            joined: flags(tables.joined),
+            flushed: flags(tables.flushed),
+            elements: tables.elements.to_vec(),
+            flushed_elements: tables.flushed_elements.to_vec(),
+            inflows: tables.inflows.to_vec(),
+        }
+    }
+}
+
+/// The first `n` values of `buf` (waits for the device): what
+/// `DeviceBuffer::copy_to_host` does, on a prefix.
+fn prefix_to_host<T: Default + Clone>(
+    gpu: &Gpu,
+    buf: &DeviceBuffer<T>,
+    n: usize,
+) -> Result<Vec<T>, Box<dyn std::error::Error>> {
+    let mut host = vec![T::default(); n];
+    if n == 0 {
+        return Ok(host);
+    }
+    let st = &gpu.stream;
+    let view = buf.slice(0..n)?;
+    let lease = view.storage().acquire(st, false, false)?;
+    view.context().bind_to_thread()?;
+    // SAFETY: the view holds `n` values of `T` on the device, `host` room
+    // for `n`; the stream is waited for before `host` is read.
+    let submitted = unsafe {
+        cuda_core::memory::memcpy_dtoh_async(
+            host.as_mut_ptr(),
+            view.cu_deviceptr(),
+            view.num_bytes(),
+            st.cu_stream(),
+        )
+    };
+    let completed = st.synchronize();
+    if completed.is_err() {
+        std::mem::forget(lease);
+    }
+    submitted.and(completed)?;
+    Ok(host)
 }
 
 impl Merged3D {
@@ -837,9 +1104,67 @@ impl Merged3D {
         let st = &gpu.stream;
         let flags = |v: &[bool]| v.iter().map(|&b| u32::from(b)).collect::<Vec<u32>>();
         let group: Vec<u32> = tables.group.iter().map(|&g| u32::from(g)).collect();
-        let flushed_k: Vec<u32> = tables.flushed_elements.iter().map(|f| f.0).collect();
-        let flushed_io: Vec<[f64; 2]> = tables
-            .flushed_elements
+        let mut merged = Self::with(
+            gpu,
+            DeviceBuffer::from_host(st, tables.elements)?,
+            tables.elements.len(),
+            DeviceBuffer::from_host(st, &group)?,
+            DeviceBuffer::from_host(st, &flags(tables.joined))?,
+            DeviceBuffer::from_host(st, &flags(tables.flushed))?,
+        )?;
+        merged.set_flushed(
+            gpu,
+            tables.flushed_elements,
+            tables.inflows,
+            tables.flushed.len(),
+        )?;
+        Ok(merged)
+    }
+
+    /// The groups `group`, `joined`, `flushed` with the elements listed in
+    /// `elements` (`n_grouped` of them), no element flushed.
+    fn with(
+        gpu: &Gpu,
+        elements: DeviceBuffer<u32>,
+        n_grouped: usize,
+        group: DeviceBuffer<u32>,
+        joined: DeviceBuffer<u32>,
+        flushed: DeviceBuffer<u32>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let st = &gpu.stream;
+        Ok(Self {
+            elements,
+            n_grouped,
+            group,
+            joined,
+            flushed,
+            flushed_k: DeviceBuffer::zeroed(st, 0)?,
+            flushed_io: DeviceBuffer::zeroed(st, 0)?,
+            n_flushed: 0,
+            inflow_offsets: DeviceBuffer::from_host(st, &[0u32])?,
+            inflow_from: DeviceBuffer::zeroed(st, 0)?,
+            inflow_rate: DeviceBuffer::zeroed(st, 0)?,
+            waves: DeviceBuffer::zeroed(st, 0)?,
+            wave_offsets: vec![0],
+            found: None,
+            counts: [0; 2],
+        })
+    }
+
+    /// The flushed elements `flushed_elements` in order, with the water
+    /// entering and leaving each, and their inflows `inflows` (element by
+    /// element in that order: the element, the node the water comes from,
+    /// the rate), on a mesh of `n_elements`: the lists and their waves.
+    fn set_flushed(
+        &mut self,
+        gpu: &Gpu,
+        flushed_elements: &[(u32, f64, f64)],
+        inflows: &[(u32, u32, f64)],
+        n_elements: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let st = &gpu.stream;
+        let flushed_k: Vec<u32> = flushed_elements.iter().map(|f| f.0).collect();
+        let flushed_io: Vec<[f64; 2]> = flushed_elements
             .iter()
             .map(|&(_, entering, leaving)| [entering, leaving])
             .collect();
@@ -849,36 +1174,147 @@ impl Merged3D {
         let mut at = 0;
         inflow_offsets.push(0u32);
         for &k in &flushed_k {
-            at += tables.inflows[at..].iter().take_while(|i| i.0 == k).count();
+            at += inflows[at..].iter().take_while(|i| i.0 == k).count();
             inflow_offsets.push(at as u32);
         }
-        assert_eq!(
-            at,
-            tables.inflows.len(),
-            "every inflow is a flushed element's"
-        );
-        let inflow_from: Vec<u32> = tables.inflows.iter().map(|i| i.1).collect();
-        let inflow_rate: Vec<f64> = tables.inflows.iter().map(|i| i.2).collect();
-        let (waves, wave_offsets) = flushed_waves(
-            &flushed_k,
-            &inflow_offsets,
-            &inflow_from,
-            tables.flushed.len(),
-        );
-        Ok(Self {
-            elements: DeviceBuffer::from_host(st, tables.elements)?,
-            n_grouped: tables.elements.len(),
-            group: DeviceBuffer::from_host(st, &group)?,
-            joined: DeviceBuffer::from_host(st, &flags(tables.joined))?,
-            flushed: DeviceBuffer::from_host(st, &flags(tables.flushed))?,
-            n_flushed: flushed_k.len(),
-            flushed_k: DeviceBuffer::from_host(st, &flushed_k)?,
-            flushed_io: DeviceBuffer::from_host(st, &flushed_io)?,
-            inflow_offsets: DeviceBuffer::from_host(st, &inflow_offsets)?,
-            inflow_from: DeviceBuffer::from_host(st, &inflow_from)?,
-            inflow_rate: DeviceBuffer::from_host(st, &inflow_rate)?,
-            waves: DeviceBuffer::from_host(st, &waves)?,
-            wave_offsets,
+        assert_eq!(at, inflows.len(), "every inflow is a flushed element's");
+        let inflow_from: Vec<u32> = inflows.iter().map(|i| i.1).collect();
+        let inflow_rate: Vec<f64> = inflows.iter().map(|i| i.2).collect();
+        let (waves, wave_offsets) =
+            flushed_waves(&flushed_k, &inflow_offsets, &inflow_from, n_elements);
+        self.n_flushed = flushed_k.len();
+        self.flushed_k = DeviceBuffer::from_host(st, &flushed_k)?;
+        self.flushed_io = DeviceBuffer::from_host(st, &flushed_io)?;
+        self.inflow_offsets = DeviceBuffer::from_host(st, &inflow_offsets)?;
+        self.inflow_from = DeviceBuffer::from_host(st, &inflow_from)?;
+        self.inflow_rate = DeviceBuffer::from_host(st, &inflow_rate)?;
+        self.waves = DeviceBuffer::from_host(st, &waves)?;
+        self.wave_offsets = wave_offsets;
+        Ok(())
+    }
+
+    /// `MergedCells::find` on the device: the step's groups from the pass's
+    /// water `water` on `s`'s mesh, replacing the last step's. Waits for the
+    /// device: the host takes the counts, and the flushed elements to put
+    /// them in the CPU's order (by element) and in waves.
+    pub fn find(
+        &mut self,
+        gpu: &Gpu,
+        s: &Statics3D,
+        water: &StepWater3D,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let st = &gpu.stream;
+        let ne = s.n_elements;
+        assert_eq!(self.flushed.len(), ne, "groups for this mesh");
+        if self.elements.len() < ne {
+            self.elements = DeviceBuffer::zeroed(st, ne)?;
+        }
+        if self.found.is_none() {
+            self.found = Some(Found {
+                counts: DeviceBuffer::zeroed(st, 4)?,
+                k: DeviceBuffer::zeroed(st, ne)?,
+                io: DeviceBuffer::zeroed(st, ne)?,
+                n: DeviceBuffer::zeroed(st, ne)?,
+                from: DeviceBuffer::zeroed(st, ne * SLOTS)?,
+                rate: DeviceBuffer::zeroed(st, ne * SLOTS)?,
+            });
+        }
+        let found = self.found.as_mut().expect("made above");
+        found.counts.zero_async(st)?;
+        // SAFETY: every buffer is sized for this mesh; `counts` holds the
+        // four u32 the kernel's atomics touch.
+        unsafe {
+            gpu.module_hooks.merged_find(
+                st,
+                launch(ne, COLUMN_BLOCK),
+                ne as u32,
+                water.dt,
+                water.thin_depth,
+                water.eta,
+                &s.bed,
+                water.eta_rate,
+                water.source,
+                water.euler_dt,
+                &s.mass,
+                &s.fnode,
+                &s.lift,
+                &s.w,
+                water.face,
+                water.subcell,
+                &s.across,
+                found.counts.cu_deviceptr() as *mut u32,
+                &mut self.group,
+                &mut self.joined,
+                &mut self.flushed,
+                &mut self.elements,
+                &mut found.k,
+                &mut found.io,
+                &mut found.n,
+                &mut found.from,
+                &mut found.rate,
+            )?;
+        }
+        let counts = found.counts.to_host_vec(st)?;
+        let [n_grouped, n_flushed, merged, flushed] = [0, 1, 2, 3].map(|i| counts[i] as usize);
+        self.n_grouped = n_grouped;
+        self.counts[0] += merged;
+        self.counts[1] += flushed;
+        if n_flushed == 0 && self.n_flushed == 0 {
+            return Ok(());
+        }
+        // The flushed elements in the CPU's order, each with its inflows
+        let k = prefix_to_host(gpu, &found.k, n_flushed)?;
+        let io = prefix_to_host(gpu, &found.io, n_flushed)?;
+        let n = prefix_to_host(gpu, &found.n, n_flushed)?;
+        let from = prefix_to_host(gpu, &found.from, n_flushed * SLOTS)?;
+        let rate = prefix_to_host(gpu, &found.rate, n_flushed * SLOTS)?;
+        let mut order: Vec<usize> = (0..n_flushed).collect();
+        order.sort_unstable_by_key(|&j| k[j]);
+        let mut flushed_elements = Vec::with_capacity(n_flushed);
+        let mut inflows = Vec::new();
+        for j in order {
+            let [entering, leaving] = io[j];
+            flushed_elements.push((k[j], entering, leaving));
+            for e in j * SLOTS..j * SLOTS + n[j] as usize {
+                inflows.push((k[j], from[e], rate[e]));
+            }
+        }
+        self.set_flushed(gpu, &flushed_elements, &inflows, ne)
+    }
+
+    /// The cells merged with others and the cells of flushed elements,
+    /// summed over the steps [`Self::find`] found (`MergedCells::counts`).
+    pub fn counts(&self) -> [usize; 2] {
+        self.counts
+    }
+
+    /// The groups on the host, the elements with a group in order.
+    pub fn download(&self, gpu: &Gpu) -> Result<MergedLists, Box<dyn std::error::Error>> {
+        let st = &gpu.stream;
+        let mut elements = prefix_to_host(gpu, &self.elements, self.n_grouped)?;
+        elements.sort_unstable();
+        let k = self.flushed_k.to_host_vec(st)?;
+        let io = self.flushed_io.to_host_vec(st)?;
+        let offsets = self.inflow_offsets.to_host_vec(st)?;
+        let from = self.inflow_from.to_host_vec(st)?;
+        let rate = self.inflow_rate.to_host_vec(st)?;
+        let mut inflows = Vec::with_capacity(from.len());
+        for (j, &k) in k.iter().enumerate() {
+            for e in offsets[j] as usize..offsets[j + 1] as usize {
+                inflows.push((k, from[e], rate[e]));
+            }
+        }
+        Ok(MergedLists {
+            group: self.group.to_host_vec(st)?,
+            joined: self.joined.to_host_vec(st)?,
+            flushed: self.flushed.to_host_vec(st)?,
+            elements,
+            flushed_elements: k
+                .iter()
+                .zip(&io)
+                .map(|(&k, io)| (k, io[0], io[1]))
+                .collect(),
+            inflows,
         })
     }
 
@@ -908,21 +1344,14 @@ impl Merged3D {
         let st = &gpu.stream;
         let ne = statics.n_elements;
         let group: Vec<u32> = (0..ne * NN).map(|idx| (idx % NN) as u32).collect();
-        Ok(Self {
-            elements: DeviceBuffer::zeroed(st, 0)?,
-            n_grouped: 0,
-            group: DeviceBuffer::from_host(st, &group)?,
-            joined: DeviceBuffer::zeroed(st, ne * NN)?,
-            flushed: DeviceBuffer::zeroed(st, ne)?,
-            flushed_k: DeviceBuffer::zeroed(st, 0)?,
-            flushed_io: DeviceBuffer::zeroed(st, 0)?,
-            n_flushed: 0,
-            inflow_offsets: DeviceBuffer::from_host(st, &[0u32])?,
-            inflow_from: DeviceBuffer::zeroed(st, 0)?,
-            inflow_rate: DeviceBuffer::zeroed(st, 0)?,
-            waves: DeviceBuffer::zeroed(st, 0)?,
-            wave_offsets: vec![0],
-        })
+        Self::with(
+            gpu,
+            DeviceBuffer::zeroed(st, 0)?,
+            0,
+            DeviceBuffer::from_host(st, &group)?,
+            DeviceBuffer::zeroed(st, ne * NN)?,
+            DeviceBuffer::zeroed(st, ne)?,
+        )
     }
 
     /// Whether any element has a group.
