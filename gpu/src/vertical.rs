@@ -104,6 +104,7 @@ pub mod kernels_vertical {
     pub fn split_omega(
         nl: u32,
         n: u32,
+        listed: &[u32],
         courant_min: f64,
         courant_max: f64,
         thin_depth: f64,
@@ -116,11 +117,18 @@ pub mod kernels_vertical {
         mut implicit: DisjointSlice<f64>,
         mut active: DisjointSlice<u32>,
     ) {
-        // Every lane reaches the vote: no early return
-        let col = thread::index_1d().get();
+        // Every lane reaches the vote: no early return. Thread t's column
+        // among those of the elements `listed` (empty: every element)
+        let t = thread::index_1d().get();
         let (nl, nw) = (nl as usize, nl as usize + 1);
         let mut any = false;
-        if col < n as usize {
+        let inside = t < n as usize;
+        let col = if inside {
+            listed_index(t, listed, NN)
+        } else {
+            0
+        };
+        if inside {
             let split = ImplicitVerticalAdvection {
                 courant_min,
                 courant_max,
@@ -593,7 +601,20 @@ impl Implicit3D {
         euler_dt: &DeviceBuffer<f64>,
         omega: &mut DeviceBuffer<f64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let n = s.n_columns();
+        self.split_on(s, eta, euler_dt, omega, On::ALL)
+    }
+
+    /// [`Self::split`] of the columns of `on`'s elements (a pass of local
+    /// time steps relaxes its own alone: the others' Ω is not read).
+    pub fn split_on(
+        &mut self,
+        s: &Statics3D,
+        eta: &DeviceBuffer<f64>,
+        euler_dt: &DeviceBuffer<f64>,
+        omega: &mut DeviceBuffer<f64>,
+        on: On<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let n = on.count(s.n_elements) * NN;
         let st = &self.gpu.stream;
         self.counts.zero_async(st)?;
         // SAFETY: the buffers are sized for this mesh and these levels;
@@ -604,6 +625,7 @@ impl Implicit3D {
                 launch(n, COLUMN_BLOCK),
                 s.n_levels as u32,
                 n as u32,
+                on.listed(&self.none_u32),
                 self.split.courant_min,
                 self.split.courant_max,
                 self.min_column_depth,

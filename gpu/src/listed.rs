@@ -48,15 +48,30 @@ pub struct DeviceList {
     len: usize,
 }
 
-/// The elements a device operation acts on: every element, or a list's.
+/// The elements a device operation acts on: every element, or a list's;
+/// with the list's halo, the elements its faces and vertex patches read.
 #[derive(Clone, Copy, Default)]
 pub struct On<'a> {
     list: Option<&'a DeviceList>,
+    halo: Option<&'a DeviceList>,
 }
 
 impl<'a> On<'a> {
     /// Every element.
-    pub const ALL: Self = Self { list: None };
+    pub const ALL: Self = Self {
+        list: None,
+        halo: None,
+    };
+
+    /// The list with its neighbours (those that share a face or a vertex
+    /// with a listed element): what a kernel must have computed for the
+    /// listed elements' faces to read it. Every element's is every element.
+    pub fn halo(&self) -> On<'a> {
+        On {
+            list: self.halo,
+            halo: self.halo,
+        }
+    }
 
     /// Whether it is every element.
     pub fn is_all(&self) -> bool {
@@ -85,11 +100,34 @@ impl<'a> On<'a> {
     }
 }
 
-/// A list kept by [`Lists`], with the host's copy it is found by.
+/// A list kept by [`Lists`], with the host's copy it is found by, and its
+/// halo (`None`: every element).
 struct Entry {
     host: Vec<u32>,
     list: DeviceList,
+    halo: Option<DeviceList>,
     used: u64,
+}
+
+/// Every element's neighbours on `mesh`: the elements that share a vertex or
+/// a face with it (a periodic face's two sides share no vertex).
+pub fn neighbours_of(mesh: &dgcom::mesh::Mesh2D) -> Vec<Vec<u32>> {
+    (0..mesh.n_elements)
+        .map(|k| {
+            let mut near: Vec<u32> = mesh.elements[k]
+                .iter()
+                .flat_map(|&v| mesh.vertex_to_elements[v].iter().map(|&e| e as u32))
+                .chain((0..4).filter_map(|face| {
+                    mesh.neighbor(dgcom::types::ElementIndex::new(k), face)
+                        .map(|nb| nb.element as u32)
+                }))
+                .filter(|&e| e as usize != k)
+                .collect();
+            near.sort_unstable();
+            near.dedup();
+            near
+        })
+        .collect()
 }
 
 /// Which list [`Lists::upload`] found or made: [`Lists::on`] reads it.
@@ -99,6 +137,8 @@ pub struct ListId(Option<usize>);
 /// The lists a run's passes act on, on the device, by content.
 pub struct Lists {
     n_elements: usize,
+    /// Every element's neighbours ([`neighbours_of`])
+    neighbours: Vec<Vec<u32>>,
     entries: Vec<Entry>,
     clock: u64,
 }
@@ -108,10 +148,12 @@ pub struct Lists {
 const MAX_LISTS: usize = 96;
 
 impl Lists {
-    /// No lists yet, on a mesh of `n_elements`.
-    pub fn new(n_elements: usize) -> Self {
+    /// No lists yet, on a mesh whose elements have the `neighbours`
+    /// ([`neighbours_of`]).
+    pub fn new(neighbours: Vec<Vec<u32>>) -> Self {
         Self {
-            n_elements,
+            n_elements: neighbours.len(),
+            neighbours,
             entries: Vec::new(),
             clock: 0,
         }
@@ -139,22 +181,42 @@ impl Lists {
             return Ok(ListId(Some(i)));
         }
         let st = &gpu.stream;
-        let mut member = vec![0u32; self.n_elements];
+        let device =
+            |list: &[u32], n_elements: usize| -> Result<DeviceList, Box<dyn std::error::Error>> {
+                let mut member = vec![0u32; n_elements];
+                for &k in list {
+                    member[k as usize] = 1;
+                }
+                Ok(DeviceList {
+                    // An empty list's elements are never read (no thread), its
+                    // flags all zero: no element
+                    listed: if list.is_empty() {
+                        DeviceBuffer::zeroed(st, 0)?
+                    } else {
+                        DeviceBuffer::from_host(st, list)?
+                    },
+                    member: DeviceBuffer::from_host(st, &member)?,
+                    len: list.len(),
+                })
+            };
+        // The halo: the listed elements and their neighbours, in order
+        let mut in_halo = vec![false; self.n_elements];
         for &k in list {
-            member[k as usize] = 1;
+            in_halo[k as usize] = true;
+            for &near in &self.neighbours[k as usize] {
+                in_halo[near as usize] = true;
+            }
         }
+        let halo: Vec<u32> = (0..self.n_elements as u32)
+            .filter(|&k| in_halo[k as usize])
+            .collect();
         let entry = Entry {
             host: list.to_vec(),
-            list: DeviceList {
-                // An empty list's elements are never read (no thread), its
-                // flags all zero: no element
-                listed: if list.is_empty() {
-                    DeviceBuffer::zeroed(st, 0)?
-                } else {
-                    DeviceBuffer::from_host(st, list)?
-                },
-                member: DeviceBuffer::from_host(st, &member)?,
-                len: list.len(),
+            list: device(list, self.n_elements)?,
+            halo: if halo.len() == self.n_elements {
+                None
+            } else {
+                Some(device(&halo, self.n_elements)?)
             },
             used: self.clock,
         };
@@ -173,6 +235,7 @@ impl Lists {
     pub fn on(&self, id: ListId) -> On<'_> {
         On {
             list: id.0.map(|i| &self.entries[i].list),
+            halo: id.0.and_then(|i| self.entries[i].halo.as_ref()),
         }
     }
 }

@@ -307,6 +307,7 @@ pub mod kernels3d {
     pub fn layer_nodal(
         nl: u32,
         n_columns: u32,
+        listed: &[u32],
         eta: &[f64],
         bed: &[f64],
         u: &[f64],
@@ -324,6 +325,8 @@ pub mod kernels3d {
             return;
         }
         let nl = nl as usize;
+        // (of the elements `listed`; empty: of every element)
+        let idx = listed_index(idx, listed, NN);
         let depth = eta[idx] - bed[idx];
         // Without a barotropic flux (`bar_hu` empty) no correction and no
         // step
@@ -369,6 +372,7 @@ pub mod kernels3d {
     pub fn layer_faces(
         nl: u32,
         n_slots: u32,
+        listed: &[u32],
         eta: &[f64],
         bed: &[f64],
         thin: &[u32],
@@ -389,6 +393,8 @@ pub mod kernels3d {
             return;
         }
         let nl = nl as usize;
+        // (of the elements `listed`; empty: of every element)
+        let s = listed_index(s, listed, SLOTS);
         let (k, f, fi) = (s / SLOTS, (s / N1) % 4, s % N1);
         let flat = k * NN + face_node(f, fi);
         let interior = flat * nl;
@@ -497,6 +503,7 @@ pub mod kernels3d {
     pub fn layer_divergence(
         nl: u32,
         n: u32,
+        listed: &[u32],
         kinds: &[u32],
         averaged: &[u32],
         contra: &[[f64; 4]],
@@ -518,6 +525,8 @@ pub mod kernels3d {
             return;
         }
         let nl = nl as usize;
+        // (of the elements `listed`; empty: of every element)
+        let t = listed_index(t, listed, nl);
         let (k, l) = (t / nl, t % nl);
         let mut q_u = [0.0; NN];
         let mut q_v = [0.0; NN];
@@ -617,6 +626,7 @@ pub mod kernels3d {
     pub fn layer_omega(
         nl: u32,
         n_columns: u32,
+        listed: &[u32],
         div: &[f64],
         eta_rate: &[f64],
         d_sigma: &[f64],
@@ -635,6 +645,8 @@ pub mod kernels3d {
             return;
         }
         let nl = nl as usize;
+        // (of the elements `listed`; empty: of every element)
+        let idx = listed_index(idx, listed, NN);
         let (k, node) = (idx / NN, idx % NN);
         // Without a barotropic flux (`eta_rate` empty) the column's own
         // divergence, summed as the CPU sums it
@@ -1600,7 +1612,7 @@ pub struct Transport3D {
     div: DeviceBuffer<f64>,
     /// An empty buffer for an absent field
     none: DeviceBuffer<f64>,
-    none_u32: DeviceBuffer<u32>,
+    pub(crate) none_u32: DeviceBuffer<u32>,
 }
 
 impl Transport3D {
@@ -1668,14 +1680,37 @@ impl Transport3D {
         barotropic: Option<&BarotropicDevice>,
         parent: Option<[&ExteriorDevice; 2]>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.compute_on(eta, u, v, barotropic, parent, On::ALL)
+    }
+
+    /// [`Self::compute`] for the elements of `on`: the nodal transports of
+    /// them and their neighbours (a face's central flux reads both sides'),
+    /// their own faces' fluxes, divergence and Ω. The other elements' rows
+    /// keep what an earlier call left: a pass of local time steps reads its
+    /// own elements' alone.
+    pub fn compute_on(
+        &mut self,
+        eta: &DeviceBuffer<f64>,
+        u: &DeviceBuffer<f64>,
+        v: &DeviceBuffer<f64>,
+        barotropic: Option<&BarotropicDevice>,
+        parent: Option<[&ExteriorDevice; 2]>,
+        on: On<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let gpu = self.gpu.clone();
         let (m, st) = (&gpu.module3d, &gpu.stream);
         let s = &self.statics;
         let nl = s.n_levels as u32;
-        let n_columns = s.n_columns();
-        let n_slots = s.n_elements * SLOTS;
         let n_sub = s.n_elements * NSUB;
-        let n_levels = s.n_elements * s.n_levels;
+        // The listed elements' values, and their halo's columns
+        let listed = on.listed(&self.none_u32);
+        let n_listed = on.count(s.n_elements);
+        let n_columns = n_listed * NN;
+        let n_slots = n_listed * SLOTS;
+        let n_levels = n_listed * s.n_levels;
+        let halo = on.halo();
+        let halo_listed = halo.listed(&self.none_u32);
+        let n_halo_columns = halo.count(s.n_elements) * NN;
         // Without a barotropic flux (`LayerTransport::compute` with `None`:
         // the layers' own transports, the slow forcing's) every pass array
         // is empty, and so are the rivers (the pass's)
@@ -1725,9 +1760,10 @@ impl Transport3D {
             )?;
             m.layer_nodal(
                 st,
-                launch(n_columns, COLUMN_BLOCK),
+                launch(n_halo_columns, COLUMN_BLOCK),
                 nl,
-                n_columns as u32,
+                n_halo_columns as u32,
+                halo_listed,
                 eta,
                 &s.bed,
                 u,
@@ -1745,6 +1781,7 @@ impl Transport3D {
                 launch(n_slots, COLUMN_BLOCK),
                 nl,
                 n_slots as u32,
+                listed,
                 eta,
                 &s.bed,
                 &self.thin,
@@ -1779,6 +1816,7 @@ impl Transport3D {
                 launch(n_levels, LEVEL_BLOCK),
                 nl,
                 n_levels as u32,
+                listed,
                 &self.kinds,
                 &s.averaged,
                 &s.contra,
@@ -1800,6 +1838,7 @@ impl Transport3D {
                 launch(n_columns, COLUMN_BLOCK),
                 nl,
                 n_columns as u32,
+                listed,
                 &self.div,
                 eta_rate,
                 &s.d_sigma,

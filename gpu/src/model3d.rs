@@ -266,6 +266,7 @@ pub mod kernels_model {
     pub fn set_sums(
         nl: u32,
         n: u32,
+        listed: &[u32],
         d_sigma: &[f64],
         rate_hu: &[f64],
         rate_hv: &[f64],
@@ -279,6 +280,8 @@ pub mod kernels_model {
             return;
         }
         let nl = nl as usize;
+        // (of the elements `listed`; empty: of every element)
+        let idx = listed_index(idx, listed, NN);
         let (du, dv) = (rate_hu[idx] - sum_u[idx], rate_hv[idx] - sum_v[idx]);
         for l in 0..nl {
             // SAFETY: thread idx alone writes column idx (idx < n).
@@ -1362,7 +1365,9 @@ fn momentum(
     rhs_v: &mut DeviceBuffer<f64>,
     on: On<'_>,
 ) {
-    cuda(baroclinic.reference(s, &values.eta, &values.rho));
+    // The reference at the levels of the elements and their neighbours
+    // (the pressure gradient's faces read both sides' columns)
+    cuda(baroclinic.reference_on(s, &values.eta, &values.rho, on.halo()));
     cuda(baroclinic.momentum(
         s,
         &values.eta,
@@ -1583,7 +1588,7 @@ where
             w: up(&self.host_copy().state.w),
             bound,
             non_finite: [ne, 1].map(|n| cuda(DeviceBuffer::zeroed(st, n).map_err(Into::into))),
-            lists: Lists::new(ne),
+            lists: Lists::new(crate::listed::neighbours_of(&self.physics.mesh)),
             levels: Levels3D::new(gpu),
             statics,
         }
@@ -2005,11 +2010,11 @@ where
             .as_ref()
             .map_or(([None; 2], [None; 2]), Nest3D::exterior);
         let parent = ext_velocity[0].zip(ext_velocity[1]).map(|(u, v)| [u, v]);
-        cuda(transport.compute(&vals.eta, &vals.u, &vals.v, Some(&pass.flux), parent));
+        cuda(transport.compute_on(&vals.eta, &vals.u, &vals.v, Some(&pass.flux), parent, on));
         if let Some(implicit) = implicit {
-            cuda(implicit.split(s, &vals.eta, &pass.flux.euler_dt, &mut transport.omega));
+            cuda(implicit.split_on(s, &vals.eta, &pass.flux.euler_dt, &mut transport.omega, on));
         }
-        cuda(baroclinic.reference(s, &vals.eta, &vals.rho));
+        cuda(baroclinic.reference_on(s, &vals.eta, &vals.rho, on.halo()));
         // The advection with the water no transport carried, field by field
         let velocity = |field, exterior| Advected {
             field,
@@ -2133,9 +2138,10 @@ where
             cuda(
                 m.set_sums(
                     st,
-                    launch(n, COLUMN_BLOCK),
+                    launch(on.count(s.n_elements) * NN, COLUMN_BLOCK),
                     nl,
-                    n as u32,
+                    (on.count(s.n_elements) * NN) as u32,
+                    on.listed(&transport.none_u32),
                     &s.d_sigma,
                     rate_hu,
                     rate_hv,
