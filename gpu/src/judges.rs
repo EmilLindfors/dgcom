@@ -21,7 +21,9 @@
 //! 3D, dgcom's own `ModeSplitIntegrator` over the device's model
 //! (`Model3D`), the case runner's terms on the gates' wet/dry beach:
 //! - **Rest about the reference**: the pycnocline at rest over the sloping
-//!   bed, across the σ-levels and the shoreline's thin columns: no flow.
+//!   bed, across the σ-levels and the shoreline's thin columns, and over a
+//!   doubly periodic bed of bumps on general quadrilaterals (the seamount
+//!   test): no flow.
 //! - **Constancy**: uniform T and S stay uniform under a sheared flow, a
 //!   wind, films, merged cells and rivers of the same water.
 //! - **Conservation**: the inventories of T and S of the stratified water.
@@ -701,7 +703,7 @@ fn largest_speed(state: &Solution3D) -> f64 {
 /// reference stratification's at every layer centre's height, no
 /// turbulence yet (as a case starts).
 fn at_rest(fx: &Fixture) -> Solution3D {
-    let profile = fx.profile.as_ref().expect("the beach has a reference");
+    let profile = fx.profile.as_ref().expect("the fixture has a reference");
     let mut state = fx.state.clone();
     let sigma = fx.sigma.sigma_rho();
     for idx in 0..state.eta.data.len() {
@@ -730,12 +732,17 @@ fn at_rest(fx: &Fixture) -> Solution3D {
 /// of the CPU and measures 1.3e-13.
 const REST_3D_BAR: f64 = 1e-10;
 
-fn rest_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
-    let fx = beach_3d();
+fn rest_3d(
+    gpu: &Arc<Gpu>,
+    tally: &mut Tally,
+    fx: &Fixture,
+    what: &str,
+    quiet: Terms,
+) -> Result<(), Box<dyn Error>> {
     let steps = 40;
     println!(
-        "3D rest about the reference: the beach, {} P{ORDER} elements × {LEVELS} levels, \
-         jittered and stretched, the pycnocline crossing its σ-levels, {steps} steps",
+        "3D rest about the reference: {what}, {} P{ORDER} elements × {LEVELS} levels, jittered \
+         and stretched, the pycnocline crossing its σ-levels, {steps} steps",
         fx.mesh.n_elements
     );
     // No mixing of the stratification (a closure's background diffusion of
@@ -746,9 +753,9 @@ fn rest_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
             .with_background(0.0, 0.0)
             .with_minimum(1e-30, 1e-30)
     };
-    let start = at_rest(&fx);
+    let start = at_rest(fx);
     let measure = |terms: Terms| -> Result<(f64, f64), Box<dyn Error>> {
-        let physics = physics_with(&fx, terms, NO_STRESS, still(), None);
+        let physics = physics_with(fx, terms, NO_STRESS, still(), None);
         let mut speed = 0.0f64;
         let t = run_3d(gpu, &physics, &start, steps, |s| {
             let now = largest_speed(s);
@@ -756,7 +763,7 @@ fn rest_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
         })?;
         Ok((speed, t))
     };
-    let (speed, t) = measure(QUIET)?;
+    let (speed, t) = measure(quiet)?;
     tally.judge(
         "at rest",
         &format!(
@@ -767,7 +774,7 @@ fn rest_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
     );
     let (speed, _) = measure(Terms {
         reference: false,
-        ..QUIET
+        ..quiet
     })?;
     tally.mutant(
         "no reference on the device: the pressure gradient of the whole density",
@@ -929,7 +936,24 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
     convergence(gpu, &mut tally)?;
     lake_at_rest(gpu, &mut tally)?;
     mass_and_positivity(gpu, &mut tally)?;
-    rest_3d(gpu, &mut tally)?;
+    rest_3d(gpu, &mut tally, &beach_3d(), "the wet/dry beach", QUIET)?;
+    // The seamount test: a doubly periodic bed of bumps 12 to 28 m deep under
+    // the pycnocline, every element a general quadrilateral, all of it wet
+    rest_3d(
+        gpu,
+        &mut tally,
+        &Fixture::new(Shape {
+            jitter: 0.15,
+            stretched: true,
+            reference: true,
+            ..Shape::WET
+        }),
+        "bumps of the bed under the pycnocline, doubly periodic (the seamount test)",
+        Terms {
+            cages: false,
+            ..QUIET
+        },
+    )?;
     tracers_3d(gpu, &mut tally)?;
     println!(
         "  {} judges, {} mutants: {}",
