@@ -45,6 +45,7 @@ use dgcom::source::SpongeProfile;
 use dgcom::time::{ModelClock, StageTime};
 use dgcom::vertical::MeanProfile;
 
+use crate::gate::{self, Bar};
 use crate::hooks::{Band3D, State3D};
 use crate::parent::Parent3D;
 use crate::stage3d::{Snapshots, report, report_mutant};
@@ -473,17 +474,14 @@ fn gate(
     }
     println!(
         "  {}",
-        if same {
-            "bit for bit"
-        } else {
-            "NOT bit for bit"
-        }
+        gate::verdict(label, same)
     );
     Ok(same)
 }
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!("== A nesting parent model's columns (Phase 4.5k) ==");
+    gate::start("parent3d", Bar::MIRRORED);
     let parents = [
         (
             "z-levels, linear in time, a deep reference",

@@ -50,6 +50,7 @@ use dgcom::source::{
 use dgcom::types::ElementIndex;
 use dgcom::vertical::{ROMSVstretching4, SigmaGrid};
 
+use crate::gate::{self, Bar};
 use crate::baroclinic::{Baroclinic3D, BaroclinicSetup};
 use crate::listed::On;
 use crate::phase0::{DX, Lcg, quad_mesh, ulps};
@@ -1027,7 +1028,24 @@ pub(crate) struct Agreement {
     worst_ulps: u64,
     /// The largest difference over the field's largest value
     pub(crate) worst_rel: f64,
+    /// The values farther from the CPU's than the running gate's tolerance
+    /// (`gate::tolerance`) of the field's largest value, or not finite on
+    /// one side alone
+    pub(crate) beyond: usize,
     first_difference: Option<usize>,
+}
+
+impl Agreement {
+    /// Whether the running gate holds this field (`gate::holds`): its bits,
+    /// or within its tolerance.
+    pub(crate) fn holds(&self) -> bool {
+        gate::holds(self.identical, self.beyond, self.len)
+    }
+
+    /// Whether the running gate fails this field of a mutant.
+    pub(crate) fn caught(&self) -> bool {
+        !self.holds()
+    }
 }
 
 pub(crate) fn agreement(cpu: &[f64], gpu: &[f64]) -> Agreement {
@@ -1038,8 +1056,10 @@ pub(crate) fn agreement(cpu: &[f64], gpu: &[f64]) -> Agreement {
         len: cpu.len(),
         worst_ulps: 0,
         worst_rel: 0.0,
+        beyond: 0,
         first_difference: None,
     };
+    let allowed = gate::tolerance() * scale;
     for (n, (&c, &g)) in cpu.iter().zip(gpu).enumerate() {
         if c.to_bits() == g.to_bits() {
             a.identical += 1;
@@ -1047,9 +1067,14 @@ pub(crate) fn agreement(cpu: &[f64], gpu: &[f64]) -> Agreement {
         }
         a.first_difference.get_or_insert(n);
         a.worst_ulps = a.worst_ulps.max(ulps(c, g));
+        let difference = (c - g).abs();
         a.worst_rel = a
             .worst_rel
-            .max((c - g).abs() / scale.max(f64::MIN_POSITIVE));
+            .max(difference / scale.max(f64::MIN_POSITIVE));
+        // A NaN or an infinity on one side alone is beyond any tolerance
+        if !(difference <= allowed) {
+            a.beyond += 1;
+        }
     }
     a
 }
@@ -1064,8 +1089,8 @@ pub(crate) fn report(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let values = device.to_host_vec(&gpu.stream)?;
     let a = agreement(cpu, &values);
-    let same = a.identical == a.len;
-    if same {
+    let same = a.holds();
+    if a.identical == a.len {
         println!("    {name:<16} {} of {} bit-identical", a.identical, a.len);
     } else {
         let at = a.first_difference.expect("a difference");
@@ -1186,13 +1211,13 @@ fn report_mutant(
         &cpu.advected[field]
     };
     let a = agreement(expected, &values);
-    let caught = a.identical < a.len;
+    let (caught, verdict) = gate::mutant(a.caught(), a.identical < a.len);
     println!(
-        "    mutant ({what}): {} {} of {} differ{}",
+        "    mutant ({what}): {} {} of {} differ, by up to {:.1e}{verdict}",
         NAMES[field],
         a.len - a.identical,
         a.len,
-        if caught { ", caught" } else { ": NOT CAUGHT" }
+        a.worst_rel,
     );
     Ok(caught)
 }
@@ -1252,7 +1277,10 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
         same &= report(gpu, name, cpu, gpu_values)?;
     }
     let residual = transport.surface_residual()?;
-    let residual_same = residual.to_bits() == layers.surface_residual.to_bits();
+    let residual_same = residual.to_bits() == layers.surface_residual.to_bits()
+        || (!gate::exact()
+            && (residual - layers.surface_residual).abs()
+                <= gate::tolerance() * layers.surface_residual.abs());
     println!(
         "    {:<16} CPU {:e}, GPU {residual:e}{}",
         "surface residual",
@@ -1313,12 +1341,12 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
         without.compute(&device.eta, u, v, Some(&device.barotropic), None)?;
         let faces = without.face.to_host_vec(&gpu.stream)?;
         let a = agreement(&layers.face, &faces);
-        let caught = a.identical < a.len;
+        let (caught, verdict) = gate::mutant(a.caught(), a.identical < a.len);
         println!(
-            "    mutant (no parent's velocity outside x = L): layer face {} of {} differ{}",
+            "    mutant (no parent's velocity outside x = L): layer face {} of {} differ, by up \n             to {:.1e}{verdict}",
             a.len - a.identical,
             a.len,
-            if caught { ", caught" } else { ": NOT CAUGHT" }
+            a.worst_rel,
         );
         same &= caught;
     }
@@ -1355,11 +1383,7 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
     );
     println!(
         "  {}",
-        if same {
-            "bit for bit"
-        } else {
-            "NOT bit for bit"
-        }
+        gate::verdict(label, same)
     );
     Ok(same)
 }
@@ -1441,6 +1465,9 @@ fn time(
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!("== The 3D transport: layer transports, Ω, advection (Phase 4) ==");
+    // One evaluation; the reference's residual, a difference of near-equal
+    // sums, moves by up to 1.5e-8 with contraction, the mutants by ≥ 5e-4
+    gate::start("transport3d", Bar::within(1e-7));
     let wet = Shape {
         nx: 24,
         ny: 20,
@@ -1543,7 +1570,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     if !failed.is_empty() {
         println!(
-            "(not bit for bit: {}; expected only in a build with multiply–add contraction)",
+            "(failed: {})",
             failed.join("; ")
         );
     }

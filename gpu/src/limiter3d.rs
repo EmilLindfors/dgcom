@@ -25,6 +25,7 @@ use dgcom::solver::{
     TracerLimiterType3D, apply_tracer_limiters_3d,
 };
 
+use crate::gate::{self, Bar};
 use crate::hooks::State3D;
 use crate::limiter::{Limiter3D, VertexPatches};
 use crate::listed::On;
@@ -260,11 +261,7 @@ fn gate(
     }
     println!(
         "  {}",
-        if same {
-            "bit for bit"
-        } else {
-            "NOT bit for bit"
-        }
+        gate::verdict(label, same)
     );
     Ok(same)
 }
@@ -372,6 +369,7 @@ fn time_on(
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!("== The 3D tracer limiter: Kuzmin about the reference, the bounds (Phase 4.3b) ==");
+    gate::start("limiter3d", Bar::MIRRORED);
     let cases = [
         ("beach", Shape::BEACH, true),
         ("channel, jittered, stretched", Shape::CHANNEL, true),
@@ -404,7 +402,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     if !failed.is_empty() {
         println!(
-            "(not bit for bit: {}; expected only in a build with multiply–add contraction)",
+            "(failed: {})",
             failed.join("; ")
         );
     }

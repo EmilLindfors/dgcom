@@ -35,6 +35,7 @@ use dgcom::solver::state::Solution3D;
 use dgcom::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
 use dgcom::time::{ModeSplitIntegrator, ModeSplitPhysics, SplitModel, SplitWork, SspScheme};
 
+use crate::gate::{self, Bar};
 use crate::forcing3d::{cages, coriolis, wind};
 use crate::hooks::State3D;
 use crate::model3d::{Model3D, Work3D};
@@ -43,35 +44,35 @@ use crate::stage3d::{Snapshots, report, report_mutant, start_state};
 use crate::swe2d::Gpu;
 use crate::transport3d::{Fixture, G, RHO0, Shape};
 
-type Physics = Hydrostatic3D<LinearEOS, GlsMixing, Reflective2D>;
+pub(crate) type Physics = Hydrostatic3D<LinearEOS, GlsMixing, Reflective2D>;
 
 /// The steps compared.
 const STEPS: usize = 4;
 /// The case runner's 3D CFL number with SSP-RK(4,3), and its cap (s).
-const CFL: f64 = 4.0;
-const DT_MAX: f64 = 60.0;
+pub(crate) const CFL: f64 = 4.0;
+pub(crate) const DT_MAX: f64 = 60.0;
 
 /// The terms of a model (a mutant leaves one out).
 #[derive(Clone, Copy)]
-struct Terms {
-    wind: bool,
-    rivers: bool,
-    cages: bool,
-    implicit: bool,
-    limiter: bool,
-    reference: bool,
-    smagorinsky: f64,
-    roughness: f64,
+pub(crate) struct Terms {
+    pub(crate) wind: bool,
+    pub(crate) rivers: bool,
+    pub(crate) cages: bool,
+    pub(crate) implicit: bool,
+    pub(crate) limiter: bool,
+    pub(crate) reference: bool,
+    pub(crate) smagorinsky: f64,
+    pub(crate) roughness: f64,
     /// The surface heat and fresh-water fluxes with their shortwave's water,
     /// and whether they read the sea surface's T
-    fluxes: Option<JerlovWater>,
-    flux_sst: bool,
+    pub(crate) fluxes: Option<JerlovWater>,
+    pub(crate) flux_sst: bool,
     /// The shear's viscosity once per step (`with_viscosity_once_per_step`)
-    viscosity_once: bool,
+    pub(crate) viscosity_once: bool,
 }
 
 impl Terms {
-    const CASE_RUNNER: Self = Self {
+    pub(crate) const CASE_RUNNER: Self = Self {
         wind: true,
         rivers: true,
         cages: true,
@@ -108,8 +109,31 @@ impl SurfaceFluxes3D for SeaSurfaceFluxes {
     }
 }
 
-/// A `Hydrostatic3D` of `fx` with `terms` (its boundaries the fixture's).
-fn physics(fx: &Fixture, terms: Terms) -> Physics {
+/// A `Hydrostatic3D` of `fx` with `terms` (its boundaries the fixture's): the
+/// gate's uniform stresses, k-ε and the beach's rivers.
+pub(crate) fn physics(fx: &Fixture, terms: Terms) -> Physics {
+    physics_with(
+        fx,
+        terms,
+        Forcing {
+            surface_stress: [0.03, -0.01],
+            bottom_stress: [0.0, 0.0],
+            surface_heat_flux: 0.0,
+        },
+        GlsMixing::k_epsilon(),
+        terms.rivers.then(|| beach_rivers(fx)),
+    )
+}
+
+/// [`physics`] with the uniform stresses `forcing`, the closure `mixing` and
+/// `rivers` (the device's own judges choose them, `judges.rs`).
+pub(crate) fn physics_with(
+    fx: &Fixture,
+    terms: Terms,
+    forcing: Forcing,
+    mixing: GlsMixing,
+    rivers: Option<dgcom::source::RiverSources>,
+) -> Physics {
     let mut limiter = TracerLimiter3DConfig {
         limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
         ..TracerLimiter3DConfig::default()
@@ -128,13 +152,9 @@ fn physics(fx: &Fixture, terms: Terms) -> Physics {
         Arc::new(fx.bathymetry.clone()),
         Arc::new(coriolis()),
         LinearEOS::default(),
-        GlsMixing::k_epsilon(),
+        mixing,
         beach_physics(fx),
-        Forcing {
-            surface_stress: [0.03, -0.01],
-            bottom_stress: [0.0, 0.0],
-            surface_heat_flux: 0.0,
-        },
+        forcing,
         G,
         RHO0,
     )
@@ -148,8 +168,8 @@ fn physics(fx: &Fixture, terms: Terms) -> Physics {
     if terms.wind {
         physics = physics.with_surface_stress(wind(fx));
     }
-    if terms.rivers {
-        physics = physics.with_rivers(beach_rivers(fx));
+    if let Some(rivers) = rivers {
+        physics = physics.with_rivers(rivers);
     }
     if terms.implicit {
         physics = physics.with_implicit_vertical_advection(ImplicitVerticalAdvection::default());
@@ -173,25 +193,25 @@ fn physics(fx: &Fixture, terms: Terms) -> Physics {
 
 /// The integrator of a run (a mutant changes it).
 #[derive(Clone, Copy)]
-struct Run {
-    barotropic_levels: usize,
-    scheme: SspScheme,
-    min_substeps: usize,
+pub(crate) struct Run {
+    pub(crate) barotropic_levels: usize,
+    pub(crate) scheme: SspScheme,
+    pub(crate) min_substeps: usize,
     /// Levels of the 3D stages' local time stepping (0: global steps)
-    baroclinic_levels: usize,
+    pub(crate) baroclinic_levels: usize,
 }
 
 impl Run {
     /// The case runner's: the pass on two levels, SSP-RK(4,3) in both,
     /// global 3D steps.
-    const CASE_RUNNER: Self = Self {
+    pub(crate) const CASE_RUNNER: Self = Self {
         barotropic_levels: 2,
         scheme: SspScheme::Rk43,
         min_substeps: dgcom::time::MIN_BAROTROPIC_SUBSTEPS,
         baroclinic_levels: 0,
     };
 
-    fn integrator(self) -> ModeSplitIntegrator {
+    pub(crate) fn integrator(self) -> ModeSplitIntegrator {
         ModeSplitIntegrator::new()
             .with_barotropic_cfl(2.0)
             .with_barotropic_scheme(SspScheme::Rk43)
@@ -513,6 +533,7 @@ fn gate(
         let (mutant, _) = on_device(gpu, &physics, mutated, &start, dt)?;
         same &= report_mutant(what, &cpu, &mutant);
     }
+    println!("    {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -532,7 +553,15 @@ fn named(limits: &TimeStepLimits) -> [(&'static str, TimeStepLimit); 5] {
 fn same_limits(label: &str, cpu: &TimeStepLimits, device: &TimeStepLimits, print: bool) -> bool {
     let mut same = true;
     for ((what, a), (_, b)) in named(cpu).into_iter().zip(named(device)) {
-        if a.dt.to_bits() != b.dt.to_bits() || a.element != b.element {
+        // Its bits and its element; or, where the gate judges by a tolerance,
+        // the step within it (two elements may then tie)
+        let agree = if gate::exact() {
+            a.dt.to_bits() == b.dt.to_bits() && a.element == b.element
+        } else {
+            a.dt == b.dt
+                || (a.dt - b.dt).abs() <= gate::tolerance() * a.dt.abs().max(b.dt.abs())
+        };
+        if !agree {
             same = false;
             if print {
                 println!(
@@ -577,7 +606,9 @@ fn bounds_agree(
                 print,
             );
             let explicit = physics.implicit_vertical_advection.is_none();
-            same &= cpu.step(explicit, scheme).to_bits() == limits.step(explicit, scheme).to_bits();
+            let (a, b) = (cpu.step(explicit, scheme), limits.step(explicit, scheme));
+            same &= a.to_bits() == b.to_bits()
+                || (!gate::exact() && (a - b).abs() <= gate::tolerance() * a.abs().max(b.abs()));
         }
     }
     Ok((same, measured))
@@ -611,7 +642,7 @@ fn bound_gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn
          frequencies measured)",
         states.len(),
         100.0 * CFL,
-        if same { "bit for bit" } else { "DIFFERENT" }
+        gate::verdict(&format!("{label}: the bound"), same)
     );
     // The mutants: another input on the device's side
     let mut thicker = self::physics(&fx, base);
@@ -640,12 +671,12 @@ fn bound_gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn
         ("thin columns to 1.5× the depth", thicker),
     ];
     for (what, mutant) in mutants {
+        // (Bit for bit a bound that agrees is one not caught; within a
+        // tolerance it may differ under it, which the other build judges)
         let (agree, _) = bounds_agree(gpu, label, &physics, &mutant, &states, false)?;
-        println!(
-            "    mutant {what}: {}",
-            if agree { "NOT CAUGHT" } else { "caught" }
-        );
-        same &= !agree;
+        let (caught, verdict) = gate::mutant(!agree, !gate::exact());
+        println!("    mutant {what}{verdict}");
+        same &= caught;
     }
     // `w` at rest on the device's side
     let rest: Vec<Solution3D> = states
@@ -666,11 +697,9 @@ fn bound_gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn
         let (limits, _) = model.time_step_limits(&s, &mut work, CFL, SspScheme::Rk43);
         agree &= same_limits(label, &cpu, &limits, false);
     }
-    println!(
-        "    mutant w at rest: {}",
-        if agree { "NOT CAUGHT" } else { "caught" }
-    );
-    same &= !agree;
+    let (caught, verdict) = gate::mutant(!agree, !gate::exact());
+    println!("    mutant w at rest{verdict}");
+    same &= caught;
     Ok(same)
 }
 
@@ -801,6 +830,12 @@ fn time(gpu: &Arc<Gpu>, fx: &Fixture, steps: usize) -> Result<(), Box<dyn Error>
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
     println!("3D steps, whole: ModeSplitIntegrator with the device's model against the CPU's");
+    // Four whole steps. Within a tolerance the first is judged: contraction
+    // moves 0.4 % of T's values by more than 1e-9 in it (a merged cell more
+    // or fewer), and from the second step on that cell's pass differs at
+    // every node, as a mutant's does
+    gate::start("step3d", Bar::within(1e-6).with_outliers(0.02));
+    gate::scope(Some("step 0"));
     let base = Terms::CASE_RUNNER;
     let run = Run::CASE_RUNNER;
     let jittered = Shape {
@@ -849,6 +884,9 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
         local(3),
         false,
     )?;
+    // One state's bound and its blow-up check: a single evaluation's bar
+    gate::set(Bar::MIRRORED);
+    gate::scope(None);
     println!("3D blow-up check: the device's against non_finite_field");
     same &= non_finite_gate(gpu, "beach", Shape::BEACH)?;
     println!("3D step's bound: the device's against Hydrostatic3D::time_step_limits");

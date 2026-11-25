@@ -28,6 +28,7 @@ use dgcom::solver::Blocks;
 use dgcom::solver::rhs::{LayerTransport, MetricForm, to_inventory, w_cell_thicknesses};
 use dgcom::solver::state::Solution3D;
 
+use crate::gate::{self, Bar};
 use crate::hooks::State3D;
 use crate::listed::On;
 use crate::stage3d::{Snapshots, report, report_mutant, start_state};
@@ -261,11 +262,7 @@ fn gate(
     }
     println!(
         "  {}",
-        if same {
-            "bit for bit"
-        } else {
-            "NOT bit for bit"
-        }
+        gate::verdict(label, same)
     );
     Ok(same)
 }
@@ -372,6 +369,7 @@ fn time(
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!("== Implicit vertical advection: the split of Ω, the relaxation (Phase 4.4b) ==");
+    gate::start("implicit3d", Bar::MIRRORED);
     let long = Shape {
         euler_dt: 40.0,
         ..Shape::BEACH
@@ -409,7 +407,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     if !failed.is_empty() {
         println!(
-            "(not bit for bit: {}; expected only in a build with multiply–add contraction)",
+            "(failed: {})",
             failed.join("; ")
         );
     }

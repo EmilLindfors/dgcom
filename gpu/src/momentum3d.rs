@@ -29,6 +29,7 @@ use dgcom::solver::rhs::{
 use dgcom::solver::state::Solution3D;
 use dgcom::source::CoriolisSource2D;
 
+use crate::gate::{self, Bar};
 use crate::baroclinic::Baroclinic3D;
 use crate::listed::On;
 use crate::swe2d::{Gpu, NN, ORDER};
@@ -231,12 +232,12 @@ fn report_mutant(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let values = device.rhs_u.to_host_vec(&gpu.stream)?;
     let a = agreement(cpu, &values);
-    let caught = a.identical < a.len;
+    let (caught, verdict) = gate::mutant(a.caught(), a.identical < a.len);
     println!(
-        "    mutant ({what}): u {} of {} differ{}",
+        "    mutant ({what}): u {} of {} differ, by up to {:.1e}{verdict}",
         a.len - a.identical,
         a.len,
-        if caught { ", caught" } else { ": NOT CAUGHT" }
+        a.worst_rel,
     );
     Ok(caught)
 }
@@ -477,11 +478,7 @@ fn gate(gpu: &Arc<Gpu>, case: Case) -> Result<bool, Box<dyn std::error::Error>> 
     }
     println!(
         "  {}",
-        if same {
-            "bit for bit"
-        } else {
-            "NOT bit for bit"
-        }
+        gate::verdict(case.label, same)
     );
     Ok(same)
 }
@@ -632,6 +629,8 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "== The 3D momentum terms: the reference, the pressure gradient, Coriolis, the viscosity (Phase 4.2) =="
     );
+    // As the transport's: 1.5e-8 with contraction, the mutants ≥ 2e-5
+    gate::start("momentum3d", Bar::within(1e-7));
     let wet = Shape::WET;
     let cases = [
         Case {
@@ -764,7 +763,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     if !failed.is_empty() {
         println!(
-            "(not bit for bit: {}; expected only in a build with multiply–add contraction)",
+            "(failed: {})",
             failed.join("; ")
         );
     }

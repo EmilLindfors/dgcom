@@ -401,6 +401,20 @@ pub mod kernels_model {
         }
     }
 
+    /// `a·b + c` per value, as this build compiles it: the gates' probe of
+    /// multiply–add contraction (`gate::probe`).
+    #[kernel]
+    pub fn multiply_add(n: u32, a: &[f64], b: &[f64], c: &[f64], mut out: DisjointSlice<f64>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: thread i alone writes value i (i < n).
+        unsafe {
+            *out.get_unchecked_mut(i) = a[i] * b[i] + c[i];
+        }
+    }
+
     /// `out += x`, a thread per value (`update_with`'s `*r += x`).
     #[kernel]
     pub fn add_into(n: u32, x: &[f64], mut out: DisjointSlice<f64>) {
@@ -512,6 +526,32 @@ pub mod kernels_model {
 // =============================================================================
 // Host side
 // =============================================================================
+
+/// `out = a·b + c` value by value on the device, as this build compiles it
+/// (`gate::probe`).
+pub(crate) fn multiply_add(
+    gpu: &Gpu,
+    a: &DeviceBuffer<f64>,
+    b: &DeviceBuffer<f64>,
+    c: &DeviceBuffer<f64>,
+    out: &mut DeviceBuffer<f64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = out.len();
+    // SAFETY: the four buffers hold n values; the output is none of the
+    // inputs.
+    unsafe {
+        gpu.module_model.multiply_add(
+            &gpu.stream,
+            launch(n, COLUMN_BLOCK),
+            n as u32,
+            a,
+            b,
+            c,
+            out,
+        )?;
+    }
+    Ok(())
+}
 
 /// The splitter's failure on the device: a CUDA call failed.
 fn cuda<T>(result: Result<T, Box<dyn std::error::Error>>) -> T {

@@ -20,6 +20,7 @@ use dgcom::source::{CoriolisSource2D, ManningFriction2D};
 use dgcom::time::Integrable;
 use dgcom::types::ElementIndex;
 
+use crate::gate::{self, Bar};
 use crate::swe2d::{DeviceState, Formulation, Gpu, GpuSWE2D, NN, ORDER};
 
 const G: f64 = 9.81;
@@ -310,6 +311,17 @@ pub fn agreement(cpu: &SWESolution2D, gpu: &SWESolution2D) -> (usize, u64, f64) 
     (identical, worst_ulps, worst_rel)
 }
 
+/// Whether the running gate holds a 2D state against the CPU's
+/// (`gate::holds`): every node's bits, or every value within its tolerance
+/// of its field's largest.
+pub(crate) fn holds(identical: usize, nodes: usize, worst_rel: f64) -> bool {
+    gate::holds(
+        identical,
+        usize::from(!(worst_rel <= gate::tolerance())),
+        nodes,
+    )
+}
+
 /// One case on both: agreement and, if `iterations > 0`, the time per
 /// element evaluation.
 fn run_case(
@@ -339,10 +351,11 @@ fn run_case(
     println!(
         "{label}: {n_el} P{ORDER} elements ({} affine), {identical} of {} nodes bit-identical \
          to the {} CPU kernel, largest difference {worst_ulps} ulp, {worst_rel:.1e} of the \
-         field's largest",
+         field's largest: {}",
         case.affine_elements(),
         n_el * NN,
-        cpu_kernel()
+        cpu_kernel(),
+        gate::verdict(label, holds(identical, n_el * NN, worst_rel))
     );
 
     if iterations > 0 {
@@ -378,6 +391,7 @@ fn run_case(
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!("== The RHS: EntropyStable, periodic ==");
+    gate::start("phase0", Bar::MIRRORED);
     run_case("parallelograms", &Case::new(48, 40, 0.0), gpu, 0)?;
     run_case("jittered", &Case::new(48, 40, 0.15), gpu, 0)?;
     run_case("jittered, timing", &Case::new(320, 300, 0.15), gpu, 20)?;
