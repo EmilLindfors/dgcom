@@ -363,12 +363,6 @@ mod app {
                     model_columns[f] = column.iter().rev().copied().collect();
                 }
                 rotate_to_east_north(&mut model_columns, point.east);
-                let space = point
-                    .parent
-                    .idx
-                    .iter()
-                    .map(|&k| k as usize)
-                    .zip(point.parent.w);
                 let mut parent_columns = [
                     vec![0.0; depths.len()],
                     vec![0.0; depths.len()],
@@ -376,7 +370,7 @@ mod app {
                     vec![0.0; depths.len()],
                 ];
                 for (f, s) in series.iter().enumerate() {
-                    if !s.sample(&time, space.clone(), &depths, parent_depth, &mut parent_out) {
+                    if !s.sample(&time, &point.parent, &depths, parent_depth, &mut parent_out) {
                         parent_out.fill(f64::NAN);
                     }
                     parent_columns[f].copy_from_slice(&parent_out);
@@ -783,9 +777,8 @@ mod app {
         bed: f64,
     ) -> f64 {
         let deepest = depths.partition_point(|&d| d <= bed).max(1) - 1;
-        let space = stencil.idx.iter().map(|&k| k as usize).zip(stencil.w);
         let mut out = [0.0];
-        if series.sample(time, space, &depths[deepest..=deepest], bed, &mut out) {
+        if series.sample(time, stencil, &depths[deepest..=deepest], bed, &mut out) {
             out[0]
         } else {
             f64::NAN
