@@ -42,6 +42,7 @@ use dgcom::time::{
 use dgcom::types::ElementIndex;
 use dgcom::vertical::SigmaGrid;
 
+use crate::gate::{self, Bar};
 use crate::hooks::{Merged3D, MergedLists, State3D};
 use crate::nest::{Domain, Nest};
 use crate::pass::{BarotropicPass3D, DevicePass, LocalPass3D};
@@ -648,8 +649,10 @@ impl Device {
 /// `others` are the mutants of a changed 2D module, `finds` those of the
 /// merged cells' search. Whether all are the same to the bit (and every
 /// mutant caught).
+#[allow(clippy::too_many_arguments)]
 fn gate<BC: SWEBoundaryCondition2D + Sync>(
     gpu: &Arc<Gpu>,
+    label: &str,
     physics: &SWEPhysics2D<BC>,
     case: &Case,
     base: Run,
@@ -772,14 +775,7 @@ fn gate<BC: SWEBoundaryCondition2D + Sync>(
             same &= report_mutant(what, &cpu, &on_device(gpu, other, case, base)?);
         }
     }
-    println!(
-        "  {}",
-        if same {
-            "bit for bit"
-        } else {
-            "NOT bit for bit"
-        }
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -967,6 +963,10 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "== The barotropic pass, global substeps and local time steps: G, the drags, DU_avg2, the filter, the rivers, the band's sources; the step's merged cells (Phase 4.4c2–d) =="
     );
+    // A whole pass and its merged cells: where a threshold decides (a cell
+    // merged, an element pooled) contraction flips up to 0.5 % of a field's
+    // flags; the mutants move thousands of values by ≥ 6e-2
+    gate::start("pass3d", Bar::MIRRORED.with_outliers(0.01));
     let mut failed = Vec::new();
     let fx = Fixture::new(Shape::BEACH);
     let physics = beach_physics(&fx);
@@ -994,7 +994,16 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     for (label, run, mutants) in beach_runs {
         println!("{label}: {} P{ORDER} elements", fx.n_elements());
         let case = beach_case(&fx, true);
-        if !gate(gpu, &physics, &case, run, mutants, &[], &FIND_MUTANTS)? {
+        if !gate(
+            gpu,
+            label,
+            &physics,
+            &case,
+            run,
+            mutants,
+            &[],
+            &FIND_MUTANTS,
+        )? {
             failed.push(label);
         }
     }
@@ -1029,7 +1038,16 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             "{label}: {} P{ORDER} elements, the band's level relaxed",
             domain.mesh.n_elements
         );
-        if !gate(gpu, &physics, &case, run, true, &others, &FIND_MUTANTS[..4])? {
+        if !gate(
+            gpu,
+            label,
+            &physics,
+            &case,
+            run,
+            true,
+            &others,
+            &FIND_MUTANTS[..4],
+        )? {
             failed.push(label);
         }
     }
@@ -1044,10 +1062,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     time(gpu, &large, Run::global(SspScheme::Rk3), 3)?;
     time(gpu, &large, Run::CASE_RUNNER, 3)?;
     if !failed.is_empty() {
-        println!(
-            "(not bit for bit: {}; expected only in a build with multiply–add contraction)",
-            failed.join("; ")
-        );
+        println!("(failed: {})", failed.join("; "));
     }
     Ok(())
 }

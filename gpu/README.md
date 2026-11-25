@@ -4,6 +4,8 @@ dgcom's GPU kernels, in Rust on NVIDIA's [cuda-oxide](https://github.com/NVIDIA/
 
 - `src/swe2d.rs`: the kernels, a device-resident SWE state (`DeviceState`, dgcom's `Integrable`) and the GPU physics module (`GpuSWE2D`, dgcom's `PhysicsModule`), built from dgcom's own module (`SWEPhysics2D::device_form`): the split forms `EntropyStable` and `WetDry`, walls, characteristic open boundaries with a uniform external state (a harmonic tide, still water), a tidal atlas's tides or a parent model's state node by node (nesting, with its relaxation band), Coriolis, the wet/dry correction, Manning friction, the positivity-bounded step. dgcom's own `Simulation` and SSP-RK steppers drive them, with global steps or local time stepping (`Multirate`, up to 8 levels: `GpuSWE2D` is dgcom's `LocalTimeStepping`).
 - `src/case.rs`: the case runner's CUDA backend (`Cuda`, dgcom's `CaseDevice`, for `[compute] device`: a 2D run, and since Phase 4.5c a 3D one, dgcom's own `Simulation3D` over `Model3D` with the state on the host after every step) and the case gate: a case file on the CPU and on the GPU, every station record and a 3D run's snapshot compared.
+- `src/gate.rs`: how a gate holds the device to the CPU (the rule of 2026-11-25, `notes/gpu.md`): bit for bit where its kernels still mirror the CPU's loops and the build does not contract multiply–adds (a probe kernel finds that), otherwise within its stated tolerance of each field's largest value, with a share of outliers where a threshold decides (a merged cell, a pooled element); a mutant is caught if the gate fails it by the same rule.
+- `src/judges.rs`: the device's own judges (`judges`, also in `all`), which ask the scheme's properties of the device and nothing of the CPU: third order of both split forms on a steady vortex over a hill on distorted meshes (and the second-order subcells under that bar), a lake at rest with a shoreline, mass to round-off and positivity on the drying beach; in 3D rest about the reference on the wet/dry beach, uniform tracers under a sheared flow with rivers, and the tracers' inventories; each with a mutant it must catch.
 - `src/phase0.rs`: the RHS against `compute_rhs_swe_2d_parallel_into`, node for node, on periodic P2 meshes (parallelograms and jittered quadrilaterals) and walled drying beaches, and timed.
 - `src/phase1.rs`: `Simulation` with SSP-RK(4,3) on the GPU against the same run on the CPU (`SWEPhysics2D`), the final states node for node, and the time per step.
 - `src/nest.rs`: a run nested in a made-up parent held in memory (no NetCDF), its boundary and relaxation band, on the CPU and the GPU with global steps and local time stepping, the final states node for node (`nest`, also in `all`).
@@ -89,19 +91,21 @@ In `gpu/` (on Windows the binary is `target\release\dgcom-gpu.exe`):
 cargo oxide run --no-fmad                   # the gates against the scalar CPU kernel
 cargo oxide run --no-fmad --features simd   # ... and against the 8-wide SIMD batch
 cargo oxide run --features simd             # multiply–adds fused: within ~1e-11; the timing
-target/release/dgcom-gpu phase1             # one gate (phase0, phase1, nest, beach, transport3d,
-                                            # momentum3d, stage3d, limiter3d, vertical3d,
-                                            # implicit3d, forcing3d, pass3d, step3d; all by
-                                            # default)
-target/release/dgcom-gpu case ../cases/tidal_channel/case.toml
-                                            # the case on the CPU and the GPU, compared
+target/release/dgcom-gpu phase1             # one gate (phase0, phase1, nest, weather, beach,
+                                            # transport3d, momentum3d, stage3d, limiter3d,
+                                            # vertical3d, implicit3d, forcing3d, pass3d, step3d,
+                                            # parent3d, judges; all by default)
+target/release/dgcom-gpu judges             # the device's own judges alone (a minute)
+target/release/dgcom-gpu case ../cases/tidal_channel/case.toml [--tolerance 1e-8] [--outliers 0]
+                                            # the case on the CPU and the GPU, compared (the bar
+                                            # where it is not judged bit for bit)
 target/release/dgcom-gpu run ../cases/tidal_channel/case.toml --set compute.device=cuda
                                             # dgcom's command line, the 2D run on the GPU
 ```
 
 The CPU has two copies of the physics: the scalar kernel, whose pointwise functions the GPU kernels call, and the SIMD batch that real runs use (`simd`), held to the scalar one bit for bit by its own gates. The gate runs against either.
 
-`--no-fmad` keeps each multiply and add separate, as the CPU code does; that build must agree with the CPU bit for bit. The default build is faster and agrees within rounding, so its gates print "differs" by about 1e-13: expected.
+`--no-fmad` keeps each multiply and add separate, as the CPU code does: in that build a gate whose kernels mirror the CPU's loops must agree with it bit for bit. The default build (the one that runs) is faster and agrees within rounding: its gates judge within their tolerances (`src/gate.rs`; `DGCOM_GATE=tolerance` asks the same of a `--no-fmad` build). Either way the command fails unless every fixture holds, every mutant is caught and the device's own judges hold; its last line counts them. A mutant whose effect is round-off's size is caught bit for bit only, and the default build says so.
 
 ## Timing a card
 
@@ -111,15 +115,15 @@ SIZES="800x80 1600x160 3200x320" REPEATS=5 gpu/time.sh
 ```
 
 1. Refuses a GPU that is more than 10 % busy (the cards are shared; `FORCE=1` overrides).
-2. Builds with `--no-fmad` and runs the gates against the SIMD batch: `all` (the RHS and `Simulation` runs, the nested runs, the 3D transport, momentum terms and stage hooks), `beach`, and `case` on `cases/tidal_channel` (25 h, every station record), global steps and local time stepping at 3 levels, and `case_atlas` on `cases/tidal_channel/atlas.toml` (the same channel forced by a tidal atlas node by node). On any card each must be bit for bit (`SKIP_GATES=1` skips them).
-3. Builds with FMA and runs `dgcom-gpu case` on the tidal channel refined to each of `SIZES` (`<nx>x<ny>` elements: 64,000 and 256,000 by default, about 1,150 steps each), on the CPU (the SIMD batch on all threads) and on the GPU, `REPEATS` times (3); then `dgcom-gpu transport3d`, `momentum3d`, `stage3d`, `limiter3d`, `vertical3d`, `implicit3d`, `forcing3d`, `pass3d` and `step3d`, the 3D transport, momentum terms, stage hooks, vertical step, implicit vertical advection, slow forcing (per element and level at 96,000 P2 elements × 20 levels), barotropic pass with the merged cells' search (per pass at 96,000 elements) and the whole 3D step (per step).
+2. Builds with `--no-fmad` and runs the gates against the SIMD batch: `all` (every gate's fixtures and mutants, and the device's own judges), `beach`, and `case` on `cases/tidal_channel` (25 h, every station record), global steps and local time stepping at 3 levels, `case_atlas` on `cases/tidal_channel/atlas.toml` (the same channel forced by a tidal atlas node by node) and `case_3d` (the 3D channel, its snapshot too). On any card each must hold: bit for bit where the kernels mirror the CPU, within its tolerance where they have left its order (`SKIP_GATES=1` skips them).
+3. Builds with FMA, runs the same gates with the build that runs (each within its tolerance), then `dgcom-gpu case` on the tidal channel refined to each of `SIZES` (`<nx>x<ny>` elements: 64,000 and 256,000 by default, about 1,150 steps each), on the CPU (the SIMD batch on all threads) and on the GPU, `REPEATS` times (3); then `dgcom-gpu transport3d`, `momentum3d`, `stage3d`, `limiter3d`, `vertical3d`, `implicit3d`, `forcing3d`, `pass3d` and `step3d`, the 3D transport, momentum terms, stage hooks, vertical step, implicit vertical advection, slow forcing (per element and level at 96,000 P2 elements × 20 levels), barotropic pass with the merged cells' search (per pass at 96,000 elements) and the whole 3D step (per step).
 4. Profiles the first size with Nsight Systems, if `nsys` is found (`SKIP_PROFILE=1` skips it): each kernel's time per step.
 
 Everything goes to `output/gpu_timing/<gpu>_<date>/` (git-ignored): each command's log and `summary.md`. The time per step is the run's wall time over its steps, start-up included; a build's first GPU run also compiles the PTX for the card, so judge by the later runs.
 
 **What to record** (`notes/gpu.md`, a section "Phase 1 on the <card> (<date>)"; the P2.7 line of `TODO.md`):
 
-- Whether the gates held on the card. A gate that differs is the finding, before any timing: the same PTX on another architecture should give the same bits under `--no-fmad`.
+- Whether the gates held on the card, in both builds (the two tables). A gate that fails is the finding, before any timing: the same PTX on another architecture should give the same bits under `--no-fmad`, and the device's own judges (convergence, rest, conservation, positivity) must hold on any card.
 - The time per step against the predictions (`notes/gpu.md`, Hardware and "Phase 1: a case file on the GPU"): from the laptop's 14.5–15.9 ms at 64,000 elements, by FP64 rate, ≈ 6 ms on the RTX 3090 and ≈ 1.7 ms on the RTX PRO 6000; the CPU it ran against (the laptop's 24 threads take 15.3–16.9 ms).
 - The kernel shares against the laptop's (`edge_fluxes_hll` 28 %, `element_rhs_volume` and `element_rhs_subcells` 22 % each, `implicit_damping` 14 %): if they hold, the card is FP64-bound as the laptop is.
 

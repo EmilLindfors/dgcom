@@ -27,6 +27,7 @@ use dgcom::time::ModeSplitPhysics;
 use dgcom::vertical::SigmaGrid;
 
 use crate::forcing::{ForcingSetup, SlowForcing3D};
+use crate::gate::{self, Bar};
 use crate::hooks::State3D;
 use crate::stage3d::{Snapshots, report, report_mutant, start_state};
 use crate::swe2d::{Gpu, NN, ORDER};
@@ -330,14 +331,7 @@ fn gate(
             same &= report_mutant(what, &cpu, &on_device(gpu, &fx, &state, &rhs, run)?);
         }
     }
-    println!(
-        "  {}",
-        if same {
-            "bit for bit"
-        } else {
-            "NOT bit for bit"
-        }
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -409,6 +403,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "== The slow forcing G: the layers' and the depth mean's advection, Coriolis, stresses, drags (Phase 4.4c1) =="
     );
+    gate::start("forcing3d", Bar::MIRRORED);
     let cases = [
         ("beach", Shape::BEACH, true),
         ("channel, jittered, stretched", Shape::CHANNEL, false),
@@ -432,10 +427,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
         3,
     )?;
     if !failed.is_empty() {
-        println!(
-            "(not bit for bit: {}; expected only in a build with multiply–add contraction)",
-            failed.join("; ")
-        );
+        println!("(failed: {})", failed.join("; "));
     }
     Ok(())
 }

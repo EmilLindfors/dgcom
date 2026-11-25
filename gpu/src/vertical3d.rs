@@ -32,6 +32,7 @@ use dgcom::solver::state::Solution3D;
 use dgcom::source::{CageDrag2D, NetCage};
 use dgcom::time::StepDrag;
 
+use crate::gate::{self, Bar};
 use crate::hooks::State3D;
 use crate::listed::On;
 use crate::stage3d::{Snapshots, report, report_mutant, start_state};
@@ -474,14 +475,7 @@ fn gate(
             same &= report_mutant(what, &cpus[0], &pad(&cpus[0], device));
         }
     }
-    println!(
-        "  {}",
-        if same {
-            "bit for bit"
-        } else {
-            "NOT bit for bit"
-        }
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -636,6 +630,8 @@ fn math_gate(gpu: &Gpu) -> Result<bool, Box<dyn std::error::Error>> {
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!("== The 3D vertical step: GLS, the implicit diffusion, the drags (Phase 4.4a) ==");
+    // The closure's powers: 1e-10 with contraction, the mutants ≥ 4e-3
+    gate::start("vertical3d", Bar::within(1e-8));
     let mut failed = Vec::new();
     if !math_gate(gpu)? {
         failed.push("dgcom::math");
@@ -662,10 +658,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
         5,
     )?;
     if !failed.is_empty() {
-        println!(
-            "(not bit for bit: {}; expected only in a build with multiply–add contraction)",
-            failed.join("; ")
-        );
+        println!("(failed: {})", failed.join("; "));
     }
     Ok(())
 }

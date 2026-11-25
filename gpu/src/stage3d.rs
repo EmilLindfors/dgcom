@@ -49,6 +49,7 @@ use dgcom::source::SpongeProfile;
 use dgcom::time::{StageStash, StageTime};
 use dgcom::vertical::{SigmaGrid, depth_average};
 
+use crate::gate::{self, Bar};
 use crate::hooks::{Band3D, Merged3D, N_FIELDS, StageHooks3D, StageValues3D, State3D};
 use crate::limiter::{Limiter3D, VertexPatches};
 use crate::limiter3d::case_runner_config;
@@ -568,14 +569,30 @@ impl Device<'_> {
 }
 
 /// `device`'s snapshots against `cpu`'s, a line per stage of the pipeline
-/// (and per value that differs); whether all are the same to the bit.
+/// (and per field that the running gate does not hold: its bits, or its
+/// tolerance, `gate::holds`; a field of a few counts by `gate::counts_hold`);
+/// whether every field the gate judges holds (`gate::judges`: within a
+/// tolerance a gate may judge its first step alone).
 pub(crate) fn report(cpu: &Snapshots, device: &Snapshots) -> bool {
     assert_eq!(cpu.len(), device.len(), "the snapshots");
     let mut same = true;
-    let mut group: Option<(String, usize, usize, usize)> = None;
-    let flush = |g: &Option<(String, usize, usize, usize)>| {
-        if let Some((name, fields, identical, len)) = g {
-            println!("    {name:<22} {fields} fields, {identical} of {len} bit-identical");
+    // A stage's name, fields, identical values, values and largest difference
+    let mut group: Option<(String, usize, usize, usize, f64)> = None;
+    let flush = |g: &Option<(String, usize, usize, usize, f64)>| {
+        if let Some((name, fields, identical, len, worst)) = g {
+            if identical == len {
+                println!("    {name:<22} {fields} fields, {identical} of {len} bit-identical");
+            } else {
+                println!(
+                    "    {name:<22} {fields} fields, {identical} of {len} bit-identical, the \
+                     others within {worst:.1e} of their field's largest{}",
+                    if gate::judges(name) {
+                        ""
+                    } else {
+                        " (not judged)"
+                    }
+                );
+            }
         }
     };
     for ((name, c), (device_name, g)) in cpu.iter().zip(device) {
@@ -585,26 +602,33 @@ pub(crate) fn report(cpu: &Snapshots, device: &Snapshots) -> bool {
             .rsplit_once(' ')
             .map_or(name.as_str(), |(stage, _)| stage);
         match &mut group {
-            Some((current, fields, identical, len)) if current == stage => {
+            Some((current, fields, identical, len, worst)) if current == stage => {
                 *fields += 1;
                 *identical += a.identical;
                 *len += a.len;
+                *worst = worst.max(a.worst_rel);
             }
             _ => {
                 flush(&group);
-                group = Some((stage.to_string(), 1, a.identical, a.len));
+                group = Some((stage.to_string(), 1, a.identical, a.len, a.worst_rel));
             }
         }
-        if a.identical < a.len {
+        let holds = if c.len() <= COUNTS {
+            gate::counts_hold(c, g)
+        } else {
+            a.holds()
+        };
+        if !holds && gate::judges(name) {
             same = false;
             let at = (0..a.len)
                 .find(|&n| c[n].to_bits() != g[n].to_bits())
                 .expect("a difference");
             println!(
-                "    {name:<22} {} of {} differ, by up to {:.1e} of the field's largest; first \
-                 at {at}: CPU {:e}, GPU {:e}",
+                "    {name:<22} {} of {} differ ({} beyond the tolerance), by up to {:.1e} of \
+                 the field's largest; first at {at}: CPU {:e}, GPU {:e}",
                 a.len - a.identical,
                 a.len,
+                a.beyond,
                 a.worst_rel,
                 c[at],
                 g[at]
@@ -615,27 +639,38 @@ pub(crate) fn report(cpu: &Snapshots, device: &Snapshots) -> bool {
     same
 }
 
+/// A field of at most this many values is a set of counts (cells merged,
+/// substeps, levels).
+const COUNTS: usize = 8;
+
 /// How many of `cpu`'s values `device`'s differ from, and where most; prints
-/// the mutant's line. Whether the gate catches it.
+/// the mutant's line. Whether the gate catches it: a field it judges and
+/// does not hold (`gate::mutant`).
 pub(crate) fn report_mutant(what: &str, cpu: &Snapshots, device: &Snapshots) -> bool {
-    let (mut total, mut worst) = (0, (0, ""));
+    let (mut total, mut worst, mut largest) = (0, (0, ""), 0.0f64);
+    let mut beyond = false;
     for ((name, c), (_, g)) in cpu.iter().zip(device) {
         let a = agreement(c, g);
         let differ = a.len - a.identical;
         total += differ;
+        largest = largest.max(a.worst_rel);
+        if gate::judges(name) {
+            beyond |= if c.len() <= COUNTS {
+                !gate::counts_hold(c, g)
+            } else {
+                a.caught()
+            };
+        }
         if differ > worst.0 {
             worst = (differ, name.as_str());
         }
     }
-    let caught = total > 0;
-    if caught {
-        println!(
-            "    mutant ({what}): {total} values differ, most in {} ({}), caught",
-            worst.1, worst.0
-        );
-    } else {
-        println!("    mutant ({what}): NOT CAUGHT");
-    }
+    let (caught, verdict) = gate::mutant(beyond, total > 0);
+    println!(
+        "    mutant ({what}): {total} values differ, most in {} ({}), by up to \
+         {largest:.1e}{verdict}",
+        worst.1, worst.0
+    );
     caught
 }
 
@@ -794,14 +829,7 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
             Mutations::default(),
         )?,
     );
-    println!(
-        "  {}",
-        if same {
-            "bit for bit"
-        } else {
-            "NOT bit for bit"
-        }
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -1073,14 +1101,7 @@ fn band_gate(
             &run(&hooks, &upload(slots, &later)?)?,
         );
     }
-    println!(
-        "  {}",
-        if same {
-            "bit for bit"
-        } else {
-            "NOT bit for bit"
-        }
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -1088,6 +1109,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "== The 3D stage values: conversions, merged cells, the mask, the density (Phase 4.3a) =="
     );
+    gate::start("stage3d", Bar::MIRRORED);
     let long = Shape {
         euler_dt: 40.0,
         ..Shape::BEACH
@@ -1145,10 +1167,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
         10,
     )?;
     if !failed.is_empty() {
-        println!(
-            "(not bit for bit: {}; expected only in a build with multiply–add contraction)",
-            failed.join("; ")
-        );
+        println!("(failed: {})", failed.join("; "));
     }
     Ok(())
 }

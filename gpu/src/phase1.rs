@@ -12,7 +12,8 @@ use std::time::Instant;
 use dgcom::simulation::Simulation;
 use dgcom::time::SSPRK43;
 
-use crate::phase0::{Case, agreement, cpu_kernel};
+use crate::gate::{self, Bar};
+use crate::phase0::{Case, agreement, cpu_kernel, holds};
 use crate::swe2d::{DeviceState, Gpu, NN};
 
 /// The CFL number of both runs.
@@ -55,12 +56,16 @@ fn run_case(
     println!(
         "{label}: {n_el} P2 elements ({} affine), {} steps on the CPU and {} on the GPU to \
          t = {t_end} s; after them {identical} of {} nodes bit-identical to the {} CPU kernel, \
-         largest difference {worst_ulps} ulp, {worst_rel:.1e} of the field's largest",
+         largest difference {worst_ulps} ulp, {worst_rel:.1e} of the field's largest: {}",
         case.affine_elements(),
         cpu_result.n_steps,
         gpu_result.n_steps,
         n_el * NN,
-        cpu_kernel()
+        cpu_kernel(),
+        gate::verdict(
+            label,
+            cpu_result.n_steps == gpu_result.n_steps && holds(identical, n_el * NN, worst_rel)
+        )
     );
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let per_step = |seconds: f64, steps: usize| seconds * 1e3 / steps as f64;
@@ -89,6 +94,8 @@ pub fn run_beach(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!("== Phase 1: Simulation with SSP-RK(4,3) on the GPU ==");
+    // Whole runs: contraction moves these by 1e-14 to 4e-11
+    gate::start("phase1", Bar::within(1e-8));
     run_case("parallelograms", &Case::new(48, 40, 0.0), gpu, 30.0)?;
     run_case("jittered", &Case::new(48, 40, 0.15), gpu, 30.0)?;
     run_case("jittered, timing", &Case::new(320, 300, 0.15), gpu, 30.0)?;

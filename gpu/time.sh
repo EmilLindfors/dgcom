@@ -8,13 +8,15 @@
 #   SIZES="800x80 1600x160 3200x320" gpu/time.sh
 #   FORCE=1 gpu/time.sh                          # time on a busy GPU anyway
 #
-# 1. The gates, built with --no-fmad, against the SIMD batch: the RHS and
-#    Simulation runs and the nested runs (`all`), the drying beach (`beach`) and
-#    cases/tidal_channel through the case runner (`case`), also with local
-#    time stepping (`case_lts`), forced by a tidal atlas (`case_atlas`) and
-#    in 3D (`case_3d`: 25 h, its snapshot too).
-#    On any card each must be the CPU's bit for bit.
-# 2. The timing, built with FMA: the refined tidal channel at each size, on
+# 1. The gates, built with --no-fmad, against the SIMD batch: every gate's
+#    fixtures and mutants and the device's own judges (`all`), the drying
+#    beach (`beach`) and cases/tidal_channel through the case runner (`case`),
+#    also with local time stepping (`case_lts`), forced by a tidal atlas
+#    (`case_atlas`) and in 3D (`case_3d`: 25 h, its snapshot too). On any card
+#    each must hold: bit for bit where the kernels mirror the CPU, within its
+#    tolerance where they have left its order (src/gate.rs).
+# 2. The same gates with the FMA build, the one that runs, each within its
+#    tolerance; then the timing: the refined tidal channel at each size, on
 #    the CPU and on the GPU, REPEATS times; and the 3D transport, momentum
 #    terms, stage hooks, vertical step and implicit vertical advection
 #    (`transport3d`, `momentum3d`, `stage3d`, `limiter3d`, `vertical3d`,
@@ -41,8 +43,15 @@ exe="$gpu_dir/target/release/dgcom-gpu"
 case $(uname -s) in MINGW* | MSYS*) exe+=".exe" ;; esac
 
 # README.md's environment, where the shell has not set it.
-if [[ -z ${CUDA_TOOLKIT_PATH:-} && -d /usr/local/cuda ]]; then
-    export CUDA_TOOLKIT_PATH=/usr/local/cuda
+# CUDA 13 where it lives beside another toolkit (/usr/local/cuda may be an
+# older one that other software builds against), as `cargo oxide doctor` looks.
+if [[ -z ${CUDA_TOOLKIT_PATH:-} ]]; then
+    newest=$({ ls -d /usr/local/cuda-13* 2>/dev/null || true; } | sort -V | tail -1)
+    if [[ -n $newest ]]; then
+        export CUDA_TOOLKIT_PATH=$newest
+    elif [[ -d /usr/local/cuda ]]; then
+        export CUDA_TOOLKIT_PATH=/usr/local/cuda
+    fi
 fi
 if ! command -v nvcc >/dev/null && [[ -n ${CUDA_TOOLKIT_PATH:-} ]]; then
     export PATH="$CUDA_TOOLKIT_PATH/bin:$PATH"
@@ -107,51 +116,69 @@ say "- CPU: $cpu, $threads threads (the SIMD batch on all of them)"
 say "- Commit: $commit; $oxide"
 say ""
 
-# 1. The gates: every node, step and record bit for bit.
-if ((SKIP_GATES == 0)); then
-    build build_nofmad --no-fmad --features simd
-    say "## Gates (--no-fmad, against the SIMD batch)"
-    say ""
+# Runs the gates with the build at hand, logs `<prefix>_<gate>.log`, and
+# writes the table: a gate holds if its command succeeds (every fixture
+# within its bar, every mutant caught, the device's own judges).
+gates() {
+    local prefix=$1
     say "| gate | result |"
     say "|---|---|"
     for gate in all beach case case_lts case_atlas case_3d; do
         if [[ $gate == case ]]; then
-            run_logged "gate_$gate" "$exe" case "$case_file"
+            run_logged "${prefix}_$gate" "$exe" case "$case_file"
         elif [[ $gate == case_lts ]]; then
-            run_logged "gate_$gate" "$exe" case "$case_file" --set numerics.local_time_stepping_levels=3
+            run_logged "${prefix}_$gate" "$exe" case "$case_file" --set numerics.local_time_stepping_levels=3
         elif [[ $gate == case_atlas ]]; then
-            run_logged "gate_$gate" "$exe" case "$atlas_file"
+            run_logged "${prefix}_$gate" "$exe" case "$atlas_file"
         elif [[ $gate == case_3d ]]; then
-            run_logged "gate_$gate" "$exe" case "$three_d_file"
+            # Where a threshold decides (a merged cell, a limited layer), a
+            # build with contraction may move a few values further
+            run_logged "${prefix}_$gate" "$exe" case "$three_d_file" --tolerance 1e-6 --outliers 1e-3
         else
-            run_logged "gate_$gate" "$exe" "$gate"
+            run_logged "${prefix}_$gate" "$exe" "$gate"
         fi
-        log="$out/gate_$gate.log"
-        compared=$({ grep -oE '[0-9]+ of [0-9]+ nodes bit-identical' "$log" || true; } | wc -l)
-        partial=$({ grep -oE '[0-9]+ of [0-9]+ nodes bit-identical' "$log" || true; } | awk '$1 != $3' | wc -l)
-        result="bit for bit"
-        if ((code != 0 || partial > 0)); then result="**differs** (gate_$gate.log)"; fi
-        if [[ $gate == case* ]] && ! grep -q 'bit for bit' "$log"; then result="**differs** (gate_$gate.log)"; fi
-        # The 3D transport's fixtures (in `all`) print their own verdict
-        if grep -q 'NOT bit for bit\|NOT CAUGHT' "$log"; then result="**differs** (gate_$gate.log)"; fi
-        if [[ $gate == case ]]; then
+        log="$out/${prefix}_$gate.log"
+        how=$({ grep -oE 'judged bit for bit|judged within [0-9.e-]+' "$log" || true; } | sort -u | tr '\n' ';' | sed 's/judged //g; s/;$//; s/;/, /g')
+        if ((code == 0)) && ! grep -q 'NOT bit for bit\|NOT within\|NOT CAUGHT\|FAILED' "$log"; then
+            result="held (${how:-no verdict printed})"
+        else
+            result="**FAILED** (${prefix}_$gate.log)"
+        fi
+        if [[ $gate == all ]]; then
+            what="every gate's fixtures and mutants against the CPU, and the device's own judges"
+        elif [[ $gate == beach ]]; then
+            what="the drying beach at 96,000 elements"
+        elif [[ $gate == case ]]; then
             what="steps, volume, clips and station records"
         elif [[ $gate == case_lts ]]; then
             what="the same with local time stepping (3 levels)"
         elif [[ $gate == case_atlas ]]; then
             what="the same forced by a tidal atlas node by node"
-        elif [[ $gate == case_3d ]]; then
-            what="the 3D channel: steps, volume, station records and the 3D snapshot"
         else
-            what="every node of $compared state$( ((compared == 1)) || echo s)"
+            what="the 3D channel: steps, volume, station records and the 3D snapshot"
         fi
         say "| \`dgcom-gpu $gate\` | $result: $what |"
     done
     say ""
+}
+
+# 1. The gates without multiply–add contraction: bit for bit where the
+# kernels mirror the CPU, within a tolerance where they have left its order.
+if ((SKIP_GATES == 0)); then
+    build build_nofmad --no-fmad --features simd
+    say "## Gates (--no-fmad, against the SIMD batch)"
+    say ""
+    gates gate
 fi
 
-# 2. The timing, with FMA: each run's wall time over its steps.
+# 2. The build that runs (with contraction): its gates within their
+# tolerances, then the timing, each run's wall time over its steps.
 build build_fma --features simd
+if ((SKIP_GATES == 0)); then
+    say "## Gates (the FMA build that runs, within each gate's tolerance)"
+    say ""
+    gates gate_fma
+fi
 rows=()
 for size in $SIZES; do
     nx=${size%x*}

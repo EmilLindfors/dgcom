@@ -20,6 +20,7 @@ use dgcom::solver::SWESolution2D;
 use dgcom::solver::state::Solution3D;
 use dgcom::time::{IntegratorInfo, ModeSplitIntegrator, Multirate, TimeIntegrator};
 
+use crate::gate;
 use crate::hooks::State3D;
 use crate::model3d::{Model3D, Work3D};
 use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, MAX_DEVICE_LEVELS};
@@ -171,12 +172,24 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
         gpu.dt_range_s.0,
         gpu.dt_range_s.1
     );
-    let same_volume = cpu.volume_m3.1.to_bits() == gpu.volume_m3.1.to_bits();
+    let exact = gate::exact();
+    let tolerance = gate::tolerance();
+    let close = |a: f64, b: f64| {
+        a.to_bits() == b.to_bits() || (!exact && (a - b).abs() <= tolerance * a.abs().max(b.abs()))
+    };
+    let same_volume = close(cpu.volume_m3.1, gpu.volume_m3.1);
     println!(
         "  volume at the end {:.9e} and {:.9e} m³: {}",
         cpu.volume_m3.1,
         gpu.volume_m3.1,
-        if same_volume { "identical" } else { "differ" }
+        if cpu.volume_m3.1.to_bits() == gpu.volume_m3.1.to_bits() {
+            "identical".to_string()
+        } else {
+            format!(
+                "differ by {:.1e} of it",
+                ((cpu.volume_m3.1 - gpu.volume_m3.1) / cpu.volume_m3.1).abs()
+            )
+        }
     );
     for note in gpu.notes.iter().filter(|n| n.starts_with("computed on")) {
         println!("  {note}");
@@ -201,60 +214,118 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
         println!("  {}", stages(&gpu));
     }
 
-    let mut all_identical = same_volume
+    // The counts are the CPU's in either mode: the steps, the clips, the 3D
+    // stages' work (a tolerance does not move a step count on these cases)
+    let mut all_same = same_volume
         && cpu.n_steps == gpu.n_steps
         && clips(&cpu) == clips(&gpu)
         && stages(&cpu) == stages(&gpu);
     for (c, g) in cpu.stations.iter().zip(&gpu.stations) {
-        let (identical, n, worst) = compare_station(c, g);
-        all_identical &= identical == n;
+        let (identical, n, worst, worst_rel) = compare_station(c, g);
+        all_same &= identical == n || (!exact && worst_rel <= tolerance);
         println!(
-            "  station {}: {identical} of {n} records bit-identical, largest difference {worst:.1e}",
+            "  station {}: {identical} of {n} records bit-identical, largest difference \
+             {worst:.1e} ({worst_rel:.1e} of its field's largest)",
             c.name
         );
     }
-    // A 3D run's snapshot (written by the same build: the same stamp)
+    // A 3D run's snapshot (written by the same build: the same stamp): its
+    // bytes, or every frame's fields within the tolerance
     if let (Ok(a), Ok(b)) = (std::fs::read(&cpu_snapshot), std::fs::read(&gpu_snapshot)) {
         let differ = a.len().max(b.len()) - a.iter().zip(&b).filter(|(x, y)| x == y).count();
-        all_identical &= differ == 0;
+        let name = cpu_snapshot
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         println!(
-            "  snapshot {}: {differ} of {} bytes differ",
-            cpu_snapshot
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
+            "  snapshot {name}: {differ} of {} bytes differ",
             a.len().max(b.len())
         );
+        if exact {
+            all_same &= differ == 0;
+        } else if differ > 0 {
+            let (beyond, values, worst) = compare_snapshots(&cpu_snapshot, &gpu_snapshot)?;
+            let allowed = gate::outliers() * values as f64;
+            all_same &= beyond as f64 <= allowed;
+            println!(
+                "  snapshot {name}: {beyond} of {values} values beyond the tolerance (at most \
+                 {allowed:.0} may be), the largest difference {worst:.1e} of its field's largest"
+            );
+        }
     }
-    if all_identical {
-        println!("  the GPU's run is the CPU's bit for bit");
+    let verdict = gate::verdict(&path.display().to_string(), all_same);
+    if all_same {
+        println!("  the GPU's run is the CPU's {verdict}");
         Ok(())
     } else {
-        Err("the GPU's run differs from the CPU's".into())
+        Err(format!("the GPU's run differs from the CPU's ({verdict})").into())
     }
 }
 
+/// Two snapshot files of the same run, frame by frame and field by field:
+/// how many values differ by more than the running gate's tolerance of their
+/// field's largest value in the frame, of how many, and the largest such
+/// difference.
+fn compare_snapshots(a: &Path, b: &Path) -> Result<(usize, usize, f64), Box<dyn Error>> {
+    let mut a = dgcom::io::SnapshotReader::open(a)?;
+    let mut b = dgcom::io::SnapshotReader::open(b)?;
+    let tolerance = gate::tolerance();
+    let (mut beyond, mut values, mut worst) = (0, 0, 0.0f64);
+    let frames = a.n_frames()?;
+    if frames != b.n_frames()? {
+        return Err("the snapshots hold different numbers of frames".into());
+    }
+    for i in 0..frames {
+        let (fa, fb) = (a.read_frame(i)?, b.read_frame(i)?);
+        let fields = |f: &dgcom::io::SnapshotFrame| -> Vec<Vec<f32>> {
+            [f.eta.clone(), f.u.clone(), f.v.clone()]
+                .into_iter()
+                .chain(f.surface.iter().cloned())
+                .chain(f.layers.iter().cloned())
+                .collect()
+        };
+        for (x, y) in fields(&fa).iter().zip(&fields(&fb)) {
+            let scale = x.iter().fold(0.0f64, |m, v| m.max(f64::from(v.abs())));
+            for (&p, &q) in x.iter().zip(y) {
+                values += 1;
+                if p.to_bits() == q.to_bits() {
+                    continue;
+                }
+                let difference = (f64::from(p) - f64::from(q)).abs();
+                worst = worst.max(difference / scale.max(f64::MIN_POSITIVE));
+                if difference.is_nan() || difference > tolerance * scale {
+                    beyond += 1;
+                }
+            }
+        }
+    }
+    Ok((beyond, values, worst))
+}
+
 /// Of two stations' records: how many values are bit-identical, of how
-/// many, and the largest absolute difference.
-fn compare_station(a: &StationSeries, b: &StationSeries) -> (usize, usize, f64) {
+/// many, the largest absolute difference, and the largest difference over
+/// its field's largest value.
+fn compare_station(a: &StationSeries, b: &StationSeries) -> (usize, usize, f64, f64) {
     let fields = |s: &StationSeries| {
         [&s.time_s, &s.eta_m, &s.u_m_s, &s.v_m_s, &s.depth_m]
             .into_iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<f64>>()
+            .map(|f| f.to_vec())
+            .collect::<Vec<_>>()
     };
-    let (a, b) = (fields(a), fields(b));
-    let n = a.len().max(b.len());
-    let identical = a
-        .iter()
-        .zip(&b)
-        .filter(|(x, y)| x.to_bits() == y.to_bits())
-        .count();
-    let worst = a
-        .iter()
-        .zip(&b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f64, f64::max);
-    (identical, n, worst)
+    let (mut identical, mut n, mut worst, mut worst_rel) = (0, 0, 0.0f64, 0.0f64);
+    for (x, y) in fields(a).iter().zip(&fields(b)) {
+        n += x.len().max(y.len());
+        let scale = x.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        for (&p, &q) in x.iter().zip(y) {
+            if p.to_bits() == q.to_bits() {
+                identical += 1;
+                continue;
+            }
+            let difference = (p - q).abs();
+            worst = worst.max(difference);
+            worst_rel = worst_rel.max(difference / scale.max(f64::MIN_POSITIVE));
+        }
+    }
+    (identical, n, worst, worst_rel)
 }

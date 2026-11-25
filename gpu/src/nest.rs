@@ -35,7 +35,8 @@ use dgcom::source::{CoriolisSource2D, ManningFriction2D, coriolis_parameter};
 use dgcom::time::{ModelClock, Multirate, SSPRK43};
 use dgcom::types::ElementIndex;
 
-use crate::phase0::{agreement, cpu_kernel};
+use crate::gate::{self, Bar};
+use crate::phase0::{agreement, cpu_kernel, holds};
 use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, NN};
 
 const G: f64 = 9.81;
@@ -270,11 +271,15 @@ fn gate(gpu: &Arc<Gpu>, nest: &Nest, levels: usize) -> Result<bool, Box<dyn Erro
         n_el * NN,
         cpu_kernel()
     );
-    Ok(cpu_result.n_steps == gpu_result.n_steps && identical == n_el * NN)
+    let same = cpu_result.n_steps == gpu_result.n_steps && holds(identical, n_el * NN, worst_rel);
+    println!("  {}", gate::verdict(nest.label, same));
+    Ok(same)
 }
 
 pub fn run_gates(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
     println!("== Phase 2: a run nested in a parent model ==");
+    // Whole runs of 8 h: contraction moves these by up to 4e-11
+    gate::start("nest", Bar::within(1e-8));
     let nests = [
         Nest::cubic(),
         Nest {

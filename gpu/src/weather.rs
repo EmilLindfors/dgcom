@@ -45,8 +45,9 @@ use dgcom::source::{
 use dgcom::time::{ModelClock, Multirate, SSPRK43};
 use dgcom::types::ElementIndex;
 
+use crate::gate::{self, Bar};
 use crate::nest::{Domain, Nest};
-use crate::phase0::{agreement, cpu_kernel};
+use crate::phase0::{agreement, cpu_kernel, holds};
 use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, NN};
 
 const G: f64 = 9.81;
@@ -249,23 +250,25 @@ fn compare(
         if levels > 0 { "coarse steps" } else { "steps" },
         cpu_kernel()
     );
-    let mut same = cpu_steps == gpu_steps && identical == n;
+    let mut same = cpu_steps == gpu_steps && holds(identical, n, worst_rel);
     for (what, mutant) in mutants {
         let (q, _) = on_device(gpu, mutant, q0, levels)?;
-        let (identical, ..) = agreement(&cpu, &q);
-        let caught = identical < n;
+        let (identical, _, worst_rel) = agreement(&cpu, &q);
+        let (caught, verdict) = gate::mutant(!holds(identical, n, worst_rel), identical < n);
         println!(
-            "  mutant {what}: {} of {n} nodes differ, {}",
+            "  mutant {what}: {} of {n} nodes differ, by up to {worst_rel:.1e}{verdict}",
             n - identical,
-            if caught { "caught" } else { "NOT CAUGHT" }
         );
         same &= caught;
     }
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
     println!("== Phases 4.5i, 4.5l: a run under a weather model's air pressure and wind ==");
+    // Whole runs of 6 h
+    gate::start("weather", Bar::within(1e-8));
     let nest = Nest::cubic();
     let domain = Domain::new(&nest)?;
     let q0 = still_water(&domain);
