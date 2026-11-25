@@ -71,6 +71,9 @@ struct Kind {
     velocity: bool,
     deep: bool,
     time: TimeInterpolation,
+    /// A level of every third point missing at the odd snapshots (a
+    /// model's bed layer under its tide: NorKyst's has them)
+    flicker: bool,
 }
 
 /// The parent grid point `(i, j)`'s position in the mesh (m).
@@ -126,7 +129,9 @@ fn reader(projection: &LocalProjection, kind: Kind) -> OceanModelReader {
                 let (x, y) = point_xy(i, j);
                 for l in 0..n_levels {
                     let d = position(k, l);
-                    let missing = land(i, j) || (!kind.fractions && d > depth[k] + 3.0);
+                    let missing = land(i, j)
+                        || (!kind.fractions && d > depth[k] + 3.0)
+                        || (kind.flicker && t % 2 == 1 && l == 3 && (i + j) % 3 == 0);
                     data.push(if missing {
                         f32::NAN
                     } else {
@@ -283,6 +288,18 @@ impl<'a> Device<'a> {
         })
     }
 
+    /// [`Self::new`] sampled by the general kernel (the CPU's order of
+    /// operations), and whether the steady kernels would have sampled it.
+    fn general(
+        gpu: &Gpu,
+        statics: &Statics3D,
+        nesting: &'a Nesting3D,
+    ) -> Result<(Self, bool), Box<dyn std::error::Error>> {
+        let device = Self::new(gpu, statics, nesting)?;
+        let (parent, steady) = device.parent.general();
+        Ok((Self { parent, ..device }, steady))
+    }
+
     /// The device's columns of `call`.
     fn columns(
         &mut self,
@@ -328,8 +345,20 @@ fn at_slots(snapshots: &Snapshots, nesting: &Nesting3D, listed: &[bool]) -> Snap
         .collect()
 }
 
-/// One parent's gate; whether all is the same to the bit (and, with
-/// `mutants`, every mutant caught).
+/// The steady kernels' bar: the weights applied to the snapshots before the
+/// interpolation in depth, the level spacings' reciprocals tabled, the
+/// stencil's weights' sum inverted once. They differ from dgcom's sampling
+/// by round-off (≤ 1e-15 of a field's largest value measured); the mutants
+/// by ≥ 3e-4.
+const STEADY: Bar = Bar {
+    tolerance: 1e-12,
+    outliers: 0.0,
+    mirrors: false,
+};
+
+/// One parent's gate: the general kernel to the bit, the steady kernels
+/// within their bar; whether both hold (and, with `mutants`, every mutant
+/// is caught).
 fn gate(
     gpu: &Arc<Gpu>,
     label: &str,
@@ -423,16 +452,35 @@ fn gate(
         slots.nodes.len()
     );
     let mut device = Device::new(gpu, &statics, &nest)?;
+    let (mut general, steady) = Device::general(gpu, &statics, &nest)?;
+    let [(coming, of), ..] = device.parent.unsteady;
+    let tracers = device.parent.unsteady[2];
     println!(
-        "  the parent on the device: {:.2} MB",
-        device.parent.bytes as f64 / 1e6
+        "  the parent on the device: {:.2} MB; {} of {} points' levels come and go in time",
+        device.parent.bytes as f64 / 1e6,
+        coming.max(tracers.0),
+        of.max(tracers.1)
     );
     let mut same = true;
     let mut cpu_by_call = Vec::new();
+    // The general kernel: dgcom's own sampling at every slot and level
+    gate::set(Bar::MIRRORED);
+    println!("  the general kernel ({}):", gate::how());
     for call in &calls {
         let cpu = cpu_columns(&fx, &nest, call);
-        same &= report(&cpu, &device.columns(gpu, &statics, call)?);
+        same &= report(&cpu, &general.columns(gpu, &statics, call)?);
         cpu_by_call.push(cpu);
+    }
+    // The steady kernels, which sample these parents in a run: the same
+    // sampling in another order of sums
+    if !steady {
+        println!("  the steady kernels do NOT sample this parent");
+        same = false;
+    }
+    gate::set(STEADY);
+    println!("  the steady kernels ({}):", gate::how());
+    for (call, cpu) in calls.iter().zip(&cpu_by_call) {
+        same &= report(cpu, &device.columns(gpu, &statics, call)?);
     }
     if mutants {
         let cpu_first = &cpu_by_call[0];
@@ -487,6 +535,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
                 velocity: true,
                 deep: true,
                 time: TimeInterpolation::Linear,
+                flicker: false,
             },
             true,
         ),
@@ -497,6 +546,18 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
                 velocity: true,
                 deep: true,
                 time: TimeInterpolation::Cubic,
+                flicker: false,
+            },
+            false,
+        ),
+        (
+            "z-levels, cubic in time, a level of every third point coming and going",
+            Kind {
+                fractions: false,
+                velocity: true,
+                deep: true,
+                time: TimeInterpolation::Cubic,
+                flicker: true,
             },
             false,
         ),
@@ -507,6 +568,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
                 velocity: false,
                 deep: false,
                 time: TimeInterpolation::Linear,
+                flicker: false,
             },
             false,
         ),

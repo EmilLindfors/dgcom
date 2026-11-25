@@ -30,6 +30,25 @@
 //! The columns land in the band's buffers ([`Band3D`]), and from there in
 //! the open faces' exterior values. The arithmetic is dgcom's own functions
 //! on the same inputs, so the bits are the CPU's (`--no-fmad`).
+//!
+//! That kernel was the largest of a nested run (22.7 ms a stage on Frøya's
+//! 20,224 slots, a fifth of the run, 2026-11-25): every thread walks the
+//! parent's levels once per field, point and snapshot. Where the parent's
+//! valid levels do not change in time and deepen with their index (a model's
+//! bed mask: `steady_field` checks it when the tables go up), two kernels
+//! take its place, the device's own form of the same sampling (the GPU may
+//! lead, `notes/gpu.md`):
+//!
+//! - `parent_moments`, a thread per parent value and moment: the snapshots
+//!   weighed once, for every slot, level and field that reads the value;
+//! - `parent_columns_steady`, a thread per slot: each point of its stencil
+//!   walked once for all the child's levels, the level spacings'
+//!   reciprocals tabled.
+//!
+//! They differ from `profile_sample_at` by round-off (the weights before the
+//! interpolation in depth, a product for a division): 6e-16 of a field's
+//! largest value on the gate's parents, which holds them within 1e-12
+//! (`parent3d`), beside the general kernel bit for bit.
 
 // As `three_d.rs`: the device loops index arrays by the loop variable.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
@@ -39,19 +58,23 @@ use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
 use dgcom::boundary::{Nesting3D, ParentModel3D, Supplied, deep_tracers};
 use dgcom::io::{ProfileLevels, ProfileSeries, Profiles, TimeStencil};
-use dgcom::io::{profile_covers, profile_sample_at};
+use dgcom::io::{profile_covers, profile_sample_at, profile_value_at};
 use dgcom::solver::Blocks;
 use dgcom::time::StageTime;
 
 use crate::hooks::{Band3D, State3D};
 use crate::swe2d::{Gpu, NN};
-use crate::three_d::{COLUMN_BLOCK, LEVEL_BLOCK, Statics3D, launch};
+use crate::three_d::{COLUMN_BLOCK, LEVEL_BLOCK, MAX_LEVELS, Statics3D, launch};
 
 /// Moments a launch takes ([`Moments`]); more go in several launches.
 pub const MAX_MOMENTS: usize = 8;
 
 /// A slot's code when its element is not listed.
 const NOT_LISTED: u32 = u32::MAX;
+
+/// A parent point's `first_valid` where the steady walk does not hold for it
+/// ([`steady_field`]).
+const UNSTEADY: u32 = u32::MAX - 1;
 
 /// What `parent_check` found for a slot.
 const SKIP: u32 = 0;
@@ -191,6 +214,31 @@ fn field<'a>(
 #[inline]
 fn code_of(codes: &[u32], slot: usize) -> u32 {
     if codes.is_empty() { 0 } else { codes[slot] }
+}
+
+/// Where the steady sampling's tables lie ([`Steady`]): each field's first
+/// value in a moment's weighed profiles (past every value for a field the
+/// parent lacks) and a moment's length; each field's first entry in the
+/// tables per point and level (`inv_dz`) and per point (`first_valid`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SteadyForm {
+    pub offsets: [u32; 4],
+    pub per_moment: u32,
+    pub tables: [u32; 4],
+    pub firsts: [u32; 4],
+}
+
+/// Where point `k`'s level `l` of the field `form` lies (a depth, or a
+/// fraction of the column), in the parent tables' `positions`.
+#[inline(always)]
+fn level_position(form: &FieldForm, positions: &[f64], k: usize, l: usize) -> f64 {
+    let at = if form.fractions != 0 {
+        k * form.n_levels as usize + l
+    } else {
+        l
+    };
+    positions[form.positions as usize + at]
 }
 
 // =============================================================================
@@ -350,6 +398,254 @@ pub mod kernels_parent {
             }
         }
     }
+
+    /// The profiles of the parent's points at a launch's moments, a thread
+    /// per moment and value (`[moment][field][point][level]`, each field at
+    /// `steady.offsets` within a moment): the snapshots of the moment's
+    /// time stencil weighed, as `profile_sample_at` weighs them after its
+    /// interpolation in depth. Where every level is valid at all snapshots
+    /// or at none (`steady_field`) the two orders are the same sum but for
+    /// round-off, and one weighing per parent value serves every slot,
+    /// level and field that reads it.
+    #[kernel]
+    pub fn parent_moments(
+        args: ParentArgs,
+        steady: SteadyForm,
+        moments: Moments,
+        values: &[f32],
+        mut out: DisjointSlice<f64>,
+    ) {
+        let i = thread::index_1d().get();
+        let per = steady.per_moment as usize;
+        if i >= moments.count as usize * per {
+            return;
+        }
+        let (m, r) = (i / per, i % per);
+        // The field whose profiles hold r (an absent field's offset is past
+        // every value)
+        let mut f = 0;
+        #[unroll]
+        for g in 0..4 {
+            if r >= steady.offsets[g] as usize {
+                f = g;
+            }
+        }
+        let form = args.fields[f];
+        let j = r - steady.offsets[f] as usize;
+        let per_time = form.n_points as usize * form.n_levels as usize;
+        let mut sum = 0.0;
+        for s in 0..moments.len[m] as usize {
+            let at = form.values as usize + moments.idx[m][s] as usize * per_time + j;
+            sum += moments.w[m][s] * values[at] as f64;
+        }
+        // SAFETY: thread i alone writes value i.
+        unsafe {
+            *out.get_unchecked_mut(i) = sum;
+        }
+    }
+
+    /// [`parent_columns`] where the parent's valid levels do not change in
+    /// time (`steady_field`), a thread per slot: each supplied field from
+    /// the moment's weighed profiles (`weighted`, [`parent_moments`]), every
+    /// point of the slot's stencil walked once for all the child's levels
+    /// (their depths in order, so the bracketing parent levels only move
+    /// down), the level spacings' reciprocals tabled (`inv_dz`, NaN at a
+    /// level that is not valid; `first_valid` a point's first valid level,
+    /// `u32::MAX` without one). The same sampling as `profile_sample_at`
+    /// in another order of sums: the device's own form (`notes/gpu.md`,
+    /// where the backends differ). A point marked [`UNSTEADY`] (a level
+    /// valid at some snapshots only: a model's bed layer under its tide) is
+    /// sampled snapshot by snapshot from `values`, as [`parent_columns`]
+    /// samples every point.
+    #[kernel]
+    pub fn parent_columns_steady(
+        args: ParentArgs,
+        steady: SteadyForm,
+        moments: Moments,
+        codes: &[u32],
+        flags: &[u32],
+        nodes: &[u32],
+        eta: &[f64],
+        bed: &[f64],
+        sigma_rho: &[f64],
+        idx: &[[u32; 4]],
+        w: &[[f64; 4]],
+        east_bed: &[[f64; 3]],
+        weighted: &[f64],
+        values: &[f32],
+        positions: &[f64],
+        inv_dz: &[f64],
+        first_valid: &[u32],
+        deep_temp: &[f64],
+        deep_salt: &[f64],
+        u: &[f64],
+        v: &[f64],
+        temp: &[f64],
+        salt: &[f64],
+        mut out_u: DisjointSlice<f64>,
+        mut out_v: DisjointSlice<f64>,
+        mut out_t: DisjointSlice<f64>,
+        mut out_s: DisjointSlice<f64>,
+    ) {
+        let slot = thread::index_1d().get();
+        let nl = args.nl as usize;
+        if slot >= args.n as usize {
+            return;
+        }
+        let flag = flags[slot];
+        if flag == SKIP {
+            return;
+        }
+        let node = nodes[slot] as usize;
+        let (e, b) = (eta[node], bed[node]);
+        // SAFETY: thread `slot` alone writes its column, values
+        // `slot·nl .. (slot + 1)·nl` of each output.
+        unsafe {
+            if flag == OWN {
+                let thin = e - b < args.min_column_depth;
+                for l in 0..nl {
+                    let (i, at) = (slot * nl + l, node * nl + l);
+                    *out_u.get_unchecked_mut(i) = if thin { 0.0 } else { u[at] };
+                    *out_v.get_unchecked_mut(i) = if thin { 0.0 } else { v[at] };
+                    *out_t.get_unchecked_mut(i) = temp[at];
+                    *out_s.get_unchecked_mut(i) = salt[at];
+                }
+                return;
+            }
+            let m = moments.of(code_of(codes, slot)).unwrap_or(0);
+            let column_depth = (e - b).max(0.0);
+            let (idx, w) = (&idx[slot], &w[slot]);
+            // The child's levels from the surface down
+            let surface_first = sigma_rho[0] > sigma_rho[nl - 1];
+            let mut acc = [0.0f64; MAX_LEVELS];
+            for f in 0..4 {
+                let supplied = if f < 2 {
+                    args.velocity != 0
+                } else {
+                    args.tracers != 0
+                };
+                if !supplied {
+                    continue;
+                }
+                let form = args.fields[f];
+                let nlp = form.n_levels as usize;
+                let fractions = form.fractions != 0;
+                let base = m * steady.per_moment as usize + steady.offsets[f] as usize;
+                let (table, firsts) = (steady.tables[f] as usize, steady.firsts[f] as usize);
+                let (mut total, mut first) = (0.0, true);
+                for i in 0..4 {
+                    let (k, wk) = (idx[i] as usize, w[i]);
+                    if wk == 0.0 {
+                        continue;
+                    }
+                    let start = first_valid[firsts + k];
+                    if start == UNSTEADY {
+                        // A point whose valid levels come and go: snapshot
+                        // by snapshot, each among its own valid levels
+                        // (dgcom's `profile_sample_at`, to the letter)
+                        let view = field(&args, f, values, positions);
+                        let time = moments.stencil(m);
+                        if !profile_covers(&view, &time, &[k as u32], &[1.0]) {
+                            continue;
+                        }
+                        total += wk;
+                        for l in 0..nl {
+                            let d = -sigma_rho[l] * column_depth;
+                            let mut value = 0.0;
+                            for j in 0..time.len {
+                                value += time.w[j]
+                                    * profile_value_at(&view, time.idx[j], k, d, column_depth)
+                                        .unwrap_or(f64::NAN);
+                            }
+                            acc[l] = if first {
+                                wk * value
+                            } else {
+                                acc[l] + wk * value
+                            };
+                        }
+                        first = false;
+                        continue;
+                    }
+                    if start == u32::MAX {
+                        continue;
+                    }
+                    total += wk;
+                    // The first valid level not above the target, and the
+                    // valid one before it
+                    let mut p = start as usize;
+                    let (mut above_z, mut above_v, mut has_above) = (0.0, 0.0, false);
+                    for step in 0..nl {
+                        let l = if surface_first { step } else { nl - 1 - step };
+                        let d = -sigma_rho[l] * column_depth;
+                        let target = if fractions {
+                            d / column_depth.max(f64::MIN_POSITIVE)
+                        } else {
+                            d
+                        };
+                        while p < nlp {
+                            if !inv_dz[table + k * nlp + p].is_nan() {
+                                let z = level_position(&form, positions, k, p);
+                                if z >= target {
+                                    break;
+                                }
+                                above_z = z;
+                                above_v = weighted[base + k * nlp + p];
+                                has_above = true;
+                            }
+                            p += 1;
+                        }
+                        let value = if p < nlp {
+                            let below = weighted[base + k * nlp + p];
+                            if has_above && level_position(&form, positions, k, p) > above_z {
+                                above_v
+                                    + (below - above_v)
+                                        * ((target - above_z) * inv_dz[table + k * nlp + p])
+                            } else {
+                                below
+                            }
+                        } else {
+                            above_v
+                        };
+                        acc[l] = if first {
+                            wk * value
+                        } else {
+                            acc[l] + wk * value
+                        };
+                    }
+                    first = false;
+                }
+                let scale = if first { f64::NAN } else { 1.0 / total };
+                for l in 0..nl {
+                    let (i, x) = (slot * nl + l, acc[l] * scale);
+                    match f {
+                        0 => *out_u.get_unchecked_mut(i) = x,
+                        1 => *out_v.get_unchecked_mut(i) = x,
+                        2 => *out_t.get_unchecked_mut(i) = x,
+                        _ => *out_s.get_unchecked_mut(i) = x,
+                    }
+                }
+            }
+            // East and north to the mesh axes; the tracers below the
+            // parent's bed
+            let [c, s, h] = east_bed[slot];
+            for l in 0..nl {
+                let i = slot * nl + l;
+                if args.velocity != 0 {
+                    let (east, north) = (*out_u.get_unchecked_mut(i), *out_v.get_unchecked_mut(i));
+                    *out_u.get_unchecked_mut(i) = east * c - north * s;
+                    *out_v.get_unchecked_mut(i) = east * s + north * c;
+                }
+                if args.tracers != 0 && args.deep != 0 && h.is_finite() {
+                    let d = -sigma_rho[l] * column_depth;
+                    let (t, sa) = (*out_t.get_unchecked_mut(i), *out_s.get_unchecked_mut(i));
+                    let (t, sa) =
+                        deep_tracers((args.z0, deep_temp, deep_salt), args.decay, h, d, t, sa);
+                    *out_t.get_unchecked_mut(i) = t;
+                    *out_s.get_unchecked_mut(i) = sa;
+                }
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -397,6 +693,76 @@ impl Codes {
     }
 }
 
+/// The steady sampling's tables on the device ([`steady_field`]): a
+/// parent whose levels are valid at every snapshot or at none, deepening
+/// with their index, is sampled by `parent_moments` and
+/// `parent_columns_steady`.
+struct Steady {
+    form: SteadyForm,
+    /// The weighed profiles of a launch's moments
+    /// (`[moment][field][point][level]`), and the times they were made for
+    weighted: DeviceBuffer<f64>,
+    made_for: Vec<f64>,
+    /// `1/(z_l − z_above)` of every point's level (0 at its first valid
+    /// level and where the two coincide, NaN where the level is not valid),
+    /// and every point's first valid level
+    inv_dz: DeviceBuffer<f64>,
+    first_valid: DeviceBuffer<u32>,
+}
+
+/// One field's part of the steady tables: every point's levels' `inv_dz`
+/// and its first valid level (`u32::MAX` without one), from `form` in the
+/// tables `values` (of `n_times` snapshots) and `positions`; and how many
+/// points are marked [`UNSTEADY`], where the steady walk would not be
+/// `profile_sample_at`'s: a level valid at one snapshot and not at another,
+/// a valid value at a position that is not finite, or valid levels that do
+/// not deepen with their index.
+fn steady_field(
+    form: &FieldForm,
+    n_times: usize,
+    values: &[f32],
+    positions: &[f64],
+) -> (Vec<f64>, Vec<u32>, usize) {
+    let (np, nl) = (form.n_points as usize, form.n_levels as usize);
+    let value = |t: usize, k: usize, l: usize| values[form.values as usize + (t * np + k) * nl + l];
+    let mut inv_dz = vec![f64::NAN; np * nl];
+    let mut first_valid = vec![u32::MAX; np];
+    let mut unsteady = 0;
+    for k in 0..np {
+        let mut above: Option<f64> = None;
+        let mut steady = true;
+        for l in 0..nl {
+            let valid = value(0, k, l).is_finite();
+            if (1..n_times).any(|t| value(t, k, l).is_finite() != valid) {
+                steady = false;
+                break;
+            }
+            if !valid {
+                continue;
+            }
+            let z = level_position(form, positions, k, l);
+            if !z.is_finite() || above.is_some_and(|z0| z < z0) {
+                steady = false;
+                break;
+            }
+            inv_dz[k * nl + l] = match above {
+                Some(z0) if z > z0 => 1.0 / (z - z0),
+                Some(_) => 0.0,
+                None => {
+                    first_valid[k] = l as u32;
+                    0.0
+                }
+            };
+            above = Some(z);
+        }
+        if !steady {
+            first_valid[k] = UNSTEADY;
+            unsteady += 1;
+        }
+    }
+    (inv_dz, first_valid, unsteady)
+}
+
 /// A parent model on the device (see the module docs).
 pub struct Parent3D {
     args: ParentArgs,
@@ -418,6 +784,12 @@ pub struct Parent3D {
     cache_eta: DeviceBuffer<f64>,
     flags: DeviceBuffer<u32>,
     codes: Codes,
+    /// The steady sampling's tables (none on more levels than the kernel's
+    /// scratch holds)
+    steady: Option<Steady>,
+    /// Each field's parent points whose valid levels come and go in time
+    /// (sampled snapshot by snapshot), of how many it reads
+    pub unsteady: [(usize, usize); 4],
     /// Every slot's element, and scratch for a call's codes, times and
     /// listed elements
     elements: Vec<usize>,
@@ -490,10 +862,48 @@ impl Parent3D {
         // The fields' profiles at the used points, every snapshot
         let (mut values, mut positions) = (Vec::<f32>::new(), Vec::<f64>::new());
         let mut fields = [FieldForm::default(); 4];
-        for (form, series) in fields.iter_mut().zip(profiles) {
+        // The steady sampling's tables, while every field allows it
+        let mut steady = Some((SteadyForm::default(), Vec::<f64>::new(), Vec::<u32>::new()));
+        let mut per_moment = 0usize;
+        // Each field's points whose levels come and go, of how many
+        let mut unsteady = [(0usize, 0usize); 4];
+        for (f, (form, series)) in fields.iter_mut().zip(profiles).enumerate() {
+            if let Some((tables, ..)) = &mut steady {
+                tables.offsets[f] = u32::MAX;
+            }
             let Some(series) = series else { continue };
             *form = upload_form(series, &used, &mut values, &mut positions)?;
+            let (inv, first, n_unsteady) =
+                steady_field(form, series.n_times(), &values, &positions);
+            unsteady[f] = (n_unsteady, used.len());
+            steady = match steady {
+                Some((mut tables, mut inv_dz, mut first_valid)) => {
+                    tables.offsets[f] = u32::try_from(per_moment)?;
+                    tables.tables[f] = u32::try_from(inv_dz.len())?;
+                    tables.firsts[f] = u32::try_from(first_valid.len())?;
+                    per_moment += inv.len();
+                    inv_dz.extend(inv);
+                    first_valid.extend(first);
+                    Some((tables, inv_dz, first_valid))
+                }
+                None => None,
+            };
         }
+        let steady = match steady {
+            Some((mut form, inv_dz, first_valid))
+                if per_moment > 0 && statics.n_levels <= MAX_LEVELS =>
+            {
+                form.per_moment = u32::try_from(per_moment)?;
+                Some(Steady {
+                    form,
+                    weighted: DeviceBuffer::zeroed(st, MAX_MOMENTS * per_moment)?,
+                    made_for: Vec::new(),
+                    inv_dz: DeviceBuffer::from_host(st, &inv_dz)?,
+                    first_valid: DeviceBuffer::from_host(st, &first_valid)?,
+                })
+            }
+            _ => None,
+        };
         let deep = model.deep_reference();
         let (z0, deep_temp, deep_salt, decay) = match deep {
             Some(deep) => {
@@ -523,6 +933,9 @@ impl Parent3D {
         };
         let bytes = values.len() * 4
             + positions.len() * 8
+            + steady.as_ref().map_or(0, |s| {
+                (s.weighted.len() + s.inv_dz.len()) * 8 + s.first_valid.len() * 4
+            })
             + n * (4 + 4 + 16 + 32 + 24 + 8 + 8 + 4)
             + (deep_temp.len() + deep_salt.len()) * 8;
         Ok(Self {
@@ -544,12 +957,23 @@ impl Parent3D {
                 clock: 0,
                 none: DeviceBuffer::zeroed(st, 0)?,
             },
+            steady,
+            unsteady,
             elements: slots.nodes.iter().map(|&k| k / NN).collect(),
             host_codes: vec![0; n],
             times: Vec::new(),
             listed: Vec::new(),
             bytes,
         })
+    }
+
+    /// This parent sampled by the general kernel (`parent_columns`: dgcom's
+    /// `profile_sample_at` at every slot and level, the CPU's own order),
+    /// which a parent whose valid levels change in time takes anyway; and
+    /// whether the steady kernels would have sampled it.
+    pub fn general(mut self) -> (Self, bool) {
+        let steady = self.steady.take().is_some();
+        (self, steady)
     }
 
     /// The parent's columns at the band's slots of `elements` for `state`,
@@ -635,10 +1059,56 @@ impl Parent3D {
                     &mut self.cache_eta,
                     &mut self.flags,
                 )?;
-                m.parent_columns(
+                let Some(steady) = &mut self.steady else {
+                    m.parent_columns(
+                        st,
+                        launch(n * statics.n_levels, LEVEL_BLOCK),
+                        self.args,
+                        moments,
+                        codes,
+                        &self.flags,
+                        &self.nodes,
+                        &state.eta,
+                        &statics.bed,
+                        &statics.sigma_rho,
+                        &self.idx,
+                        &self.w,
+                        &self.east_bed,
+                        &self.values,
+                        &self.positions,
+                        &self.deep_temp,
+                        &self.deep_salt,
+                        &state.u,
+                        &state.v,
+                        &state.temp,
+                        &state.salt,
+                        out_u,
+                        out_v,
+                        out_t,
+                        out_s,
+                    )?;
+                    continue;
+                };
+                // The moments' weighed profiles, unless the last launch
+                // made these (a stage's second call, a cached pass)
+                if steady.made_for != times {
+                    m.parent_moments(
+                        st,
+                        launch(times.len() * steady.form.per_moment as usize, LEVEL_BLOCK),
+                        self.args,
+                        steady.form,
+                        moments,
+                        &self.values,
+                        &mut steady.weighted,
+                    )?;
+                    steady.made_for.clear();
+                    steady.made_for.extend_from_slice(times);
+                }
+                m.parent_columns_steady(
                     st,
-                    launch(n * statics.n_levels, LEVEL_BLOCK),
+                    launch(n, COLUMN_BLOCK),
                     self.args,
+                    steady.form,
                     moments,
                     codes,
                     &self.flags,
@@ -649,8 +1119,11 @@ impl Parent3D {
                     &self.idx,
                     &self.w,
                     &self.east_bed,
+                    &steady.weighted,
                     &self.values,
                     &self.positions,
+                    &steady.inv_dz,
+                    &steady.first_valid,
                     &self.deep_temp,
                     &self.deep_salt,
                     &state.u,

@@ -741,6 +741,7 @@ The rule is in Decisions. What holds the device since this day, in `gpu/` (branc
   | what | why | measured difference |
   |---|---|---|
   | multiply–add contraction in the build that runs (every kernel) | the FMA build is the faster one, and always was the one that ran | 1e-13 to 2e-11 of a field's largest value per right-hand side; where a threshold decides, 0.4 % of T after one 3D step (the table above); a Chiloé day's stations 2.0 mm in η and 6.7 mm/s (2026-11-16) |
+  | the nesting band's parent columns, where a parent point's valid levels do not change in time (`parent_columns_steady`) | the snapshots weighed before the walk over the levels, one walk per parent point for all of a node's levels, the level spacings' reciprocals tabled: 22.7 → 1.0 ms a stage on Frøya | 6e-16 of a field's largest value (`parent3d`; Frøya's NorKyst parent: 2.1e-14 of 35 in S at 96 evaluations of 402,840 values a field) |
 
 ## Assessment (2026-11-25): where the time is, and what is worth doing
 
@@ -894,7 +895,7 @@ C3: Chiloé 3D on the 3090; F3: Frøya 3D on the 4060; C2: Chiloé 2D. Gains are
 |---|---|---|---|---|---|
 | R1 | Local 3D steps whose passes cost what they list: the pre-passes over the listed elements and the neighbours their faces read | 43 % of C3's kernel time is pre-passes, 12 of 16 passes list 1–5 % of the elements | C3 on local steps −26 % modelled (258 → ≈ 190 s per model hour; with 5 levels and the 120 s cap ≈ 160); F3 little (its passes list 87 %) | a day: ten kernels take a list, a halo list per pass | low: the same bits, the local-steps gates stay bit for bit |
 | R2 | The element steps from the device's own rates (`Bound3D`), the levels kept while their inputs hold | 0.62–0.86 s of a 4.3–7.2 s coarse step; 1.4 GB down each | C3 on local steps −12 to −18 %; F3 −2.8 % | half a day | low: dgcom's own functions on the device |
-| R3 | The parent's band in the steady order | 22.7 ms a stage, 17.5–19.7 % of F3 | F3 −17 % modelled on global steps | half a day | low: a gate of its own within 1e-12 |
+| R3 | The parent's band in the steady order | 22.7 ms a stage, 17.5–19.7 % of F3 | **done (below): F3 −17 % measured on global steps** | half a day | low: a gate of its own within 1e-12 |
 | R4 | The horizontal pair kernels on P2's tensor product: `D` with its exact zeros (27 + 27 half-terms for 162), the face jump lifted into its face node alone, the pair metrics tabled, one launch for the four advected fields; `pressure_gradient` and `reference_edges` on 18 pairs | 28 % of a C3 global step, each at the card's FP64 rate | −12 % of the 3D stages modelled (C3 −7 %, F3 −4 %) | two days | medium: the bits change (4.4e-16 of D), tolerance gates and the judges hold it; goes to the CPU too (P2.2's "≈ 3× fewer pairs") |
 | R5 | The latency-bound column and element kernels reshaped (a thread per value, or the level loop unrolled): `layer_nodal`, `layer_faces`, `layer_omega`, `set_sums`, `displacements` (once a stage), `mask_flow`, `shift_means`, `pass_stage` | 13 % of a C3 global step at 5–14× its arithmetic | C3 −8 % modelled | a day | low to medium: sums in level order keep their bits only with a scan |
 | R6 | Reciprocals for the divisions: `reference_edge`'s share, `pass_stage`'s drags and damping, Akima's Δσ terms, `column_pressures` | 29 %, 58 %, ≈ 40 %, 42 % of those kernels' FP64 work | −3 to −5 % of C3 and F3 modelled | a day | low: an ulp per value, shared functions change on the CPU too |
@@ -911,6 +912,18 @@ C3: Chiloé 3D on the 3090; F3: Frøya 3D on the 4060; C2: Chiloé 2D. Gains are
 - **Chiloé 3D ≤ 100 s per model hour on the 3090: within reach, modelled.** R1 and R2 with 5 levels and the 120 s cap put a coarse step of 112.5 s at ≈ 4.5 s (stages 1.6, pass 1.9, the rest 1.0): ≈ 145 s per model hour. R4–R6 on the stages and the pass's kernels: ≈ 110–120. Under 100 needs the pass under ≈ 45 s per model hour (R6 on `pass_stage`, the 2D kernels' divisions), a longer cap, or the PRO 6000.
 - **Frøya ≤ 12 s per model hour over 71 h on the 4060: not without FP64 relief.** The 71 h run costs 1.48× its first two hours, so the bar is ≈ 8 s on the 2 h window (from 20.7). R3, R7, R4–R9 together model ≈ 12–13: 1.6–1.7×, not 2.6×. What is left is FP64 arithmetic at 1:64 on a mesh that already fills the card. R12, or a card with more FP64: the PRO 6000 has ≈ 8× the 4060's.
 - **Chiloé 2D ≤ 15 s per model hour on the 3090: not on this card by kernel work.** 33.7 now. Its large passes are FP64-bound near the card's rate and its short passes latency-bound (2026-11-16); the divisions left are ≈ 30 % of `subcell_terms`. Tables and reciprocals model ≈ 28–30. The PRO 6000's 3.4× the 3090's FP64 rate would give ≈ 10–12 by the ratio, if its passes fill it.
+
+## Built from the ranked list (2026-11-25)
+
+Each on its own branch, stacked on `feat/gpu-judges` in this order. Timings are FMA builds, A and B alternated after a warm-up of each, the same card and the same day.
+
+### R3: the nesting band's parent in the steady order (`perf/gpu-parent-sampling`)
+
+- **What.** `Nesting3D::columns` on the device was dgcom's `profile_sample_at` at every slot and level: for each of a node's 20 levels and each of its (up to) four parent points, a search of the parent's levels in each of the two snapshots. Two kernels replace it where they can (`gpu/src/parent.rs`): `parent_moments` weighs the snapshots once per parent value and moment (a thread per value), and `parent_columns_steady` walks each parent point's levels once for all of the node's levels (both rise, so the walk is a merge), with the level spacings' reciprocals tabled. That order needs a parent point's valid levels to be the same in every snapshot, which the upload checks point by point.
+- **NorKyst's are not, everywhere.** The first form asked it of the whole parent and Frøya's never took it (59.7 against 59.7 s): `u`'s level 10 of point 112 is missing at snapshot 0 and present at 5. Now a point whose levels come and go is marked (`UNSTEADY`) and takes the snapshot-by-snapshot walk inside the same kernel; `Parent3D::unsteady` counts them per field.
+- **Held by** `parent3d`: four parents (one with levels that come and go at 7 of 20 points), the general kernel the CPU's bit for bit in the build without contraction, the steady kernels within 1e-12 of it (measured 6.2e-16), each with its mutants. On Frøya's own parent, a build that ran both kernels on every evaluation (0.2 h, 96 evaluations, 402,840 values a field): the largest difference 2.1e-14 of 35 in S, 5.3e-15 of 14 in T, 1.7e-16 of 0.4 in u; none beyond 1e-9 of the field's largest.
+- **Measured** (RTX 4060, Frøya's 2 h window, global steps; A is `origin/main`): 59.9, 59.7 → 49.9, 49.7 s, **30.0 → 24.9 s per model hour (−17 %)**; the device's peak 2,009 → 2,015 MiB. In the new binary's profile `parent_columns_steady` is 2.1 % of the kernel time (1.0 ms a launch; `parent_columns` was 19.7 %, 22.7 ms). The local steps' gain is measured with the next branch's.
+- The same order would serve the CPU's `OceanModelColumns` (parked, with what to measure first).
 
 ## Out of TODO.md
 
