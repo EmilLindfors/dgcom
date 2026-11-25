@@ -109,7 +109,7 @@ mod mean_profile;
 mod sigma;
 mod stretching;
 
-pub use mean_profile::MeanProfile;
+pub use mean_profile::{MeanProfile, mean_profile_at};
 pub use sigma::{SigmaGrid, depth_average};
 pub use stretching::{
     DoubleTanhStretching, ROMSVstretching4, SongHaidvogelStretching, Stretching, UniformStretching,

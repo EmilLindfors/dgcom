@@ -93,7 +93,9 @@ pub use nesting_3d::{
     ColumnContext3D, DeviceParent3D, Nesting3D, NestingBand3D, NestingColumns, NestingSlots,
     ParentColumn, ParentColumns3D, ReferenceColumns, Supplied, sample_columns,
 };
-pub use ocean_columns::{DeepReference, OceanColumnsOptions, OceanModelColumns};
+pub use ocean_columns::{
+    DeepReference, OceanColumnsOptions, OceanModelColumns, ParentModel3D, ParentNode, deep_tracers,
+};
 pub use ocean_nesting::{
     NestingError, NestingOptions, NestingRelaxation2D, OceanModelState, ParentDatum,
     parent_external_state, parent_state, parent_term, relaxation_source,

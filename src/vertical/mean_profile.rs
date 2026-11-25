@@ -134,6 +134,20 @@ impl MeanProfile {
         Some(Self { z0, temp, salt })
     }
 
+    /// The profile of T and S on a 1 m grid from height `z0` (m) up.
+    ///
+    /// # Panics
+    /// Without a grid point, or with T and S of different lengths.
+    pub fn new(z0: f64, temp: Vec<f64>, salt: Vec<f64>) -> Self {
+        assert!(
+            !temp.is_empty() && temp.len() == salt.len(),
+            "MeanProfile: {} temperatures and {} salinities",
+            temp.len(),
+            salt.len()
+        );
+        Self { z0, temp, salt }
+    }
+
     /// The heights of the grid points (m, increasing) and T and S there.
     pub fn samples(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let heights = (0..self.temp.len()).map(|i| self.z0 + i as f64).collect();
@@ -141,17 +155,32 @@ impl MeanProfile {
     }
 
     /// T and S at height `z` (m), linear between grid points and held beyond
-    /// them.
+    /// them ([`mean_profile_at`] of [`Self::table`]).
     pub fn at(&self, z: f64) -> (f64, f64) {
-        let x = (z - self.z0).clamp(0.0, (self.temp.len() - 1) as f64);
-        let i = (x.floor() as usize).min(self.temp.len().saturating_sub(2));
-        let w = (x - i as f64).clamp(0.0, 1.0);
-        let j = (i + 1).min(self.temp.len() - 1);
-        (
-            self.temp[i] + w * (self.temp[j] - self.temp[i]),
-            self.salt[i] + w * (self.salt[j] - self.salt[i]),
-        )
+        mean_profile_at(self.z0, &self.temp, &self.salt, z)
     }
+
+    /// The profile as a table: the height of its lowest grid point (m), then
+    /// T and S on the 1 m grid from there up. What a device evaluates
+    /// [`mean_profile_at`] over (P2.7).
+    pub fn table(&self) -> (f64, &[f64], &[f64]) {
+        (self.z0, &self.temp, &self.salt)
+    }
+}
+
+/// T and S at height `z` (m) of a [`MeanProfile`]'s table
+/// ([`MeanProfile::table`]: its lowest height `z0`, T and S on a 1 m grid
+/// from there), linear between grid points and held beyond them.
+#[inline]
+pub fn mean_profile_at(z0: f64, temp: &[f64], salt: &[f64], z: f64) -> (f64, f64) {
+    let x = (z - z0).clamp(0.0, (temp.len() - 1) as f64);
+    let i = (x.floor() as usize).min(temp.len().saturating_sub(2));
+    let w = (x - i as f64).clamp(0.0, 1.0);
+    let j = (i + 1).min(temp.len() - 1);
+    (
+        temp[i] + w * (temp[j] - temp[i]),
+        salt[i] + w * (salt[j] - salt[i]),
+    )
 }
 
 #[cfg(test)]

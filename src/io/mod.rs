@@ -150,7 +150,9 @@ pub use norkyst_reader::{
 };
 pub use ocean_model::{OceanModelReader, OceanState};
 pub use particle_file::{ParticleFileReader, ParticleFileWriter, ParticleFrame, status_code};
-pub use profile_series::{ProfileLevels, ProfileSeries};
+pub use profile_series::{
+    ProfileLevels, ProfileSeries, Profiles, profile_covers, profile_sample_at, profile_value_at,
+};
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
 pub use restart::{
     DriverData, Restart2D, Restart3D, RestartError, domain_fingerprint_2d, domain_fingerprint_3d,

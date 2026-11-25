@@ -16,13 +16,19 @@
 //!   tracers below the parent's bed relax to a horizontally uniform profile;
 //! - the velocity is rotated from east/north to the mesh axes.
 //!
+//! A device samples the same columns ([`ParentModel3D`], P2.7): each node's
+//! stencil, east axis and parent bed ([`ParentNode`]) and the profiles of
+//! the points they use, uploaded once, and at each depth the functions the
+//! host's sampling runs ([`crate::io::profile_sample_at`],
+//! [`deep_tracers`]).
+//!
 //! The depth mean is the 2D nesting's ([`crate::boundary::OceanModelState`]);
 //! the 3D nesting only uses the shear and the tracers, so the parent's
 //! velocity profile is not rescaled to the child's depth.
 
 use std::sync::{Arc, OnceLock};
 
-use crate::boundary::{ColumnContext3D, ParentColumn, ParentColumns3D, Supplied};
+use crate::boundary::{ColumnContext3D, DeviceParent3D, ParentColumn, ParentColumns3D, Supplied};
 use crate::io::{
     CoordinateProjection, OceanModelReader, ProfileSeries, Stencil, TimeInterpolation, TimeStencil,
     east_axis,
@@ -30,7 +36,7 @@ use crate::io::{
 use crate::mesh::Mesh2D;
 use crate::operators::DGOperators2D;
 use crate::time::ModelClock;
-use crate::vertical::SigmaGrid;
+use crate::vertical::{MeanProfile, SigmaGrid, mean_profile_at};
 
 /// The tracers below a parent's bed ([`OceanModelColumns::with_deep_reference`]).
 ///
@@ -49,14 +55,68 @@ use crate::vertical::SigmaGrid;
 /// ```
 ///
 /// the reference profile plus the parent's anomaly at its bed, decaying with
-/// the depth below it.
-#[derive(Clone)]
+/// the depth below it ([`deep_tracers`]).
+#[derive(Clone, Debug)]
 pub struct DeepReference {
-    /// Temperature (°C) and salinity at depth `d` below the surface (m,
-    /// positive down), the same everywhere
-    pub profile: Arc<dyn Fn(f64) -> (f64, f64) + Send + Sync>,
+    /// Temperature (°C) and salinity at height `z = −d` (m), the same
+    /// everywhere
+    pub profile: MeanProfile,
     /// e-folding depth of the parent's anomaly below its bed (m)
     pub decay: f64,
+}
+
+/// The tracers `(temp, salt)` a parent gives at depth `d` (m below the
+/// surface): below its bed at depth `h`, the reference `table`'s plus the
+/// parent's anomaly at its bed, decaying over `decay` metres
+/// ([`DeepReference`]; `table` is its profile's [`MeanProfile::table`]);
+/// unchanged at or above the bed. The exponential is
+/// [`crate::math::exp`], the same bits on every CPU and a device.
+#[inline]
+pub fn deep_tracers(
+    table: (f64, &[f64], &[f64]),
+    decay: f64,
+    h: f64,
+    d: f64,
+    temp: f64,
+    salt: f64,
+) -> (f64, f64) {
+    if d > h {
+        let (z0, t_ref, s_ref) = table;
+        let (t_h, s_h) = mean_profile_at(z0, t_ref, s_ref, -h);
+        let decay = crate::math::exp(-(d - h) / decay);
+        let (t_d, s_d) = mean_profile_at(z0, t_ref, s_ref, -d);
+        (t_d + decay * (temp - t_h), s_d + decay * (salt - s_h))
+    } else {
+        (temp, salt)
+    }
+}
+
+/// Where a child node samples a parent model ([`ParentModel3D::node`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParentNode {
+    /// The parent's points and weights
+    pub stencil: Stencil,
+    /// East in the mesh axes, `(cos, sin)` of its angle from x
+    pub east: (f64, f64),
+    /// The parent's bed depth there (m: its `depth` field over the
+    /// stencil), NaN without one; a [`DeepReference`] acts below it
+    pub bed: f64,
+}
+
+/// A parent model as a device samples it ([`DeviceParent3D::Model`]): what
+/// [`OceanModelColumns`] samples its columns from, so that a device samples
+/// the same with the same functions.
+pub trait ParentModel3D: Send + Sync {
+    /// The profiles of u and v (east and north), T and S, each if the
+    /// parent has it.
+    fn profiles(&self) -> [Option<&ProfileSeries>; 4];
+    /// The tracers below the parent's bed, if not held.
+    fn deep_reference(&self) -> Option<&DeepReference>;
+    /// Where node `node` (`[element][node]`) at `position` samples the
+    /// parent; `None` where the parent does not cover it.
+    fn node(&self, node: usize, position: (f64, f64)) -> Option<ParentNode>;
+    /// The snapshots' weights at simulation time `t`.
+    fn moment(&self, t: f64) -> TimeStencil;
 }
 
 /// Most child layers [`OceanModelColumns`] samples (a stack buffer of the
@@ -92,16 +152,9 @@ pub struct OceanModelColumns<P> {
     options: OceanColumnsOptions,
     /// The tracers below the parent's bed, if not held
     deep: Option<DeepReference>,
-    /// Horizontal stencil and east axis of every mesh node (`[element][node]`),
-    /// `None` if the parent does not cover it; computed on first use.
-    nodes: Vec<OnceLock<Option<NodeStencil>>>,
-}
-
-/// Where a child node samples the parent.
-struct NodeStencil {
-    stencil: Stencil,
-    /// East in the mesh axes, `(cos, sin)` of its angle from x.
-    east: (f64, f64),
+    /// Where every mesh node (`[element][node]`) samples the parent, `None`
+    /// if the parent does not cover it; computed on first use.
+    nodes: Vec<OnceLock<Option<ParentNode>>>,
 }
 
 impl<P: CoordinateProjection> OceanModelColumns<P> {
@@ -149,8 +202,8 @@ impl<P: CoordinateProjection> OceanModelColumns<P> {
         self
     }
 
-    /// The stencil and east axis of `node` at `position`.
-    fn node(&self, node: usize, position: (f64, f64)) -> Option<&NodeStencil> {
+    /// Where `node` at `position` samples the parent.
+    fn sampling(&self, node: usize, position: (f64, f64)) -> Option<&ParentNode> {
         self.nodes[node]
             .get_or_init(|| {
                 let (lat, lon) = self.projection.xy_to_geo(position.0, position.1);
@@ -165,9 +218,18 @@ impl<P: CoordinateProjection> OceanModelColumns<P> {
                         Stencil::point(k)
                     }
                 };
-                Some(NodeStencil {
+                let bed = self.reader.depth().map_or(f64::NAN, |depth| {
+                    stencil
+                        .idx
+                        .iter()
+                        .zip(stencil.w)
+                        .map(|(&k, w)| w * depth[k as usize])
+                        .sum()
+                });
+                Some(ParentNode {
                     stencil,
                     east: east_axis(&self.projection, lat, lon),
+                    bed,
                 })
             })
             .as_ref()
@@ -199,10 +261,11 @@ impl<P: CoordinateProjection + Send + Sync> ParentColumns3D for OceanModelColumn
     }
 
     fn column(&self, ctx: &ColumnContext3D, sigma: &SigmaGrid, out: ParentColumn<'_>) -> bool {
-        let Some(NodeStencil {
+        let Some(ParentNode {
             stencil,
             east: (c, s),
-        }) = self.node(ctx.node, ctx.position)
+            bed: h,
+        }) = self.sampling(ctx.node, ctx.position)
         else {
             return false;
         };
@@ -218,9 +281,8 @@ impl<P: CoordinateProjection + Send + Sync> ParentColumns3D for OceanModelColumn
         }
         let depths = &depths[..n_levels];
         let time = self.moment(ctx.time);
-        let space = stencil.idx.iter().map(|&k| k as usize).zip(stencil.w);
         let sample = |series: Option<&ProfileSeries>, out: &mut [f64]| {
-            series.is_some_and(|p| p.sample(&time, space.clone(), depths, column_depth, out))
+            series.is_some_and(|p| p.sample(&time, stencil, depths, column_depth, out))
         };
         let supplied = self.supplies();
         if supplied.velocity {
@@ -241,27 +303,45 @@ impl<P: CoordinateProjection + Send + Sync> ParentColumns3D for OceanModelColumn
         }
         // Below the parent's bed: the reference plus the decaying anomaly
         if supplied.tracers
-            && let (Some(deep), Some(depth)) = (&self.deep, self.reader.depth())
+            && let Some(deep) = &self.deep
+            && h.is_finite()
         {
-            let h: f64 = stencil
-                .idx
-                .iter()
-                .zip(stencil.w)
-                .map(|(&k, w)| w * depth[k as usize])
-                .sum();
-            if h.is_finite() {
-                let (t_h, s_h) = (deep.profile)(h);
-                for (l, &d) in depths.iter().enumerate() {
-                    if d > h {
-                        let decay = (-(d - h) / deep.decay).exp();
-                        let (t_d, s_d) = (deep.profile)(d);
-                        out.temp[l] = t_d + decay * (out.temp[l] - t_h);
-                        out.salt[l] = s_d + decay * (out.salt[l] - s_h);
-                    }
-                }
+            let table = deep.profile.table();
+            for (l, &d) in depths.iter().enumerate() {
+                (out.temp[l], out.salt[l]) =
+                    deep_tracers(table, deep.decay, *h, d, out.temp[l], out.salt[l]);
             }
         }
         true
+    }
+
+    /// A device samples the parent itself ([`ParentModel3D`]).
+    fn device_form(&self) -> Option<DeviceParent3D<'_>> {
+        Some(DeviceParent3D::Model(self))
+    }
+}
+
+impl<P: CoordinateProjection + Send + Sync> ParentModel3D for OceanModelColumns<P> {
+    fn profiles(&self) -> [Option<&ProfileSeries>; 4] {
+        let velocity = self.reader.velocity_profiles();
+        [
+            velocity.map(|p| p.0),
+            velocity.map(|p| p.1),
+            self.reader.temperature_profile(),
+            self.reader.salinity_profile(),
+        ]
+    }
+
+    fn deep_reference(&self) -> Option<&DeepReference> {
+        self.deep.as_ref()
+    }
+
+    fn node(&self, node: usize, position: (f64, f64)) -> Option<ParentNode> {
+        self.sampling(node, position).copied()
+    }
+
+    fn moment(&self, t: f64) -> TimeStencil {
+        OceanModelColumns::moment(self, t)
     }
 }
 
@@ -389,6 +469,12 @@ mod tests {
         let shallow = Arc::try_unwrap(reader(&projection)).expect("one owner");
         let m = shallow.grid().len();
         let reference = |d: f64| (10.0 - 0.1 * d, 35.0);
+        let heights = || (0..=20).map(|i| -20.0 + i as f64);
+        let profile = MeanProfile::new(
+            -20.0,
+            heights().map(|z| reference(-z).0).collect(),
+            heights().map(|z| reference(-z).1).collect(),
+        );
         let parent = OceanModelColumns::new(
             Arc::new(shallow.with_depth(vec![5.0; m])),
             &mesh,
@@ -398,7 +484,7 @@ mod tests {
             OceanColumnsOptions::default(),
         )
         .with_deep_reference(DeepReference {
-            profile: Arc::new(reference),
+            profile,
             decay: 2.0,
         });
         let sigma = SigmaGrid::uniform(4);

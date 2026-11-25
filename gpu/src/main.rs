@@ -9,8 +9,8 @@
 //! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, weather, beach,
 //!                                             # transport3d, momentum3d, stage3d,
 //!                                             # limiter3d, vertical3d, implicit3d,
-//!                                             # forcing3d, pass3d, step3d; all by
-//!                                             # default)
+//!                                             # forcing3d, pass3d, step3d, parent3d;
+//!                                             # all by default)
 //! target\release\dgcom-gpu.exe case <case.toml> [--set key.path=value]...
 //!                                             # a case on the CPU and the GPU, compared
 //! target\release\dgcom-gpu.exe run <case.toml> [--set ...]
@@ -40,7 +40,9 @@
 //!   (`forcing3d`); the barotropic pass on global substeps and on local
 //!   time steps with its `DU_avg2`, filter, rivers and the 2D module's
 //!   volume sources, the step's rates and balance, and its merged cells
-//!   from what the pass moved (`pass3d`); value for value.
+//!   from what the pass moved (`pass3d`); a nesting parent model's columns
+//!   at the band's slots, sampled on the device (`parent3d`); value for
+//!   value.
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
 //! must be the CPU's bit for bit; that is the gate.
@@ -61,6 +63,8 @@ mod listed;
 mod model3d;
 mod momentum3d;
 mod nest;
+mod parent;
+mod parent3d;
 mod pass;
 mod pass3d;
 mod phase0;
@@ -150,6 +154,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if which == "all" || which == "step3d" {
         step3d::run(&gpu)?;
+    }
+    if which == "all" || which == "parent3d" {
+        parent3d::run(&gpu)?;
     }
     Ok(())
 }

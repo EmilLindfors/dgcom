@@ -46,8 +46,8 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::boundary::NestingError;
 use crate::boundary::band::boundary_distances;
+use crate::boundary::{NestingError, ParentModel3D};
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use crate::operators::DGOperators2D;
 use crate::solver::Blocks;
@@ -105,19 +105,38 @@ pub trait ParentColumns3D: Send + Sync {
 
     /// How a device evaluates the parent (P2.7), if it can; `None` (the
     /// default) leaves it to the host at every evaluation.
-    fn device_form(&self) -> Option<DeviceParent3D> {
+    fn device_form(&self) -> Option<DeviceParent3D<'_>> {
         None
     }
 }
 
 /// A parent as a device evaluates it ([`ParentColumns3D::device_form`]): a
 /// closed set, as the 2D forcing's device forms.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeviceParent3D {
+#[derive(Clone, Copy)]
+pub enum DeviceParent3D<'a> {
     /// The same columns at every time, free surface and child state,
     /// covering every node ([`ReferenceColumns`]): evaluated once, they hold
     /// for the run.
     Fixed,
+    /// A parent model's profiles, which the device samples at the child's
+    /// layers itself ([`crate::boundary::OceanModelColumns`]).
+    Model(&'a dyn ParentModel3D),
+}
+
+impl DeviceParent3D<'_> {
+    /// Whether the parent is fixed ([`Self::Fixed`]).
+    pub fn is_fixed(&self) -> bool {
+        matches!(self, Self::Fixed)
+    }
+}
+
+impl std::fmt::Debug for DeviceParent3D<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Fixed => "Fixed",
+            Self::Model(_) => "Model",
+        })
+    }
 }
 
 /// A fixed reference state as the parent: the columns of a [`Solution3D`]
@@ -169,7 +188,7 @@ impl ParentColumns3D for ReferenceColumns {
     }
 
     /// Fixed: the reference's columns, whatever the time and the child.
-    fn device_form(&self) -> Option<DeviceParent3D> {
+    fn device_form(&self) -> Option<DeviceParent3D<'_>> {
         Some(DeviceParent3D::Fixed)
     }
 }
@@ -365,18 +384,31 @@ impl Nesting3D {
     }
 
     /// How a device evaluates the parent ([`ParentColumns3D::device_form`]).
-    pub fn device_form(&self) -> Option<DeviceParent3D> {
+    pub fn device_form(&self) -> Option<DeviceParent3D<'_>> {
         self.parent.device_form()
     }
 
     /// The band's slots as flat tables: what a device relaxes with, the
-    /// parent's columns of [`NestingColumns::values`] uploaded.
+    /// parent's columns of [`NestingColumns::values`] uploaded (or sampled
+    /// there, [`DeviceParent3D::Model`]).
     pub fn slots(&self) -> NestingSlots<'_> {
         NestingSlots {
             nodes: &self.nodes,
+            positions: &self.positions,
             velocity_rate: &self.velocity_rate,
             tracer_rate: &self.tracer_rate,
             supplied: self.supplied,
+        }
+    }
+
+    /// The exterior values of the 3D kernels at the nested open faces, with
+    /// `values` at the slots (`[slot][level]`, [`Self::slots`]' order).
+    pub fn exterior_field<'b>(&'b self, values: &'b [f64]) -> ExteriorField<'b> {
+        ExteriorField {
+            tags: &self.tags,
+            slot_of_node: &self.slot_of_node,
+            n_levels: self.n_levels,
+            values,
         }
     }
 
@@ -516,6 +548,8 @@ type BandColumn<'a> = (
 pub struct NestingSlots<'a> {
     /// `[element][node]` of every slot
     pub nodes: &'a [usize],
+    /// Mesh coordinates of every slot's node (m)
+    pub positions: &'a [(f64, f64)],
     /// The shear's and the tracers' relaxation rates of every slot (1/s)
     pub velocity_rate: &'a [f64],
     pub tracer_rate: &'a [f64],
@@ -536,12 +570,7 @@ impl NestingColumns<'_> {
     }
 
     fn field<'b>(&'b self, values: &'b [f64]) -> ExteriorField<'b> {
-        ExteriorField {
-            tags: &self.nesting.tags,
-            slot_of_node: &self.nesting.slot_of_node,
-            n_levels: self.nesting.n_levels,
-            values,
-        }
+        self.nesting.exterior_field(values)
     }
 
     /// The parent's u, v, T and S at every slot (`[slot][level]`, in
@@ -859,7 +888,7 @@ mod tests {
             ..NestingBand3D::default()
         };
         let (mesh, ops, profile) = setup(band);
-        assert_eq!(profile.device_form(), None);
+        assert!(profile.device_form().is_none());
         let sigma = SigmaGrid::uniform(4);
         let bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -20.0);
         let n = mesh.n_elements * ops.n_nodes * 4;
@@ -877,7 +906,7 @@ mod tests {
             &band,
         )
         .unwrap();
-        assert_eq!(nesting.device_form(), Some(DeviceParent3D::Fixed));
+        assert!(nesting.device_form().is_some_and(|f| f.is_fixed()));
         let values = |state: &Solution3D, t: f64, thin: f64| {
             let columns = nesting.columns(
                 state,
