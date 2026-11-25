@@ -182,10 +182,11 @@ pub fn atmosphere_source(
     )
 }
 
-/// Wind stress `ρ_air C_d(|U|) |U| U` (N/m²) of the wind `(u, v)`.
+/// Wind stress `ρ_air C_d(|U|) |U| U` (N/m²) of the wind `(u, v)`. The
+/// speed is [`crate::math::hypot`]: the same bits on every CPU and a device.
 #[inline]
 fn wind_stress(u: f64, v: f64, c: AtmosphereConstants) -> (f64, f64) {
-    let speed = u.hypot(v);
+    let speed = crate::math::hypot(u, v);
     let stress = c.rho_air * c.drag.compute(speed) * speed;
     (stress * u, stress * v)
 }

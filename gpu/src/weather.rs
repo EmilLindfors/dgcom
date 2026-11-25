@@ -1,23 +1,28 @@
-//! The weather gate (P2.7 Phase 4.5i, `notes/gpu.md`): a run under a weather
-//! model's air pressure (`GriddedAtmosphere2D`, its pressure gradient on the
-//! depth mean) with its open boundary raised by the inverse barometer
-//! (`InverseBarometer`), on the CPU and on the GPU, with global steps and
-//! local time stepping, compared bit for bit.
+//! The weather gate (P2.7 Phases 4.5i and 4.5l, `notes/gpu.md`): a run under
+//! a weather model's air pressure and wind (`GriddedAtmosphere2D`, its
+//! pressure gradient and wind stress on the depth mean) with its open
+//! boundary raised by the inverse barometer (`InverseBarometer`), on the CPU
+//! and on the GPU, with global steps and local time stepping, compared bit
+//! for bit.
 //!
 //! The weather is made up and held in memory (no NetCDF needed): a low of
 //! 15 hPa crossing `nest`'s channel eastward at 10 m/s over a pressure
-//! gradient of 3 hPa per 40 km, hourly on a 4 km grid, ramped up over half
-//! an hour. Two configurations, as the case runner builds a weather case:
+//! gradient of 3 hPa per 40 km, a south-westerly of 7 m/s with the low's
+//! cyclonic wind of up to 8.5 m/s about it, hourly on a 4 km grid, ramped up
+//! over half an hour. Three configurations, as the case runner builds a
+//! weather case:
 //!
 //! - an M2 tide at the open boundary raised by the full inverse barometer,
 //!   the Coriolis force and the pressure;
+//! - the same with the wind stress on the depth mean (a 2D run's: a 3D run
+//!   hands the wind to its columns);
 //! - `nest`'s parent at the open boundary raised by a quarter of it (as the
 //!   case runner raises NorKyst's), its relaxation band, then the pressure:
 //!   the device adds the band's and the weather's sources in the CPU's order.
 //!
 //! The mutants give the device another input: no pressure source, another
 //! factor of the inverse barometer, the weather ramped up over an hour, no
-//! inverse barometer.
+//! inverse barometer, no wind, another drag law.
 
 use std::error::Error;
 use std::sync::Arc;
@@ -34,7 +39,9 @@ use dgcom::io::{
 use dgcom::physics::{PhysicsBuilder, SWEPhysics2D};
 use dgcom::simulation::Simulation;
 use dgcom::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig};
-use dgcom::source::{CoriolisSource2D, GriddedAtmosphere2D, ManningFriction2D, coriolis_parameter};
+use dgcom::source::{
+    CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D, ManningFriction2D, coriolis_parameter,
+};
 use dgcom::time::{ModelClock, Multirate, SSPRK43};
 use dgcom::types::ElementIndex;
 
@@ -63,12 +70,19 @@ fn weather_reader(projection: &LocalProjection) -> Arc<AtmosphereReader> {
         .map(|k| T0 + 3600.0 * k as f64)
         .collect();
     let mut pressure = Vec::with_capacity(times.len() * m);
+    let (mut u10, mut v10) = (Vec::with_capacity(times.len() * m), Vec::new());
     for &t in &times {
         let centre = -30_000.0 + 10.0 * (t - T0);
         for &y in &ys {
             for &x in &xs {
                 let r2 = ((x - centre).powi(2) + (y - 2000.0).powi(2)) / 30_000.0_f64.powi(2);
                 pressure.push(P_REFERENCE + 300.0 * x / 40_000.0 - 1500.0 * (-r2).exp());
+                // A south-westerly, and the low's wind about it, anticlockwise
+                let swirl = 12.0 * 1.6487 * r2.sqrt() * (-r2).exp();
+                let (dx, dy) = (x - centre, y - 2000.0);
+                let r = dx.hypot(dy).max(1.0);
+                u10.push(5.0 - swirl * dy / r);
+                v10.push(5.0 + swirl * dx / r);
             }
         }
     }
@@ -78,12 +92,23 @@ fn weather_reader(projection: &LocalProjection) -> Arc<AtmosphereReader> {
             .with_field(
                 AtmosphereField::Pressure,
                 FieldSeries::with_offset(m, &pressure, P_REFERENCE),
+            )
+            .with_wind(
+                FieldSeries::with_offset(m, &u10, 0.0),
+                FieldSeries::with_offset(m, &v10, 0.0),
             ),
     )
 }
 
-/// The weather on `domain`'s nodes, ramped up over `ramp` seconds.
+/// The weather's air pressure on `domain`'s nodes, ramped up over `ramp`
+/// seconds.
 fn atmosphere(domain: &Domain, ramp: f64) -> Result<GriddedAtmosphere2D, Box<dyn Error>> {
+    Ok(windy(domain, ramp)?.without_wind())
+}
+
+/// The weather's air pressure and wind on `domain`'s nodes, ramped up over
+/// `ramp` seconds.
+fn windy(domain: &Domain, ramp: f64) -> Result<GriddedAtmosphere2D, Box<dyn Error>> {
     let projection = LocalProjection::new(63.5, 8.0);
     Ok(GriddedAtmosphere2D::new(
         weather_reader(&projection),
@@ -240,7 +265,7 @@ fn compare(
 }
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
-    println!("== Phase 4.5i: a run under a weather model's air pressure ==");
+    println!("== Phases 4.5i, 4.5l: a run under a weather model's air pressure and wind ==");
     let nest = Nest::cubic();
     let domain = Domain::new(&nest)?;
     let q0 = still_water(&domain);
@@ -287,6 +312,38 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
             &q0,
             physics(&domain, None, Some(&weather), with(&full)),
             &physics(&domain, None, Some(&weather), with(&full)),
+            &mutants,
+        )?;
+    }
+
+    // The same with the wind stress on the depth mean (a 2D run's)
+    let wind = windy(&domain, 1800.0)?;
+    let smith = windy(&domain, 1800.0)?.with_drag(DragCoefficient::Smith);
+    let (windy_tide, smith_tide) = (raised(&wind, 1.0), raised(&smith, 1.0));
+    for levels in [0, 3] {
+        let with = |open| MultiBoundaryCondition2D::new(&wall).with_open(open);
+        let mutants = if levels == 0 {
+            vec![
+                (
+                    "no wind",
+                    physics(&domain, None, Some(&weather), with(&full)),
+                ),
+                (
+                    "Smith's drag, not Large and Pond's",
+                    physics(&domain, None, Some(&smith), with(&smith_tide)),
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
+        all &= compare(
+            gpu,
+            "tide raised by the inverse barometer, wind and pressure",
+            levels,
+            &domain,
+            &q0,
+            physics(&domain, None, Some(&wind), with(&windy_tide)),
+            &physics(&domain, None, Some(&wind), with(&windy_tide)),
             &mutants,
         )?;
     }

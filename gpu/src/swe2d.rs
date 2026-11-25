@@ -3448,13 +3448,6 @@ impl<'a> GpuSWE2D<'a> {
                     post.push(Post::Relaxation(relaxations.len() - 1));
                 }
                 DeviceSource2D::Atmosphere(a) => {
-                    // The wind stress's speed is the platform's hypot on the
-                    // CPU (a 3D run's 2D module has the pressure alone)
-                    if a.switches()[0] {
-                        return Err("the weather's wind stress on the depth mean (a 2D run's; \
-                                    P2.7, notes/gpu.md)"
-                            .into());
-                    }
                     if post.iter().any(|p| matches!(p, Post::Atmosphere)) {
                         return Err("the weather's source twice".into());
                     }
