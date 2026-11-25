@@ -41,11 +41,11 @@ use dgcom::mesh::{Bathymetry2D, Mesh2D};
 use dgcom::operators::{DGOperators2D, GeometricFactors2D};
 use dgcom::physics::vertical_mixing::Forcing;
 use dgcom::physics::{GlsMixing, JerlovWater};
-use dgcom::simulation::Simulation;
+use dgcom::simulation::{RunModel3D, Simulation};
 use dgcom::solver::SWESolution2D;
 use dgcom::solver::state::Solution3D;
 use dgcom::source::{CoriolisSource2D, River, RiverSeries, RiverSources};
-use dgcom::time::{SSPRK43, SspScheme};
+use dgcom::time::{ModeSplitPhysics, SSPRK43, SspScheme};
 use dgcom::types::ElementIndex;
 
 use crate::hooks::State3D;
@@ -658,32 +658,120 @@ const NO_STRESS: Forcing = Forcing {
 };
 
 /// `steps` steps of the case runner's integrator (`Run::CASE_RUNNER`) from
-/// `start` on the device, each of the CPU's own bound of the device's state
-/// (at most the case runner's cap); `each` sees the state after every step.
+/// `start` on the device, as a run takes them (`Simulation3D`): on global 3D
+/// steps (`levels` 0) each of the CPU's own bound of the device's state, on
+/// local ones the coarse step of the levels the device's own element steps
+/// give (at most the case runner's cap either way); then the end of a step
+/// (`RunModel3D::post_process`: the tracer limiter, the density, `w`).
+/// `each` sees the state after every step. The time reached, and the finest
+/// level a step used.
 fn run_3d(
     gpu: &Arc<Gpu>,
     physics: &Physics,
     start: &Solution3D,
     steps: usize,
+    levels: usize,
     mut each: impl FnMut(&Solution3D),
-) -> Result<f64, Box<dyn Error>> {
-    let model = Model3D::new(gpu, physics)?;
+) -> Result<(f64, usize), Box<dyn Error>> {
     let mut host = start.clone();
     physics.update_density(&mut host);
+    let mut model = Model3D::new(gpu, physics)?;
+    model.start_from(&host);
     let mut state = State3D::upload(gpu, &host)?;
-    let mut integrator = Run::CASE_RUNNER.integrator().on::<Work3D>();
-    let mut t = 0.0;
+    let run = Run {
+        baroclinic_levels: levels,
+        ..Run::CASE_RUNNER
+    };
+    let mut integrator = run.integrator().on::<Work3D>();
+    let (mut t, mut finest) = (0.0, 0);
     for _ in 0..steps {
         model.update_density(&mut state);
-        let dt = physics
-            .compute_dt_ssp(&host, CFL_3D, SspScheme::Rk43)
-            .min(DT_MAX);
+        let dt = if levels == 0 {
+            physics
+                .compute_dt_ssp(&host, CFL_3D, SspScheme::Rk43)
+                .min(DT_MAX)
+        } else {
+            let mut element_dt = vec![0.0; physics.mesh.n_elements];
+            let work = integrator.work_for(&model, &mut state);
+            model.element_steps(&state, work, CFL_3D, SspScheme::Rk43, &mut element_dt);
+            let stencils = ModeSplitPhysics::stage_stencils(physics);
+            integrator.assign_baroclinic_levels(
+                &element_dt,
+                &physics.mesh,
+                &stencils,
+                Some(DT_MAX),
+                None,
+            )
+        };
         integrator.step(&mut state, &model, dt, t);
+        if let Some(stats) = integrator.baroclinic_multirate_stats() {
+            finest = finest.max(stats.finest_level);
+        }
+        let work = integrator.work_mut().expect("a step made the work");
+        RunModel3D::post_process(&model, &mut state, work);
         t += dt;
         state.download_into(gpu, &mut host)?;
         each(&host);
     }
-    Ok(t)
+    Ok((t, finest))
+}
+
+/// [`run_3d`]'s steps on the CPU (its own element steps on local 3D
+/// steps; with `kept`, those of the start at every step, so that no element
+/// changes its level): the CPU's kernels on a judge's fixture, for the line
+/// it prints.
+fn run_3d_cpu(
+    physics: &Physics,
+    start: &Solution3D,
+    steps: usize,
+    levels: usize,
+    kept: bool,
+    mut each: impl FnMut(&Solution3D),
+) {
+    let mut state = start.clone();
+    let run = Run {
+        baroclinic_levels: levels,
+        ..Run::CASE_RUNNER
+    };
+    let mut integrator = run.integrator();
+    let mut t = 0.0;
+    let mut element_dt = Vec::new();
+    for _ in 0..steps {
+        physics.update_density(&mut state);
+        let dt = if levels == 0 {
+            physics
+                .compute_dt_ssp(&state, CFL_3D, SspScheme::Rk43)
+                .min(DT_MAX)
+        } else {
+            if element_dt.is_empty() || !kept {
+                element_dt.resize(physics.mesh.n_elements, 0.0);
+                physics.element_steps_into(&state, CFL_3D, SspScheme::Rk43, &mut element_dt);
+            }
+            let stencils = ModeSplitPhysics::stage_stencils(physics);
+            integrator.assign_baroclinic_levels(
+                &element_dt,
+                &physics.mesh,
+                &stencils,
+                Some(DT_MAX),
+                None,
+            )
+        };
+        integrator.step(&mut state, physics, dt, t);
+        physics.post_process(&mut state);
+        t += dt;
+        each(&state);
+    }
+}
+
+/// The largest layer speed over `steps` global steps from `start` on the
+/// CPU (m/s).
+fn rest_on_cpu(physics: &Physics, start: &Solution3D, steps: usize) -> f64 {
+    let mut speed = 0.0f64;
+    run_3d_cpu(physics, start, steps, 0, false, |s| {
+        let now = largest_speed(s);
+        speed = if now.is_nan() { now } else { speed.max(now) };
+    });
+    speed
 }
 
 /// The largest layer speed of `state` (m/s), NaN if a value is not finite.
@@ -727,6 +815,24 @@ fn at_rest(fx: &Fixture) -> Solution3D {
     state
 }
 
+/// `fx`'s water at rest as [`at_rest`], its temperature linear in height
+/// (0.25 °C/m from 12 °C at mean sea level) and its salinity uniform: with
+/// the linear equation of state a density linear in z, whose pressure
+/// gradient along sloping levels the σ-pairs cancel without a reference.
+fn at_rest_linear(fx: &Fixture) -> Solution3D {
+    let mut state = at_rest(fx);
+    let sigma = fx.sigma.sigma_rho();
+    for idx in 0..state.eta.data.len() {
+        let (eta, bed) = (state.eta.data[idx], fx.bathymetry.data[idx]);
+        for (l, &s) in sigma.iter().enumerate() {
+            let at = idx * LEVELS + l;
+            state.temp[at] = 12.0 + 0.25 * (eta + s * (eta - bed));
+            state.salt[at] = 33.0;
+        }
+    }
+    state
+}
+
 /// The largest layer speed water at rest about its reference may reach
 /// (m/s): dgcom's `stratified_lake_with_dry_land_stays_at_rest` asks this
 /// of the CPU and measures 1.3e-13.
@@ -754,14 +860,16 @@ fn rest_3d(
             .with_minimum(1e-30, 1e-30)
     };
     let start = at_rest(fx);
-    let measure = |terms: Terms| -> Result<(f64, f64), Box<dyn Error>> {
-        let physics = physics_with(fx, terms, NO_STRESS, still(), None);
+    let run = |physics: &Physics, start: &Solution3D| -> Result<(f64, f64), Box<dyn Error>> {
         let mut speed = 0.0f64;
-        let t = run_3d(gpu, &physics, &start, steps, |s| {
+        let (t, _) = run_3d(gpu, physics, start, steps, 0, |s| {
             let now = largest_speed(s);
             speed = if now.is_nan() { now } else { speed.max(now) };
         })?;
         Ok((speed, t))
+    };
+    let measure = |terms: Terms| -> Result<(f64, f64), Box<dyn Error>> {
+        run(&physics_with(fx, terms, NO_STRESS, still(), None), &start)
     };
     let (speed, t) = measure(quiet)?;
     tally.judge(
@@ -778,6 +886,50 @@ fn rest_3d(
     })?;
     tally.mutant(
         "no reference on the device: the pressure gradient of the whole density",
+        &format!("the largest layer speed {speed:.2e} m/s"),
+        speed.is_nan() || speed > REST_3D_BAR,
+    );
+    // Without a reference, a density linear in height: the pressure
+    // gradient's kernels on pressures of the whole column, which must cancel
+    // pair by pair (about the reference above they work on an anomaly of
+    // zero). dgcom's `stratified_lake_with_dry_land_stays_at_rest` and the
+    // seamount test ask this of the CPU.
+    let linear = at_rest_linear(fx);
+    // (and without the Kuzmin limiter, which with no reference to take
+    // the departure from clips the stratification along the sloping levels)
+    let bare = Terms {
+        reference: false,
+        limiter: false,
+        ..quiet
+    };
+    let physics = physics_with(fx, bare, NO_STRESS, still(), None);
+    let (speed, t) = run(&physics, &linear)?;
+    let on_cpu = rest_on_cpu(&physics, &linear, steps);
+    tally.judge(
+        "at rest on a density linear in height, no reference",
+        &format!(
+            "over {steps} steps ({t:.0} s) the largest layer speed {speed:.2e} m/s (the CPU's \
+             kernels: {on_cpu:.2e}); it must stay under {REST_3D_BAR:.0e}"
+        ),
+        speed <= REST_3D_BAR,
+    );
+    // The pairs cancel one by one at rest, so no error in D or in the lift
+    // shows here (an entry of D off by 1e-3 leaves 6e-13 m/s). What shows
+    // is the stratification no longer linear: the Kuzmin limiter on, which
+    // with no reference clips it along the sloping levels
+    let clipped = physics_with(
+        fx,
+        Terms {
+            limiter: true,
+            ..bare
+        },
+        NO_STRESS,
+        still(),
+        None,
+    );
+    let (speed, _) = run(&clipped, &linear)?;
+    tally.mutant(
+        "the Kuzmin limiter on, about no reference",
         &format!("the largest layer speed {speed:.2e} m/s"),
         speed.is_nan() || speed > REST_3D_BAR,
     );
@@ -830,13 +982,22 @@ fn inventory(fx: &Fixture, state: &Solution3D, tracer: &[f64]) -> f64 {
     }))
 }
 
-fn tracers_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
+/// The tracers' judges on global 3D steps (`levels` 0) or on local ones of
+/// up to `levels` levels (the passes on their elements' lists, the element
+/// steps the device's own).
+fn tracers_3d(gpu: &Arc<Gpu>, tally: &mut Tally, levels: usize) -> Result<(), Box<dyn Error>> {
     let fx = beach_3d();
     let steps = 40;
+    let stepping = if levels == 0 {
+        "global 3D steps".to_string()
+    } else {
+        format!("local 3D steps on up to {levels} levels")
+    };
     println!(
-        "3D tracers: the beach under its sheared flow, a wind and its uniform stress, films \
-         and thin columns, {steps} steps"
+        "3D tracers, {stepping}: the beach under its sheared flow, a wind and its uniform \
+         stress, films and thin columns, {steps} steps"
     );
+    let mut finest = 0;
     let forcing = Forcing {
         surface_stress: [0.03, -0.01],
         ..NO_STRESS
@@ -856,59 +1017,115 @@ fn tracers_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
     uniform.salt.fill(salt);
     uniform.tke.clear();
     uniform.gls.clear();
-    let drift_with = |river_temp: f64| -> Result<f64, Box<dyn Error>> {
+    let drift_in = |s: &Solution3D, drift: &mut f64| {
+        for (&t, &x) in s.temp.iter().zip(&s.salt) {
+            let d = (t - temp).abs().max((x - salt).abs());
+            *drift = if d.is_nan() { d } else { drift.max(d) };
+        }
+    };
+    // (the device's drift and the finest level used; the CPU's kernels' if
+    // asked)
+    let drift_with = |rivers: Option<f64>,
+                      fluxes: Option<JerlovWater>,
+                      cpu: bool|
+     -> Result<(f64, usize, f64), Box<dyn Error>> {
         let physics = physics_with(
             &fx,
             Terms {
                 limiter: false,
+                fluxes,
                 ..moving
             },
             forcing,
             GlsMixing::k_epsilon(),
-            Some(rivers_of(&fx, river_temp, salt)),
+            rivers.map(|t| rivers_of(&fx, t, salt)),
         );
         let mut drift = 0.0f64;
-        run_3d(gpu, &physics, &uniform, steps, |s| {
-            for (&t, &x) in s.temp.iter().zip(&s.salt) {
-                let d = (t - temp).abs().max((x - salt).abs());
-                drift = if d.is_nan() { d } else { drift.max(d) };
-            }
+        let (_, finest) = run_3d(gpu, &physics, &uniform, steps, levels, |s| {
+            drift_in(s, &mut drift)
         })?;
-        Ok(drift)
+        let mut on_cpu = f64::NAN;
+        if cpu {
+            on_cpu = 0.0;
+            run_3d_cpu(&physics, &uniform, steps, levels, false, |s| {
+                drift_in(s, &mut on_cpu)
+            });
+        }
+        Ok((drift, finest, on_cpu))
     };
-    let drift = drift_with(temp)?;
-    tally.judge(
-        "uniform T and S stay uniform (rivers of the same water)",
-        &format!("the largest drift {drift:.2e}; it must stay under {CONSTANCY_BAR:.0e}"),
-        drift <= CONSTANCY_BAR,
-    );
-    let drift = drift_with(temp + 1e-3)?;
-    tally.mutant(
-        "the rivers' water 1e-3 °C warmer",
-        &format!("the largest drift {drift:.2e}"),
-        drift.is_nan() || drift > CONSTANCY_BAR,
-    );
+    if levels == 0 {
+        let (drift, _, on_cpu) = drift_with(Some(temp), None, true)?;
+        tally.judge(
+            "uniform T and S stay uniform (rivers of the same water)",
+            &format!(
+                "the largest drift {drift:.2e} (the CPU's kernels: {on_cpu:.2e}); it must stay \
+                 under {CONSTANCY_BAR:.0e}"
+            ),
+            drift <= CONSTANCY_BAR,
+        );
+        let (drift, _, _) = drift_with(Some(temp + 1e-3), None, false)?;
+        tally.mutant(
+            "the rivers' water 1e-3 °C warmer",
+            &format!("the largest drift {drift:.2e}"),
+            drift.is_nan() || drift > CONSTANCY_BAR,
+        );
+    } else {
+        // On local steps the scheme itself does not keep them uniform on
+        // this beach, on the CPU as on the device, with rivers or without
+        // (dgcom's `beach_tracers_are_constant_and_conserved_with_local_time_steps`
+        // asks it of levels fixed by position, and finds it): printed with
+        // the CPU's kernels' beside it, not judged (notes/3d-numerics.md)
+        let (drift, used, on_cpu) = drift_with(None, None, true)?;
+        finest = finest.max(used);
+        let (rivers, _, rivers_on_cpu) = drift_with(Some(temp), None, true)?;
+        // ... and the CPU's with every element on the level of its first
+        // step
+        let kept = {
+            let physics = physics_with(
+                &fx,
+                Terms {
+                    limiter: false,
+                    ..moving
+                },
+                forcing,
+                GlsMixing::k_epsilon(),
+                None,
+            );
+            let mut drift = 0.0f64;
+            run_3d_cpu(&physics, &uniform, steps, levels, true, |s| {
+                drift_in(s, &mut drift)
+            });
+            drift
+        };
+        println!(
+            "  (uniform T and S drift by {drift:.2e} without rivers and {rivers:.2e} with rivers \
+             of the same water; the CPU's kernels: {on_cpu:.2e} and {rivers_on_cpu:.2e}, and \
+             {kept:.2e} without rivers on the levels of the first step kept. The scheme's on \
+             local steps, where global steps keep {CONSTANCY_BAR:.0e}: not judged)"
+        );
+    }
     // The inventories of the stratified water, nothing entering
     let mut stratified = start_state(&fx);
     stratified.tke.clear();
     stratified.gls.clear();
-    let drift_of = |terms: Terms| -> Result<(f64, f64), Box<dyn Error>> {
+    let drift_of = |terms: Terms| -> Result<(f64, f64, usize), Box<dyn Error>> {
         let physics = physics_with(&fx, terms, forcing, GlsMixing::k_epsilon(), None);
         let before = [
             inventory(&fx, &stratified, &stratified.temp),
             inventory(&fx, &stratified, &stratified.salt),
         ];
         let (mut worst, mut end) = (0.0f64, [0.0; 2]);
-        run_3d(gpu, &physics, &stratified, steps, |s| {
+        let (_, finest) = run_3d(gpu, &physics, &stratified, steps, levels, |s| {
             end = [inventory(&fx, s, &s.temp), inventory(&fx, s, &s.salt)];
             for (now, was) in end.iter().zip(&before) {
                 let d = ((now - was) / was).abs();
                 worst = if d.is_nan() { d } else { worst.max(d) };
             }
         })?;
-        Ok((worst, ((end[0] - before[0]) / before[0]).abs()))
+        Ok((worst, ((end[0] - before[0]) / before[0]).abs(), finest))
     };
-    let (worst, _) = drift_of(moving)?;
+    let (worst, _, used) = drift_of(moving)?;
+    finest = finest.max(used);
     tally.judge(
         "the inventories of T and S are kept",
         &format!(
@@ -917,7 +1134,7 @@ fn tracers_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
         ),
         worst <= INVENTORY_BAR,
     );
-    let (_, heat) = drift_of(Terms {
+    let (_, heat, _) = drift_of(Terms {
         fluxes: Some(JerlovWater::III),
         ..moving
     })?;
@@ -926,6 +1143,15 @@ fn tracers_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
         &format!("T's inventory changed by {heat:.2e} of itself"),
         heat.is_nan() || heat > INVENTORY_BAR,
     );
+    // On local steps the judges above say nothing of them unless a pass
+    // listed a part of the mesh
+    if levels > 0 {
+        tally.judge(
+            "the steps were local",
+            &format!("the finest level used was {finest} (a time-step ratio of 2^{finest})"),
+            finest > 0,
+        );
+    }
     Ok(())
 }
 
@@ -954,7 +1180,8 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn Error>> {
             ..QUIET
         },
     )?;
-    tracers_3d(gpu, &mut tally)?;
+    tracers_3d(gpu, &mut tally, 0)?;
+    tracers_3d(gpu, &mut tally, 2)?;
     println!(
         "  {} judges, {} mutants: {}",
         tally.judged,

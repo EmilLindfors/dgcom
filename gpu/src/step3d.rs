@@ -305,9 +305,10 @@ fn on_cpu(physics: &Physics, run: Run, start: &Solution3D, dt: f64) -> (Snapshot
     (snapshots, clock.elapsed().as_secs_f64())
 }
 
-/// The same steps on the device, the levels of local 3D steps from its own
-/// state: the snapshots and the time (s, the snapshots' downloads and the
-/// levels' assignment not counted).
+/// The same steps on the device, the levels of local 3D steps from the
+/// device's own element steps with the integrator's work, as a run takes
+/// them (`RunModel3D::element_steps_into`): the snapshots and the time (s,
+/// the snapshots' downloads and the levels' assignment not counted).
 fn on_device(
     gpu: &Arc<Gpu>,
     physics: &Physics,
@@ -315,19 +316,31 @@ fn on_device(
     start: &Solution3D,
     dt: f64,
 ) -> Result<(Snapshots, f64), Box<dyn Error>> {
-    let model = Model3D::new(gpu, physics)?;
+    // The work's `w` stays the start's, as the CPU's state's does
+    let mut model = Model3D::new(gpu, physics)?;
+    model.start_from(start);
     let mut state = State3D::upload(gpu, start)?;
     let mut integrator = run.integrator().on::<Work3D>();
     let mut snapshots = Snapshots::new();
-    // The state on the host; its `w` stays the start's, as the CPU's does
     let mut host = start.clone();
     let (mut time, mut t) = (0.0, 0.0);
     for n in 0..STEPS {
         model.update_density(&mut state);
-        if run.baroclinic_levels > 0 {
-            state.download_into(gpu, &mut host)?;
-        }
-        let dt = run.step(&mut integrator, physics, &host, dt);
+        let dt = if run.baroclinic_levels == 0 {
+            dt
+        } else {
+            let mut element_dt = vec![0.0; physics.mesh.n_elements];
+            let work = integrator.work_for(&model, &mut state);
+            model.element_steps(&state, work, CFL, run.scheme, &mut element_dt);
+            let stencils = ModeSplitPhysics::stage_stencils(physics);
+            integrator.assign_baroclinic_levels(
+                &element_dt,
+                &physics.mesh,
+                &stencils,
+                Some(DT_MAX),
+                None,
+            )
+        };
         let clock = Instant::now();
         integrator.step(&mut state, &model, dt, t);
         gpu.stream.synchronize()?;
@@ -558,7 +571,7 @@ fn same_limits(label: &str, cpu: &TimeStepLimits, device: &TimeStepLimits, print
         let agree = if gate::exact() {
             a.dt.to_bits() == b.dt.to_bits() && a.element == b.element
         } else {
-            a.dt == b.dt || (a.dt - b.dt).abs() <= gate::tolerance() * a.dt.abs().max(b.dt.abs())
+            gate::close(a.dt, b.dt)
         };
         if !agree {
             same = false;
@@ -621,16 +634,13 @@ fn bounds_agree(
                     .zip(&on_device)
                     .filter(|(a, b)| a.to_bits() == b.to_bits())
                     .count();
-                let agree = on_cpu.iter().zip(&on_device).all(|(&a, &b)| {
-                    a.to_bits() == b.to_bits()
-                        || (!gate::exact()
-                            && (a - b).abs() <= gate::tolerance() * a.abs().max(b.abs()))
-                });
-                same &= agree;
+                same &= on_cpu
+                    .iter()
+                    .zip(&on_device)
+                    .all(|(&a, &b)| gate::close(a, b));
             }
             let (a, b) = (cpu.step(explicit, scheme), limits.step(explicit, scheme));
-            same &= a.to_bits() == b.to_bits()
-                || (!gate::exact() && (a - b).abs() <= gate::tolerance() * a.abs().max(b.abs()));
+            same &= gate::close(a, b);
         }
     }
     if print {

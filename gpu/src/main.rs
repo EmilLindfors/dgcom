@@ -149,7 +149,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
         let mut path = None;
         let mut overrides = Vec::new();
         // A case's bar where it is not judged bit for bit: whole runs
-        let mut bar = gate::Bar::within(1e-8);
+        // A day of the 2D channel with contraction: 2.2e-8 of the cross-channel
+        // current's largest value (4.0e-8 on local time steps)
+        let mut bar = gate::Bar::within(1e-7);
         let mut rest = rest.iter();
         while let Some(arg) = rest.next() {
             match arg.as_str() {
@@ -187,7 +189,13 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
             stopped.push(format!("{name}: {e}"));
         }
     }
-    let (held, failed) = gate::summary();
+    let (held, failed, unjudged) = gate::summary();
+    if unjudged > 0 {
+        println!(
+            "({unjudged} mutants under their gate's tolerance were not judged by this build: \
+             the build without multiply–add contraction judges them)"
+        );
+    }
     println!(
         "== {held} fixtures held against the CPU{} ==",
         if failed.is_empty() && stopped.is_empty() {

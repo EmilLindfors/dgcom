@@ -594,7 +594,10 @@ fn time(
 /// `dgcom::math` on the device against the CPU, 1 M pairs over the ranges
 /// the column physics takes and beyond (`x` 1e-8–1e2 on a log scale, `y`
 /// −3–3); with the platform's (`f64::powf` …) for contrast, which the
-/// CPU's column physics took before. Whether every value is the same.
+/// CPU's column physics took before. Whether every value is the same; in a
+/// build with multiply–add contraction, whether each is within
+/// `MATH_TOLERANCE` of the CPU's (the functions are plain arithmetic, which
+/// contraction rounds otherwise).
 fn math_gate(gpu: &Gpu) -> Result<bool, Box<dyn std::error::Error>> {
     let n = 1_000_000;
     let x: Vec<f64> = (0..n)
@@ -607,7 +610,7 @@ fn math_gate(gpu: &Gpu) -> Result<bool, Box<dyn std::error::Error>> {
     let mut same = true;
     println!("dgcom::math, {n} pairs:");
     for (j, name) in ["pow", "exp", "ln", "hypot"].into_iter().enumerate() {
-        let (mut differ, mut platform) = (0, 0);
+        let (mut differ, mut platform, mut worst) = (0, 0, 0.0f64);
         for i in 0..n {
             let (a, b) = (x[i], y[i]);
             let [cpu, std] = match j {
@@ -616,17 +619,34 @@ fn math_gate(gpu: &Gpu) -> Result<bool, Box<dyn std::error::Error>> {
                 2 => [dgcom::math::ln(a), a.ln()],
                 _ => [dgcom::math::hypot(a, b), a.hypot(b)],
             };
-            differ += usize::from(cpu.to_bits() != device[i][j].to_bits());
+            let d = device[i][j];
+            if cpu.to_bits() != d.to_bits() {
+                differ += 1;
+                // Not finite on one side alone: beyond any tolerance
+                let relative = (cpu - d).abs() / cpu.abs().max(f64::MIN_POSITIVE);
+                worst = if relative.is_finite() {
+                    worst.max(relative)
+                } else {
+                    f64::INFINITY
+                };
+            }
             platform += usize::from(cpu.to_bits() != std.to_bits());
         }
+        let holds = differ == 0 || (!gate::exact() && worst <= MATH_TOLERANCE);
         println!(
-            "    {name:<6} device against CPU: {differ} differ (the platform's differs from it in \
-             {platform})"
+            "    {name:<6} device against CPU: {differ} differ, the largest by {worst:.1e} of the \
+             value (the platform's differs from it in {platform}){}",
+            if holds { "" } else { ": NOT held" }
         );
-        same &= differ == 0;
+        same &= holds;
     }
+    println!("    {}", gate::verdict("dgcom::math", same));
     Ok(same)
 }
+
+/// How far a `dgcom::math` function on the device may be from the CPU's, of
+/// the value, where the build contracts multiply–adds.
+const MATH_TOLERANCE: f64 = 1e-13;
 
 pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     println!("== The 3D vertical step: GLS, the implicit diffusion, the drags (Phase 4.4a) ==");
