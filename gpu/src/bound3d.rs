@@ -31,9 +31,11 @@ use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
 use dgcom::boundary::SWEBoundaryCondition2D;
 use dgcom::physics::{
-    ColumnState, GlsMixing, Hydrostatic3D, LinearEOS, TimeStepLimit, TimeStepLimits,
-    element_column_rates, inverse_length, sloping_level_limit, sloping_level_step_unmeasured,
+    ColumnState, GlsMixing, Hydrostatic3D, LinearEOS, PhysicsModule, SWEPhysics2D, TimeStepLimit,
+    TimeStepLimits, element_column_rates, inverse_length, sloping_level_limit,
+    sloping_level_step_unmeasured,
 };
+use dgcom::solver::SWESolution2D;
 use dgcom::solver::rhs::baroclinic::{
     ElementReference, SlopingElement, sloping_level_frequency_of, sloping_level_rate_of,
 };
@@ -42,7 +44,7 @@ use dgcom::solver::rhs::{viscous_dt, viscous_metric};
 use dgcom::time::SspScheme;
 use dgcom::types::ElementIndex;
 
-use crate::baroclinic::{Baroclinic3D, pair_at};
+use crate::baroclinic::{Baroclinic3D, ReferenceFieldsDevice, pair_at};
 use crate::hooks::State3D;
 use crate::swe2d::{Gpu, N1, NN};
 use crate::three_d::{COLUMN_BLOCK, NSUB, Statics3D, launch};
@@ -234,7 +236,8 @@ pub mod kernels_bound {
 
     /// Every element's step on its sloping levels that needs no measured
     /// frequency (`sloping_level_step_unmeasured` of its bound `sloping`,
-    /// against the step `needed` of the others, the scheme's `limit`); the
+    /// against the step `needed` of the others, or the element's own of
+    /// `needed_each` if that is not empty, the scheme's `limit`); the
     /// others listed in `candidates` (`count[0]` of them, zeroed before; the
     /// list's order the atomics', which no result depends on), their steps
     /// left to [`sloping_frequencies`].
@@ -243,6 +246,7 @@ pub mod kernels_bound {
         ne: u32,
         limit: f64,
         needed: f64,
+        needed_each: &[f64],
         min_column_depth: f64,
         eta: &[f64],
         bed: &[f64],
@@ -260,6 +264,11 @@ pub mod kernels_bound {
             let idx = k * NN + i;
             thin |= eta[idx] - bed[idx] < min_column_depth;
         }
+        let needed = if needed_each.is_empty() {
+            needed
+        } else {
+            needed_each[k]
+        };
         match sloping_level_step_unmeasured(sloping[k], thin, limit, needed) {
             // SAFETY: thread k alone writes element k.
             Some(dt) => unsafe { *steps.get_unchecked_mut(k) = dt },
@@ -396,8 +405,12 @@ pub struct Bound3D {
     count: DeviceBuffer<u32>,
     /// The frequencies' scratch (empty without a reference)
     scratch: DeviceBuffer<f64>,
-    /// Coriolis's bound (static)
+    /// Coriolis's bound (static), and every element's
     coriolis: TimeStepLimit,
+    coriolis_each: Vec<f64>,
+    /// Every element's step from its other bounds, which its sloping
+    /// levels' step is weighed against (the element steps)
+    needed: DeviceBuffer<f64>,
     viscosity: ViscosityBound,
     /// The steps on the host
     host: [Vec<f64>; 3],
@@ -418,20 +431,19 @@ impl Bound3D {
         let lengths: Vec<f64> = (0..ne * NN)
             .map(|idx| inverse_length(geom, idx / NN, idx % NN))
             .collect();
-        // `Hydrostatic3D::time_step_limits`' Coriolis bound
-        let coriolis = (0..ne)
+        // `Hydrostatic3D::time_step_limits`' Coriolis bound, element by
+        // element
+        let coriolis_each: Vec<f64> = (0..ne)
             .map(|k| {
                 let f = mesh
                     .element_vertices(ElementIndex::new(k))
                     .iter()
                     .map(|&[_, y]| physics.coriolis.f_at(y).abs())
                     .fold(0.0, f64::max);
-                TimeStepLimit {
-                    dt: 1.0 / f,
-                    element: k,
-                }
+                1.0 / f
             })
-            .fold(TimeStepLimit::NONE, TimeStepLimit::min);
+            .collect();
+        let coriolis = smallest(&coriolis_each);
         let nu = physics.horizontal_viscosity;
         let viscosity = if nu.is_zero() {
             ViscosityBound::Zero
@@ -463,6 +475,8 @@ impl Bound3D {
                 0
             })?,
             coriolis,
+            coriolis_each,
+            needed: zeros(ne)?,
             viscosity,
             host: [vec![0.0; ne], vec![0.0; ne], vec![0.0; ne]],
         })
@@ -485,11 +499,143 @@ impl Bound3D {
         scheme: SspScheme,
     ) -> Result<(TimeStepLimits, usize), Box<dyn std::error::Error>> {
         let gpu = self.gpu.clone();
+        let st = &gpu.stream;
+        self.rates(statics, physics, baroclinic, s, w, cfl)?;
+        let viscosity = self.viscosity_limit(statics, physics, viscosity, s, cfl)?;
+        let [advection_h, vertical_h, _] = &mut self.host;
+        self.advection.copy_to_host(st, advection_h)?;
+        self.vertical.copy_to_host(st, vertical_h)?;
+        let advection = smallest(advection_h);
+        let vertical = smallest(vertical_h);
+        let mut limits = TimeStepLimits {
+            advection,
+            vertical,
+            coriolis: self.coriolis,
+            sloping_levels: TimeStepLimit::NONE,
+            viscosity,
+        };
+        let Some(fields) = baroclinic.fields.as_ref() else {
+            return Ok((limits, 0));
+        };
+        let explicit_vertical = physics.implicit_vertical_advection.is_none();
+        let needed = limits.needed(explicit_vertical, scheme);
+        let measured = self.sloping(statics, physics, fields, s, scheme, needed, false)?;
+        self.steps.copy_to_host(st, &mut self.host[2])?;
+        limits.sloping_levels = smallest(&self.host[2]);
+        Ok((limits, measured))
+    }
+
+    /// `Hydrostatic3D::element_steps_into` of the device state `s` (its `w`
+    /// in `w`) into `out`: every element's step for local time stepping,
+    /// from the device's own rates. The advective bound is the least over
+    /// the element and its face neighbours; then Coriolis's, the vertical
+    /// advection's (at `LOCAL_STEP_IMPLICIT_COURANT` times its explicit
+    /// bound where its excess is implicit), the sloping levels' against the
+    /// element's own step so far, the viscosity's with the face neighbours'
+    /// `ν`: the CPU's arithmetic on the per-element numbers, which come to
+    /// the host (three arrays of `ne`, where the CPU's function took the
+    /// whole state down). How many frequencies were measured.
+    pub fn element_steps<BC>(
+        &mut self,
+        statics: &Statics3D,
+        physics: &Hydrostatic3D<LinearEOS, GlsMixing, BC>,
+        baroclinic: &mut Baroclinic3D,
+        viscosity: &mut Viscosity3D,
+        s: &State3D,
+        w: &DeviceBuffer<f64>,
+        cfl: f64,
+        scheme: SspScheme,
+        out: &mut [f64],
+    ) -> Result<usize, Box<dyn std::error::Error>>
+    where
+        BC: SWEBoundaryCondition2D + Clone + Send + Sync,
+        SWEPhysics2D<BC>: PhysicsModule<SWESolution2D>,
+    {
+        let gpu = self.gpu.clone();
+        let st = &gpu.stream;
+        let mesh = &physics.mesh;
+        let ne = statics.n_elements;
+        assert_eq!(out.len(), ne, "one step per element");
+        self.rates(statics, physics, baroclinic, s, w, cfl)?;
+        let [advection_h, vertical_h, _] = &mut self.host;
+        self.advection.copy_to_host(st, advection_h)?;
+        self.vertical.copy_to_host(st, vertical_h)?;
+        // The vertical advection's Courant number: one where it is
+        // explicit, a few where its excess is implicit
+        let courant = if physics.implicit_vertical_advection.is_none() {
+            1.0
+        } else {
+            Hydrostatic3D::<LinearEOS, GlsMixing, BC>::LOCAL_STEP_IMPLICIT_COURANT
+        };
+        let ssp = scheme.ssp_coefficient();
+        for (k, dt) in out.iter_mut().enumerate() {
+            let bound = (0..4)
+                .filter_map(|face| mesh.neighbor(ElementIndex::new(k), face))
+                .map(|nb| advection_h[nb.element])
+                .fold(advection_h[k], f64::min);
+            *dt = bound
+                .min(self.coriolis_each[k])
+                .min(courant * ssp * vertical_h[k]);
+        }
+        let mut measured = 0;
+        if let Some(fields) = baroclinic.fields.as_ref() {
+            self.needed.copy_from_host(st, out)?;
+            measured = self.sloping(statics, physics, fields, s, scheme, 0.0, true)?;
+            self.steps.copy_to_host(st, &mut self.host[2])?;
+            for (dt, &sloping) in out.iter_mut().zip(&self.host[2]) {
+                *dt = dt.min(sloping);
+            }
+        }
+        // The viscosity's, with the face neighbours' (BR1 couples them in)
+        let order = physics.ops.order;
+        let neighbours_largest = |largest: &[f64], k: usize| {
+            (0..4)
+                .filter_map(|face| mesh.neighbor(ElementIndex::new(k), face))
+                .map(|nb| largest[nb.element])
+                .fold(largest[k], f64::max)
+        };
+        match &mut self.viscosity {
+            ViscosityBound::Zero => {}
+            ViscosityBound::Background(_) => {
+                let nu = physics.horizontal_viscosity.background;
+                for (k, dt) in out.iter_mut().enumerate() {
+                    let metric = viscous_metric(mesh, &physics.ops, &physics.geom, k);
+                    *dt = dt.min(viscous_dt(nu, metric, order, cfl));
+                }
+            }
+            ViscosityBound::Smagorinsky {
+                metric,
+                levels,
+                largest,
+                host,
+            } => {
+                viscosity.largest(statics, &s.eta, &s.u, &s.v, levels, largest)?;
+                largest.copy_to_host(st, host)?;
+                for (k, dt) in out.iter_mut().enumerate() {
+                    let nu = neighbours_largest(host, k);
+                    *dt = dt.min(viscous_dt(nu, metric[k], order, cfl));
+                }
+            }
+        }
+        Ok(measured)
+    }
+
+    /// Every element's advective and vertical steps and its sloping levels'
+    /// bound (`bound_rates`) into this bound's buffers, the reference at
+    /// `s`'s levels first (`baroclinic`'s, as a stage takes it).
+    fn rates<BC: SWEBoundaryCondition2D>(
+        &mut self,
+        statics: &Statics3D,
+        physics: &Hydrostatic3D<LinearEOS, GlsMixing, BC>,
+        baroclinic: &mut Baroclinic3D,
+        s: &State3D,
+        w: &DeviceBuffer<f64>,
+        cfl: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let gpu = self.gpu.clone();
         let (m, st) = (&gpu.module_bound, &gpu.stream);
         let t = statics;
         let (ne, nl) = (t.n_elements, t.n_levels as u32);
-        let buoyancy = physics.g / physics.rho0;
-        let mcd = physics.min_column_depth;
         baroclinic.reference(t, &s.eta, &s.rho)?;
         let none = DeviceBuffer::<f64>::zeroed(st, 0)?;
         let fields = baroclinic.fields.as_ref();
@@ -507,8 +653,8 @@ impl Bound3D {
                 (physics.ops.order as f64 + 1.0).powi(2),
                 physics.g,
                 physics.rho0,
-                buoyancy,
-                mcd,
+                physics.g / physics.rho0,
+                physics.min_column_depth,
                 &s.eta,
                 &s.u,
                 &s.v,
@@ -532,25 +678,33 @@ impl Bound3D {
                 &mut self.sloping,
             )?;
         }
-        let viscosity = self.viscosity_limit(statics, physics, viscosity, s, cfl)?;
-        let [advection_h, vertical_h, steps_h] = &mut self.host;
-        self.advection.copy_to_host(st, advection_h)?;
-        self.vertical.copy_to_host(st, vertical_h)?;
-        let advection = smallest(advection_h);
-        let vertical = smallest(vertical_h);
-        let mut limits = TimeStepLimits {
-            advection,
-            vertical,
-            coriolis: self.coriolis,
-            sloping_levels: TimeStepLimit::NONE,
-            viscosity,
-        };
-        let Some(fields) = fields else {
-            return Ok((limits, 0));
-        };
-        let explicit_vertical = physics.implicit_vertical_advection.is_none();
-        let needed = limits.needed(explicit_vertical, scheme);
+        Ok(())
+    }
+
+    /// Every element's step on its sloping levels into `self.steps`
+    /// (`sloping_steps` of the bounds [`Self::rates`] left, then the
+    /// measured frequencies of the elements that need one), each against
+    /// the step `needed` of the other bounds, or (`each`) against its own in
+    /// `self.needed`; how many frequencies were measured.
+    fn sloping<BC: SWEBoundaryCondition2D>(
+        &mut self,
+        statics: &Statics3D,
+        physics: &Hydrostatic3D<LinearEOS, GlsMixing, BC>,
+        fields: &ReferenceFieldsDevice,
+        s: &State3D,
+        scheme: SspScheme,
+        needed: f64,
+        each: bool,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let gpu = self.gpu.clone();
+        let (m, st) = (&gpu.module_bound, &gpu.stream);
+        let t = statics;
+        let (ne, nl) = (t.n_elements, t.n_levels as u32);
+        let buoyancy = physics.g / physics.rho0;
+        let mcd = physics.min_column_depth;
         let limit = sloping_level_limit(scheme);
+        let none = DeviceBuffer::<f64>::zeroed(st, 0)?;
+        let needed_each = if each { &self.needed } else { &none };
         self.count.copy_from_host(st, &[0])?;
         // SAFETY: as above; `count` is a u32 the atomics alone touch, and
         // `scratch` holds `FREQUENCY_THREADS` threads' (`Self::new`).
@@ -561,6 +715,7 @@ impl Bound3D {
                 ne as u32,
                 limit,
                 needed,
+                needed_each,
                 mcd,
                 &s.eta,
                 &t.bed,
@@ -598,10 +753,7 @@ impl Bound3D {
                 &mut self.steps,
             )?;
         }
-        self.steps.copy_to_host(st, steps_h)?;
-        limits.sloping_levels = smallest(steps_h);
-        let measured = self.count.to_host_vec(st)?[0] as usize;
-        Ok((limits, measured))
+        Ok(self.count.to_host_vec(st)?[0] as usize)
     }
 
     /// The viscosity's limit of `Hydrostatic3D::time_step_limits`: the

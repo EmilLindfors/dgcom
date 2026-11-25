@@ -1183,6 +1183,39 @@ where
         ))
     }
 
+    /// `Hydrostatic3D::element_steps_into` of the device state `s` (its `w`
+    /// the last step's, or the start's) into `out`, on the device
+    /// (`Bound3D::element_steps`); how many elements had their sloping
+    /// levels' frequency measured.
+    pub fn element_steps(
+        &self,
+        s: &State3D,
+        work: &mut Work3D,
+        cfl: f64,
+        scheme: SspScheme,
+        out: &mut [f64],
+    ) -> usize {
+        let Work3D {
+            statics,
+            baroclinic,
+            viscosity,
+            bound,
+            w,
+            ..
+        } = work;
+        cuda(bound.element_steps(
+            statics,
+            self.physics,
+            baroclinic,
+            viscosity,
+            s,
+            w,
+            cfl,
+            scheme,
+            out,
+        ))
+    }
+
     /// The 2D module's negative-depth clips.
     pub fn negative_depth_clips(&self) -> usize {
         self.module.negative_depth_clips()
@@ -2632,8 +2665,9 @@ where
         self.physics.step_of(limits, scheme)
     }
 
-    /// The CPU's of the whole state on the host: the local 3D steps' levels
-    /// need it once a coarse step (Parked: on the device, as the bound).
+    /// Every element's step from the device's own rates
+    /// ([`Model3D::element_steps`]): the local 3D steps' levels need them
+    /// once a coarse step, and no copy of the state.
     fn element_steps_into(
         &self,
         state: &State3D,
@@ -2642,9 +2676,7 @@ where
         out: &mut [f64],
         work: &mut Work3D,
     ) {
-        let mut view = self.view(state, Some(work));
-        self.physics
-            .element_steps_into(view.full(), cfl, scheme, out);
+        self.element_steps(state, work, cfl, scheme, out);
     }
 
     fn stencils(&self) -> Vec<RhsStencil> {

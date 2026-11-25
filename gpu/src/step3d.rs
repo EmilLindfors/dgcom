@@ -588,6 +588,9 @@ fn bounds_agree(
 ) -> Result<(bool, usize), Box<dyn Error>> {
     let mut model = Model3D::new(gpu, device)?;
     let (mut same, mut measured) = (true, 0);
+    // The element steps compared, those with the CPU's bits, and the
+    // frequencies measured for them
+    let mut steps = (0, 0, 0);
     for (n, state) in states.iter().enumerate() {
         // The state's `w` comes with the work (`new_work`: the host's)
         model.start_from(state);
@@ -605,10 +608,37 @@ fn bounds_agree(
                 print,
             );
             let explicit = physics.implicit_vertical_advection.is_none();
+            // The element steps of local time stepping, at both Courant
+            // numbers (the larger has frequencies measured)
+            {
+                let ne = physics.mesh.n_elements;
+                let (mut on_cpu, mut on_device) = (vec![0.0; ne], vec![0.0; ne]);
+                physics.element_steps_into(state, cfl, scheme, &mut on_cpu);
+                steps.2 += model.element_steps(&s, &mut work, cfl, scheme, &mut on_device);
+                steps.0 += ne;
+                steps.1 += on_cpu
+                    .iter()
+                    .zip(&on_device)
+                    .filter(|(a, b)| a.to_bits() == b.to_bits())
+                    .count();
+                let agree = on_cpu.iter().zip(&on_device).all(|(&a, &b)| {
+                    a.to_bits() == b.to_bits()
+                        || (!gate::exact()
+                            && (a - b).abs() <= gate::tolerance() * a.abs().max(b.abs()))
+                });
+                same &= agree;
+            }
             let (a, b) = (cpu.step(explicit, scheme), limits.step(explicit, scheme));
             same &= a.to_bits() == b.to_bits()
                 || (!gate::exact() && (a - b).abs() <= gate::tolerance() * a.abs().max(b.abs()));
         }
+    }
+    if print {
+        println!(
+            "    {label}: the element steps of local time stepping, {} of {} bit-identical ({} \
+             frequencies measured for them)",
+            steps.1, steps.0, steps.2
+        );
     }
     Ok((same, measured))
 }
