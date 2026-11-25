@@ -43,8 +43,15 @@ exe="$gpu_dir/target/release/dgcom-gpu"
 case $(uname -s) in MINGW* | MSYS*) exe+=".exe" ;; esac
 
 # README.md's environment, where the shell has not set it.
-if [[ -z ${CUDA_TOOLKIT_PATH:-} && -d /usr/local/cuda ]]; then
-    export CUDA_TOOLKIT_PATH=/usr/local/cuda
+# CUDA 13 where it lives beside another toolkit (/usr/local/cuda may be an
+# older one that other software builds against), as `cargo oxide doctor` looks.
+if [[ -z ${CUDA_TOOLKIT_PATH:-} ]]; then
+    newest=$({ ls -d /usr/local/cuda-13* 2>/dev/null || true; } | sort -V | tail -1)
+    if [[ -n $newest ]]; then
+        export CUDA_TOOLKIT_PATH=$newest
+    elif [[ -d /usr/local/cuda ]]; then
+        export CUDA_TOOLKIT_PATH=/usr/local/cuda
+    fi
 fi
 if ! command -v nvcc >/dev/null && [[ -n ${CUDA_TOOLKIT_PATH:-} ]]; then
     export PATH="$CUDA_TOOLKIT_PATH/bin:$PATH"
