@@ -283,6 +283,18 @@ impl<'a> Device<'a> {
         })
     }
 
+    /// [`Self::new`] sampled by the general kernel (the CPU's order of
+    /// operations), and whether the steady kernels would have sampled it.
+    fn general(
+        gpu: &Gpu,
+        statics: &Statics3D,
+        nesting: &'a Nesting3D,
+    ) -> Result<(Self, bool), Box<dyn std::error::Error>> {
+        let device = Self::new(gpu, statics, nesting)?;
+        let (parent, steady) = device.parent.general();
+        Ok((Self { parent, ..device }, steady))
+    }
+
     /// The device's columns of `call`.
     fn columns(
         &mut self,
@@ -328,8 +340,20 @@ fn at_slots(snapshots: &Snapshots, nesting: &Nesting3D, listed: &[bool]) -> Snap
         .collect()
 }
 
-/// One parent's gate; whether all is the same to the bit (and, with
-/// `mutants`, every mutant caught).
+/// The steady kernels' bar: the weights applied to the snapshots before the
+/// interpolation in depth, the level spacings' reciprocals tabled, the
+/// stencil's weights' sum inverted once. They differ from dgcom's sampling
+/// by round-off (≤ 1e-15 of a field's largest value measured); the mutants
+/// by ≥ 3e-4.
+const STEADY: Bar = Bar {
+    tolerance: 1e-12,
+    outliers: 0.0,
+    mirrors: false,
+};
+
+/// One parent's gate: the general kernel to the bit, the steady kernels
+/// within their bar; whether both hold (and, with `mutants`, every mutant
+/// is caught).
 fn gate(
     gpu: &Arc<Gpu>,
     label: &str,
@@ -423,16 +447,31 @@ fn gate(
         slots.nodes.len()
     );
     let mut device = Device::new(gpu, &statics, &nest)?;
+    let (mut general, steady) = Device::general(gpu, &statics, &nest)?;
     println!(
         "  the parent on the device: {:.2} MB",
         device.parent.bytes as f64 / 1e6
     );
     let mut same = true;
     let mut cpu_by_call = Vec::new();
+    // The general kernel: dgcom's own sampling at every slot and level
+    gate::set(Bar::MIRRORED);
+    println!("  the general kernel ({}):", gate::how());
     for call in &calls {
         let cpu = cpu_columns(&fx, &nest, call);
-        same &= report(&cpu, &device.columns(gpu, &statics, call)?);
+        same &= report(&cpu, &general.columns(gpu, &statics, call)?);
         cpu_by_call.push(cpu);
+    }
+    // The steady kernels, which sample these parents in a run: the same
+    // sampling in another order of sums
+    if !steady {
+        println!("  the steady kernels do NOT sample this parent");
+        same = false;
+    }
+    gate::set(STEADY);
+    println!("  the steady kernels ({}):", gate::how());
+    for (call, cpu) in calls.iter().zip(&cpu_by_call) {
+        same &= report(cpu, &device.columns(gpu, &statics, call)?);
     }
     if mutants {
         let cpu_first = &cpu_by_call[0];

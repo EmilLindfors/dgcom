@@ -140,6 +140,12 @@ pub fn tolerance() -> f64 {
     state().bar.tolerance
 }
 
+/// How the gate that runs judges, in words (a part of a gate with a bar of
+/// its own prints it).
+pub fn how() -> String {
+    describe()
+}
+
 fn describe() -> String {
     if exact() {
         "judged bit for bit: no multiply–add contraction, kernels in the CPU's order".into()
