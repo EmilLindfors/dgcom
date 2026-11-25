@@ -143,7 +143,7 @@ impl CaseFile {
         // the mean: held, its bottom water ran down the deep holes' walls
         if let Some(mean) = mean.clone() {
             columns = parent_columns(Some(DeepReference {
-                profile: Arc::new(move |depth| mean.at(-depth)),
+                profile: mean.clone(),
                 decay: DEEP_DECAY,
             }));
             sample_columns(

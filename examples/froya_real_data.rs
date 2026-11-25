@@ -3973,7 +3973,7 @@ fn tidal_run_3d<'a>(
     // mean profile: held, its bottom water ran down the deep holes' walls
     if let Some(mean) = mean.clone().filter(|_| !dbg("held")) {
         columns = parent_columns(Some(DeepReference {
-            profile: Arc::new(move |d| mean.at(-d)),
+            profile: mean.clone(),
             decay: DEEP_DECAY,
         }));
         sample(&columns, &mut state, &mut covered);

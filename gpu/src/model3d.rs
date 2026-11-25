@@ -37,11 +37,13 @@
 //! columns). The forcing a trait object evaluates on the host is evaluated
 //! there at the CPU's times and uploaded: a surface stress field, the
 //! rivers' tracers, the surface heat and fresh-water fluxes (over the sea
-//! surface gathered from the device, 4.5h), and a nesting band's columns
-//! (`Nesting3D::columns` on the band's nodes, gathered from the device, its
-//! cache the CPU's; a fixed parent's once, 4.5g). The viscosity once per
-//! step keeps the step start's tendency on the device and adds it at every
-//! stage (4.5j; global steps only, as on the CPU). Not yet on the device:
+//! surface gathered from the device, 4.5h). A nesting band's parent model
+//! is sampled on the device ([`Parent3D`], 4.5k), a fixed parent evaluated
+//! once (4.5g), any other parent on the host (`Nesting3D::columns` on the
+//! band's nodes, gathered from the device, its cache the CPU's). The
+//! viscosity once per step keeps the step start's tendency on the device and
+//! adds it at every stage (4.5j; global steps only, as on the CPU). Not yet
+//! on the device:
 //! the conservative momentum form, the constant-depth pressure gradient;
 //! [`Model3D::new`] refuses them by name.
 //!
@@ -87,6 +89,7 @@ use crate::hooks::{
 };
 use crate::limiter::{Limiter3D, VertexPatches};
 use crate::listed::{ListId, Lists, On, listed_index};
+use crate::parent::Parent3D;
 use crate::pass::{BarotropicPass3D, DevicePass, LocalPass3D};
 use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, NN, level_of};
 use crate::three_d::{
@@ -648,14 +651,18 @@ impl Levels3D {
     }
 }
 
-/// A nesting band on the device: its slots' columns gathered from a state,
-/// the parent's evaluated on the host by the physics' own `Nesting3D`
-/// (`columns`, whose cache by time and `η` is then the CPU's), uploaded to
-/// the band's relaxation ([`Band3D`]) and the open faces' exterior values.
-/// A fixed parent (`DeviceParent3D::Fixed`) is evaluated once.
+/// A nesting band on the device: the parent's columns at its slots, for the
+/// band's relaxation ([`Band3D`]) and the open faces' exterior values. A
+/// parent model (`DeviceParent3D::Model`) is sampled on the device
+/// ([`Parent3D`], 4.5k); a fixed parent (`DeviceParent3D::Fixed`) is
+/// evaluated once; any other parent on the host, by the physics' own
+/// `Nesting3D` (`columns`, whose cache by time and `η` is then the CPU's)
+/// over the slots' columns gathered from a state, and uploaded.
 struct Nest3D {
     band: Band3D,
     supplied: Supplied,
+    /// The parent model sampled on the device, if it is one
+    model: Option<Parent3D>,
     /// Whether the parent is fixed, and its columns are set
     fixed: bool,
     set: bool,
@@ -672,16 +679,40 @@ struct Nest3D {
 }
 
 impl Nest3D {
-    fn new(gpu: &Gpu, s: &Statics3D, nesting: &Nesting3D, n_nodes: usize) -> Self {
+    fn new(
+        gpu: &Gpu,
+        s: &Statics3D,
+        nesting: &Nesting3D,
+        n_nodes: usize,
+        min_column_depth: f64,
+    ) -> Self {
         let slots = nesting.slots();
         let st = &gpu.stream;
         let nodes: Vec<u32> = slots.nodes.iter().map(|&n| n as u32).collect();
         let (n, nl) = (nodes.len(), s.n_levels);
         let zeros = |n: usize| cuda(DeviceBuffer::<f64>::zeroed(st, n).map_err(Into::into));
+        let model = match nesting.device_form() {
+            Some(DeviceParent3D::Model(model)) => Some(cuda(Parent3D::new(
+                gpu,
+                s,
+                nesting,
+                model,
+                min_column_depth,
+            ))),
+            _ => None,
+        };
+        // A model's columns are the device's: the exterior values from the
+        // start (a field not supplied is never read)
+        let exterior = model.as_ref().map(|_| {
+            let zeros = vec![0.0; n * nl];
+            let field = nesting.exterior_field(&zeros);
+            std::array::from_fn(|_| cuda(ExteriorDevice::new(gpu, s, &field)))
+        });
         Self {
             band: cuda(Band3D::new(gpu, s, slots)),
             supplied: slots.supplied,
-            fixed: nesting.device_form() == Some(DeviceParent3D::Fixed),
+            model,
+            fixed: nesting.device_form().is_some_and(|f| f.is_fixed()),
             set: false,
             nodes: cuda(DeviceBuffer::from_host(st, &nodes).map_err(Into::into)),
             gathered: [
@@ -699,7 +730,7 @@ impl Nest3D {
                 vec![0.0; n * nl],
             ],
             state: Solution3D::new(s.n_elements, n_nodes, nl),
-            exterior: None,
+            exterior,
         }
     }
 
@@ -723,6 +754,21 @@ impl Nest3D {
         }
         self.set = true;
         let nesting = physics.nesting.as_ref().expect("a nested model");
+        if let Some(parent) = self.model.as_mut() {
+            let Some(DeviceParent3D::Model(model)) = nesting.device_form() else {
+                unreachable!("the parent model's device form");
+            };
+            cuda(parent.evaluate(gpu, s, model, values, time, elements, &mut self.band));
+            let exterior = self.exterior.as_mut().expect("a model's exterior values");
+            for (to, from) in exterior.iter_mut().zip(&self.band.values) {
+                cuda(
+                    to.values
+                        .copy_from_device_async(from, &gpu.stream)
+                        .map_err(Into::into),
+                );
+            }
+            return;
+        }
         let (st, nl) = (&gpu.stream, s.n_levels);
         let n = self.host[0].len();
         if n > 0 {
@@ -1459,7 +1505,7 @@ where
             nest: p
                 .nesting
                 .as_ref()
-                .map(|nesting| Nest3D::new(gpu, &statics, nesting, NN)),
+                .map(|nesting| Nest3D::new(gpu, &statics, nesting, NN, p.min_column_depth)),
             // The start's (its bound reads it before the first step)
             w: up(&self.host_copy().state.w),
             bound,
