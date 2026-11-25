@@ -893,7 +893,7 @@ C3: Chiloé 3D on the 3090; F3: Frøya 3D on the 4060; C2: Chiloé 2D. Gains are
 
 | | what | evidence | gain | cost | risk |
 |---|---|---|---|---|---|
-| R1 | Local 3D steps whose passes cost what they list: the pre-passes over the listed elements and the neighbours their faces read | 43 % of C3's kernel time is pre-passes, 12 of 16 passes list 1–5 % of the elements | C3 on local steps −26 % modelled (258 → ≈ 190 s per model hour; with 5 levels and the 120 s cap ≈ 160); F3 little (its passes list 87 %) | a day: ten kernels take a list, a halo list per pass | low: the same bits, the local-steps gates stay bit for bit |
+| R1 | Local 3D steps whose passes cost what they list: the pre-passes over the listed elements and the neighbours their faces read | 43 % of C3's kernel time is pre-passes, 12 of 16 passes list 1–5 % of the elements | **done (below): C3 on local steps −27 to −33 % measured** (217 → 160 s per model hour; with 5 levels and the 120 s cap 209 → 141); F3 −6 % | a day: ten kernels take a list, a halo list per pass | low: the same bits, the local-steps gates stay bit for bit |
 | R2 | The element steps from the device's own rates (`Bound3D`), the levels kept while their inputs hold | 0.62–0.86 s of a 4.3–7.2 s coarse step; 1.4 GB down each | **the steps done (below): C3 on local steps −10 to −16 % measured**; the levels kept: not built | half a day | low: dgcom's own functions on the device |
 | R3 | The parent's band in the steady order | 22.7 ms a stage, 17.5–19.7 % of F3 | **done (below): F3 −17 % measured on global steps** | half a day | low: a gate of its own within 1e-12 |
 | R4 | The horizontal pair kernels on P2's tensor product: `D` with its exact zeros (27 + 27 half-terms for 162), the face jump lifted into its face node alone, the pair metrics tabled, one launch for the four advected fields; `pressure_gradient` and `reference_edges` on 18 pairs | 28 % of a C3 global step, each at the card's FP64 rate | −12 % of the 3D stages modelled (C3 −7 %, F3 −4 %) | two days | medium: the bits change (4.4e-16 of D), tolerance gates and the judges hold it; goes to the CPU too (P2.2's "≈ 3× fewer pairs") |
@@ -933,9 +933,26 @@ Each on its own branch, stacked on `feat/gpu-judges` in this order. Timings are 
 - **Left of R2.** The levels are still found every coarse step. In Frøya's new profile the frequencies' measurement (`sloping_frequencies`, 31 ms a coarse step) is 3.5 % of the kernel time on local steps: keep an element's level while its rates stay inside its level's band, or measure every few steps.
 - The two runs of an A/B on local steps part within hours by more than round-off (the smallest element step at 2 h: 86.4 against 88.7 s): a level or a limiter decided by a threshold turns a last digit into a different step for an element. The checks above compare the two functions on the same state.
 
+### R1: a pass of local 3D steps computes its pre-passes for the elements it lists (`perf/gpu-lts-lists`)
+
+- **What.** A pass of local 3D steps advances the elements of its level, but ran the stage's pre-passes over every element (4.5d restricted the heavy right-hand-side kernels only): 43 % of the kernel time of Chiloé's 3 levels, where 12 of a coarse step's 16 passes list 1–5 % of the elements. A list now carries its halo, the listed elements and those that share a face or a vertex with one (`listed::neighbours_of`, `On::halo`), and ten kernels take a list: over the halo (a face reads both sides) the reference at the levels (`reference_fields`), `displacements`, `column_pressures`, `layer_nodal` and `viscosity_layer_gradients`; over the listed elements `layer_faces`, `layer_divergence`, `layer_omega`, `split_omega` and `set_sums`. The other elements' rows keep what an earlier pass left, which no pass reads.
+- **The same bits.** `step3d`'s local fixtures (two and three levels, four coarse steps, 939,606 values a step) are the CPU's bit for bit in the build without contraction, on the RTX 4060 and the RTX 3090; `dgcom-gpu all` exit 0 on the 4060 (`--no-fmad`, 69 fixtures, 442 s).
+- **Measured, Chiloé 3D on the RTX 3090**, hour 3 → 3.25 under the tide (A is the branch below):
+
+  | stepping | `origin/main` | R2 | R1 | per model hour | device peak |
+  |---|---|---|---|---|---|
+  | 3 levels, 60 s cap | 64.6, 64.8 s | 54.3, 54.4 | 39.9, 39.9 | 258 → 217 → **160 s** | 21,054 → 21,095 MiB |
+  | 5 levels, 120 s cap | 57.9, 57.9 | 52.1, 52.2 | 35.2, 35.2 | 232 → 209 → **141 s** | 21,054 → 21,135 MiB |
+  | global | 73.7, 74.1 | 73.4, 73.8 | 73.4, 73.7 | 295 → 294 s | 13,671 MiB |
+
+- **Measured, Frøya on the RTX 4060**, 2 h, 3 levels and the 240 s cap: 36.7, 36.5 → 34.5, 34.6 s, **18.3 → 17.3 s per model hour (−6 %)**; the 3D stages 19.0 → 17.1 s; global steps 49.7 against 49.7 s.
+- **Chiloé's 5 levels now** (`DG_PROFILE`, 8 coarse steps of 112.5 s in 35.2 s): the barotropic pass 14.9 s (59 s per model hour), the 3D stages 14.1 s (56), the vertical step 1.2 s, the step bound and element steps 1.5 s, the wait for the queue at the blow-up check 1.0 s. In Nsight Systems' trace of the 3 levels (6 coarse steps, 14.9 s of kernels, the device busy 97.0 %): the pass's kernels 38 % (`pass_stage_lts` 9.5 %, `subcell_terms` 8.7, `element_rhs_volume` 7.6, `edge_fluxes_hll` 5.9, `element_rhs_subcells` 4.0), `advect_horizontal` 6.7, `advect_vertical` 6.2, `kuzmin_limit` 6.0, `pressure_gradient` 4.5, `reference_edges` 4.2; the ten listed pre-passes 2.5 s of 14.9 (they were 8.8 of 20.3).
+- **Still on every element in a pass**: `kuzmin_means` (1.3 %), `kuzmin_centres` (0.5), `to_inventory` (0.5), `viscosity_columns` (0.5); and `displacements` twice a stage (2.6 %, half of it to save). Parked.
+
 ## Out of TODO.md
 
 ### Parked
+- **P2.7** The kernels a pass of local 3D steps still runs on every element: `kuzmin_means`, `kuzmin_centres`, `to_inventory`, `viscosity_columns` (`gpu/src/limiter.rs`, `viscosity.rs`, `three_d.rs`): 2.8 % of the kernel time of Chiloé's 3 levels on the RTX 3090 after R1 (2026-11-25). Each takes a list as R1's ten did (the limiter's means over the halo: its patch reads the vertex neighbours').
 - **P2.7** (2026-11-25) The verdict on every line below, the new lines and their ranking are in "Assessment (2026-11-25)" above; a line stays here until it is done or dropped there.
 - **P2.7** A 3D convergence judge on the device: dgcom's `tracer_advection_converges_on_distorted_elements` (a smooth tracer carried by a uniform current over a flat bed through a doubly periodic distorted mesh, N + 1) needs a flat periodic fixture, a passive tracer (`LinearEOS` with no expansion) and no drag under `Model3D`. The judges have rest (the beach, the seamount), constancy and conservation in 3D, not an order.
 - **P2.7** Four mutants move values by round-off's size and are caught bit for bit only (`stage3d`'s band parent 10 min later, `implicit3d`'s thin depth halved, `forcing3d`'s momentum upwind in the vertical, the bound's `w` at rest): each needs a stronger form (an hour later; a fixture whose thin columns carry flow; a sheared column) before its gate's kernels leave the CPU's order, where no build would catch it.
