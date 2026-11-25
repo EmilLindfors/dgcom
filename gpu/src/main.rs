@@ -187,7 +187,13 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
             stopped.push(format!("{name}: {e}"));
         }
     }
-    let (held, failed) = gate::summary();
+    let (held, failed, unjudged) = gate::summary();
+    if unjudged > 0 {
+        println!(
+            "({unjudged} mutants under their gate's tolerance were not judged by this build: \
+             the build without multiply–add contraction judges them)"
+        );
+    }
     println!(
         "== {held} fixtures held against the CPU{} ==",
         if failed.is_empty() && stopped.is_empty() {

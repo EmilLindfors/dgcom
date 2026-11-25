@@ -174,9 +174,7 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
     );
     let exact = gate::exact();
     let tolerance = gate::tolerance();
-    let close = |a: f64, b: f64| {
-        a.to_bits() == b.to_bits() || (!exact && (a - b).abs() <= tolerance * a.abs().max(b.abs()))
-    };
+    let close = gate::close;
     let same_volume = close(cpu.volume_m3.1, gpu.volume_m3.1);
     println!(
         "  volume at the end {:.9e} and {:.9e} m³: {}",
@@ -316,13 +314,25 @@ fn compare_station(a: &StationSeries, b: &StationSeries) -> (usize, usize, f64, 
     let (mut identical, mut n, mut worst, mut worst_rel) = (0, 0, 0.0f64, 0.0f64);
     for (x, y) in fields(a).iter().zip(&fields(b)) {
         n += x.len().max(y.len());
-        let scale = x.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        // Records missing on one side are beyond any tolerance
+        if x.len() != y.len() {
+            (worst, worst_rel) = (f64::INFINITY, f64::INFINITY);
+        }
+        let scale = x
+            .iter()
+            .filter(|v| v.is_finite())
+            .fold(0.0f64, |m, v| m.max(v.abs()));
         for (&p, &q) in x.iter().zip(y) {
             if p.to_bits() == q.to_bits() {
                 identical += 1;
                 continue;
             }
-            let difference = (p - q).abs();
+            // ... and a value not finite on one side alone
+            let difference = if p.is_finite() && q.is_finite() {
+                (p - q).abs()
+            } else {
+                f64::INFINITY
+            };
             worst = worst.max(difference);
             worst_rel = worst_rel.max(difference / scale.max(f64::MIN_POSITIVE));
         }

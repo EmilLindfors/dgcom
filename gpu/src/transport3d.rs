@@ -1032,6 +1032,9 @@ pub(crate) struct Agreement {
     /// (`gate::tolerance`) of the field's largest value, or not finite on
     /// one side alone
     pub(crate) beyond: usize,
+    /// The values not finite on one side alone, or differently not finite:
+    /// no share of outliers covers them
+    pub(crate) wild: usize,
     first_difference: Option<usize>,
 }
 
@@ -1039,7 +1042,7 @@ impl Agreement {
     /// Whether the running gate holds this field (`gate::holds`): its bits,
     /// or within its tolerance.
     pub(crate) fn holds(&self) -> bool {
-        gate::holds(self.identical, self.beyond, self.len)
+        self.wild == 0 && gate::holds(self.identical, self.beyond, self.len)
     }
 
     /// Whether the running gate fails this field of a mutant.
@@ -1050,13 +1053,19 @@ impl Agreement {
 
 pub(crate) fn agreement(cpu: &[f64], gpu: &[f64]) -> Agreement {
     assert_eq!(cpu.len(), gpu.len(), "the field's length");
-    let scale = cpu.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    // The field's largest finite value (an infinity would make every
+    // difference small)
+    let scale = cpu
+        .iter()
+        .filter(|x| x.is_finite())
+        .fold(0.0f64, |m, x| m.max(x.abs()));
     let mut a = Agreement {
         identical: 0,
         len: cpu.len(),
         worst_ulps: 0,
         worst_rel: 0.0,
         beyond: 0,
+        wild: 0,
         first_difference: None,
     };
     let allowed = gate::tolerance() * scale;
@@ -1069,8 +1078,12 @@ pub(crate) fn agreement(cpu: &[f64], gpu: &[f64]) -> Agreement {
         a.worst_ulps = a.worst_ulps.max(ulps(c, g));
         let difference = (c - g).abs();
         a.worst_rel = a.worst_rel.max(difference / scale.max(f64::MIN_POSITIVE));
-        // A NaN or an infinity on one side alone is beyond any tolerance
-        if difference.is_nan() || difference > allowed {
+        // A NaN or an infinity on one side alone is beyond any tolerance,
+        // and no outlier
+        if !c.is_finite() || !g.is_finite() {
+            a.wild += 1;
+            a.beyond += 1;
+        } else if difference > allowed {
             a.beyond += 1;
         }
     }

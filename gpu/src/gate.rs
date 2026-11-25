@@ -72,6 +72,9 @@ struct State {
     /// The gates' verdicts so far
     held: usize,
     failed: Vec<String>,
+    /// Mutants whose effect was under the tolerance: this build did not
+    /// judge them
+    unjudged: usize,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -80,6 +83,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     bar: Bar::MIRRORED,
     held: 0,
     failed: Vec::new(),
+    unjudged: 0,
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -209,10 +213,23 @@ pub fn verdict(label: &str, same: bool) -> String {
     }
 }
 
-/// The gates' verdicts: how many fixtures held, and the failures.
-pub fn summary() -> (usize, Vec<String>) {
+/// The gates' verdicts: how many fixtures held, the failures, and how many
+/// mutants this build did not judge ([`mutant`]).
+pub fn summary() -> (usize, Vec<String>, usize) {
     let s = state();
-    (s.held, s.failed.clone())
+    (s.held, s.failed.clone(), s.unjudged)
+}
+
+/// Whether two numbers agree for the gate that runs: their bits, or, where
+/// it judges by a tolerance, both finite and within it of the larger. An
+/// infinity or a NaN on one side alone never agrees (no bound against a
+/// bound, a blown-up value against a number).
+pub fn close(a: f64, b: f64) -> bool {
+    a.to_bits() == b.to_bits()
+        || (!exact()
+            && a.is_finite()
+            && b.is_finite()
+            && (a - b).abs() <= tolerance() * a.abs().max(b.abs()))
 }
 
 /// The share of a field's values the running gate lets be farther than its
@@ -224,17 +241,22 @@ pub fn outliers() -> f64 {
 /// A mutant's verdict: `beyond` is whether the running gate fails it (a
 /// field it does not hold), `differs` whether any value differs at all.
 /// Bit for bit, any difference catches it. Within a tolerance, a mutant
-/// whose effect is under the tolerance is not caught; where the kernels
-/// still mirror the CPU that is no failure of this build (the build without
-/// contraction catches it by its bits, and says so here), where they have
-/// left the CPU's order it is one: the mutant must be made to show.
+/// whose effect is under the tolerance is not caught. Where the kernels
+/// still mirror the CPU, this build then does not judge that mutant and
+/// says so (its differences from the CPU are the contraction's as much as
+/// the mutant's): the build without contraction judges it, by its bits. The
+/// summary counts those. Where the kernels have left the CPU's order no
+/// build judges it by its bits, so it is a failure: the mutant must be made
+/// to show.
 pub fn mutant(beyond: bool, differs: bool) -> (bool, &'static str) {
     if beyond {
         (true, ", caught")
     } else if !exact() && differs && state().bar.mirrors {
+        state().unjudged += 1;
         (
             true,
-            ": under the tolerance (caught bit for bit, in a build without contraction)",
+            ": under the tolerance, not judged by this build (the build without contraction \
+             judges it, by its bits)",
         )
     } else {
         (false, ": NOT CAUGHT")
@@ -251,10 +273,9 @@ pub fn counts_hold(cpu: &[f64], device: &[f64]) -> bool {
         .all(|(c, g)| c.to_bits() == g.to_bits());
     identical
         || (!exact()
-            && cpu
-                .iter()
-                .zip(device)
-                .all(|(c, g)| (c - g).abs() <= 0.05 * c.abs().max(1.0)))
+            && cpu.iter().zip(device).all(|(c, g)| {
+                c.is_finite() && g.is_finite() && (c - g).abs() <= 0.05 * c.abs().max(1.0)
+            }))
 }
 
 /// Within a tolerance, the fields the running gate judges: those whose name
