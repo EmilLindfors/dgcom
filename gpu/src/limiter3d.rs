@@ -259,10 +259,7 @@ fn gate(
             same &= report_mutant(what, cpu, &device);
         }
     }
-    println!(
-        "  {}",
-        gate::verdict(label, same)
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -401,10 +398,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
         10,
     )?;
     if !failed.is_empty() {
-        println!(
-            "(failed: {})",
-            failed.join("; ")
-        );
+        println!("(failed: {})", failed.join("; "));
     }
     Ok(())
 }

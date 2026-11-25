@@ -29,8 +29,8 @@ use dgcom::solver::rhs::{
 use dgcom::solver::state::Solution3D;
 use dgcom::source::CoriolisSource2D;
 
-use crate::gate::{self, Bar};
 use crate::baroclinic::Baroclinic3D;
+use crate::gate::{self, Bar};
 use crate::listed::On;
 use crate::swe2d::{Gpu, NN, ORDER};
 use crate::three_d::Statics3D;
@@ -476,10 +476,7 @@ fn gate(gpu: &Arc<Gpu>, case: Case) -> Result<bool, Box<dyn std::error::Error>> 
             a.len
         );
     }
-    println!(
-        "  {}",
-        gate::verdict(case.label, same)
-    );
+    println!("  {}", gate::verdict(case.label, same));
     Ok(same)
 }
 
@@ -762,10 +759,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
         10,
     )?;
     if !failed.is_empty() {
-        println!(
-            "(failed: {})",
-            failed.join("; ")
-        );
+        println!("(failed: {})", failed.join("; "));
     }
     Ok(())
 }

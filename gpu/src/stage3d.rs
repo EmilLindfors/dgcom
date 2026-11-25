@@ -586,7 +586,11 @@ pub(crate) fn report(cpu: &Snapshots, device: &Snapshots) -> bool {
                 println!(
                     "    {name:<22} {fields} fields, {identical} of {len} bit-identical, the \
                      others within {worst:.1e} of their field's largest{}",
-                    if gate::judges(name) { "" } else { " (not judged)" }
+                    if gate::judges(name) {
+                        ""
+                    } else {
+                        " (not judged)"
+                    }
                 );
             }
         }
@@ -825,10 +829,7 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
             Mutations::default(),
         )?,
     );
-    println!(
-        "  {}",
-        gate::verdict(label, same)
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -1100,10 +1101,7 @@ fn band_gate(
             &run(&hooks, &upload(slots, &later)?)?,
         );
     }
-    println!(
-        "  {}",
-        gate::verdict(label, same)
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -1169,10 +1167,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
         10,
     )?;
     if !failed.is_empty() {
-        println!(
-            "(failed: {})",
-            failed.join("; ")
-        );
+        println!("(failed: {})", failed.join("; "));
     }
     Ok(())
 }

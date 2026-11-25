@@ -111,11 +111,6 @@ pub fn probe(gpu: &Gpu) -> Result<bool, Box<dyn Error>> {
     Ok(fused)
 }
 
-/// Whether the build contracts multiply–adds (true until [`probe`] has run).
-pub fn fused() -> bool {
-    state().fused.unwrap_or(true)
-}
-
 /// Starts gate `name` with its `bar`; prints how it judges.
 pub fn start(name: &'static str, bar: Bar) {
     let mut s = state();
@@ -206,14 +201,6 @@ pub fn verdict(label: &str, same: bool) -> String {
             format!("NOT within {:.0e}", s.bar.tolerance)
         }
     }
-}
-
-/// Records a failure that is not a comparison's (a count, a run that
-/// stopped).
-pub fn fail(what: &str) {
-    let mut s = state();
-    let name = s.name;
-    s.failed.push(format!("{name}: {what}"));
 }
 
 /// The gates' verdicts: how many fixtures held, and the failures.

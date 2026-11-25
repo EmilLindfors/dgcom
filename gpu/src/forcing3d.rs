@@ -26,8 +26,8 @@ use dgcom::source::{CageDrag2D, CoriolisSource2D, NetCage};
 use dgcom::time::ModeSplitPhysics;
 use dgcom::vertical::SigmaGrid;
 
-use crate::gate::{self, Bar};
 use crate::forcing::{ForcingSetup, SlowForcing3D};
+use crate::gate::{self, Bar};
 use crate::hooks::State3D;
 use crate::stage3d::{Snapshots, report, report_mutant, start_state};
 use crate::swe2d::{Gpu, NN, ORDER};
@@ -331,10 +331,7 @@ fn gate(
             same &= report_mutant(what, &cpu, &on_device(gpu, &fx, &state, &rhs, run)?);
         }
     }
-    println!(
-        "  {}",
-        gate::verdict(label, same)
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -430,10 +427,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
         3,
     )?;
     if !failed.is_empty() {
-        println!(
-            "(failed: {})",
-            failed.join("; ")
-        );
+        println!("(failed: {})", failed.join("; "));
     }
     Ok(())
 }

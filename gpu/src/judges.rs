@@ -73,7 +73,10 @@ impl Tally {
     /// A judge's line: `measured` against its bar, and whether it holds.
     pub(crate) fn judge(&mut self, name: &str, measured: &str, pass: bool) {
         self.judged += 1;
-        println!("  {name}: {measured}: {}", if pass { "ok" } else { "FAILED" });
+        println!(
+            "  {name}: {measured}: {}",
+            if pass { "ok" } else { "FAILED" }
+        );
         if !pass {
             self.failed.push(name.to_string());
         }
@@ -261,10 +264,13 @@ impl Vortex {
 
     /// The depth's L2 error (rms over the square, m) of `state` on `case`.
     fn error(&self, case: &Case, state: &SWESolution2D) -> f64 {
-        state.l2_error_depth(&case.mesh, &case.ops, &case.geom, |x, y| self.depth(x, y))
-            / self.side
+        state.l2_error_depth(&case.mesh, &case.ops, &case.geom, |x, y| self.depth(x, y)) / self.side
     }
 }
+
+/// The vortex's errors on a sequence of meshes, the orders between them and
+/// the runs' steps.
+type Orders = (Vec<f64>, Vec<f64>, Vec<usize>);
 
 /// The vortex's errors on `resolutions` after `t_end`, on the device as
 /// `device` changes it, and the orders between them.
@@ -274,7 +280,7 @@ fn vortex_orders(
     device: impl Fn(&Case) -> Device2D,
     resolutions: &[usize],
     t_end: f64,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<usize>), Box<dyn Error>> {
+) -> Result<Orders, Box<dyn Error>> {
     let vortex = Vortex::HERE;
     let mut errors = Vec::new();
     let mut steps = Vec::new();
@@ -336,8 +342,13 @@ fn convergence(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> 
         ("EntropyStable", Formulation::EntropyStable),
         ("WetDry, fully wet", wet_dry),
     ] {
-        let (errors, orders, steps) =
-            vortex_orders(gpu, formulation, |_| Device2D::default(), &resolutions, t_end)?;
+        let (errors, orders, steps) = vortex_orders(
+            gpu,
+            formulation,
+            |_| Device2D::default(),
+            &resolutions,
+            t_end,
+        )?;
         let cpu = vortex_orders_cpu(formulation, &resolutions, t_end);
         tally.judge(
             name,
@@ -483,7 +494,7 @@ fn lake_at_rest(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>>
     let shore = (0..case.mesh.n_elements)
         .filter(|&k| {
             let h = &case.q.data[0][k * NN..(k + 1) * NN];
-            h.iter().any(|&h| h == 0.0) && h.iter().any(|&h| h > 0.0)
+            h.contains(&0.0) && h.iter().any(|&h| h > 0.0)
         })
         .count();
     println!(
@@ -600,7 +611,7 @@ fn mass_and_positivity(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn 
                         "{} steps, {} clips, the smallest depth {least:.2e} m",
                         run.steps, run.clips
                     ),
-                    run.clips > 0 || !(least >= 0.0),
+                    run.clips > 0 || least.is_nan() || least < 0.0,
                 )
             }
             Err(e) => (format!("the run stopped ({e})"), true),
@@ -761,7 +772,7 @@ fn rest_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
     tally.mutant(
         "no reference on the device: the pressure gradient of the whole density",
         &format!("the largest layer speed {speed:.2e} m/s"),
-        !(speed <= REST_3D_BAR),
+        speed.is_nan() || speed > REST_3D_BAR,
     );
     Ok(())
 }
@@ -868,7 +879,7 @@ fn tracers_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
     tally.mutant(
         "the rivers' water 1e-3 °C warmer",
         &format!("the largest drift {drift:.2e}"),
-        !(drift <= CONSTANCY_BAR),
+        drift.is_nan() || drift > CONSTANCY_BAR,
     );
     // The inventories of the stratified water, nothing entering
     let mut stratified = start_state(&fx);
@@ -906,7 +917,7 @@ fn tracers_3d(gpu: &Arc<Gpu>, tally: &mut Tally) -> Result<(), Box<dyn Error>> {
     tally.mutant(
         "the surface heat flux on",
         &format!("T's inventory changed by {heat:.2e} of itself"),
-        !(heat <= INVENTORY_BAR),
+        heat.is_nan() || heat > INVENTORY_BAR,
     );
     Ok(())
 }

@@ -271,8 +271,7 @@ fn gate(gpu: &Arc<Gpu>, nest: &Nest, levels: usize) -> Result<bool, Box<dyn Erro
         n_el * NN,
         cpu_kernel()
     );
-    let same =
-        cpu_result.n_steps == gpu_result.n_steps && holds(identical, n_el * NN, worst_rel);
+    let same = cpu_result.n_steps == gpu_result.n_steps && holds(identical, n_el * NN, worst_rel);
     println!("  {}", gate::verdict(nest.label, same));
     Ok(same)
 }

@@ -649,6 +649,7 @@ impl Device {
 /// `others` are the mutants of a changed 2D module, `finds` those of the
 /// merged cells' search. Whether all are the same to the bit (and every
 /// mutant caught).
+#[allow(clippy::too_many_arguments)]
 fn gate<BC: SWEBoundaryCondition2D + Sync>(
     gpu: &Arc<Gpu>,
     label: &str,
@@ -774,10 +775,7 @@ fn gate<BC: SWEBoundaryCondition2D + Sync>(
             same &= report_mutant(what, &cpu, &on_device(gpu, other, case, base)?);
         }
     }
-    println!(
-        "  {}",
-        gate::verdict(label, same)
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -996,7 +994,16 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     for (label, run, mutants) in beach_runs {
         println!("{label}: {} P{ORDER} elements", fx.n_elements());
         let case = beach_case(&fx, true);
-        if !gate(gpu, label, &physics, &case, run, mutants, &[], &FIND_MUTANTS)? {
+        if !gate(
+            gpu,
+            label,
+            &physics,
+            &case,
+            run,
+            mutants,
+            &[],
+            &FIND_MUTANTS,
+        )? {
             failed.push(label);
         }
     }
@@ -1031,7 +1038,16 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
             "{label}: {} P{ORDER} elements, the band's level relaxed",
             domain.mesh.n_elements
         );
-        if !gate(gpu, label, &physics, &case, run, true, &others, &FIND_MUTANTS[..4])? {
+        if !gate(
+            gpu,
+            label,
+            &physics,
+            &case,
+            run,
+            true,
+            &others,
+            &FIND_MUTANTS[..4],
+        )? {
             failed.push(label);
         }
     }
@@ -1046,10 +1062,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     time(gpu, &large, Run::global(SspScheme::Rk3), 3)?;
     time(gpu, &large, Run::CASE_RUNNER, 3)?;
     if !failed.is_empty() {
-        println!(
-            "(failed: {})",
-            failed.join("; ")
-        );
+        println!("(failed: {})", failed.join("; "));
     }
     Ok(())
 }

@@ -317,7 +317,7 @@ pub fn agreement(cpu: &SWESolution2D, gpu: &SWESolution2D) -> (usize, u64, f64) 
 pub(crate) fn holds(identical: usize, nodes: usize, worst_rel: f64) -> bool {
     gate::holds(
         identical,
-        usize::from(!(worst_rel <= gate::tolerance())),
+        usize::from(worst_rel.is_nan() || worst_rel > gate::tolerance()),
         nodes,
     )
 }

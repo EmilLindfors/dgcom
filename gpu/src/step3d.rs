@@ -35,8 +35,8 @@ use dgcom::solver::state::Solution3D;
 use dgcom::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
 use dgcom::time::{ModeSplitIntegrator, ModeSplitPhysics, SplitModel, SplitWork, SspScheme};
 
-use crate::gate::{self, Bar};
 use crate::forcing3d::{cages, coriolis, wind};
+use crate::gate::{self, Bar};
 use crate::hooks::State3D;
 use crate::model3d::{Model3D, Work3D};
 use crate::pass3d::{beach_physics, beach_rivers};
@@ -558,8 +558,7 @@ fn same_limits(label: &str, cpu: &TimeStepLimits, device: &TimeStepLimits, print
         let agree = if gate::exact() {
             a.dt.to_bits() == b.dt.to_bits() && a.element == b.element
         } else {
-            a.dt == b.dt
-                || (a.dt - b.dt).abs() <= gate::tolerance() * a.dt.abs().max(b.dt.abs())
+            a.dt == b.dt || (a.dt - b.dt).abs() <= gate::tolerance() * a.dt.abs().max(b.dt.abs())
         };
         if !agree {
             same = false;

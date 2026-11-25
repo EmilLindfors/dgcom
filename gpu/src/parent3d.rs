@@ -472,10 +472,7 @@ fn gate(
             &at_slots(&fresh, &nest, &listed),
         );
     }
-    println!(
-        "  {}",
-        gate::verdict(label, same)
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 

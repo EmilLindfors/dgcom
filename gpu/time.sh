@@ -8,13 +8,15 @@
 #   SIZES="800x80 1600x160 3200x320" gpu/time.sh
 #   FORCE=1 gpu/time.sh                          # time on a busy GPU anyway
 #
-# 1. The gates, built with --no-fmad, against the SIMD batch: the RHS and
-#    Simulation runs and the nested runs (`all`), the drying beach (`beach`) and
-#    cases/tidal_channel through the case runner (`case`), also with local
-#    time stepping (`case_lts`), forced by a tidal atlas (`case_atlas`) and
-#    in 3D (`case_3d`: 25 h, its snapshot too).
-#    On any card each must be the CPU's bit for bit.
-# 2. The timing, built with FMA: the refined tidal channel at each size, on
+# 1. The gates, built with --no-fmad, against the SIMD batch: every gate's
+#    fixtures and mutants and the device's own judges (`all`), the drying
+#    beach (`beach`) and cases/tidal_channel through the case runner (`case`),
+#    also with local time stepping (`case_lts`), forced by a tidal atlas
+#    (`case_atlas`) and in 3D (`case_3d`: 25 h, its snapshot too). On any card
+#    each must hold: bit for bit where the kernels mirror the CPU, within its
+#    tolerance where they have left its order (src/gate.rs).
+# 2. The same gates with the FMA build, the one that runs, each within its
+#    tolerance; then the timing: the refined tidal channel at each size, on
 #    the CPU and on the GPU, REPEATS times; and the 3D transport, momentum
 #    terms, stage hooks, vertical step and implicit vertical advection
 #    (`transport3d`, `momentum3d`, `stage3d`, `limiter3d`, `vertical3d`,

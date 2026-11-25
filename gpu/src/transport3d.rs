@@ -50,8 +50,8 @@ use dgcom::source::{
 use dgcom::types::ElementIndex;
 use dgcom::vertical::{ROMSVstretching4, SigmaGrid};
 
-use crate::gate::{self, Bar};
 use crate::baroclinic::{Baroclinic3D, BaroclinicSetup};
+use crate::gate::{self, Bar};
 use crate::listed::On;
 use crate::phase0::{DX, Lcg, quad_mesh, ulps};
 use crate::swe2d::{Gpu, N1, NN, ORDER};
@@ -1068,11 +1068,9 @@ pub(crate) fn agreement(cpu: &[f64], gpu: &[f64]) -> Agreement {
         a.first_difference.get_or_insert(n);
         a.worst_ulps = a.worst_ulps.max(ulps(c, g));
         let difference = (c - g).abs();
-        a.worst_rel = a
-            .worst_rel
-            .max(difference / scale.max(f64::MIN_POSITIVE));
+        a.worst_rel = a.worst_rel.max(difference / scale.max(f64::MIN_POSITIVE));
         // A NaN or an infinity on one side alone is beyond any tolerance
-        if !(difference <= allowed) {
+        if difference.is_nan() || difference > allowed {
             a.beyond += 1;
         }
     }
@@ -1381,10 +1379,7 @@ fn gate(gpu: &Arc<Gpu>, label: &str, shape: Shape) -> Result<bool, Box<dyn std::
         differ(1),
         ne * NN * LEVELS
     );
-    println!(
-        "  {}",
-        gate::verdict(label, same)
-    );
+    println!("  {}", gate::verdict(label, same));
     Ok(same)
 }
 
@@ -1569,10 +1564,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
         10,
     )?;
     if !failed.is_empty() {
-        println!(
-            "(failed: {})",
-            failed.join("; ")
-        );
+        println!("(failed: {})", failed.join("; "));
     }
     Ok(())
 }

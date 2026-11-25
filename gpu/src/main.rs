@@ -171,16 +171,20 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
     }
     if which != "all" && !GATES.iter().any(|&(name, ..)| name == which) {
         let names: Vec<&str> = GATES.iter().map(|&(name, ..)| name).collect();
-        return Err(format!("no gate {which:?}: all, case or one of {}", names.join(", ")).into());
+        return Err(format!(
+            "no gate {which:?}: all, case or one of {}",
+            names.join(", ")
+        )
+        .into());
     }
     // Every gate asked for runs, whatever the others find
     let mut stopped = Vec::new();
     for (name, run, in_all) in GATES {
-        if which == name || (which == "all" && in_all) {
-            if let Err(e) = run(&gpu) {
-                println!("{name}: {e}");
-                stopped.push(format!("{name}: {e}"));
-            }
+        if (which == name || (which == "all" && in_all))
+            && let Err(e) = run(&gpu)
+        {
+            println!("{name}: {e}");
+            stopped.push(format!("{name}: {e}"));
         }
     }
     let (held, failed) = gate::summary();

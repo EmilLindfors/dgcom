@@ -45,8 +45,8 @@ use dgcom::source::{
 use dgcom::time::{ModelClock, Multirate, SSPRK43};
 use dgcom::types::ElementIndex;
 
-use crate::nest::{Domain, Nest};
 use crate::gate::{self, Bar};
+use crate::nest::{Domain, Nest};
 use crate::phase0::{agreement, cpu_kernel, holds};
 use crate::swe2d::{DeviceState, Gpu, GpuSWE2D, NN};
 

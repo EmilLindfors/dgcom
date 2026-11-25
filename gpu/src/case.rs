@@ -294,7 +294,7 @@ fn compare_snapshots(a: &Path, b: &Path) -> Result<(usize, usize, f64), Box<dyn 
                 }
                 let difference = (f64::from(p) - f64::from(q)).abs();
                 worst = worst.max(difference / scale.max(f64::MIN_POSITIVE));
-                if !(difference <= tolerance * scale) {
+                if difference.is_nan() || difference > tolerance * scale {
                     beyond += 1;
                 }
             }
