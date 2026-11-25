@@ -6,6 +6,8 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **GPU: a pass of local 3D steps computes its pre-passes for the elements it lists (P2.7, `notes/gpu.md`).** The stage's pre-passes (the reference at the levels, the displacements, the columns' pressures, the layer transports and Ω, the viscosity's layer gradients, the implicit split) ran over every element in every pass; they now run over the pass's elements, or those and their neighbours where a face reads both sides (`listed::neighbours_of`, `On::halo`). The same bits (`dgcom-gpu step3d`). Chiloé 3D on the RTX 3090: 217 → 160 s per model hour on 3 levels, 209 → 141 on 5 levels with a 120 s cap (295 on global steps).
+
 - **GPU: the element steps of local 3D steps from the device's own rates (P2.7, `notes/gpu.md`).** A device run on local 3D steps took the whole state to the host once a coarse step for dgcom's `element_steps_into`; `Bound3D::element_steps` computes them on the device from the step bound's rates, the CPU's bit for bit (`dgcom-gpu step3d`). Chiloé 3D on the RTX 3090 on 3 levels: 258 → 217 s per model hour.
 
 - **GPU: the nesting band's parent columns sampled in another order (P2.7, `notes/gpu.md`).** Where a parent point's valid levels do not change in time, the device weighs the parent's snapshots once per value and walks each parent point's levels once for all of a node's levels (`parent_moments`, `parent_columns_steady`); a point whose levels come and go keeps dgcom's snapshot-by-snapshot walk. The first GPU kernels that leave the CPU's order: within 6e-16 of a field's largest value of the general kernel, which stays the CPU's bit for bit (`dgcom-gpu parent3d`). Frøya's nested 3D run on the RTX 4060, global steps: 30.0 → 24.9 s per model hour.

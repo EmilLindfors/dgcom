@@ -205,6 +205,7 @@ pub mod kernels_viscosity {
     pub fn viscosity_layer_gradients(
         nl: u32,
         n: u32,
+        listed: &[u32],
         background: f64,
         depth: &[f64],
         mean: &[[f64; 2]],
@@ -225,6 +226,8 @@ pub mod kernels_viscosity {
             return;
         }
         let nl = nl as usize;
+        // (of the elements `listed`; empty: of every element)
+        let t = listed_index(t, listed, nl);
         let (k, l) = (t / nl, t % nl);
         let shear = |idx: usize| {
             if depth[idx] == 0.0 {
@@ -622,7 +625,10 @@ impl Viscosity3D {
         let (m, st) = (&gpu.module_viscosity, &gpu.stream);
         let s = statics;
         let nl = s.n_levels as u32;
-        let n = s.n_elements * s.n_levels;
+        // The gradients of the listed elements and their neighbours (the
+        // diffusion's faces read both sides' fluxes)
+        let halo = on.halo();
+        let n = halo.count(s.n_elements) * s.n_levels;
         let n_listed = on.count(s.n_elements) * s.n_levels;
         // SAFETY: as in `means`; `rhs_u`, `rhs_v` are none of the inputs.
         unsafe {
@@ -631,6 +637,7 @@ impl Viscosity3D {
                 launch(n, LEVEL_BLOCK),
                 nl,
                 n as u32,
+                halo.listed(&self.none_u32),
                 self.viscosity.background,
                 &self.depth,
                 &self.mean,

@@ -318,7 +318,7 @@ fn gate(gpu: &Arc<Gpu>, case: Case) -> Result<bool, Box<dyn std::error::Error>> 
     }
     if fx.profile.is_some() && thin > 0 {
         // No depth-mean force along the subcell interfaces
-        baroclinic.pressures(&statics, &device.eta, &device.rho)?;
+        baroclinic.pressures(&statics, &device.eta, &device.rho, On::ALL)?;
         baroclinic.sub_mean = DeviceBuffer::zeroed(&gpu.stream, ne * crate::three_d::NSUB)?;
         baroclinic.gradient(
             &statics,

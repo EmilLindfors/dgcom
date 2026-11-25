@@ -155,6 +155,7 @@ pub mod kernels_baroclinic {
     pub fn reference_fields(
         nl: u32,
         n_columns: u32,
+        listed: &[u32],
         heights: &[f64],
         temp: &[f64],
         salt: &[f64],
@@ -184,6 +185,8 @@ pub mod kernels_baroclinic {
             return;
         }
         let nl = nl as usize;
+        // (of the elements `listed`; empty: of every element)
+        let idx = listed_index(idx, listed, NN);
         // SAFETY: thread idx alone writes column idx (idx < n_columns, nl
         // levels each).
         unsafe {
@@ -244,6 +247,7 @@ pub mod kernels_baroclinic {
     pub fn displacements(
         nl: u32,
         n_elements: u32,
+        listed: &[u32],
         min_column_depth: f64,
         eta: &[f64],
         bed: &[f64],
@@ -260,6 +264,8 @@ pub mod kernels_baroclinic {
             return;
         }
         let nl = nl as usize;
+        // (of the elements `listed`; empty: of every element)
+        let k = listed_index(k, listed, 1);
         let (nodes, block) = (k * NN..(k + 1) * NN, k * NN * nl..(k + 1) * NN * nl);
         let kappa = element_displacement(
             &eta[nodes.clone()],
@@ -289,6 +295,7 @@ pub mod kernels_baroclinic {
     pub fn column_pressures(
         nl: u32,
         n_columns: u32,
+        listed: &[u32],
         rho_ref: f64,
         eta: &[f64],
         bed: &[f64],
@@ -305,6 +312,8 @@ pub mod kernels_baroclinic {
             return;
         }
         let nl = nl as usize;
+        // (of the elements `listed`; empty: of every element)
+        let idx = listed_index(idx, listed, NN);
         let column = idx * nl..(idx + 1) * nl;
         let reference = if density.is_empty() {
             None
@@ -1085,14 +1094,29 @@ impl Baroclinic3D {
         eta: &DeviceBuffer<f64>,
         rho: &DeviceBuffer<f64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.reference_on(statics, eta, rho, On::ALL)
+    }
+
+    /// [`Self::reference`] at the columns of the elements of `on` (a pass's
+    /// elements with their neighbours, whose columns its faces read); the
+    /// others keep what they were last filled with.
+    pub fn reference_on(
+        &mut self,
+        statics: &Statics3D,
+        eta: &DeviceBuffer<f64>,
+        rho: &DeviceBuffer<f64>,
+        on: On<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (Some(profile), Some(fields)) = (&self.profile, &mut self.fields) else {
             return Ok(());
         };
+        let listed = on.listed(&self.none_u32);
+        let n_listed = on.count(statics.n_elements);
         let gpu = &self.gpu;
         let (m, st) = (&gpu.module_baroclinic, &gpu.stream);
         let s = statics;
         let nl = s.n_levels as u32;
-        let n_columns = s.n_columns();
+        let n_columns = n_listed * NN;
         let ReferenceFieldsDevice {
             tracers: [temp, salt],
             gradients: [gradient_t, gradient_s],
@@ -1111,6 +1135,7 @@ impl Baroclinic3D {
                 launch(n_columns, COLUMN_BLOCK),
                 nl,
                 n_columns as u32,
+                listed,
                 &profile.heights,
                 &profile.temp,
                 &profile.salt,
@@ -1137,9 +1162,10 @@ impl Baroclinic3D {
             )?;
             m.displacements(
                 st,
-                launch(s.n_elements, COLUMN_BLOCK),
+                launch(n_listed, COLUMN_BLOCK),
                 nl,
-                s.n_elements as u32,
+                n_listed as u32,
+                listed,
                 self.min_column_depth,
                 eta,
                 &s.bed,
@@ -1171,7 +1197,7 @@ impl Baroclinic3D {
         rhs_v: &mut DeviceBuffer<f64>,
         on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.pressures(statics, eta, rho)?;
+        self.pressures(statics, eta, rho, on.halo())?;
         self.gradient(statics, eta, rho, u, v, rhs_u, rhs_v, on)
     }
 
@@ -1191,12 +1217,14 @@ impl Baroclinic3D {
         statics: &Statics3D,
         eta: &DeviceBuffer<f64>,
         rho: &DeviceBuffer<f64>,
+        on: On<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let gpu = self.gpu.clone();
         let (m, st) = (&gpu.module_baroclinic, &gpu.stream);
         let s = statics;
         let nl = s.n_levels as u32;
-        let n_columns = s.n_columns();
+        // The columns of `on`'s elements (a pass's with their neighbours)
+        let n_columns = on.count(s.n_elements) * NN;
         let referenced = self.fields.is_some();
         let (density, stratification, displacement) = match &self.fields {
             Some(f) => (&f.density, &f.stratification, &f.displacement),
@@ -1209,6 +1237,7 @@ impl Baroclinic3D {
                 launch(n_columns, COLUMN_BLOCK),
                 nl,
                 n_columns as u32,
+                on.listed(&self.none_u32),
                 self.rho0,
                 eta,
                 &s.bed,

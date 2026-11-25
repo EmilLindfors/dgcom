@@ -1545,6 +1545,7 @@ impl BarotropicPass3D {
                 launch(ne, LEVEL_BLOCK),
                 1,
                 ne as u32,
+                &self.none_u32,
                 &self.kinds,
                 &s.averaged,
                 &s.contra,
