@@ -243,13 +243,23 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
         if exact {
             all_same &= differ == 0;
         } else if differ > 0 {
-            let (beyond, values, worst) = compare_snapshots(&cpu_snapshot, &gpu_snapshot)?;
-            let allowed = gate::outliers() * values as f64;
-            all_same &= beyond as f64 <= allowed;
-            println!(
-                "  snapshot {name}: {beyond} of {values} values beyond the tolerance (at most \
-                 {allowed:.0} may be), the largest difference {worst:.1e} of its field's largest"
-            );
+            // Field by field over the frames: each may have its own share
+            // farther than the tolerance, none another's
+            for field in compare_snapshots(&cpu_snapshot, &gpu_snapshot)? {
+                let allowed = gate::outliers() * field.values as f64;
+                let holds = field.beyond as f64 <= allowed;
+                all_same &= holds;
+                println!(
+                    "  snapshot {name}, {}: {} of {} values beyond the tolerance (at most \
+                     {allowed:.0} may be), the largest difference {:.1e} of its field's \
+                     largest{}",
+                    field.name,
+                    field.beyond,
+                    field.values,
+                    field.worst,
+                    if holds { "" } else { ": NOT held" }
+                );
+            }
         }
     }
     let verdict = gate::verdict(&path.display().to_string(), all_same);
@@ -261,15 +271,43 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Two snapshot files of the same run, frame by frame and field by field:
-/// how many values differ by more than the running gate's tolerance of their
-/// field's largest value in the frame, of how many, and the largest such
-/// difference.
-fn compare_snapshots(a: &Path, b: &Path) -> Result<(usize, usize, f64), Box<dyn Error>> {
+/// A snapshot field's agreement over a run's frames.
+struct FieldDifference {
+    name: String,
+    /// Values farther than the gate's tolerance of the field's largest value
+    /// in their frame (or not finite on one side alone)
+    beyond: usize,
+    values: usize,
+    /// The largest difference over the field's largest value in its frame
+    worst: f64,
+}
+
+/// Two snapshot files of the same run, frame by frame, per field over the
+/// frames: how many values differ by more than the running gate's tolerance
+/// of their field's largest value in the frame, of how many, and the largest
+/// such difference.
+fn compare_snapshots(a: &Path, b: &Path) -> Result<Vec<FieldDifference>, Box<dyn Error>> {
     let mut a = dgcom::io::SnapshotReader::open(a)?;
     let mut b = dgcom::io::SnapshotReader::open(b)?;
     let tolerance = gate::tolerance();
-    let (mut beyond, mut values, mut worst) = (0, 0, 0.0f64);
+    let header = a.header();
+    let mut out: Vec<FieldDifference> = ["η", "depth-mean u", "depth-mean v"]
+        .into_iter()
+        .map(String::from)
+        .chain(header.surface.iter().map(|s| format!("surface {s}")))
+        .chain(
+            header
+                .levels
+                .iter()
+                .flat_map(|levels| levels.fields.iter().cloned()),
+        )
+        .map(|name| FieldDifference {
+            name,
+            beyond: 0,
+            values: 0,
+            worst: 0.0,
+        })
+        .collect();
     let frames = a.n_frames()?;
     if frames != b.n_frames()? {
         return Err("the snapshots hold different numbers of frames".into());
@@ -283,22 +321,34 @@ fn compare_snapshots(a: &Path, b: &Path) -> Result<(usize, usize, f64), Box<dyn 
                 .chain(f.layers.iter().cloned())
                 .collect()
         };
-        for (x, y) in fields(&fa).iter().zip(&fields(&fb)) {
-            let scale = x.iter().fold(0.0f64, |m, v| m.max(f64::from(v.abs())));
+        let (xs, ys) = (fields(&fa), fields(&fb));
+        if xs.len() != out.len() || ys.len() != out.len() {
+            return Err("the snapshots hold other fields than their header names".into());
+        }
+        for ((x, y), field) in xs.iter().zip(&ys).zip(&mut out) {
+            let scale = x
+                .iter()
+                .filter(|v| v.is_finite())
+                .fold(0.0f64, |m, v| m.max(f64::from(v.abs())));
             for (&p, &q) in x.iter().zip(y) {
-                values += 1;
+                field.values += 1;
                 if p.to_bits() == q.to_bits() {
                     continue;
                 }
                 let difference = (f64::from(p) - f64::from(q)).abs();
-                worst = worst.max(difference / scale.max(f64::MIN_POSITIVE));
-                if difference.is_nan() || difference > tolerance * scale {
-                    beyond += 1;
+                if !difference.is_finite() {
+                    field.beyond += 1;
+                    field.worst = f64::INFINITY;
+                    continue;
+                }
+                field.worst = field.worst.max(difference / scale.max(f64::MIN_POSITIVE));
+                if difference > tolerance * scale {
+                    field.beyond += 1;
                 }
             }
         }
     }
-    Ok((beyond, values, worst))
+    Ok(out)
 }
 
 /// Of two stations' records: how many values are bit-identical, of how

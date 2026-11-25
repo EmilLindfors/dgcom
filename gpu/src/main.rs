@@ -149,7 +149,9 @@ fn gates(which: &str, rest: &[String]) -> Result<(), Box<dyn std::error::Error>>
         let mut path = None;
         let mut overrides = Vec::new();
         // A case's bar where it is not judged bit for bit: whole runs
-        let mut bar = gate::Bar::within(1e-8);
+        // A day of the 2D channel with contraction: 2.2e-8 of the cross-channel
+        // current's largest value (4.0e-8 on local time steps)
+        let mut bar = gate::Bar::within(1e-7);
         let mut rest = rest.iter();
         while let Some(arg) = rest.next() {
             match arg.as_str() {

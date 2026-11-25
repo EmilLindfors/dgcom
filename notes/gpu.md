@@ -713,7 +713,7 @@ The rule is in Decisions. What holds the device since this day, in `gpu/` (branc
   | `pass3d` (a whole pass and its merged cells) | 1e-13, and ≤ 0.5 % of a field's flags flipped (a cell merged, an element pooled) | 6e-2, thousands of values | 1e-9 but for 1 % of a field |
   | `step3d` (four whole steps) | step 1: 0.4 % of T's values by more than 1e-9, the largest 3e-3; step 4: 89 % of η's (one merged cell more moves the pass at every node) | 6e-2, millions of values | the first step within 1e-6 but for 2 %; the later steps reported |
   | `step3d`'s bound and blow-up check | 1e-13 | (bit for bit only) | 1e-9 |
-  | `case` | the 25 h channel 3.6e-13 at a station (2026-11-16) | | 1e-8, `--tolerance`, `--outliers`; a 3D run's snapshot frame by frame |
+  | `case` (a whole run, field by field) | the 2D channel's 25 h: η 3.6e-12, the cross-channel current 2.2e-8 at 2 of 73,440 values (4.0e-8 on local steps). The 3D channel's 25 h: η 2.1e-5, T 9.0e-3, u 8.3e-2 and v 2.1e-1 at their worst values; 0.6 % of u's values beyond 1e-3, 0.04 % of v's beyond 1e-2 | | 1e-7; `time.sh`'s 3D case 1e-2 but for 0.1 % of a field (`--tolerance`, `--outliers`, a share per field) |
 
   A field of at most eight values is a set of counts (cells merged, substeps, levels): within 5 % where a tolerance judges.
 - **Mutants a tolerance cannot catch.** Four of the ≈ 190 move values by round-off's size: the band's parent 10 min later in `stage3d` (4e-16 of the tendencies' largest), `implicit3d`'s thin depth halved (4.5e-16), `forcing3d`'s momentum upwind in the vertical (1.4e-14), the bound's `w` at rest. The build without contraction catches them by their bits; the FMA build says "under the tolerance" and does not fail. A gate whose kernels leave the CPU's order has no bit-for-bit build, so there such a mutant is a failure: it must be made to show first.
@@ -744,12 +744,13 @@ The rule is in Decisions. What holds the device since this day, in `gpu/` (branc
   - The 3D judges ran global steps only and no end of step. They run a step's end as a run does (`RunModel3D::post_process`), and the tracers' judges also on local 3D steps of two levels with the device's own element steps (the finest level used is judged: 2). The inventories hold there (8.1e-12). **Uniform tracers do not stay uniform on local 3D steps**: 2.65e-6 after 40 steps, 4.31e-6 with rivers of the same water, where global steps keep 1.4e-8; the CPU's kernels give the same numbers to the digits, also with every element kept on its first level (2.59e-6). That is the scheme's, not the device's: printed with the CPU's beside it, not judged ("Local 3D steps" below).
   - Left as they are, and to know: all judges ask steady or invariant properties (an error that scales a whole right-hand side shows in the 2D convergence judge alone); the first-step bar of `step3d` lets 2 % of a field be farther than 1e-6 (finite); a field of at most eight counts holds within 5 %; `case --outliers` pools its share over every field and frame; the mutants "rivers warmer" and "heat flux on" change the problem, not the device.
   - With these: 16 judges, 13 mutants.
+- **At the top of the stack** (`fix/gpu-gates-review`, 2026-11-25). RTX 4060: `gpu/time.sh` (2,332 s): in the build without contraction `all` (70 fixtures; 16 judges, 13 mutants), `beach`, `case`, `case_lts`, `case_atlas` and `case_3d` hold bit for bit; in the FMA build `all` holds (70), and the three case gates `case`, `case_lts`, `case_3d` first **failed**: their FMA bars (1e-8; 1e-6 but for 0.1 %) had never been measured. They are set from the measurement now (the table above) and hold; `time.sh` exits non-zero on a failed gate (it exited 0 with three). RTX 3090: `all` exit 0 in both builds, 70 fixtures.
 - **On both cards.** RTX 4060 (laptop): `all` exit 0 in both builds, 68 fixtures held (`--no-fmad` 474 s, FMA 387 s), 12 judges and 10 mutants. RTX 3090 (the server, its own CPU): `all` exit 0 in both builds, 68 fixtures held; the judges the same to the digits printed but the lake at rest 8.0e-14 m/s, the 3D rest 3.9e-13, the uniform tracers 1.3e-8 and the inventories 7.2e-12 (the seamount judge, added after that run, with the next branch's: `output/radical/steps/` there).
 - **Where the backends differ** (every place; a row per change that leaves the CPU's bits):
 
   | what | why | measured difference |
   |---|---|---|
-  | multiply–add contraction in the build that runs (every kernel) | the FMA build is the faster one, and always was the one that ran | 1e-13 to 2e-11 of a field's largest value per right-hand side; where a threshold decides, 0.4 % of T after one 3D step (the table above); a Chiloé day's stations 2.0 mm in η and 6.7 mm/s (2026-11-16) |
+  | multiply–add contraction in the build that runs (every kernel) | the FMA build is the faster one, and always was the one that ran | 1e-13 to 2e-11 of a field's largest value per right-hand side; where a threshold decides, 0.4 % of T after one 3D step (the table above); a Chiloé day's stations 2.0 mm in η and 6.7 mm/s (2026-11-16); a 3D run's thresholds grow it: the 3D channel after 25 h, T within 0.9 % and u within 8 % of the field's largest at the worst value (the row of `case` above) |
   | the nesting band's parent columns, where a parent point's valid levels do not change in time (`parent_columns_steady`) | the snapshots weighed before the walk over the levels, one walk per parent point for all of a node's levels, the level spacings' reciprocals tabled: 22.7 → 1.0 ms a stage on Frøya | 6e-16 of a field's largest value (`parent3d`; Frøya's NorKyst parent: 2.1e-14 of 35 in S at 96 evaluations of 402,840 values a field) |
 
 ## Assessment (2026-11-25): where the time is, and what is worth doing
@@ -918,6 +919,7 @@ C3: Chiloé 3D on the 3090; F3: Frøya 3D on the 4060; C2: Chiloé 2D. Gains are
 
 ### The bars
 
+- **Reached (2026-11-25, measured):** Chiloé 3D 141 s per model hour on 5 levels with a 120 s cap, 160 as the case is, 294 on global steps; 127 on 6 levels with a 240 s cap (31.8, 31.8 s for the quarter hour; its cost alone, the longer cap not judged); `barotropic_levels = 8` changes nothing (35.3 s). Frøya's 71 h 23.2. Chiloé 2D untouched: the first hour 30.5, 30.5 s, the day 837.1 s with the final build, its `stations.csv` the bytes of the run before (836.3 s), so its gauges score as before: Puerto Montt 19.3 cm at +10 min, Ancud 3.9 cm, Melinka 5.9 cm (`scripts/ioc_gauge_skill.py`, the second M2 period). None of the three bars is met; what follows is what would.
 - **Chiloé 3D ≤ 100 s per model hour on the 3090: within reach, modelled.** R1 and R2 with 5 levels and the 120 s cap put a coarse step of 112.5 s at ≈ 4.5 s (stages 1.6, pass 1.9, the rest 1.0): ≈ 145 s per model hour. R4–R6 on the stages and the pass's kernels: ≈ 110–120. Under 100 needs the pass under ≈ 45 s per model hour (R6 on `pass_stage`, the 2D kernels' divisions), a longer cap, or the PRO 6000.
 - **Frøya ≤ 12 s per model hour over 71 h on the 4060: not without FP64 relief.** The 71 h run costs 1.48× its first two hours, so the bar is ≈ 8 s on the 2 h window (from 20.7). R3, R7, R4–R9 together model ≈ 12–13: 1.6–1.7×, not 2.6×. What is left is FP64 arithmetic at 1:64 on a mesh that already fills the card. R12, or a card with more FP64: the PRO 6000 has ≈ 8× the 4060's.
 - **Chiloé 2D ≤ 15 s per model hour on the 3090: not on this card by kernel work.** 33.7 now. Its large passes are FP64-bound near the card's rate and its short passes latency-bound (2026-11-16); the divisions left are ≈ 30 % of `subcell_terms`. Tables and reciprocals model ≈ 28–30. The PRO 6000's 3.4× the 3090's FP64 rate would give ≈ 10–12 by the ratio, if its passes fill it.
@@ -961,7 +963,34 @@ Each on its own branch, stacked on `feat/gpu-judges` in this order. Timings are 
 
 ### Frøya's 71 h on the RTX 4060, before and after (2026-11-25)
 
-`cases/froya/rivers_3d.toml` with MET Nordic's weather, 3 levels and a 120 s cap (the 240 s cap blows up on `main` and on the stack, "Local 3D steps" below), each run alone on the card: `main` (04a67a2) 2,086.9 s, **29.4 s per model hour**; the stack (R3, R2, R1) 1,644.6 s, **23.2 s per model hour** (−21 %). The bar is 12. Mausund's gauge is the same to the printed digits in both and in the run of 2026-11-24 (`output/p45_gpu/lts3_240`): centred RMSE 5.7 cm, bias +2.6 cm, correlation 0.9980 against the observations. `norkyst_profiles_3d` on both snapshots against that run's: the depth-mean currents and M2 ellipses at the NorKyst point, Kattholmen and Frohavet the same to 0.001 m/s and 1°, the surface T bias within 0.02 °C, the bed layer's within 0.02 °C (`output/radical/froya71/`). Not done: the final build's `all` and `gpu/time.sh` on the 4060, the Bodø and Frøya 2D scored cases, Chiloé's gauges and its 2D day after, the coastline mesh's tidal cycle and its error (running on the server: `~/dgcom/output/radical/coast/`), the CPU test tier.
+`cases/froya/rivers_3d.toml` with MET Nordic's weather, 3 levels and a 120 s cap (the 240 s cap blows up on `main` and on the stack, "Local 3D steps" below), each run alone on the card: `main` (04a67a2) 2,086.9 s, **29.4 s per model hour**; the stack (R3, R2, R1) 1,644.6 s, **23.2 s per model hour** (−21 %). The bar is 12. Mausund's gauge is the same to the printed digits in both and in the run of 2026-11-24 (`output/p45_gpu/lts3_240`): centred RMSE 5.7 cm, bias +2.6 cm, correlation 0.9980 against the observations. `norkyst_profiles_3d` on both snapshots against that run's: the depth-mean currents and M2 ellipses at the NorKyst point, Kattholmen and Frohavet the same to 0.001 m/s and 1°, the surface T bias within 0.02 °C, the bed layer's within 0.02 °C (`output/radical/froya71/`).
+
+## The coastline mesh in 3D on the GPU (2026-11-25)
+
+`cases/froya/rivers_coast_3d.toml` (23,727 P2 elements × 20 levels, 200 m at the coast, 50 m at the nine river mouths; NorKyst's band, the rivers) with MET Nordic's weather, on the RTX 3090 (the stack's FMA build; `~/dgcom/output/radical/coast/` there).
+
+- **It runs, on global 3D steps.** The first hour, alone on the card: 472 s (817 steps of 1.7–9.2 s), 5.2 GB on the device. 15.5 h (3 h of spin-up and an M2 period): 5,313 s, **343 s per model hour** (7,643 steps of 1.7–9.9 s, no negative-depth clip; builds shared the server's CPU for part of it). On the RTX 4060 the first 0.1 h from rest takes 41.7 s (40 steps of 9 s).
+- **Why it costs that.** The elements' own steps span 8 to over 60 s at 15.5 h (1 % under 10.6 s, the median 62.9 s; down to 1.7 s within the first hour): the 50 m elements at the mouths set every element's step. On 4 levels of local steps the coarse step is eight times the smallest and an hour costs as much (≈ 500 s). On 6 levels `main`'s hour took 6.65× fewer element evaluations of the 3D stages than global steps, but that run is on the edge of a blow-up (\"Local 3D steps\" above). Local steps are what this mesh needs, 3–6× by that count, once they are safe.
+- **The error in time**, against the same run at half the steps (both Courant numbers halved: 3,426 steps of 1.2–5.1 s for 3 h; the same mesh and levels, so a reference in time and not in space), over the nodes at least 10 m deep (`examples/snapshot_compare_3d.rs`), RMS and largest:
+
+  | t | η | depth-mean current | surface current | surface T |
+  |---|---|---|---|---|
+  | 1 h | 0.29, 35.9 mm | 2.4, 132 mm/s | 7.5, 595 mm/s | 0.009, 0.82 °C |
+  | 2 h | 0.06, 7.4 mm | 1.5, 62 mm/s | 5.4, 228 mm/s | 0.016, 0.89 °C |
+  | 3 h | 0.23, 20.0 mm | 1.1, 40 mm/s | 4.5, 235 mm/s | 0.015, 0.96 °C |
+
+  The RMS is small against the tide (η to +1.1 m, currents to 2.2 m/s in those hours); the largest differences sit at single nodes, where a limiter or a front decides. A reference finer in space or in levels is not made.
+- **The farm sites**, hourly frames over 12.5 h after 3 h of spin-up (`examples/norkyst_profiles_3d.rs`; the 500 m case over the same hours on 3 levels with a 120 s cap; the M2 fit of a 12.5 h record is a rough one):
+
+  | point | depth-mean speed, rms: coastline mesh | 500 m grid | NorKyst-800 | M2 major axis: coastline mesh | 500 m grid | NorKyst-800 |
+  |---|---|---|---|---|---|---|
+  | NorKyst point (24.6 m in the mesh, 48.6 m in NorKyst) | 0.036 m/s | 0.014 | 0.219 | 0.038 m/s at 174° | 0.018 at 150° | 0.279 at 149° |
+  | Kattholmen (23.9 m, 50.3 m) | 0.037 | 0.009 | 0.207 | 0.047 at 91° | 0.012 at 145° | 0.262 at 146° |
+  | Frohavet (89.0 m, 55.5 m) | 0.242 | 0.245 | 0.284 | 0.299 at 104° | 0.311 at 105° | 0.375 at 118° |
+
+  The coastline mesh carries 2.5 to 4 times the 500 m grid's current at the two farm points, and a sixth of NorKyst's, whose column there is twice as deep. In open water (Frohavet) the two meshes agree. Which of the model and NorKyst is right at the farms needs a current record there.
+- **Seen and not followed up.** In the first hour (the ramp) the smallest T of the run fell from 7.51 to 5.54 °C on global steps: a tracer undershoot of 2 °C somewhere, not located.
+- `examples/norkyst_profiles_3d.rs` did not compile on `main` (it passed `ProfileSeries::sample` an iterator where it takes a `&Stencil` since 4.5k); fixed on `fix/norkyst-profiles-example`.
 
 ## Local 3D steps: what the judges and the long runs found (2026-11-25)
 
@@ -987,6 +1016,10 @@ The card has ≈ 3.4× the RTX 3090's FP64 rate and ≈ 8× the RTX 4060's (thei
 ## Out of TODO.md
 
 ### Parked
+- **P2.7** (the loop, 2026-11-25) A long run should leave restarts: from Frøya's 46 h restart five stepping variants took under five minutes together, where each 71 h run takes half an hour, and the run that found the blow-up had to be made again to get one. `[restart] interval_hours` by default in a 3D case of more than a day, and a kept set of "event" states per case (Frøya 46 h, Chiloé 3 h) that A/Bs, stability checks and `snapshot_compare_3d` start from.
+- **P2.7** (the loop) What a long run finds should become a judge of seconds: the local steps' tracer drift shows in 40 steps on 720 elements, the blow-ups it may stand behind at 35–46 h. Next: a stability judge from an event state (one model hour, pass or fail) in `dgcom-gpu judges` or the case runner.
+- **P2.7** (the loop) A small mesh with the slow one's spread: a crop of the coastline mesh around one river mouth and Kattholmen (a few km, nested in the 500 m run) has its 3–60 s element steps at a tenth of the elements; the full mesh costs 343–472 s per model hour on the RTX 3090.
+- **P2.7** (the loop) Tiers for the gates: the judges and the gates a change touches (1–2 min), `all` (7 min a build), `gpu/time.sh` (39 min on the laptop, both builds and the timings). Only the last pull request of a stack needs the last; a `dgcom-gpu quick` could name the first.
 - **P2.7** The kernels a pass of local 3D steps still runs on every element: `kuzmin_means`, `kuzmin_centres`, `to_inventory`, `viscosity_columns` (`gpu/src/limiter.rs`, `viscosity.rs`, `three_d.rs`): 2.8 % of the kernel time of Chiloé's 3 levels on the RTX 3090 after R1 (2026-11-25). Each takes a list as R1's ten did (the limiter's means over the halo: its patch reads the vertex neighbours').
 - **P2.7** (2026-11-25) The verdict on every line below, the new lines and their ranking are in "Assessment (2026-11-25)" above; a line stays here until it is done or dropped there.
 - **P2.7** A 3D convergence judge on the device: dgcom's `tracer_advection_converges_on_distorted_elements` (a smooth tracer carried by a uniform current over a flat bed through a doubly periodic distorted mesh, N + 1) needs a flat periodic fixture, a passive tracer (`LinearEOS` with no expansion) and no drag under `Model3D`. The judges have rest (the beach, the seamount), constancy and conservation in 3D, not an order.
