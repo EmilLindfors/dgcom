@@ -71,6 +71,9 @@ struct Kind {
     velocity: bool,
     deep: bool,
     time: TimeInterpolation,
+    /// A level of every third point missing at the odd snapshots (a
+    /// model's bed layer under its tide: NorKyst's has them)
+    flicker: bool,
 }
 
 /// The parent grid point `(i, j)`'s position in the mesh (m).
@@ -126,7 +129,9 @@ fn reader(projection: &LocalProjection, kind: Kind) -> OceanModelReader {
                 let (x, y) = point_xy(i, j);
                 for l in 0..n_levels {
                     let d = position(k, l);
-                    let missing = land(i, j) || (!kind.fractions && d > depth[k] + 3.0);
+                    let missing = land(i, j)
+                        || (!kind.fractions && d > depth[k] + 3.0)
+                        || (kind.flicker && t % 2 == 1 && l == 3 && (i + j) % 3 == 0);
                     data.push(if missing {
                         f32::NAN
                     } else {
@@ -448,9 +453,13 @@ fn gate(
     );
     let mut device = Device::new(gpu, &statics, &nest)?;
     let (mut general, steady) = Device::general(gpu, &statics, &nest)?;
+    let [(coming, of), ..] = device.parent.unsteady;
+    let tracers = device.parent.unsteady[2];
     println!(
-        "  the parent on the device: {:.2} MB",
-        device.parent.bytes as f64 / 1e6
+        "  the parent on the device: {:.2} MB; {} of {} points' levels come and go in time",
+        device.parent.bytes as f64 / 1e6,
+        coming.max(tracers.0),
+        of.max(tracers.1)
     );
     let mut same = true;
     let mut cpu_by_call = Vec::new();
@@ -526,6 +535,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
                 velocity: true,
                 deep: true,
                 time: TimeInterpolation::Linear,
+                flicker: false,
             },
             true,
         ),
@@ -536,6 +546,18 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
                 velocity: true,
                 deep: true,
                 time: TimeInterpolation::Cubic,
+                flicker: false,
+            },
+            false,
+        ),
+        (
+            "z-levels, cubic in time, a level of every third point coming and going",
+            Kind {
+                fractions: false,
+                velocity: true,
+                deep: true,
+                time: TimeInterpolation::Cubic,
+                flicker: true,
             },
             false,
         ),
@@ -546,6 +568,7 @@ pub fn run(gpu: &Arc<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
                 velocity: false,
                 deep: false,
                 time: TimeInterpolation::Linear,
+                flicker: false,
             },
             false,
         ),

@@ -58,7 +58,7 @@ use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
 use dgcom::boundary::{Nesting3D, ParentModel3D, Supplied, deep_tracers};
 use dgcom::io::{ProfileLevels, ProfileSeries, Profiles, TimeStencil};
-use dgcom::io::{profile_covers, profile_sample_at};
+use dgcom::io::{profile_covers, profile_sample_at, profile_value_at};
 use dgcom::solver::Blocks;
 use dgcom::time::StageTime;
 
@@ -71,6 +71,10 @@ pub const MAX_MOMENTS: usize = 8;
 
 /// A slot's code when its element is not listed.
 const NOT_LISTED: u32 = u32::MAX;
+
+/// A parent point's `first_valid` where the steady walk does not hold for it
+/// ([`steady_field`]).
+const UNSTEADY: u32 = u32::MAX - 1;
 
 /// What `parent_check` found for a slot.
 const SKIP: u32 = 0;
@@ -449,7 +453,10 @@ pub mod kernels_parent {
     /// level that is not valid; `first_valid` a point's first valid level,
     /// `u32::MAX` without one). The same sampling as `profile_sample_at`
     /// in another order of sums: the device's own form (`notes/gpu.md`,
-    /// where the backends differ).
+    /// where the backends differ). A point marked [`UNSTEADY`] (a level
+    /// valid at some snapshots only: a model's bed layer under its tide) is
+    /// sampled snapshot by snapshot from `values`, as [`parent_columns`]
+    /// samples every point.
     #[kernel]
     pub fn parent_columns_steady(
         args: ParentArgs,
@@ -465,6 +472,7 @@ pub mod kernels_parent {
         w: &[[f64; 4]],
         east_bed: &[[f64; 3]],
         weighted: &[f64],
+        values: &[f32],
         positions: &[f64],
         inv_dz: &[f64],
         first_valid: &[u32],
@@ -531,6 +539,33 @@ pub mod kernels_parent {
                         continue;
                     }
                     let start = first_valid[firsts + k];
+                    if start == UNSTEADY {
+                        // A point whose valid levels come and go: snapshot
+                        // by snapshot, each among its own valid levels
+                        // (dgcom's `profile_sample_at`, to the letter)
+                        let view = field(&args, f, values, positions);
+                        let time = moments.stencil(m);
+                        if !profile_covers(&view, &time, &[k as u32], &[1.0]) {
+                            continue;
+                        }
+                        total += wk;
+                        for l in 0..nl {
+                            let d = -sigma_rho[l] * column_depth;
+                            let mut value = 0.0;
+                            for j in 0..time.len {
+                                value += time.w[j]
+                                    * profile_value_at(&view, time.idx[j], k, d, column_depth)
+                                        .unwrap_or(f64::NAN);
+                            }
+                            acc[l] = if first {
+                                wk * value
+                            } else {
+                                acc[l] + wk * value
+                            };
+                        }
+                        first = false;
+                        continue;
+                    }
                     if start == u32::MAX {
                         continue;
                     }
@@ -677,36 +712,40 @@ struct Steady {
 
 /// One field's part of the steady tables: every point's levels' `inv_dz`
 /// and its first valid level (`u32::MAX` without one), from `form` in the
-/// tables `values` (of `n_times` snapshots) and `positions`. `None` where
-/// the steady sampling would not be `profile_sample_at`'s: a level valid at
-/// one snapshot and not at another, a valid value at a position that is not
-/// finite, or valid levels that do not deepen with their index.
+/// tables `values` (of `n_times` snapshots) and `positions`; and how many
+/// points are marked [`UNSTEADY`], where the steady walk would not be
+/// `profile_sample_at`'s: a level valid at one snapshot and not at another,
+/// a valid value at a position that is not finite, or valid levels that do
+/// not deepen with their index.
 fn steady_field(
     form: &FieldForm,
     n_times: usize,
     values: &[f32],
     positions: &[f64],
-) -> Option<(Vec<f64>, Vec<u32>)> {
+) -> (Vec<f64>, Vec<u32>, usize) {
     let (np, nl) = (form.n_points as usize, form.n_levels as usize);
     let value = |t: usize, k: usize, l: usize| values[form.values as usize + (t * np + k) * nl + l];
     let mut inv_dz = vec![f64::NAN; np * nl];
     let mut first_valid = vec![u32::MAX; np];
+    let mut unsteady = 0;
     for k in 0..np {
         let mut above: Option<f64> = None;
+        let mut steady = true;
         for l in 0..nl {
             let valid = value(0, k, l).is_finite();
             if (1..n_times).any(|t| value(t, k, l).is_finite() != valid) {
-                return None;
+                steady = false;
+                break;
             }
             if !valid {
                 continue;
             }
             let z = level_position(form, positions, k, l);
-            if !z.is_finite() {
-                return None;
+            if !z.is_finite() || above.is_some_and(|z0| z < z0) {
+                steady = false;
+                break;
             }
             inv_dz[k * nl + l] = match above {
-                Some(z0) if z < z0 => return None,
                 Some(z0) if z > z0 => 1.0 / (z - z0),
                 Some(_) => 0.0,
                 None => {
@@ -716,8 +755,12 @@ fn steady_field(
             };
             above = Some(z);
         }
+        if !steady {
+            first_valid[k] = UNSTEADY;
+            unsteady += 1;
+        }
     }
-    Some((inv_dz, first_valid))
+    (inv_dz, first_valid, unsteady)
 }
 
 /// A parent model on the device (see the module docs).
@@ -741,8 +784,12 @@ pub struct Parent3D {
     cache_eta: DeviceBuffer<f64>,
     flags: DeviceBuffer<u32>,
     codes: Codes,
-    /// The steady sampling's tables, where the parent allows it
+    /// The steady sampling's tables (none on more levels than the kernel's
+    /// scratch holds)
     steady: Option<Steady>,
+    /// Each field's parent points whose valid levels come and go in time
+    /// (sampled snapshot by snapshot), of how many it reads
+    pub unsteady: [(usize, usize); 4],
     /// Every slot's element, and scratch for a call's codes, times and
     /// listed elements
     elements: Vec<usize>,
@@ -818,15 +865,19 @@ impl Parent3D {
         // The steady sampling's tables, while every field allows it
         let mut steady = Some((SteadyForm::default(), Vec::<f64>::new(), Vec::<u32>::new()));
         let mut per_moment = 0usize;
+        // Each field's points whose levels come and go, of how many
+        let mut unsteady = [(0usize, 0usize); 4];
         for (f, (form, series)) in fields.iter_mut().zip(profiles).enumerate() {
             if let Some((tables, ..)) = &mut steady {
                 tables.offsets[f] = u32::MAX;
             }
             let Some(series) = series else { continue };
             *form = upload_form(series, &used, &mut values, &mut positions)?;
-            let field = steady_field(form, series.n_times(), &values, &positions);
-            steady = match (steady, field) {
-                (Some((mut tables, mut inv_dz, mut first_valid)), Some((inv, first))) => {
+            let (inv, first, n_unsteady) =
+                steady_field(form, series.n_times(), &values, &positions);
+            unsteady[f] = (n_unsteady, used.len());
+            steady = match steady {
+                Some((mut tables, mut inv_dz, mut first_valid)) => {
                     tables.offsets[f] = u32::try_from(per_moment)?;
                     tables.tables[f] = u32::try_from(inv_dz.len())?;
                     tables.firsts[f] = u32::try_from(first_valid.len())?;
@@ -835,7 +886,7 @@ impl Parent3D {
                     first_valid.extend(first);
                     Some((tables, inv_dz, first_valid))
                 }
-                _ => None,
+                None => None,
             };
         }
         let steady = match steady {
@@ -907,6 +958,7 @@ impl Parent3D {
                 none: DeviceBuffer::zeroed(st, 0)?,
             },
             steady,
+            unsteady,
             elements: slots.nodes.iter().map(|&k| k / NN).collect(),
             host_codes: vec![0; n],
             times: Vec::new(),
@@ -1068,6 +1120,7 @@ impl Parent3D {
                     &self.w,
                     &self.east_bed,
                     &steady.weighted,
+                    &self.values,
                     &self.positions,
                     &steady.inv_dz,
                     &steady.first_valid,
