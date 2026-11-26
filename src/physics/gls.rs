@@ -34,18 +34,35 @@
 //! Galperin et al.'s (1988) limit `l ≤ c_lim √(2k)/N` (stable water) bounds
 //! the length.
 //!
+//! In any water the length is also at most the distance to the nearer
+//! boundary, `l ≤ min(z − z_b + z₀_b, η − z + z₀_s)` at a w-point `z` of a
+//! column over a bed `z_b` under a surface `η`: an eddy is no larger than
+//! the water that holds it. A log layer's `κ(z′ + z₀)` is 2.5 times below
+//! it, the parabolic `κ z′(1 − z′/D)` of an open channel more, so it acts on
+//! no state the column's own mixing reaches. It acts on what advection
+//! leaves: `k` and `ψ` move separately and not monotonically, and a large
+//! `k` beside a small positive `ψ` is a length of kilometres that no
+//! stratification limits where there is none. Its explicit production
+//! `P = ν S²` then fed it: from Frøya's 46 h restart (2026-11-26) the 3D run
+//! reached `k` of 2.3·10⁵ m²/s² and diffusivities of 5.7·10⁵ m²/s on global
+//! steps, 4.1·10⁷ on local ones, where a uniform tracer's implicit diffusion
+//! lost 1e-5 of itself to round-off (now solved for the increment,
+//! [`crate::physics::apply_vertical_diffusion`]); with the bound, 23 m²/s²
+//! and 103 m²/s (TODO P4.5, `notes/3d-mixing.md`).
+//!
 //! # Discretisation (Umlauf & Burchard 2005; GOTM `tkeeq`, `genericeq`)
 //!
 //! `k` and `ψ` live at the w-points. Once per baroclinic step, before the
 //! implicit vertical diffusion of momentum and tracers that uses the new `ν`,
 //! `ν′`:
 //! 1. `S²`, `N²` at the interior w-points from the layer-centre velocity and
-//!    density, `P`, `B` from the old `ν`, `ν′`, `ε`;
+//!    density, `P`, `B` from the old `ν`, `ν′`, `ε` (`ε` at least `ε_min`
+//!    and the wall's);
 //! 2. `k`, then `ψ`, by one backward-Euler step with implicit diffusion. The
 //!    sinks are linearised in the new value (Patankar 1980: a negative
 //!    `B` is a sink when `P + B < 0`), so both stay positive for any `Δt`;
-//! 3. `ε` from the new `k`, `ψ`, bounded below by `ε_min` and the Galperin
-//!    limit, and `ψ` reset to the bounded `ε`.
+//! 3. `ε` from the new `k`, `ψ`, bounded below by `ε_min`, the wall and the
+//!    Galperin limit, and `ψ` reset to the bounded `ε`.
 //!
 //! The boundaries are logarithmic layers with flux conditions at the
 //! boundary layers' centres: no flux of `k`, and the flux of `ψ` of a log
@@ -687,10 +704,30 @@ impl GlsMixing {
         (cm * x, cmp * x)
     }
 
-    /// `ε` bounded below by `ε_min` and, in stable water, the length limit.
+    /// The longest length at w-point `j` of a column with w-points `z_w`:
+    /// the distance to the nearer boundary, each with its roughness (see the
+    /// module docs); unbounded at the boundary w-points themselves.
     #[inline]
-    fn bounded_dissipation(&self, k: f64, eps: f64, n2: f64) -> f64 {
-        let eps = eps.max(self.eps_min);
+    fn wall_length(&self, z_w: &[f64], j: usize, z0_surface: f64) -> f64 {
+        let top = z_w.len() - 1;
+        if j == 0 || j == top {
+            return f64::INFINITY;
+        }
+        (z_w[j] - z_w[0] + self.z0_bottom).min(z_w[top] - z_w[j] + z0_surface)
+    }
+
+    /// `ε` at least `ε_min` and the dissipation of the length `wall`.
+    #[inline]
+    fn walled_dissipation(&self, k: f64, eps: f64, wall: f64) -> f64 {
+        eps.max(self.eps_min)
+            .max(self.stability.cm3 * pow(k, 1.5) / wall)
+    }
+
+    /// `ε` bounded below by `ε_min`, the length `wall` and, in stable water,
+    /// the length limit.
+    #[inline]
+    fn bounded_dissipation(&self, k: f64, eps: f64, n2: f64, wall: f64) -> f64 {
+        let eps = self.walled_dissipation(k, eps, wall);
         match self.length_limit {
             Some(c_lim) if n2 > 0.0 => {
                 let cm3 = self.stability.cm3;
@@ -980,13 +1017,17 @@ impl GlsMixing {
             f.n2.fill(0.0);
         }
 
+        let wall = |j: usize| self.wall_length(column.z_w, j, z0_surface);
+
         if nl >= 2 {
-            // P, B, ε of the old turbulence, at least the minima. Advection
-            // (`Hydrostatic3D::with_turbulence_advection`) can leave values
-            // below them, or not even positive: such a point is taken as
-            // having no turbulence (k and ε at their minima), not as `k`
-            // with the minimum ε, whose length `k^(3/2)/ε_min` would mix the
-            // column at tens of m²/s
+            // P, B, ε of the old turbulence, at least the minima and the
+            // wall's. Advection (`Hydrostatic3D::with_turbulence_advection`)
+            // can leave values below them, or not even positive: such a
+            // point is taken as having no turbulence (k and ε at their
+            // minima), not as `k` with the minimum ε, whose length
+            // `k^(3/2)/ε_min` would mix the column at tens of m²/s. It can
+            // also leave a large `k` beside a small positive `ψ`, whose
+            // length the wall bounds (see the module docs)
             for j in 1..nl {
                 let valid = tke[j] > 0.0 && psi[j] > 0.0;
                 let (k, unbounded) = if valid {
@@ -995,7 +1036,7 @@ impl GlsMixing {
                 } else {
                     (self.k_min, self.eps_min)
                 };
-                let eps = unbounded.max(self.eps_min);
+                let eps = self.walled_dissipation(k, unbounded, wall(j));
                 if !valid || k != tke[j] || eps != unbounded {
                     tke[j] = k;
                     psi[j] = self.psi(k, eps);
@@ -1083,7 +1124,8 @@ impl GlsMixing {
 
             // ε bounded, and ψ consistent with it
             for j in 1..nl {
-                let eps = self.bounded_dissipation(tke[j], self.dissipation(tke[j], psi[j]), n2[j]);
+                let eps = self.dissipation(tke[j], psi[j]);
+                let eps = self.bounded_dissipation(tke[j], eps, n2[j], wall(j));
                 psi[j] = self.psi(tke[j], eps);
             }
         }
@@ -1100,7 +1142,8 @@ impl GlsMixing {
         }
 
         for j in 0..nw {
-            let eps = self.bounded_dissipation(tke[j], self.dissipation(tke[j], psi[j]), f.n2[j]);
+            let eps = self.dissipation(tke[j], psi[j]);
+            let eps = self.bounded_dissipation(tke[j], eps, f.n2[j], wall(j));
             let (num, nuh) = self.coefficients(tke[j], eps, f.n2[j]);
             av[j] = num + self.background_viscosity;
             kt[j] = nuh + self.background_diffusivity;
@@ -1186,6 +1229,50 @@ mod tests {
                 &mut kt,
             );
             av
+        }
+    }
+
+    /// A large `k` beside a small `ε` at two w-points mid-column, as the
+    /// advection left them in the 3D judges' beach (k 0.7 m²/s² and
+    /// ε 2·10⁻⁶ m²/s³: a length of 4·10⁴ m), in an unstratified, sheared
+    /// column of weak turbulence: no stratification limits the length, the
+    /// wall does. Without it their `ν = c_μ k²/ε` of 10⁴ m²/s produced `k` of
+    /// thousands of m²/s² there within the step and a viscosity of 10⁷ m²/s
+    /// (on the beach 2·10⁷; on Frøya 5.7·10⁵ m²/s on global steps, 4.1·10⁷
+    /// on local ones, TODO P4.5). With it every length is at most the
+    /// distance to the nearer boundary, and the viscosity a few m²/s at most.
+    #[test]
+    fn the_length_is_at_most_the_distance_to_the_nearer_boundary() {
+        for mixing in [
+            GlsMixing::k_epsilon(),
+            GlsMixing::k_omega(),
+            GlsMixing::generic(),
+        ] {
+            let (nl, depth) = (20, 4.0);
+            let mut column = Homogeneous::new(&mixing, nl, depth, 0.1, 0.0, 1e-6, 1e-9);
+            for j in [11, 12] {
+                column.tke[j] = 0.7;
+                column.gls[j] = mixing.psi(0.7, 2e-6);
+            }
+            let mut scratch = Vec::new();
+            let av = column.step(&mixing, 11.0, &mut scratch);
+            let largest = av.iter().cloned().fold(0.0, f64::max);
+            assert!(
+                largest < 5.0,
+                "{:?}: viscosity up to {largest:e} m²/s",
+                mixing.params
+            );
+            for j in 1..nl {
+                let (k, psi) = (column.tke[j], column.gls[j]);
+                let length = mixing.stability.cm3 * pow(k, 1.5) / mixing.dissipation(k, psi);
+                let z = column.z_w[j] + depth;
+                let wall = (z + mixing.z0_bottom).min(depth - z + mixing.z0_surface);
+                assert!(
+                    length <= wall * (1.0 + 1e-12),
+                    "{:?}: the length at w-point {j} is {length} m, {wall} m from a wall",
+                    mixing.params
+                );
+            }
         }
     }
 
