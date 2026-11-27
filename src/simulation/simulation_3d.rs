@@ -3673,6 +3673,147 @@ mod tests {
         );
     }
 
+    /// Regression (Frøya, TODO P4.5, 2026-11-27): a column that has just
+    /// stopped being thin, in an element with deep nodes under a fast sheared
+    /// current, does not run away. Frøya's 46 h event on 3 levels at a 240 s
+    /// cap blew up, on the CPU and the GPU alike, in element 6656: its node
+    /// at 1.0 m had just left the thin depth, at the depth mean (0.05 m/s),
+    /// beside nodes 16 m deep at 1.6 m/s. With no thin column left the
+    /// element moved its layers by the DG volume terms, whose fluxes at the
+    /// shallow node are the deep nodes', many times its layers' volume, and
+    /// its top layer reached −12.5 m/s within the first stage of a 60 s
+    /// substep (0.93 of the element's bound).
+    ///
+    /// Here a doubly periodic patch of 250 m P2 elements on 20 levels
+    /// stretched to the surface, as Frøya's: a channel 30 m deep beside a
+    /// plateau at the thin depth (1 m), along a direction of slope 2 across
+    /// the elements, so that the banks' elements hold both. A current along
+    /// the banks, 1.6 m/s in the channel (sheared, the top layer at about
+    /// 1.5 times the depth mean) and 0.05 m/s on the plateau, has no
+    /// divergence. The plateau starts thin (0.9995 m) and floods as the
+    /// channel's level is raised. Steps of 0.93 of the bound.
+    ///
+    /// Measured: the largest speed 2.70 from 2.40 m/s (the same over 40
+    /// steps). With the subcells at the thin depth, as before
+    /// `Hydrostatic3D::SUBCELL_DEPTH_RATIO`, 3.6·10¹⁷ m/s at the eighth step
+    /// and not finite at the ninth.
+    #[test]
+    fn a_column_just_out_of_thin_water_beside_a_deep_current_holds() {
+        use crate::vertical::SongHaidvogelStretching;
+        let (n, width) = (8, 250.0);
+        let period = n as f64 * width;
+        let mesh = Arc::new(Mesh2D::uniform_periodic(0.0, period, 0.0, period, n, n));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        // 0 in the channel, 1 on the plateau: banks 250 m wide across
+        // s = (y − 2x) mod period = period/4 and 3·period/4
+        let slope = 2.0;
+        let plateau = |x: f64, y: f64| {
+            let s = (y - slope * x).rem_euclid(period);
+            let ramp = |centre: f64| ((s - centre) / width + 0.5).clamp(0.0, 1.0);
+            ramp(0.25 * period) - ramp(0.75 * period)
+        };
+        let (deep, thin) = (30.0, 1.0);
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            -deep + (deep - thin) * plateau(x, y)
+        }));
+        // The channel's level raised towards +0.1 m over 10 min, which
+        // floods the plateau across the banks
+        struct ChannelRise;
+        impl SourceTerm2D for ChannelRise {
+            fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D {
+                if ctx.bathymetry > -10.0 {
+                    return SWEState2D::zero();
+                }
+                let level = 0.1 - ctx.bathymetry - ctx.state.h;
+                SWEState2D::new(level / 600.0, 0.0, 0.0)
+            }
+
+            fn name(&self) -> &'static str {
+                "channel_rise"
+            }
+
+            fn changes_mass(&self) -> bool {
+                true
+            }
+        }
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::WetDry)
+        .with_wet_dry_correction(true)
+        .with_source_arc(Arc::new(ChannelRise))
+        .build();
+        let sigma = SigmaGrid::new(20, SongHaidvogelStretching::new(5.0, 0.4, 10.0));
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-3, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        )
+        .with_min_column_depth(thin);
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let eos = LinearEOS::default();
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        let along = [1.0, slope].map(|c| c / (1.0 + slope * slope).sqrt());
+        let mut banks = 0;
+        for k in 0..mesh.n_elements {
+            let mut depths = [f64::INFINITY, 0.0];
+            for i in 0..nn {
+                let el = ElementIndex::new(k);
+                let [x, y] = mesh.reference_to_physical(el, ops.nodes_r[i], ops.nodes_s[i]);
+                let idx = k * nn + i;
+                let on_plateau = plateau(x, y);
+                let speed = 1.6 + (0.05 - 1.6) * on_plateau;
+                state.eta.data[idx] = -0.0005;
+                state.ubar.data[idx] = speed * along[0];
+                state.vbar.data[idx] = speed * along[1];
+                for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                    // Faster at the top, about the depth mean (Σ Δσ (σ + ½)
+                    // = 0); none on the plateau
+                    let profile = 1.0 + (1.0 - on_plateau) * (s + 0.5);
+                    let at = idx * nl + l;
+                    state.u[at] = speed * profile * along[0];
+                    state.v[at] = speed * profile * along[1];
+                    state.temp[at] = eos.t0;
+                    state.salt[at] = eos.s0;
+                }
+                let depth = -bathymetry.data[idx];
+                depths = [depths[0].min(depth), depths[1].max(depth)];
+            }
+            banks += usize::from(depths[0] <= thin && depths[1] > 20.0);
+        }
+        assert!(banks >= 8, "test regime: {banks} elements hold both depths");
+        physics.update_density(&mut state);
+        let speeds = |s: &Solution3D| max_or_nan(s.u.iter().zip(&s.v).map(|(u, v)| u.hypot(*v)));
+        let start = speeds(&state);
+        let dt = 0.93 * physics.compute_dt_ssp(&state, 4.0, SspScheme::Rk43);
+        let mut fastest = start;
+        run_beach_with(SspScheme::Rk43, dt, &physics, &mut state, 12, |s| {
+            fastest = max_or_nan([fastest, speeds(s)]);
+        });
+        println!(
+            "banks: {banks} elements, steps of {dt:.1} s, the largest speed {fastest:.3} from {start:.3} m/s"
+        );
+        assert!(
+            fastest < 1.25 * start,
+            "a layer beside the banks ran to {fastest:.3e} m/s from {start:.3} m/s"
+        );
+    }
+
     /// A stratified x–z channel at rest: 8 P2 elements of 1 km, walls, 20
     /// surface-stretched levels, no tracer diffusion, the bed `bed(x)` (dry
     /// where it is above 0). `rho(z)` sets T, and is the PGF's reference

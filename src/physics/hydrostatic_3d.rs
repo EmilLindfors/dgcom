@@ -561,7 +561,8 @@ where
         rho0: f64,
     ) -> Self {
         // The 2D wet/dry kernel's subcells where the layers take them
-        swe_physics.subcell_depth = Some(Self::DEFAULT_MIN_COLUMN_DEPTH);
+        swe_physics.subcell_depth =
+            Some(Self::SUBCELL_DEPTH_RATIO * Self::DEFAULT_MIN_COLUMN_DEPTH);
         let transport_scratch = Mutex::new(
             LayerTransport::new(mesh.n_elements, &ops, sigma.n_levels())
                 .with_metric(MetricForm::of(swe_physics.formulation)),
@@ -816,6 +817,24 @@ where
     /// Default of [`Self::with_min_column_depth`] (m), ROMS's usual `Dcrit`.
     pub const DEFAULT_MIN_COLUMN_DEPTH: f64 = 0.1;
 
+    /// The depth below which a column puts its element on the subcells, in
+    /// thin depths ([`Self::with_min_column_depth`]): an element leaves them
+    /// only once its shallowest column is twice the thin depth.
+    ///
+    /// A column that stops being thin starts its shear from the depth mean
+    /// ū. In the DG volume terms its layers pair with those of the element's
+    /// deeper nodes, and a pair's two-point flux `{H_z u}{u}` weighs each
+    /// side by its layer thickness, so at the shallow node the deep node's
+    /// momentum flux dominates: in Frøya's element 6656 (2026-11-27; a node
+    /// at 1.0 m beside 16 m, 1.6 m/s, the column at ū = 0.05 m/s), the top
+    /// layer reached −12.5 m/s within the first stage of a 60 s substep (0.93
+    /// of the element's bound), against the 6·10⁻⁴ m/s² of `u ∂u/∂x` there,
+    /// and the run blew up (`notes/3d-numerics.md`, TODO P4.5). On the
+    /// subcells up to twice the thin depth the column rebuilds its shear in
+    /// the element's finite-volume transport, and the DG terms meet it with
+    /// half the contrast and a profile of its own.
+    pub const SUBCELL_DEPTH_RATIO: f64 = 2.0;
+
     /// 3D wetting and drying: columns shallower than `depth` (m), down to dry
     /// nodes, are thin (Warner et al. 2013, ROMS's `Dcrit` masks):
     /// - they carry no vertical shear: their 3D velocity is the depth mean ū,
@@ -825,12 +844,18 @@ where
     /// - they exert and feel no baroclinic pressure difference, and exchange
     ///   no baroclinic transport (only their share of the barotropic flux);
     /// - an element with a thin column moves its layers, tracers and momentum
-    ///   through the GLL subcell interfaces of the 2D `WetDry` kernel, which
-    ///   this sets to take its subcells in the same elements
-    ///   (`SWEPhysics2D::subcell_depth`): the layers then carry exactly the
-    ///   water the 2D pass moved node by node, a dry bank blocked by its
-    ///   hydrostatic reconstruction (see
-    ///   [`crate::solver::rhs::LayerTransport::compute`]).
+    ///   through the GLL subcell interfaces of the 2D `WetDry` kernel (see
+    ///   [`crate::solver::rhs::LayerTransport::compute`]): the layers then
+    ///   carry exactly the water the 2D pass moved node by node, a dry bank
+    ///   blocked by its hydrostatic reconstruction.
+    ///
+    /// This sets the 2D kernel to take its subcells in the elements with a
+    /// column shallower than [`Self::SUBCELL_DEPTH_RATIO`] times `depth`
+    /// (`SWEPhysics2D::subcell_depth`), and the layers follow it where it
+    /// did so throughout the step: an element whose columns are not thin but
+    /// not twice as deep moves its layers on the subcells too, each with its
+    /// share of the barotropic flux, and exchanges no baroclinic transport
+    /// within itself (its faces exchange both).
     ///
     /// Where the pass still kept an element's balance only as a whole (it
     /// switched to the subcells during the step, or the positivity limiter
@@ -848,7 +873,7 @@ where
             "minimum column depth must be positive, got {depth}"
         );
         self.min_column_depth = depth;
-        self.swe_physics.subcell_depth = Some(depth);
+        self.swe_physics.subcell_depth = Some(Self::SUBCELL_DEPTH_RATIO * depth);
         self
     }
 
