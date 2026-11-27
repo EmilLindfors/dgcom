@@ -823,13 +823,14 @@ where
     ///
     /// A column that stops being thin starts its shear from the depth mean
     /// ū. In the DG volume terms its layers pair with those of the element's
-    /// deeper nodes, and a pair's two-point flux `{H_z u}{u}` weighs each
-    /// side by its layer thickness, so at the shallow node the deep node's
-    /// momentum flux dominates: in Frøya's element 6656 (2026-11-27; a node
-    /// at 1.0 m beside 16 m, 1.6 m/s, the column at ū = 0.05 m/s), the top
-    /// layer reached −12.5 m/s within the first stage of a 60 s substep (0.93
-    /// of the element's bound), against the 6·10⁻⁴ m/s² of `u ∂u/∂x` there,
-    /// and the run blew up (`notes/3d-numerics.md`, TODO P4.5). On the
+    /// deeper nodes, and a pair weighs each side by its layer thickness, so
+    /// at the shallow node the layer fluxes are the deep nodes': many times
+    /// its layers' volume, which the implicit vertical advection carries up
+    /// the column with the momentum they bring. In Frøya's element 6656
+    /// (2026-11-27; a node at 1.0 m beside 16 m at 1.6 m/s, the column at
+    /// ū = 0.05 m/s) the top layer reached −12.5 m/s within the first stage
+    /// of a 60 s substep, at 0.93 of the element's bound, and the run blew up
+    /// (`notes/3d-numerics.md`, "3D local time stepping"; TODO P4.5). On the
     /// subcells up to twice the thin depth the column rebuilds its shear in
     /// the element's finite-volume transport, and the DG terms meet it with
     /// half the contrast and a profile of its own.
