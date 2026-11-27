@@ -28,6 +28,9 @@
 //!   wind, films, merged cells and rivers of the same water.
 //! - **Conservation**: the inventories of T and S of the stratified water.
 //!
+//! Both 3D judges run on global 3D steps and on local ones of two levels,
+//! to the same bars.
+//!
 //! Each judge has a mutant it must catch: the device given another input
 //! (an operator table off by a part in a thousand, another bed, no wet/dry
 //! correction, no reference), which the judge must fail.
@@ -717,15 +720,12 @@ fn run_3d(
 }
 
 /// [`run_3d`]'s steps on the CPU (its own element steps on local 3D
-/// steps; with `kept`, those of the start at every step, so that no element
-/// changes its level): the CPU's kernels on a judge's fixture, for the line
-/// it prints.
+/// steps): the CPU's kernels on a judge's fixture, for the line it prints.
 fn run_3d_cpu(
     physics: &Physics,
     start: &Solution3D,
     steps: usize,
     levels: usize,
-    kept: bool,
     mut each: impl FnMut(&Solution3D),
 ) {
     let mut state = start.clone();
@@ -735,7 +735,7 @@ fn run_3d_cpu(
     };
     let mut integrator = run.integrator();
     let mut t = 0.0;
-    let mut element_dt = Vec::new();
+    let mut element_dt = vec![0.0; physics.mesh.n_elements];
     for _ in 0..steps {
         physics.update_density(&mut state);
         let dt = if levels == 0 {
@@ -743,10 +743,7 @@ fn run_3d_cpu(
                 .compute_dt_ssp(&state, CFL_3D, SspScheme::Rk43)
                 .min(DT_MAX)
         } else {
-            if element_dt.is_empty() || !kept {
-                element_dt.resize(physics.mesh.n_elements, 0.0);
-                physics.element_steps_into(&state, CFL_3D, SspScheme::Rk43, &mut element_dt);
-            }
+            physics.element_steps_into(&state, CFL_3D, SspScheme::Rk43, &mut element_dt);
             let stencils = ModeSplitPhysics::stage_stencils(physics);
             integrator.assign_baroclinic_levels(
                 &element_dt,
@@ -767,7 +764,7 @@ fn run_3d_cpu(
 /// CPU (m/s).
 fn rest_on_cpu(physics: &Physics, start: &Solution3D, steps: usize) -> f64 {
     let mut speed = 0.0f64;
-    run_3d_cpu(physics, start, steps, 0, false, |s| {
+    run_3d_cpu(physics, start, steps, 0, |s| {
         let now = largest_speed(s);
         speed = if now.is_nan() { now } else { speed.max(now) };
     });
@@ -1047,63 +1044,34 @@ fn tracers_3d(gpu: &Arc<Gpu>, tally: &mut Tally, levels: usize) -> Result<(), Bo
         let mut on_cpu = f64::NAN;
         if cpu {
             on_cpu = 0.0;
-            run_3d_cpu(&physics, &uniform, steps, levels, false, |s| {
+            run_3d_cpu(&physics, &uniform, steps, levels, |s| {
                 drift_in(s, &mut on_cpu)
             });
         }
         Ok((drift, finest, on_cpu))
     };
-    if levels == 0 {
-        let (drift, _, on_cpu) = drift_with(Some(temp), None, true)?;
-        tally.judge(
-            "uniform T and S stay uniform (rivers of the same water)",
-            &format!(
-                "the largest drift {drift:.2e} (the CPU's kernels: {on_cpu:.2e}); it must stay \
-                 under {CONSTANCY_BAR:.0e}"
-            ),
-            drift <= CONSTANCY_BAR,
-        );
-        let (drift, _, _) = drift_with(Some(temp + 1e-3), None, false)?;
-        tally.mutant(
-            "the rivers' water 1e-3 °C warmer",
-            &format!("the largest drift {drift:.2e}"),
-            drift.is_nan() || drift > CONSTANCY_BAR,
-        );
-    } else {
-        // On local steps the scheme itself does not keep them uniform on
-        // this beach, on the CPU as on the device, with rivers or without
-        // (dgcom's `beach_tracers_are_constant_and_conserved_with_local_time_steps`
-        // asks it of levels fixed by position, and finds it): printed with
-        // the CPU's kernels' beside it, not judged (notes/3d-numerics.md)
-        let (drift, used, on_cpu) = drift_with(None, None, true)?;
-        finest = finest.max(used);
-        let (rivers, _, rivers_on_cpu) = drift_with(Some(temp), None, true)?;
-        // ... and the CPU's with every element on the level of its first
-        // step
-        let kept = {
-            let physics = physics_with(
-                &fx,
-                Terms {
-                    limiter: false,
-                    ..moving
-                },
-                forcing,
-                GlsMixing::k_epsilon(),
-                None,
-            );
-            let mut drift = 0.0f64;
-            run_3d_cpu(&physics, &uniform, steps, levels, true, |s| {
-                drift_in(s, &mut drift)
-            });
-            drift
-        };
-        println!(
-            "  (uniform T and S drift by {drift:.2e} without rivers and {rivers:.2e} with rivers \
-             of the same water; the CPU's kernels: {on_cpu:.2e} and {rivers_on_cpu:.2e}, and \
-             {kept:.2e} without rivers on the levels of the first step kept. The scheme's on \
-             local steps, where global steps keep {CONSTANCY_BAR:.0e}: not judged)"
-        );
-    }
+    // The same bar on local steps as on global ones. Until 2026-11-26 local
+    // steps drifted by 2.7e-6 here (4.3e-6 with the rivers), the CPU's
+    // kernels too: GLS lengths of kilometres that advection left behind
+    // gave diffusivities of 10⁷ m²/s, whose implicit solve lost a uniform
+    // tracer to round-off; the length is bounded by the wall and the solve
+    // is for the increment since (TODO P4.5, notes/gpu.md "Local 3D steps")
+    let (drift, used, on_cpu) = drift_with(Some(temp), None, true)?;
+    finest = finest.max(used);
+    tally.judge(
+        "uniform T and S stay uniform (rivers of the same water)",
+        &format!(
+            "the largest drift {drift:.2e} (the CPU's kernels: {on_cpu:.2e}); it must stay \
+             under {CONSTANCY_BAR:.0e}"
+        ),
+        drift <= CONSTANCY_BAR,
+    );
+    let (drift, _, _) = drift_with(Some(temp + 1e-3), None, false)?;
+    tally.mutant(
+        "the rivers' water 1e-3 °C warmer",
+        &format!("the largest drift {drift:.2e}"),
+        drift.is_nan() || drift > CONSTANCY_BAR,
+    );
     // The inventories of the stratified water, nothing entering
     let mut stratified = start_state(&fx);
     stratified.tke.clear();

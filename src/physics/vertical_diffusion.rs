@@ -8,6 +8,22 @@
 //! Discretization (Backward Euler in time, Centered in space):
 //! (ϕ_k^{n+1} - ϕ_k^n) / Δt = 1/Δz_k [ K_{k+1/2} (ϕ_{k+1}^{n+1} - ϕ_k^{n+1}) / Δz_{k+1/2}
 //!                                   - K_{k-1/2} (ϕ_k^{n+1} - ϕ_{k-1}^{n+1}) / Δz_{k-1/2} ]
+//!
+//! # The increment, not the new value
+//!
+//! With `M = I + Δt A` the system's matrix, the solve is for the increment
+//! `δ = ϕ^{n+1} − ϕ^n` of `M δ = r`, with the residual
+//! `r = (boundary fluxes) − Δt A ϕ^n` formed from the differences
+//! `ϕ_{k±1} − ϕ_k` and the drags, then `ϕ^{n+1} = ϕ^n + δ`. It is the same
+//! system, but a field that is uniform in the column with no fluxes and no
+//! drags has `r = 0` exactly, so it stays uniform bit for bit whatever
+//! `K Δt/Δz²`. Solving `M ϕ^{n+1} = ϕ^n` for the value instead loses the
+//! `1` of the diagonal `1 + Δt(K_{k+½}/Δz_{k+½} + K_{k−½}/Δz_{k−½})/Δz_k`
+//! to round-off as the ratio grows: at `K Δt/(Δz Δz_w) ≈ 10⁹` a uniform
+//! tracer came out 4e-5 of itself off (a 2·10⁷ m²/s diffusivity of a
+//! degenerate turbulence state, 11 s, 0.2 m layers; the 3D judges'
+//! local-steps drift, TODO P4.5, `notes/gpu.md` "Local 3D steps"). The
+//! round-off of the increment is relative to the increment.
 
 use crate::math::hypot;
 use crate::mesh::data::Bathymetry2D;
@@ -523,9 +539,9 @@ impl ColumnScratch {
 /// One backward-Euler step of `∂φ/∂t = ∂/∂z(ν ∂φ/∂z) − λ_l φ` in a column,
 /// with the upward fluxes `flux_top` at the surface and `flux_bot +
 /// drag_bot·φ₀` at the bed (`drag_bot·φ₀` and `λ_l φ` at the new time,
-/// `λ_l` from `drag_layers`, zero without). `work` holds the tridiagonal
-/// system and the solver's buffers. The reference of
-/// [`solve_diffusion_pair`], which the model uses.
+/// `λ_l` from `drag_layers`, zero without), solved for the increment (see
+/// the module docs). `work` holds the tridiagonal system and the solver's
+/// buffers. The reference of [`solve_diffusion_pair`], which the model uses.
 #[cfg(test)]
 fn solve_diffusion_column(
     phi: &mut [f64],
@@ -539,58 +555,101 @@ fn solve_diffusion_column(
     [a, b, c, d, x, c_prime, d_prime]: [&mut [f64]; 7],
 ) {
     let n = phi.len();
+    diffusion_matrix(
+        nu,
+        dz,
+        dt,
+        drag_bot,
+        drag_layers,
+        [&mut *a, &mut *b, &mut *c],
+    );
+    let column = DiffusionColumn {
+        a,
+        c,
+        dt,
+        drag_bot,
+        drag_layers,
+        lambda: [dt / dz[0], dt / dz[n - 1]],
+    };
+    column.residual_into(phi, flux_top, flux_bot, d);
+    solve_tridiagonal(a, b, c, d, x, c_prime, d_prime);
+    for (phi, dx) in phi.iter_mut().zip(x.iter()) {
+        *phi += dx;
+    }
+}
 
-    // Reset arrays
-    a.fill(0.0);
-    b.fill(0.0);
-    c.fill(0.0);
-
+/// The matrix `M = I + Δt A` of [`solve_diffusion_column`]: its sub-, main
+/// and super-diagonals into `a`, `b`, `c`.
+fn diffusion_matrix(
+    nu: &[f64],
+    dz: &[f64],
+    dt: f64,
+    drag_bot: f64,
+    drag_layers: Option<&[f64]>,
+    [a, b, c]: [&mut [f64]; 3],
+) {
+    let n = dz.len();
     for k in 0..n {
         let lambda = dt / dz[k];
-        d[k] = phi[k]; // RHS starts with old value
-
-        // Lower flux term: lambda * nu_{k-1/2} * (phi_k - phi_{k-1}) / dist
-        // Corresponds to index k in nu (bottom is 0)
+        // The flux through the w-point below (ν at index k) and above
         let val_lower = if k == 0 {
-            0.0 // Boundary
+            0.0
         } else {
             let dist = 0.5 * (dz[k] + dz[k - 1]);
             lambda * nu[k] / dist
         };
-
-        // Upper flux term: lambda * nu_{k+1/2} * (phi_{k+1} - phi_k) / dist
-        // Corresponds to index k+1 in nu
         let val_upper = if k == n - 1 {
-            0.0 // Boundary
+            0.0
         } else {
             let dist = 0.5 * (dz[k] + dz[k + 1]);
             lambda * nu[k + 1] / dist
         };
-
         a[k] = -val_lower;
         c[k] = -val_upper;
         b[k] = 1.0 + val_lower + val_upper + drag_layers.map_or(0.0, |rate| dt * rate[k]);
     }
+    // The bed's drag, at the new time
+    b[0] += dt / dz[0] * drag_bot;
+}
 
-    // Apply Boundary Conditions to RHS
-    // Bottom: - lambda * Flux_{bot}, the drag part implicit
-    let lambda_bot = dt / dz[0];
-    d[0] -= lambda_bot * flux_bot;
-    b[0] += lambda_bot * drag_bot;
+/// What the residual of a column's solve reads: the off-diagonals of
+/// [`diffusion_matrix`], the drags and `Δt/Δz` of the end layers.
+struct DiffusionColumn<'a> {
+    a: &'a [f64],
+    c: &'a [f64],
+    dt: f64,
+    drag_bot: f64,
+    drag_layers: Option<&'a [f64]>,
+    /// `Δt/Δz` of the bed and the surface layer
+    lambda: [f64; 2],
+}
 
-    // Top: + lambda * Flux_{top}
-    let lambda_top = dt / dz[n - 1];
-    d[n - 1] += lambda_top * flux_top;
-
-    solve_tridiagonal(a, b, c, d, x, c_prime, d_prime);
-
-    phi.copy_from_slice(x);
+impl DiffusionColumn<'_> {
+    /// The residual `r = d − M φ` of `φ` into `out`, with `d` the old values
+    /// plus the end fluxes: the fluxes between the layers from the
+    /// differences of `φ`, the drags of `φ`, and the end fluxes (see the
+    /// module docs). Zero, exactly, for a uniform `φ` with no flux or drag.
+    fn residual_into(&self, phi: &[f64], flux_top: f64, flux_bot: f64, out: &mut [f64]) {
+        let n = phi.len();
+        let [lambda_bot, lambda_top] = self.lambda;
+        for k in 0..n {
+            let mut r = -self.drag_layers.map_or(0.0, |rate| self.dt * rate[k]) * phi[k];
+            if k > 0 {
+                r += self.a[k] * (phi[k] - phi[k - 1]);
+            }
+            if k < n - 1 {
+                r += self.c[k] * (phi[k] - phi[k + 1]);
+            }
+            out[k] = r;
+        }
+        out[0] -= lambda_bot * (flux_bot + self.drag_bot * phi[0]);
+        out[n - 1] += lambda_top * flux_top;
+    }
 }
 
 /// [`solve_diffusion_column`] for two fields with the same `ν` and drags
 /// (`u` and `v`; `T` and `S`): the matrix is built and eliminated once, for
-/// both right-hand sides, with each field's result bit for bit its own
-/// solve's.
+/// both residuals, with each field's result bit for bit its own solve's.
 fn solve_diffusion_pair(
     phis: [&mut [f64]; 2],
     nu: &[f64],
@@ -603,27 +662,14 @@ fn solve_diffusion_pair(
     [a, b, c, d, x, c_prime, d_prime]: [&mut [f64]; 7],
 ) {
     let n = dz.len();
-    for k in 0..n {
-        let lambda = dt / dz[k];
-        let val_lower = if k == 0 {
-            0.0
-        } else {
-            let dist = 0.5 * (dz[k] + dz[k - 1]);
-            lambda * nu[k] / dist
-        };
-        let val_upper = if k == n - 1 {
-            0.0
-        } else {
-            let dist = 0.5 * (dz[k] + dz[k + 1]);
-            lambda * nu[k + 1] / dist
-        };
-        a[k] = -val_lower;
-        c[k] = -val_upper;
-        b[k] = 1.0 + val_lower + val_upper + drag_layers.map_or(0.0, |rate| dt * rate[k]);
-    }
-    let lambda_bot = dt / dz[0];
-    let lambda_top = dt / dz[n - 1];
-    b[0] += lambda_bot * drag_bot;
+    diffusion_matrix(
+        nu,
+        dz,
+        dt,
+        drag_bot,
+        drag_layers,
+        [&mut *a, &mut *b, &mut *c],
+    );
 
     // The elimination's factors, shared: `c_prime` and `1/m` (in `x`)
     c_prime[0] = c[0] / b[0];
@@ -635,17 +681,26 @@ fn solve_diffusion_pair(
         }
         x[i] = m;
     }
+    let column = DiffusionColumn {
+        a,
+        c,
+        dt,
+        drag_bot,
+        drag_layers,
+        lambda: [dt / dz[0], dt / dz[n - 1]],
+    };
     for (phi, (top, bot)) in phis.into_iter().zip(flux_top.into_iter().zip(flux_bot)) {
-        d.copy_from_slice(phi);
-        d[0] -= lambda_bot * bot;
-        d[n - 1] += lambda_top * top;
+        // The increment from the residual, added
+        column.residual_into(phi, top, bot, d);
         d_prime[0] = d[0] / x[0];
         for i in 1..n {
             d_prime[i] = (d[i] - a[i] * d_prime[i - 1]) * x[i];
         }
-        phi[n - 1] = d_prime[n - 1];
+        let mut increment = d_prime[n - 1];
+        phi[n - 1] += increment;
         for i in (0..n - 1).rev() {
-            phi[i] = d_prime[i] - c_prime[i] * phi[i + 1];
+            increment = d_prime[i] - c_prime[i] * increment;
+            phi[i] += increment;
         }
     }
 }
@@ -707,6 +762,42 @@ mod tests {
                 for (x, y) in e.iter().zip(p) {
                     assert_eq!(x.to_bits(), y.to_bits());
                 }
+            }
+        }
+    }
+
+    /// A uniform T and S with no flux or drag stay uniform bit for bit
+    /// however large the diffusivity. Solved for the new values, the
+    /// diagonal's `1` was lost to round-off as `K Δt/Δz²` grew: under the
+    /// 2·10⁷ m²/s of a degenerate turbulence state (11 s, layers of 0.05 to
+    /// 0.6 m) a uniform 12.3 °C came out off by 1e-6 to 1e-5, the 3D
+    /// judges' tracer drift on local steps (TODO P4.5).
+    #[test]
+    fn a_uniform_column_stays_uniform_under_any_diffusivity() {
+        let n = 20;
+        let dz: Vec<f64> = (0..n).map(|k| 0.05 + 0.03 * k as f64).collect();
+        let mut work: [Vec<f64>; 7] = std::array::from_fn(|_| vec![0.0; n]);
+        for nu_max in [1e-3, 1.0, 1e4, 2e7, 1e12] {
+            let nu: Vec<f64> = (0..=n)
+                .map(|k| nu_max * (0.05 + ((k as f64) * 0.9).sin().abs()))
+                .collect();
+            let mut fields = [vec![12.3; n], vec![33.1; n]];
+            let [t, s] = &mut fields;
+            let [a, b, c, d, x, cp, dp] = &mut work;
+            solve_diffusion_pair(
+                [t, s],
+                &nu,
+                &dz,
+                11.0,
+                [0.0, 0.0],
+                [0.0, 0.0],
+                0.0,
+                None,
+                [a, b, c, d, x, cp, dp],
+            );
+            for (field, value) in fields.iter().zip([12.3, 33.1]) {
+                let off = field.iter().map(|&x| (x - value).abs()).fold(0.0, f64::max);
+                assert_eq!(off, 0.0, "ν up to {nu_max:e} m²/s: off by {off:e}");
             }
         }
     }
