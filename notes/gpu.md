@@ -1026,7 +1026,18 @@ Found while timing the stack; none of it is the GPU's alone. The scheme is dgcom
     | 240 s | 1,094 of 112–240 → 1,065 of 240 s | 1,607.1 → 1,443.7 s (the first shared the CPU with the test tier) | 453 → 437 | 3 → 3 | 69.4 → 78.7 s |
 
     The fix makes the runs faster: the shore elements whose shallow columns set the shortest steps now move their layers on the subcells. Mausund is the same in all four (centred RMSE 5.7 cm, r 0.9980; bias +2.5 against +2.6 cm). `norkyst_profiles_3d` at the NorKyst point, Kattholmen and Frohavet, with and without the fix: every T bias and RMSE within 0.02 °C, S within 0.01, the mean currents within 0.005 m/s, the M2 major axes within 0.013 m/s, and the angles within 4° (Kattholmen's ellipse is 0.014 m/s); r within 0.05 at depths where it is 0.0–0.5.
-- **What follows.** Local 3D steps keep uniform tracers uniform on the beach as global steps do, and Frøya's 46 h event is understood and passes. Not yet checked with the fix: the coastline mesh's 6 levels, on the edge before (above). The check of 2026-11-27 was stopped at its start: it shared the laptop with the full test suite, and Claude Code stopped both when memory ran low. Run it alone. Until then: global steps on the coastline mesh; on Frøya's 500 m grid a 240 s cap or 120 s, which cost within 3 % of each other.
+- **The coastline mesh on 6 levels (2026-11-27, RTX 4060, alone on the card; the first hour from rest with the weather; `output/radical/drift/runs/coast_*`).**
+  - **Both binaries hold the hour now.** With the drift's fixes alone: 60 coarse steps of 60 s in 346.5 s. With the subcell fix: 335.3 s. Global steps with the fix: 648 steps of 3.4–9.3 s in 605.9 s, so local steps are 1.8× faster. No clips in any.
+  - **Against the global run at 1 h** (nodes ≥ 10 m deep, RMS and largest, `examples/snapshot_compare_3d.rs`):
+
+    | 6 levels | η | ū | surface u | T |
+    |---|---|---|---|---|
+    | without the subcell fix | 5.3, 121 mm | 15.9 mm/s, 0.60 m/s | 30.6 mm/s, 2.04 m/s | 53 m°C, 2.3 °C |
+    | with it | 2.7, 316 mm | 15.4 mm/s, 1.24 m/s | 30.7 mm/s, 2.92 m/s | 20 m°C, 2.4 °C |
+
+  - **The largest differences are around river 851's mouth** (elements 2072, 2089, 2090: 50 m elements, 2–25 m deep, currents of 1.5–2.5 m/s). η has a grid-scale wiggle of 0.1–0.35 m between an element's nodes there in all three runs, global steps included (parked in `notes/3d-numerics.md`). Without the subcell fix the 3 m node of element 2072 carries 2.54 m/s depth mean and 3.78 m/s at the top, against the global run's 1.51 and 1.90; with it 1.28 and 1.57.
+  - **So local steps on this mesh hold, but their error is not small.** At 1 h they differ from global steps ten times more than global steps differ from themselves at half the step (η 0.29 mm, ū 2.4 mm/s RMS, above), nearly all of it at the river mouths. The interface error of the multirate scheme scales with `(λΔt)²` across six levels there.
+- **What follows.** Local 3D steps keep uniform tracers uniform on the beach as global steps do, and Frøya's 46 h event is understood and passes. On Frøya's 500 m grid a 240 s cap or 120 s cost within 3 % of each other. On the coastline mesh measure local steps' error against global steps over a tidal cycle, at the farm sites and the river mouths, before using them for farm currents.
 
 ## On the RTX PRO 6000: what to run and what to record
 
