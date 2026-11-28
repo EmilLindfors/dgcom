@@ -61,6 +61,11 @@ impl CaseFile {
                 .map(|k| domain.mesh.element_diameter(k))
                 .collect(),
         )];
+        // A patch's elements by their index in the whole mesh
+        if let Some(patch) = &domain.patch {
+            let whole = patch.whole_elements.iter().map(|&k| k as f64).collect();
+            element_fields.push(("whole_element", whole));
+        }
         if case.three_d.is_none() {
             // The 2D run's element steps at rest, as its first step takes them
             let clock = case.clock()?;

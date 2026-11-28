@@ -118,6 +118,117 @@ pub struct MeshSection {
     /// high water needs `false`.
     #[serde(default = "default_true")]
     pub drop_land: bool,
+    /// Run on a cut-out of the mesh only (default: the whole mesh).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<Patch>,
+}
+
+/// `[mesh.patch]`: the run on a cut-out of its mesh, for experiments that
+/// need minutes where the whole domain needs hours (a local growth, a
+/// blow-up, a scheme's switch at a farm site).
+///
+/// The whole mesh and bed are built first, as the whole run builds them
+/// (the raster, the smoothing, the 3D bed, the land dropped), and the patch
+/// is cut from them: its elements, their numbering's order and their bed
+/// are the whole run's, bit for bit. Then the case is built on the patch as
+/// on any mesh: the faces to the dropped elements take `faces`' tag (an
+/// open boundary nests in the case's parent there, and blends its bed
+/// across its band, unless `blend_bed = false`), a `[[boundary]]` whose
+/// faces were all cut away is left out, and the stations and rivers are
+/// placed on the whole mesh and kept if they fall in the patch.
+///
+/// `--resume` with a restart of the whole run starts the patch from its
+/// state: the patch's elements' state, at the restart's time, with outputs
+/// of its own. Without `output.directory` a patch writes to a folder of its
+/// own inside the whole run's (`output/<name>/patch_…`), so it never
+/// overwrites the whole run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Patch {
+    /// Around this element of the whole mesh: its index as the runs report
+    /// it and `dgcom mesh` writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element: Option<usize>,
+    /// Around this point (a placed mesh): the element holding it, or the
+    /// nearest one by its centre.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center: Option<GeoPoint>,
+    /// With `element` or `center`: the elements whose centre is within this
+    /// distance (km) of the element's centre or of the point, connected to
+    /// its element through each other, so another arm of water the circle
+    /// crosses is left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius_km: Option<f64>,
+    /// Or the elements whose centre is in this box, `[west, south, east,
+    /// north]` (degrees; a placed mesh).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<[f64; 4]>,
+    /// What the faces to the dropped elements become (default `"open"`, the
+    /// case's open boundary; `"wall"` for a closed basin).
+    #[serde(default = "default_patch_faces")]
+    pub faces: SideTag,
+}
+
+impl Patch {
+    /// The patch's own output folder's name, from its region.
+    pub fn label(&self) -> String {
+        match (self.element, self.center, self.bbox, self.radius_km) {
+            (Some(k), _, _, Some(r)) => format!("patch_e{k}_{r}km"),
+            (_, Some(c), _, Some(r)) => {
+                let h = |v: f64, pos: char, neg: char| {
+                    format!("{:.4}{}", v.abs(), if v < 0.0 { neg } else { pos })
+                };
+                format!("patch_{}_{}_{r}km", h(c.lat, 'N', 'S'), h(c.lon, 'E', 'W'))
+            }
+            (_, _, Some([w, s, e, n]), _) => format!("patch_{w}_{s}_{e}_{n}"),
+            _ => "patch".into(),
+        }
+    }
+
+    fn validate(&self, placed: bool) -> Result<(), CaseError> {
+        let invalid = |msg: String| Err(CaseError::Invalid(msg));
+        match (self.element, self.center, self.bbox) {
+            (Some(_), None, None) | (None, Some(_), None) => match self.radius_km {
+                Some(r) if positive(r) => {}
+                r => {
+                    return invalid(format!(
+                        "mesh.patch.radius_km must be positive with element or center, not {r:?}"
+                    ));
+                }
+            },
+            (None, None, Some([w, s, e, n])) => {
+                if self.radius_km.is_some() {
+                    return invalid(
+                        "mesh.patch.radius_km goes with element or center, not bbox".into(),
+                    );
+                }
+                if !(w < e && s < n && (-90.0..=90.0).contains(&s) && (-90.0..=90.0).contains(&n)) {
+                    return invalid(format!(
+                        "mesh.patch.bbox must be [west, south, east, north], not {:?}",
+                        [w, s, e, n]
+                    ));
+                }
+            }
+            _ => {
+                return invalid(
+                    "[mesh.patch] needs exactly one of `element`, `center` and `bbox`".into(),
+                );
+            }
+        }
+        if let Some(c) = self.center
+            && !((-90.0..=90.0).contains(&c.lat) && c.lon.is_finite())
+        {
+            return invalid(format!("mesh.patch.center {c:?} is not on the Earth"));
+        }
+        if (self.center.is_some() || self.bbox.is_some()) && !placed {
+            return invalid(
+                "mesh.patch.center and bbox need a placed mesh (mesh.geographic, or \
+                 mesh.origin); mesh.patch.element does not"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl MeshSection {
@@ -1916,6 +2027,9 @@ fn default_gravity() -> f64 {
 fn default_true() -> bool {
     true
 }
+fn default_patch_faces() -> SideTag {
+    SideTag::Open
+}
 fn default_band_km() -> f64 {
     3.0
 }
@@ -2152,6 +2266,9 @@ impl Case {
             return invalid(format!("mesh.origin {o:?} is not on the Earth"));
         }
         let placed = self.placed();
+        if let Some(p) = &m.patch {
+            p.validate(placed)?;
+        }
         let b = &self.bathymetry;
         match (&b.depth_m, &b.ramp, &b.raster) {
             (Some(d), None, None) if d.is_finite() => {}
@@ -2571,6 +2688,13 @@ impl Case {
             w.validate(self)?;
             if let Some(m) = &w.mesh {
                 m.validate_shape("waves.mesh")?;
+                if m.patch.is_some() || self.mesh.patch.is_some() {
+                    return invalid(
+                        "a patch cuts the run's mesh only: [mesh.patch] with a [waves.mesh] of \
+                         their own is not supported, and waves.mesh takes no patch"
+                            .into(),
+                    );
+                }
             }
         }
         // Last, so that a build without NetCDF still checks the rest

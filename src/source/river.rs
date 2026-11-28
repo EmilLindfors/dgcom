@@ -493,6 +493,42 @@ impl RiverSources {
         (Self::placed(kept, placed, mesh, geom, bathymetry), errors)
     }
 
+    /// The rivers placed in the elements `kept` of the mesh they were placed
+    /// on, in `mesh`, the submesh of those elements in that order
+    /// ([`Mesh2D::retain_elements`]) with their bed: each river in the same
+    /// element at the same weights, renumbered, so a cut-out of a domain
+    /// takes the whole domain's rivers that enter it as the whole run takes
+    /// them. Returns them and the names of the others, which enter dropped
+    /// elements. Before [`Self::set_levels`].
+    pub fn retain_elements(
+        self,
+        kept: &[usize],
+        mesh: &Mesh2D,
+        geom: &GeometricFactors2D,
+        bathymetry: &Bathymetry2D,
+    ) -> (Self, Vec<String>) {
+        assert!(
+            self.shape.is_empty(),
+            "the rivers' levels are set after the cut"
+        );
+        let new = |k: ElementIndex| kept.binary_search(&k.as_usize()).ok();
+        assert!(kept.is_sorted(), "a submesh keeps the elements' order");
+        let (mut rivers, mut placed, mut left_out) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, river) in self.rivers.into_iter().enumerate() {
+            match new(self.elements[i]) {
+                Some(k) => {
+                    rivers.push(river);
+                    placed.push((ElementIndex::new(k), self.snapped[i]));
+                }
+                None => left_out.push(river.name),
+            }
+        }
+        (
+            Self::placed(rivers, placed, mesh, geom, bathymetry),
+            left_out,
+        )
+    }
+
     /// The rivers in their elements, `placed[i]` = (element, snap
     /// distance), each element under water.
     fn placed(
@@ -1284,6 +1320,34 @@ mod tests {
                 RiverError::NegativeDischarge { .. }
             ]
         ));
+    }
+
+    /// On a cut-out of the mesh the rivers in its elements keep their
+    /// element (renumbered) and weights, and the others are named.
+    #[test]
+    fn a_cut_keeps_the_rivers_in_its_elements_as_they_were() {
+        let (mesh, ops, geom, bed) = mesh();
+        let rivers = vec![
+            River::new("west", [50.0, 50.0], 1.0),
+            River::new("east", [350.0, 150.0], 2.0),
+            River::new("east too", [360.0, 140.0], 3.0),
+        ];
+        let whole = RiverSources::new(rivers, &mesh, &geom, &bed, 50.0, &[]).unwrap();
+        let east = |k: ElementIndex| mesh.reference_to_physical(k, 0.0, 0.0)[0] > 200.0;
+        let (sub, kept) = mesh.retain_elements(east, BoundaryTag::Wall);
+        let sub_geom = GeometricFactors2D::compute(&sub, &ops);
+        let sub_bed = bed.select_elements(&kept);
+        let shares: Vec<Vec<f64>> = (1..3).map(|i| whole.share(i).to_vec()).collect();
+        let element = whole.element(1).as_usize();
+        let (cut, left_out) = whole.retain_elements(&kept, &sub, &sub_geom, &sub_bed);
+        assert_eq!(left_out, vec!["west".to_string()]);
+        assert_eq!(cut.len(), 2);
+        for i in 0..2 {
+            assert_eq!(kept[cut.element(i).as_usize()], element);
+            assert_eq!(cut.share(i), shares[i].as_slice());
+        }
+        assert_eq!(cut.in_element(cut.element(0).as_usize()), &[0, 1]);
+        assert!((cut.total_discharge(0.0) - 5.0).abs() < 1e-15);
     }
 
     /// The source integrates to the discharge over the element, and touches

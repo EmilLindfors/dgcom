@@ -16,10 +16,11 @@
 
 use std::sync::Arc;
 
+use super::patch::{DomainPatch, WholeMesh};
 use super::schema::{
-    AtlasCorrection, AtmosphereSection, BathymetrySection, BedFor3D, Case, FarmSection,
-    GaugeCorrection, MeshSection, Nesting, RasterKind, RiversSection, Sampling, SideTag, Slopes3D,
-    Station,
+    AtlasCorrection, AtmosphereSection, BathymetrySection, BedFor3D, BoundarySection, Case,
+    FarmSection, GaugeCorrection, MeshSection, Nesting, RasterKind, RiversSection, Sampling,
+    SideTag, Slopes3D, Station,
 };
 use super::{CaseError, CaseFile};
 use crate::analysis::{GaugeRecord, HarmonicAnalysis, TideGaugeStation};
@@ -87,6 +88,8 @@ pub struct Domain {
     pub cages: Vec<NetCage>,
     /// `[rivers]`: the rivers placed on the mesh
     pub rivers: Option<RiverSources>,
+    /// `[mesh.patch]`: what was cut out of the whole mesh
+    pub patch: Option<DomainPatch>,
     /// What was done to build it, line by line, for a log
     pub notes: Vec<String>,
 }
@@ -184,15 +187,38 @@ impl CaseFile {
         let case = &self.case;
         let projection = case.projection();
         let mut notes = Vec::new();
-        let (mut mesh, ops, geom, mut bathymetry) =
+        let (mut mesh, ops, mut geom, mut bathymetry) =
             self.mesh_and_bed(&case.mesh, projection.as_ref(), &mut notes)?;
+
+        // `[mesh.patch]`: cut it out of the whole mesh, which is kept to
+        // place the stations and rivers on as the whole run does
+        let (mut patch, mut whole) = (None, None);
+        if let Some(spec) = &case.mesh.patch {
+            let full = WholeMesh {
+                mesh,
+                geom,
+                bathymetry,
+            };
+            let cut = self.cut_patch(spec, full, &ops, projection.as_ref(), &mut notes)?;
+            (mesh, geom, bathymetry) = (cut.mesh, cut.geom, cut.bathymetry);
+            (patch, whole) = (Some(cut.patch), Some(cut.whole));
+        }
+        // A patch leaves out the `[[boundary]]` entries whose faces it cut away
+        let cut_tags = open_tags(&mesh)?;
+        let in_use = |b: &BoundarySection| patch.is_none() || cut_tags.contains(&b.tag);
+        for b in case.boundaries.iter().filter(|b| !in_use(b)) {
+            notes.push(format!(
+                "[[boundary]] tag = {:?}: none of its faces is in the patch, left out",
+                b.tag.name()
+            ));
+        }
 
         // What the boundaries' tides carry, for the fit of a station's record
         let tide_constituents = self.tide_constituents()?;
 
         // Tidal atlases: the open faces they do not cover become walls
         let mut atlases = Vec::new();
-        for b in &case.boundaries {
+        for b in case.boundaries.iter().filter(|b| in_use(b)) {
             let Some(spec) = &b.atlas else { continue };
             let path = self.resolve(&spec.file);
             let mut atlas = read_atlas(&path)?;
@@ -247,7 +273,7 @@ impl CaseFile {
         // and the bed is blended to theirs across the band
         let mut parents = Vec::new();
         let mut parent_reader = None;
-        for b in &case.boundaries {
+        for b in case.boundaries.iter().filter(|b| in_use(b)) {
             let Some(spec) = &b.nesting else { continue };
             let projection = projection.as_ref().expect("validated: placed");
             let (parent, reader) = self.nest(
@@ -263,18 +289,35 @@ impl CaseFile {
             parents.push((b.tag, parent));
             parent_reader = Some(reader);
         }
+        // A 3D patch whose cut left its nested boundary out still starts
+        // its columns from the parent, as the whole run does
+        if parent_reader.is_none()
+            && case.three_d.is_some()
+            && let Some(spec) = case.boundaries.iter().find_map(|b| b.nesting.as_ref())
+        {
+            let path = self.resolve(&spec.file);
+            parent_reader = Some(Arc::new(read_parent(&path, true)?));
+            notes.push(format!(
+                "parent {}: read for the 3D start only (its boundary is not in the patch)",
+                path.display()
+            ));
+        }
 
         let open_tags = open_tags(&mesh)?;
         for tag in &open_tags {
             if !case.boundaries.iter().any(|b| b.tag == *tag) {
                 return Err(CaseError::Invalid(format!(
                     "the mesh has {tag:?} boundary faces but the case no [[boundary]] with \
-                     tag = {:?}",
-                    tag.name()
+                     tag = {:?}{}",
+                    tag.name(),
+                    match patch {
+                        Some(_) => " (mesh.patch.faces = \"wall\" closes the patch's cut)",
+                        None => "",
+                    }
                 )));
             }
         }
-        for b in &case.boundaries {
+        for b in case.boundaries.iter().filter(|b| in_use(b)) {
             if !open_tags.contains(&b.tag) {
                 return Err(CaseError::Invalid(format!(
                     "[[boundary]] tag = {:?}: the mesh has no faces with that tag",
@@ -282,7 +325,30 @@ impl CaseFile {
                 )));
             }
         }
-        let stations = self.stations(&mesh, &ops, &bathymetry, projection.as_ref(), &mut notes)?;
+        // A patch's stations: placed on the whole mesh, kept where they fall
+        // in it
+        let stations = match (&patch, &whole) {
+            (Some(patch), Some(w)) => {
+                let all = self.stations(
+                    &w.mesh,
+                    &ops,
+                    &w.bathymetry,
+                    projection.as_ref(),
+                    &mut notes,
+                )?;
+                let (kept, left_out) = patch.keep_stations(all, &mesh, &ops);
+                if !left_out.is_empty() {
+                    notes.push(format!(
+                        "patch: {} of {} stations outside it, left out: {}",
+                        left_out.len(),
+                        left_out.len() + kept.len(),
+                        left_out.join(", ")
+                    ));
+                }
+                kept
+            }
+            _ => self.stations(&mesh, &ops, &bathymetry, projection.as_ref(), &mut notes)?,
+        };
         if stations.iter().any(|s| s.gauge.is_some()) {
             notes.push(format!(
                 "gauged stations: the model's record is fitted with the constituents the \
@@ -343,6 +409,7 @@ impl CaseFile {
             waves: None,
             cages: Vec::new(),
             rivers: None,
+            patch,
             notes,
         };
         if let Some(farm) = &case.farm {
@@ -359,7 +426,31 @@ impl CaseFile {
         if let Some(spec) = &case.rivers {
             let projection = projection.as_ref().expect("validated: placed");
             let mut notes = Vec::new();
-            domain.rivers = Some(self.rivers(spec, &domain, projection, &mut notes)?);
+            fn on(d: &Domain) -> (&Mesh2D, &GeometricFactors2D, &Bathymetry2D) {
+                (&d.mesh, &d.geom, &d.bathymetry)
+            }
+            domain.rivers = Some(match (&domain.patch, &whole) {
+                // Placed on the whole mesh, kept where they enter the patch
+                (Some(patch), Some(w)) => {
+                    let all = (&w.mesh, &w.geom, &w.bathymetry);
+                    let all = self.rivers(spec, all, projection, &mut notes)?;
+                    let n = all.len();
+                    let (mesh, geom, bed) = on(&domain);
+                    let (kept, left_out) =
+                        all.retain_elements(&patch.whole_elements, mesh, geom, bed);
+                    notes.push(format!(
+                        "patch: {} of the {n} rivers enter it (their elements above are the \
+                         whole mesh's){}",
+                        kept.len(),
+                        match left_out.len() {
+                            0 => String::new(),
+                            _ => format!("; left out: {}", left_out.join(", ")),
+                        }
+                    ));
+                    kept
+                }
+                _ => self.rivers(spec, on(&domain), projection, &mut notes)?,
+            });
             domain.notes.extend(notes);
         }
         Ok(domain)
@@ -371,7 +462,7 @@ impl CaseFile {
     fn rivers(
         &self,
         spec: &RiversSection,
-        domain: &Domain,
+        (mesh, geom, bathymetry): (&Mesh2D, &GeometricFactors2D, &Bathymetry2D),
         projection: &LocalProjection,
         notes: &mut Vec<String>,
     ) -> Result<RiverSources, CaseError> {
@@ -412,9 +503,9 @@ impl CaseFile {
             .collect();
         let (sources, skipped) = RiverSources::on_mesh(
             rivers,
-            &domain.mesh,
-            &domain.geom,
-            &domain.bathymetry,
+            mesh,
+            geom,
+            bathymetry,
             1000.0 * spec.snap_km,
             &parent_tags,
         );
@@ -859,8 +950,18 @@ impl CaseFile {
         let path = self.resolve(&spec.file);
         let reader = Arc::new(read_parent(&path, self.case.three_d.is_some())?);
         notes.push(format!("parent {}: {}", path.display(), reader.summary()));
-        let invalid =
-            |e: &dyn std::fmt::Display| CaseError::Invalid(format!("{}: {e}", path.display()));
+        // A patch's cut lies inside the domain, away from a boundary
+        // atlas's points on its perimeter
+        let hint = match (&self.case.mesh.patch, &spec.atlas) {
+            (Some(_), Some(_)) => {
+                "; a patch's cut is inside the domain, away from the atlas's points on its \
+                 perimeter: boundary.<n>.nesting.atlas_coverage_m takes them from farther"
+            }
+            _ => "",
+        };
+        let invalid = |e: &dyn std::fmt::Display| {
+            CaseError::Invalid(format!("{}: {e}{hint}", path.display()))
+        };
         let atlas = spec
             .atlas
             .as_ref()

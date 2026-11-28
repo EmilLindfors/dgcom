@@ -38,6 +38,16 @@ impl DGSolution2D {
         }
     }
 
+    /// The values of the elements `kept` (indices into this one, e.g. those
+    /// [`crate::mesh::Mesh2D::retain_elements`] returns), in that order.
+    pub fn select_elements(&self, kept: &[usize]) -> Self {
+        Self {
+            data: super::select_rows(&self.data, self.n_nodes, kept),
+            n_elements: kept.len(),
+            n_nodes: self.n_nodes,
+        }
+    }
+
     /// Create a solution storage from existing data.
     pub fn from_data(data: Vec<f64>, n_elements: usize, n_nodes: usize) -> Self {
         debug_assert_eq!(data.len(), n_elements * n_nodes);

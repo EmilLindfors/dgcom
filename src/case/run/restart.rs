@@ -75,9 +75,40 @@ impl CaseFile {
         Some(self.resolve(from))
     }
 
+    /// Refuse a restart to start this case's patch from unless the whole
+    /// run wrote it: its case this one without `[mesh.patch]` (beyond
+    /// [`RESUME_MAY_CHANGE`] and `restart.changes`), at the mesh's order
+    /// (`n_nodes` nodes per element).
+    pub(super) fn check_seed(
+        &self,
+        path: &Path,
+        driver: &DriverData,
+        n_nodes: usize,
+        domain: &crate::case::Domain,
+    ) -> Result<(), CaseError> {
+        if n_nodes != domain.ops.n_nodes {
+            return Err(CaseError::Invalid(format!(
+                "cannot start the patch from {}: {n_nodes} nodes per element, the case {}",
+                path.display(),
+                domain.ops.n_nodes
+            )));
+        }
+        self.check_against(path, driver, &["mesh.patch"])
+    }
+
     /// Refuse a restart written by a run whose resolved case differs from
     /// this one's beyond [`RESUME_MAY_CHANGE`] and `restart.changes`.
     pub(super) fn check_resumed(&self, path: &Path, driver: &DriverData) -> Result<(), CaseError> {
+        self.check_against(path, driver, &[])
+    }
+
+    /// [`Self::check_resumed`] with the keys `also` free as well.
+    fn check_against(
+        &self,
+        path: &Path,
+        driver: &DriverData,
+        also: &[&str],
+    ) -> Result<(), CaseError> {
         let refuse = |why: String| {
             Err(CaseError::Invalid(format!(
                 "cannot resume from {}: {why}",
@@ -100,6 +131,7 @@ impl CaseFile {
             RESUME_MAY_CHANGE
                 .iter()
                 .copied()
+                .chain(also.iter().copied())
                 .chain(changes.iter().map(String::as_str))
                 .any(|p| covers(p, key))
         };
@@ -118,6 +150,17 @@ impl CaseFile {
             differ.join("; ")
         ))
     }
+}
+
+/// What the log says of a patch started from the whole run's restart.
+pub(super) fn seed_note(path: &Path, time: f64, driver: &DriverData) -> String {
+    format!(
+        "patch started from the whole run's restart {} at {:.2} h (its elements' state; \
+         outputs of its own from there), written by {}",
+        path.display(),
+        time / 3600.0,
+        driver.metadata("build").unwrap_or("an unknown build")
+    )
 }
 
 /// Whether `prefix` is `key` or a table above it (`boundary` covers

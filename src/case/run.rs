@@ -388,30 +388,50 @@ impl CaseFile {
             return refuse(&what);
         }
         let mut notes = Vec::new();
-        // A resumed run: the restart's state, time and records
+        // A resumed run: the restart's state, time and records. A patch
+        // started from the whole run's restart takes its elements' state at
+        // its time, with outputs of its own
+        let mut seeded = None;
         let resumed = match self.resume_path() {
             Some(path) => {
                 let restart = Restart2D::read(&path)
                     .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
-                physics.check_restart(&restart).map_err(|e| {
-                    CaseError::Invalid(format!("cannot resume from {}: {e}", path.display()))
-                })?;
-                self.check_resumed(&path, &restart.driver)?;
-                let resumed = restart::Resumed {
-                    path,
-                    time: restart.time,
-                    driver: restart.driver,
-                };
-                notes.push(resumed.note());
-                Some((restart.state, resumed))
+                match domain.patch.as_ref() {
+                    Some(patch) if patch.is_whole(restart.state.n_elements) => {
+                        self.check_seed(&path, &restart.driver, restart.state.n_nodes, domain)?;
+                        notes.push(restart::seed_note(&path, restart.time, &restart.driver));
+                        let q = patch.seed_2d(&restart.state, &domain.bathymetry);
+                        seeded = Some((q, restart.time));
+                        None
+                    }
+                    _ => {
+                        physics.check_restart(&restart).map_err(|e| {
+                            CaseError::Invalid(format!(
+                                "cannot resume from {}: {e}",
+                                path.display()
+                            ))
+                        })?;
+                        self.check_resumed(&path, &restart.driver)?;
+                        let resumed = restart::Resumed {
+                            path,
+                            time: restart.time,
+                            driver: restart.driver,
+                        };
+                        notes.push(resumed.note());
+                        Some((restart.state, resumed))
+                    }
+                }
             }
             None => None,
         };
-        let (mut q, resumed) = match resumed {
-            Some((state, resumed)) => (state, Some(resumed)),
-            None => (still_water(case, domain), None),
+        let (mut q, resumed, t_start) = match (resumed, seeded) {
+            (Some((state, resumed)), _) => {
+                let t = resumed.time;
+                (state, Some(resumed), t)
+            }
+            (None, Some((state, t))) => (state, None, t),
+            (None, None) => (still_water(case, domain), None, 0.0),
         };
-        let t_start = resumed.as_ref().map_or(0.0, |r| r.time);
         if t_start >= t_end - 1e-6 {
             return Err(CaseError::Invalid(format!(
                 "the restart is at {:.2} h, at or past the run's end ({} h)",
@@ -661,8 +681,10 @@ impl CaseFile {
             .atmosphere
             .as_ref()
             .filter(|_| case.atmosphere.as_ref().is_some_and(|a| a.pressure));
+        // Those with faces on the mesh: all of them, but on a patch
         case.boundaries
             .iter()
+            .filter(|b| domain.open_tags.contains(&b.tag))
             .map(|b| -> Result<_, CaseError> {
                 // The weather's inverse-barometer level, the fraction this
                 // boundary adds

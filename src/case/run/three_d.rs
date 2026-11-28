@@ -288,21 +288,42 @@ impl CaseFile {
         // (Mellor et al. 1998) and the advection that is its adjoint
         let mut physics = physics.with_reference_profile(reference);
 
-        // A resumed run: the restart's state, time, history and records
+        // A resumed run: the restart's state, time, history and records. A
+        // patch started from the whole run's restart takes its elements'
+        // columns and history at its time, with outputs of its own
+        let mut seeded = false;
         let restart = match self.resume_path() {
             Some(path) => {
                 let restart = Restart3D::read(&path)
                     .map_err(|e| CaseError::Io(format!("{}: {e}", path.display())))?;
                 // The domain before any output is touched (`Simulation3D::resume`
                 // checks it again)
-                let domain = crate::io::domain_fingerprint_3d(mesh, bed, &sigma);
-                if restart.domain != domain {
-                    return Err(CaseError::Invalid(format!(
-                        "cannot resume from {}: its mesh, bed or σ-grid differ",
-                        path.display()
-                    )));
-                }
-                self.check_resumed(&path, &restart.driver)?;
+                let fingerprint = crate::io::domain_fingerprint_3d(mesh, bed, &sigma);
+                let restart = match domain.patch.as_ref() {
+                    Some(patch) if patch.is_whole(restart.state.n_elements) => {
+                        self.check_seed(&path, &restart.driver, restart.state.n_nodes, domain)?;
+                        if restart.state.n_levels != nl {
+                            return Err(CaseError::Invalid(format!(
+                                "cannot start the patch from {}: {} levels, the case {nl}",
+                                path.display(),
+                                restart.state.n_levels
+                            )));
+                        }
+                        notes.push(restart::seed_note(&path, restart.time, &restart.driver));
+                        seeded = true;
+                        patch.seed_3d(&restart, fingerprint)
+                    }
+                    _ => {
+                        if restart.domain != fingerprint {
+                            return Err(CaseError::Invalid(format!(
+                                "cannot resume from {}: its mesh, bed or σ-grid differ",
+                                path.display()
+                            )));
+                        }
+                        self.check_resumed(&path, &restart.driver)?;
+                        restart
+                    }
+                };
                 Some((path, restart))
             }
             None => None,
@@ -315,11 +336,15 @@ impl CaseFile {
                 case.run.duration_hours
             )));
         }
-        let resumed = restart.as_ref().map(|(path, r)| restart::Resumed {
-            path: path.clone(),
-            time: r.time,
-            driver: r.driver.clone(),
-        });
+        // A seeded patch's outputs are its own, from its start
+        let resumed = restart
+            .as_ref()
+            .filter(|_| !seeded)
+            .map(|(path, r)| restart::Resumed {
+                path: path.clone(),
+                time: r.time,
+                driver: r.driver.clone(),
+            });
         notes.extend(resumed.as_ref().map(restart::Resumed::note));
 
         // The run: the steps land on the field outputs. The stations are
@@ -350,16 +375,17 @@ impl CaseFile {
                 }
             }
         };
-        barotropic(&state, &mut q);
+        // The volume at the start: a seeded patch's is its restart's
+        barotropic(restart.as_ref().map_or(&state, |(_, r)| &r.state), &mut q);
         let volume_start = match &resumed {
             Some(r) => restart::counters(&r.driver)?.1,
             None => volume(domain, &q),
         };
         // The first station time after the restart's (which the stopped run
-        // recorded)
+        // recorded), or from the start
         let mut next_station = match &resumed {
             Some(r) => ((r.time / station_every + 1e-9).floor() + 1.0) * station_every,
-            None => 0.0,
+            None => (t_start / station_every - 1e-9).ceil().max(0.0) * station_every,
         };
         let mut failure = None;
         let mut restarts = restart::RestartSchedule::new(self, t_start);

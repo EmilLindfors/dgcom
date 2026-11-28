@@ -695,6 +695,41 @@ impl Mesh2D {
         (self.select_elements(&kept, new_boundary), kept)
     }
 
+    /// The elements for which `inside` is true that are connected to
+    /// `start` through faces between such elements (periodic ones
+    /// included), in ascending order: a region of the mesh around an
+    /// element without the pieces the region cuts off from it, such as
+    /// another arm of water inside the same circle. Empty if `start` is not
+    /// inside.
+    pub fn connected_elements(
+        &self,
+        start: ElementIndex,
+        inside: impl Fn(ElementIndex) -> bool,
+    ) -> Vec<usize> {
+        if !inside(start) {
+            return Vec::new();
+        }
+        let mut seen = vec![false; self.n_elements];
+        seen[start.as_usize()] = true;
+        let mut queue = std::collections::VecDeque::from([start.as_usize()]);
+        let mut found = Vec::new();
+        while let Some(k) = queue.pop_front() {
+            found.push(k);
+            for face in 0..4 {
+                let Some(next) = self.neighbor(ElementIndex::new(k), face) else {
+                    continue;
+                };
+                let n = next.element;
+                if !seen[n] && inside(ElementIndex::new(n)) {
+                    seen[n] = true;
+                    queue.push_back(n);
+                }
+            }
+        }
+        found.sort_unstable();
+        found
+    }
+
     /// The mesh with its elements numbered along a Hilbert curve through
     /// their centroids, and, for each of its elements, the index of that
     /// element in `self`.
@@ -1302,6 +1337,28 @@ mod tests {
         assert_eq!(all.n_edges, mesh.n_edges);
         assert_eq!(all.element_edges, mesh.element_edges);
         assert_consistent(&all);
+    }
+
+    /// The region's elements reached from the start through each other:
+    /// a strip with a gap at x ∈ (2, 3) splits in two, and the start's side
+    /// is what comes back, ascending; a start outside gives nothing.
+    #[test]
+    fn connected_elements_stop_at_the_regions_gaps() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 6.0, 0.0, 2.0, 6, 2);
+        let x = |e: ElementIndex| mesh.reference_to_physical(e, 0.0, 0.0)[0];
+        let inside = |e: ElementIndex| !(2.0..3.0).contains(&x(e));
+        let start = (0..mesh.n_elements).map(k).find(|&e| x(e) > 5.0).unwrap();
+        let found = mesh.connected_elements(start, inside);
+        assert_eq!(found.len(), 6, "x = 3.5, 4.5, 5.5 in two rows");
+        assert!(found.iter().all(|&e| x(k(e)) > 3.0));
+        assert!(found.is_sorted());
+        let left = (0..mesh.n_elements).map(k).find(|&e| x(e) < 1.0).unwrap();
+        assert_eq!(mesh.connected_elements(left, inside).len(), 4);
+        let gap = (0..mesh.n_elements)
+            .map(k)
+            .find(|&e| (2.0..3.0).contains(&x(e)))
+            .unwrap();
+        assert!(mesh.connected_elements(gap, inside).is_empty());
     }
 
     #[test]

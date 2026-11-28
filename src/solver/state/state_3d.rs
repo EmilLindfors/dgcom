@@ -77,6 +77,37 @@ pub struct Solution3D {
 }
 
 impl Solution3D {
+    /// The columns of the elements `kept` (indices into this state, e.g.
+    /// those [`crate::mesh::Mesh2D::retain_elements`] returns), in that
+    /// order: every field, the turbulence too if the state has it.
+    pub fn select_elements(&self, kept: &[usize]) -> Self {
+        let pick = |values: &[f64]| match values.len() {
+            0 => Vec::new(),
+            n => {
+                assert_eq!(n % self.n_elements, 0, "an element-major field");
+                crate::solver::core::select_rows(values, n / self.n_elements, kept)
+            }
+        };
+        Self {
+            n_elements: kept.len(),
+            n_nodes: self.n_nodes,
+            n_levels: self.n_levels,
+            eta: self.eta.select_elements(kept),
+            ubar: self.ubar.select_elements(kept),
+            vbar: self.vbar.select_elements(kept),
+            u: pick(&self.u),
+            v: pick(&self.v),
+            w: pick(&self.w),
+            temp: pick(&self.temp),
+            salt: pick(&self.salt),
+            rho: pick(&self.rho),
+            eddy_viscosity: pick(&self.eddy_viscosity),
+            eddy_diffusivity: pick(&self.eddy_diffusivity),
+            tke: pick(&self.tke),
+            gls: pick(&self.gls),
+        }
+    }
+
     /// Set the temperature and salinity of the columns `fill` picks from
     /// `profile(z) → (T, S)` at their layer centres
     /// `z = η + σ_l (η − B)`, over the bed `bed[node]` and the surface `eta`
