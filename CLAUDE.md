@@ -190,6 +190,12 @@ cargo check --no-default-features --features parallel,simd
 # Run a case file (the idealized example needs no data)
 cargo run --release --bin dgcom -- run cases/tidal_channel/case.toml
 
+# ... on a cut-out of its mesh: minutes, not hours (`[mesh.patch]`; add
+# --resume <whole run's restart> to start it from that run; notes/case-files.md P8.14)
+cargo run --release --bin dgcom -- run cases/froya/rivers_3d.toml \
+    --set "mesh.patch.center={lat=63.869331,lon=8.665231}" --set mesh.patch.radius_km=5 \
+    --set boundary.0.nesting.band_km=1 --set boundary.0.nesting.atlas_coverage_m=25000
+
 # Run all tests
 cargo test
 

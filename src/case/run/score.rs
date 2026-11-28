@@ -82,6 +82,14 @@ impl CaseFile {
             .map(|s| s.name.as_str())
             .collect();
         let mut stations = read_station_records(&dir.join("stations.csv"), &names)?;
+        // A patch records the stations in it only
+        if self.case.mesh.patch.is_some() {
+            let recorded: Vec<bool> = stations.iter().map(|s| !s.time_s.is_empty()).collect();
+            let mut keep = recorded.iter();
+            stations.retain(|_| *keep.next().expect("one per station"));
+            let mut keep = recorded.iter();
+            gauges.retain(|_| *keep.next().expect("one per station"));
+        }
         let carried = self.tide_constituents()?;
         notes.push(format!(
             "the model's record fitted with {}",

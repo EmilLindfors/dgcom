@@ -32,19 +32,24 @@
 //!   own, from a JONSWAP sea or a parent wave model's spectra;
 //! - a fish farm's net cages dragging on the flow (`[farm]`);
 //! - restarts, and runs resumed from them bit for bit (`[restart]`), the
-//!   resumed case checked against the restart's.
+//!   resumed case checked against the restart's;
+//! - a run on a cut-out of the mesh (`[mesh.patch]`, [`Patch`]): around an
+//!   element or a point, or a longitude/latitude box, its cut walled or
+//!   open, started from rest or from the whole run's restart.
 //!
 //! Next: the farm's analysis and particles (TODO F.1, F.2), and retiring
 //! `froya_real_data`'s moved modes (`notes/case-files.md`).
 
 pub mod cli;
 mod domain;
+mod patch;
 mod run;
 pub mod schema;
 
 use std::path::{Path, PathBuf};
 
 pub use domain::{Domain, ParentWavePoints, StationProbe, WaveDomain};
+pub use patch::DomainPatch;
 pub use run::{
     CaseDevice, DeviceCallback3D, DeviceRun, DeviceRun3D, DeviceRunReport, DeviceRunReport3D,
     MeshReport, Progress, RunReport, ScoreReport, StateView3D, StationSeries,
@@ -98,15 +103,18 @@ impl CaseFile {
         Ok(Self { case, base_dir })
     }
 
-    /// The output directory: `output.directory`, else `output/<run.name>`,
-    /// relative to the case file.
+    /// The output directory: `output.directory`, else `output/<run.name>`
+    /// (a patch's `output/<run.name>/patch_…`, [`Patch::label`]), relative to
+    /// the case file.
     pub fn output_dir(&self) -> PathBuf {
-        let dir = self
-            .case
-            .output
-            .directory
-            .clone()
-            .unwrap_or_else(|| Path::new("output").join(&self.case.run.name));
+        let dir = self.case.output.directory.clone().unwrap_or_else(|| {
+            let whole = Path::new("output").join(&self.case.run.name);
+            // A patch inside the whole run's folder, never over its files
+            match &self.case.mesh.patch {
+                Some(p) => whole.join(p.label()),
+                None => whole,
+            }
+        });
         self.base_dir.join(dir)
     }
 
@@ -258,6 +266,55 @@ mod tests {
         case.mesh.gmsh = None;
         case.mesh.rectangle = None;
         assert!(matches!(case.validate(), Err(CaseError::Invalid(_))));
+    }
+
+    /// `[mesh.patch]`: one region, a radius with a point and none with a
+    /// box, lon/lat only on a placed mesh, not in the waves' own mesh; its
+    /// output goes inside the whole run's folder.
+    #[test]
+    fn a_patch_needs_one_region_and_lon_lat_a_placed_mesh() {
+        let with = |patch: &str| format!("{MINIMAL}\n[mesh.patch]\n{patch}\n");
+        let refused = |patch: &str, what: &str| {
+            let err = match parse(&with(patch)) {
+                Err(e) => e,
+                Ok(case) => case.validate().unwrap_err().to_string(),
+            };
+            assert!(err.contains(what), "{patch}: {err}");
+        };
+        refused("radius_km = 1.0", "exactly one of");
+        refused(
+            "element = 1\ncenter = { lat = 63.7, lon = 8.5 }\nradius_km = 1.0",
+            "exactly one of",
+        );
+        refused("element = 1", "radius_km must be positive");
+        refused(
+            "element = 1\nradius_km = -1.0",
+            "radius_km must be positive",
+        );
+        refused("bbox = [8.0, 63.0, 9.0, 64.0]\nradius_km = 1.0", "not bbox");
+        refused("bbox = [9.0, 63.0, 8.0, 64.0]", "west, south, east, north");
+        refused(
+            "center = { lat = 63.7, lon = 8.5 }\nradius_km = 1.0",
+            "placed",
+        );
+        refused("element = 1\nradius_km = 1.0\nfaces = \"sea\"", "sea");
+        let case = parse(&with("element = 1\nradius_km = 0.5")).unwrap();
+        case.validate().unwrap();
+        assert_eq!(case.mesh.patch.as_ref().unwrap().faces, SideTag::Open);
+        let placed = with("center = { lat = 63.7, lon = 8.5 }\nradius_km = 1.0").replace(
+            "[bathymetry]",
+            "[mesh.origin]\nlat = 63.7\nlon = 8.5\n\n[bathymetry]",
+        );
+        let case = parse(&placed).unwrap();
+        case.validate().unwrap();
+        let file = CaseFile {
+            case,
+            base_dir: PathBuf::from("cases"),
+        };
+        assert_eq!(
+            file.output_dir(),
+            Path::new("cases/output/case/patch_63.7000N_8.5000E_1km")
+        );
     }
 
     #[test]

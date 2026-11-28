@@ -15,4 +15,5 @@ mod system_solution;
 pub use blocks::Blocks;
 pub use solution_1d::DGSolution1D;
 pub use solution_2d::DGSolution2D;
+pub(crate) use system_solution::select_rows;
 pub use system_solution::{SystemSolution, SystemSolution2D};

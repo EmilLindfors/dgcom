@@ -237,6 +237,21 @@ The `bbox=` of the run must be the mesh's: both centre the local projection
 on it. For `scripts/norkyst_current_comparison.py` pass the same centre
 (`lat0=63.865 lon0=8.675`).
 
+A case can also cut such a sub-domain out of its own mesh, without
+meshing it again: `[mesh.patch]` (`bbox`, or `element`/`center` and
+`radius_km`) keeps the whole mesh's elements and bed there bit for bit,
+and `--resume` with the whole run's restart starts it from that run's
+state (`notes/case-files.md`, P8.14):
+
+```bash
+dgcom run cases/froya/rivers_3d.toml --set "mesh.patch.center={lat=63.869331,lon=8.665231}" \
+    --set mesh.patch.radius_km=5 --set boundary.0.nesting.band_km=1 \
+    --set boundary.0.nesting.atlas_coverage_m=25000
+```
+
+(The nesting's tide correction reads the case's atlas, whose points lie on
+the whole box's perimeter, 19 km from this cut.)
+
 ## Test meshes
 
 `scripts/gmsh_fixtures.py` builds the meshes in `tests/data/gmsh/` with the Gmsh

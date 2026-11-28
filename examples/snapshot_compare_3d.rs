@@ -12,8 +12,10 @@
 //! deep in the reference: η, the depth-mean velocity and, for 3D files, the
 //! surface layer's velocity and T, as the RMS and the largest difference
 //! (with where the largest is), and how many values differ at all, the
-//! surface fields (a coupled run's sea state) included. Both runs must be on
-//! the same mesh and levels.
+//! surface fields (a coupled run's sea state) included. Both runs must have
+//! the same levels; on different meshes (a `[mesh.patch]` run against its
+//! whole run) only the points are compared, each file sampled on its own
+//! mesh.
 //!
 //! `points=` adds the same differences at named points (farm sites, river
 //! mouths), interpolated within the element holding each (its nodal basis),
@@ -64,7 +66,9 @@ impl Stat {
 /// A named point of `points=` and its differences over the frames.
 struct Point {
     name: String,
+    /// Where it is on the reference's mesh and on the run's
     probe: Probe2D,
+    probe_b: Probe2D,
     /// The reference's depth there, summed over the frames
     depth: f64,
     /// The reference's depth-mean speed (mm/s)
@@ -76,10 +80,13 @@ struct Point {
     temperature: Stat,
 }
 
-/// The points of a `points=` spec (`@<file>` reads one per line).
+/// The points of a `points=` spec (`@<file>` reads one per line), on the
+/// reference's mesh (`header`, whose projection places them) and on the
+/// run's (`header_b`).
 fn parse_points(
     spec: &str,
     header: &SnapshotHeader,
+    header_b: &SnapshotHeader,
 ) -> Result<Vec<Point>, Box<dyn std::error::Error>> {
     let spec = match spec.strip_prefix('@') {
         Some(file) => std::fs::read_to_string(file)?
@@ -100,6 +107,7 @@ fn parse_points(
     };
     let ops = DGOperators2D::new(header.order);
     let locator = PointLocator2D::new(&header.mesh);
+    let locator_b = PointLocator2D::new(&header_b.mesh);
     let mut points = Vec::new();
     for item in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         let (name, place) = item
@@ -121,10 +129,12 @@ fn parse_points(
             }
         };
         let name = name.trim().to_string();
-        match Probe2D::at(&locator, &ops, [x, y]) {
-            Some(probe) => points.push(Point {
+        let on = |l: &PointLocator2D| Probe2D::at(l, &ops, [x, y]);
+        match (on(&locator), on(&locator_b)) {
+            (Some(probe), Some(probe_b)) => points.push(Point {
                 name,
                 probe,
+                probe_b,
                 depth: 0.0,
                 speed: Stat::default(),
                 eta: Stat::default(),
@@ -133,7 +143,8 @@ fn parse_points(
                 layers: Stat::default(),
                 temperature: Stat::default(),
             }),
-            None => println!("{name}: outside the mesh, left out"),
+            (None, _) => println!("{name}: outside the reference's mesh, left out"),
+            (_, None) => println!("{name}: outside the run's mesh, left out"),
         }
     }
     Ok(points)
@@ -159,11 +170,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut a = SnapshotReader::open(reference?)?;
     let mut b = SnapshotReader::open(run?)?;
     let (n, nl) = (a.header().n_points(), a.header().n_levels());
-    if (b.header().n_points(), b.header().n_levels()) != (n, nl) {
-        return Err("the files have different meshes or levels".into());
+    if b.header().n_levels() != nl {
+        return Err("the files have different levels".into());
+    }
+    // A patch against its whole run: the points only, each file sampled
+    // on its own mesh
+    let same_mesh = b.header().n_points() == n;
+    if !same_mesh && points_spec.is_none() {
+        return Err("the files have different meshes: compare them at points=".into());
     }
     let mut points = match points_spec {
-        Some(spec) => parse_points(spec, a.header())?,
+        Some(spec) => parse_points(spec, a.header(), b.header())?,
         None => Vec::new(),
     };
     let nn = n / a.header().mesh.n_elements;
@@ -177,131 +194,164 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bed = a.header().bathymetry.clone();
     let times_b = b.times()?;
-    println!(
-        "nodes ≥ {min_depth} m deep; RMS / max (node) of run − reference\n\
-         {:>8} | {:>7} | {:>19} | {:>19} | {:>19} | {:>19} | {:>9}",
-        "t (h)", "nodes", "η (mm)", "ū (mm/s)", "surface u (mm/s)", "T (m°C)", "differ"
-    );
+    if same_mesh {
+        println!(
+            "nodes ≥ {min_depth} m deep; RMS / max (node) of run − reference\n\
+             {:>8} | {:>7} | {:>19} | {:>19} | {:>19} | {:>19} | {:>9}",
+            "t (h)", "nodes", "η (mm)", "ū (mm/s)", "surface u (mm/s)", "T (m°C)", "differ"
+        );
+    } else {
+        println!("different meshes (a patch against its whole run?): the points only");
+    }
     for i in 0..a.n_frames()? {
         let t = a.time(i)?;
         let Some(j) = times_b.iter().position(|&tb| (tb - t).abs() < 1e-3) else {
             continue;
         };
         let (fa, fb) = (a.read_frame(i)?, b.read_frame(j)?);
-        let deep: Vec<usize> = (0..n)
-            .filter(|&p| f64::from(fa.eta[p]) - bed[p] >= min_depth)
-            .collect();
-        // RMS and largest |difference| (with its node) over `samples`
-        let stats = |samples: &mut dyn Iterator<Item = (usize, f64)>| {
-            let (mut sum, mut count, mut max, mut at) = (0.0, 0usize, 0.0_f64, 0);
-            for (p, d) in samples {
-                sum += d * d;
-                count += 1;
-                if d.abs() > max {
-                    (max, at) = (d.abs(), p);
-                }
-            }
-            format!(
-                "{:>8.3} {:>7.2} ({at:>6})",
-                (sum / count.max(1) as f64).sqrt(),
-                max
-            )
-        };
-        let diff = |x: &[f32], y: &[f32], k: usize| f64::from(y[k]) - f64::from(x[k]);
-        let top = |p: usize| p * nl + nl - 1;
-        let (surface, temperature) = match layered {
-            Some((fu, fv, ft)) => (
-                stats(&mut deep.iter().map(|&p| {
-                    let (ua, va) = (&fa.layers[fu], &fa.layers[fv]);
-                    let (ub, vb) = (&fb.layers[fu], &fb.layers[fv]);
-                    let d = (diff(ua, ub, top(p))).hypot(diff(va, vb, top(p)));
-                    (p, 1e3 * d)
-                })),
-                stats(&mut deep.iter().flat_map(|&p| {
-                    let (ta, tb) = (&fa.layers[ft], &fb.layers[ft]);
-                    (0..nl).map(move |l| (p, 1e3 * diff(ta, tb, p * nl + l)))
-                })),
-            ),
-            None => ("—".into(), "—".into()),
-        };
-        // Values that differ in any bit, over every node and field (the
-        // surface fields too: a coupled run's sea state)
-        let differ = [(&fa.eta, &fb.eta), (&fa.u, &fb.u), (&fa.v, &fb.v)]
-            .into_iter()
-            .chain(fa.layers.iter().zip(&fb.layers))
-            .chain(fa.surface.iter().zip(&fb.surface))
-            .map(|(x, y)| {
-                x.iter()
-                    .zip(y)
-                    .filter(|(p, q)| p.to_bits() != q.to_bits())
-                    .count()
-            })
-            .sum::<usize>();
-        println!(
-            "{:>8.3} | {:>7} | {} | {} | {:>19} | {:>19} | {:>9}",
-            t / 3600.0,
-            deep.len(),
-            stats(&mut deep.iter().map(|&p| (p, 1e3 * diff(&fa.eta, &fb.eta, p)))),
-            stats(&mut deep.iter().map(|&p| {
-                let d = (diff(&fa.u, &fb.u, p)).hypot(diff(&fa.v, &fb.v, p));
-                (p, 1e3 * d)
-            })),
-            surface,
-            temperature,
-            differ,
-        );
+        if same_mesh {
+            nodewise(&fa, &fb, &bed, n, nl, min_depth, layered, t);
+        }
 
         // The points: a nodal field interpolated at the probe (`stride`
-        // values per node, the `offset`-th of them)
+        // values per node, the `offset`-th of them), each file on its mesh
         if t <= 3600.0 * from_hours + 1e-3 {
             continue;
         }
+        let at = |values: &[f32], probe: &Probe2D, stride: usize, offset: usize| -> f64 {
+            let first = probe.element().as_usize() * nn;
+            probe
+                .weights()
+                .iter()
+                .enumerate()
+                .map(|(i, w)| w * f64::from(values[(first + i) * stride + offset]))
+                .sum()
+        };
         for point in &mut points {
-            let first = point.probe.element().as_usize() * nn;
-            let at = |values: &[f32], stride: usize, offset: usize| -> f64 {
-                let weights = point.probe.weights();
-                weights
-                    .iter()
-                    .enumerate()
-                    .map(|(i, w)| w * f64::from(values[(first + i) * stride + offset]))
-                    .sum()
-            };
-            let point_bed: f64 = point
-                .probe
+            let (pa, pb) = (&point.probe, &point.probe_b);
+            let first = pa.element().as_usize() * nn;
+            let point_bed: f64 = pa
                 .weights()
                 .iter()
                 .enumerate()
                 .map(|(i, w)| w * bed[first + i])
                 .sum();
-            let depth = at(&fa.eta, 1, 0) - point_bed;
+            let depth = at(&fa.eta, pa, 1, 0) - point_bed;
             if depth < POINT_MIN_DEPTH {
                 continue;
             }
-            point.depth += depth;
-            point
-                .speed
-                .add(1e3 * at(&fa.u, 1, 0).hypot(at(&fa.v, 1, 0)));
-            point.eta.add(1e3 * (at(&fb.eta, 1, 0) - at(&fa.eta, 1, 0)));
-            let du = at(&fb.u, 1, 0) - at(&fa.u, 1, 0);
-            let dv = at(&fb.v, 1, 0) - at(&fa.v, 1, 0);
-            point.mean.add(1e3 * du.hypot(dv));
+            let speed = 1e3 * at(&fa.u, pa, 1, 0).hypot(at(&fa.v, pa, 1, 0));
+            let eta = 1e3 * (at(&fb.eta, pb, 1, 0) - at(&fa.eta, pa, 1, 0));
+            let du = at(&fb.u, pb, 1, 0) - at(&fa.u, pa, 1, 0);
+            let dv = at(&fb.v, pb, 1, 0) - at(&fa.v, pa, 1, 0);
+            let mut layers = Vec::new();
             if let Some((fu, fv, ft)) = layered {
                 for l in 0..nl {
-                    let du = at(&fb.layers[fu], nl, l) - at(&fa.layers[fu], nl, l);
-                    let dv = at(&fb.layers[fv], nl, l) - at(&fa.layers[fv], nl, l);
-                    point.layers.add(1e3 * du.hypot(dv));
-                    if l == nl - 1 {
-                        point.surface.add(1e3 * du.hypot(dv));
-                    }
-                    let dt = at(&fb.layers[ft], nl, l) - at(&fa.layers[ft], nl, l);
-                    point.temperature.add(1e3 * dt);
+                    let du = at(&fb.layers[fu], pb, nl, l) - at(&fa.layers[fu], pa, nl, l);
+                    let dv = at(&fb.layers[fv], pb, nl, l) - at(&fa.layers[fv], pa, nl, l);
+                    let dt = at(&fb.layers[ft], pb, nl, l) - at(&fa.layers[ft], pa, nl, l);
+                    layers.push((1e3 * du.hypot(dv), 1e3 * dt));
                 }
+            }
+            point.depth += depth;
+            point.speed.add(speed);
+            point.eta.add(eta);
+            point.mean.add(1e3 * du.hypot(dv));
+            for (l, &(u, t)) in layers.iter().enumerate() {
+                point.layers.add(u);
+                if l == nl - 1 {
+                    point.surface.add(u);
+                }
+                point.temperature.add(t);
             }
         }
     }
+    report_points(&points, from_hours);
+    Ok(())
+}
 
+/// The frame's differences over the nodes at least `min_depth` deep in the
+/// reference, one row: two files on the same mesh.
+#[allow(clippy::too_many_arguments)]
+fn nodewise(
+    fa: &dgcom::io::SnapshotFrame,
+    fb: &dgcom::io::SnapshotFrame,
+    bed: &[f64],
+    n: usize,
+    nl: usize,
+    min_depth: f64,
+    layered: Option<(usize, usize, usize)>,
+    t: f64,
+) {
+    let deep: Vec<usize> = (0..n)
+        .filter(|&p| f64::from(fa.eta[p]) - bed[p] >= min_depth)
+        .collect();
+    // RMS and largest |difference| (with its node) over `samples`
+    let stats = |samples: &mut dyn Iterator<Item = (usize, f64)>| {
+        let (mut sum, mut count, mut max, mut at) = (0.0, 0usize, 0.0_f64, 0);
+        for (p, d) in samples {
+            sum += d * d;
+            count += 1;
+            if d.abs() > max {
+                (max, at) = (d.abs(), p);
+            }
+        }
+        format!(
+            "{:>8.3} {:>7.2} ({at:>6})",
+            (sum / count.max(1) as f64).sqrt(),
+            max
+        )
+    };
+    let diff = |x: &[f32], y: &[f32], k: usize| f64::from(y[k]) - f64::from(x[k]);
+    let top = |p: usize| p * nl + nl - 1;
+    let (surface, temperature) = match layered {
+        Some((fu, fv, ft)) => (
+            stats(&mut deep.iter().map(|&p| {
+                let (ua, va) = (&fa.layers[fu], &fa.layers[fv]);
+                let (ub, vb) = (&fb.layers[fu], &fb.layers[fv]);
+                let d = (diff(ua, ub, top(p))).hypot(diff(va, vb, top(p)));
+                (p, 1e3 * d)
+            })),
+            stats(&mut deep.iter().flat_map(|&p| {
+                let (ta, tb) = (&fa.layers[ft], &fb.layers[ft]);
+                (0..nl).map(move |l| (p, 1e3 * diff(ta, tb, p * nl + l)))
+            })),
+        ),
+        None => ("—".into(), "—".into()),
+    };
+    // Values that differ in any bit, over every node and field (the
+    // surface fields too: a coupled run's sea state)
+    let differ = [(&fa.eta, &fb.eta), (&fa.u, &fb.u), (&fa.v, &fb.v)]
+        .into_iter()
+        .chain(fa.layers.iter().zip(&fb.layers))
+        .chain(fa.surface.iter().zip(&fb.surface))
+        .map(|(x, y)| {
+            x.iter()
+                .zip(y)
+                .filter(|(p, q)| p.to_bits() != q.to_bits())
+                .count()
+        })
+        .sum::<usize>();
+    println!(
+        "{:>8.3} | {:>7} | {} | {} | {:>19} | {:>19} | {:>9}",
+        t / 3600.0,
+        deep.len(),
+        stats(&mut deep.iter().map(|&p| (p, 1e3 * diff(&fa.eta, &fb.eta, p)))),
+        stats(&mut deep.iter().map(|&p| {
+            let d = (diff(&fa.u, &fb.u, p)).hypot(diff(&fa.v, &fb.v, p));
+            (p, 1e3 * d)
+        })),
+        surface,
+        temperature,
+        differ,
+    );
+}
+
+/// The points' table and the depth-mean difference against the reference's
+/// speed.
+fn report_points(points: &[Point], from_hours: f64) {
     if points.is_empty() {
-        return Ok(());
+        return;
     }
     println!(
         "\npoints, over the common frames after {from_hours} h where the reference is \
@@ -318,7 +368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "levels' u (mm/s)",
         "T (m°C)"
     );
-    for p in &points {
+    for p in points {
         println!(
             "{:<20} | {:>9.1} | {:>6} | {} | {} | {} | {} | {} | {}",
             p.name,
@@ -349,5 +399,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             largest.1
         );
     }
-    Ok(())
 }

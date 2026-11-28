@@ -18,6 +18,14 @@
 use crate::types::ElementIndex;
 use std::array;
 
+/// The rows `kept` of `values`, `row` values each, in that order: an
+/// element-major field of a state on a submesh. Empty stays empty.
+pub(crate) fn select_rows(values: &[f64], row: usize, kept: &[usize]) -> Vec<f64> {
+    kept.iter()
+        .flat_map(|&k| values[k * row..][..row].iter().copied())
+        .collect()
+}
+
 /// Solution storage for systems of N conservation laws (1D).
 ///
 /// Stores nodal values in interleaved layout:
@@ -149,6 +157,17 @@ impl<const N: usize> SystemSolution2D<N> {
             data: array::from_fn(|_| vec![0.0; total]),
             n_elements,
             n_nodes,
+        }
+    }
+
+    /// The state of the elements `kept` (indices into this one, e.g. those
+    /// [`crate::mesh::Mesh2D::retain_elements`] returns), in that order.
+    pub fn select_elements(&self, kept: &[usize]) -> Self {
+        let n = self.n_nodes;
+        Self {
+            data: array::from_fn(|v| select_rows(&self.data[v], n, kept)),
+            n_elements: kept.len(),
+            n_nodes: n,
         }
     }
 

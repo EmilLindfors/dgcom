@@ -389,6 +389,32 @@ impl Restart3D {
             driver: file.driver()?,
         })
     }
+
+    /// The restart of the elements `kept` of its domain (indices, e.g.
+    /// those [`Mesh2D::retain_elements`] returns, in that order) on the
+    /// domain whose fingerprint is `domain`: their columns and slow forcing,
+    /// the reference stratification and the driver's data as they are. A
+    /// cut-out of a domain continues from it as the whole run would have
+    /// there, up to what crosses the cut.
+    pub fn select_elements(&self, kept: &[usize], domain: u64) -> Self {
+        Self {
+            time: self.time,
+            domain,
+            state: self.state.select_elements(kept),
+            slow_forcing: SlowForcingRecord {
+                g: self
+                    .slow_forcing
+                    .g
+                    .iter()
+                    .map(|g| g.select_elements(kept))
+                    .collect(),
+                t: self.slow_forcing.t.clone(),
+                next_t: self.slow_forcing.next_t,
+            },
+            reference_profile: self.reference_profile.clone(),
+            driver: self.driver.clone(),
+        }
+    }
 }
 
 /// The fixed part of a restart file before its sections.
