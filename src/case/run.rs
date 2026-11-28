@@ -681,6 +681,17 @@ impl CaseFile {
             .atmosphere
             .as_ref()
             .filter(|_| case.atmosphere.as_ref().is_some_and(|a| a.pressure));
+        // A patch nested in the whole run: its state at every open face
+        if let Some(parent) = &domain.run_parent {
+            return Ok(domain
+                .open_tags
+                .iter()
+                .map(|&tag| {
+                    let bc = open_boundary(parent.clone(), BoundaryVelocity::AtRest, None);
+                    (tag, bc)
+                })
+                .collect());
+        }
         // Those with faces on the mesh: all of them, but on a patch
         case.boundaries
             .iter()
@@ -795,6 +806,12 @@ impl CaseFile {
             if spec.band_km > 0.0 {
                 builder = builder.with_source(parent.relaxation(60.0 * spec.band_minutes));
             }
+        }
+        // A patch nested in the whole run: its band
+        if let (Some(parent), Some(patch)) = (&domain.run_parent, &self.case.mesh.patch)
+            && patch.band_km > 0.0
+        {
+            builder = builder.with_source(parent.relaxation(60.0 * patch.band_minutes));
         }
         // The weather: wind stress and pressure gradient
         if let Some(atmosphere) = &domain.atmosphere {

@@ -250,7 +250,9 @@ dgcom run cases/froya/rivers_3d.toml --set "mesh.patch.center={lat=63.869331,lon
 ```
 
 (The nesting's tide correction reads the case's atlas, whose points lie on
-the whole box's perimeter, 19 km from this cut.)
+the whole box's perimeter, 19 km from this cut.) Nested in NorKyst a patch
+follows NorKyst at its cut; `mesh.patch.whole_run` nests it in a whole
+run's own snapshots instead, which it then replays (`docs/patches.md`).
 
 ## Test meshes
 

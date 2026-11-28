@@ -167,12 +167,30 @@ pub struct Patch {
     /// case's open boundary; `"wall"` for a closed basin).
     #[serde(default = "default_patch_faces")]
     pub faces: SideTag,
+    /// Nest the patch in the whole run's own output instead of the case's
+    /// boundaries: the whole run's snapshot file (`<name>.dgsnap`, with its
+    /// frames over the patch's run), whose state every open face of the
+    /// patch takes (at a cut face the dropped neighbour's, the trace the
+    /// whole run's flux saw) and the band inside them relaxes to
+    /// ([`crate::boundary::RunParent`]). The patch then replays the whole
+    /// run, from its start or from its restart: the snapshots' interval
+    /// bounds what it resolves at the cut (a few minutes for a tide).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_run: Option<PathBuf>,
+    /// With `whole_run`: the band's width inside the open faces (km,
+    /// default 1; 0 for the faces' own nodes only).
+    #[serde(default = "default_patch_band_km")]
+    pub band_km: f64,
+    /// With `whole_run`: the band's relaxation time at the faces (minutes,
+    /// default 30).
+    #[serde(default = "default_band_minutes")]
+    pub band_minutes: f64,
 }
 
 impl Patch {
     /// The patch's own output folder's name, from its region.
     pub fn label(&self) -> String {
-        match (self.element, self.center, self.bbox, self.radius_km) {
+        let region = match (self.element, self.center, self.bbox, self.radius_km) {
             (Some(k), _, _, Some(r)) => format!("patch_e{k}_{r}km"),
             (_, Some(c), _, Some(r)) => {
                 let h = |v: f64, pos: char, neg: char| {
@@ -182,6 +200,10 @@ impl Patch {
             }
             (_, _, Some([w, s, e, n]), _) => format!("patch_{w}_{s}_{e}_{n}"),
             _ => "patch".into(),
+        };
+        match self.whole_run {
+            Some(_) => format!("{region}_in_run"),
+            None => region,
         }
     }
 
@@ -219,6 +241,18 @@ impl Patch {
             && !((-90.0..=90.0).contains(&c.lat) && c.lon.is_finite())
         {
             return invalid(format!("mesh.patch.center {c:?} is not on the Earth"));
+        }
+        if self.whole_run.is_some() && self.faces == SideTag::Wall {
+            return invalid(
+                "mesh.patch.whole_run nests the patch's open faces: faces = \"wall\" has none"
+                    .into(),
+            );
+        }
+        if !(self.band_km >= 0.0 && self.band_km.is_finite()) || !positive(self.band_minutes) {
+            return invalid(format!(
+                "mesh.patch.band_km must be ≥ 0 and band_minutes positive, not {} and {}",
+                self.band_km, self.band_minutes
+            ));
         }
         if (self.center.is_some() || self.bbox.is_some()) && !placed {
             return invalid(
@@ -2029,6 +2063,9 @@ fn default_true() -> bool {
 }
 fn default_patch_faces() -> SideTag {
     SideTag::Open
+}
+fn default_patch_band_km() -> f64 {
+    1.0
 }
 fn default_band_km() -> f64 {
     3.0

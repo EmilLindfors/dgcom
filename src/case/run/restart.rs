@@ -70,7 +70,7 @@ impl Resumed {
 
 impl CaseFile {
     /// The restart this run resumes from (`restart.from`), if any.
-    pub(super) fn resume_path(&self) -> Option<PathBuf> {
+    pub(crate) fn resume_path(&self) -> Option<PathBuf> {
         let from = self.case.restart.as_ref()?.from.as_ref()?;
         Some(self.resolve(from))
     }

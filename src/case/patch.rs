@@ -124,10 +124,20 @@ pub(super) struct Cut {
 }
 
 impl CaseFile {
-    /// The width (km) of the relaxation band at the faces tagged `tag`: its
-    /// `[[boundary]]`'s nesting band, or a 3D run's band where no parent is
-    /// nested; `None` for walls and for a 2D boundary that nests in none.
+    /// The width (km) of the relaxation band at the faces tagged `tag`: a
+    /// patch's own nested in the whole run, its `[[boundary]]`'s nesting
+    /// band, or a 3D run's band where no parent is nested; `None` for walls
+    /// and for a 2D boundary that nests in none.
     fn band_km_at(&self, tag: SideTag) -> Option<f64> {
+        if let Some(p) = self
+            .case
+            .mesh
+            .patch
+            .as_ref()
+            .filter(|p| p.whole_run.is_some())
+        {
+            return Some(p.band_km);
+        }
         let b = self.case.boundaries.iter().find(|b| b.tag == tag)?;
         match (&b.nesting, &self.case.three_d) {
             (Some(n), _) => Some(n.band_km),

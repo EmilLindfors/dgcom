@@ -25,7 +25,8 @@ use super::schema::{
 use super::{CaseError, CaseFile};
 use crate::analysis::{GaugeRecord, HarmonicAnalysis, TideGaugeStation};
 use crate::boundary::{
-    BoundaryCoverage, GaugeAdjustment, NestingOptions, OceanModelState, ParentDatum, TidalAtlas,
+    BoundaryCoverage, GaugeAdjustment, NestingOptions, OceanModelState, ParentDatum, RunParent,
+    TidalAtlas,
 };
 use crate::io::{
     AtmosphereReader, BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox,
@@ -36,7 +37,7 @@ use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, PointLocator2D, read_gmsh_m
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::Coare35;
 use crate::solver::Probe2D;
-use crate::source::{CageFootprint, NetCage, RiverSources};
+use crate::source::{CageFootprint, NetCage, RiverSources, SpongeProfile};
 use crate::source::{GriddedAtmosphere2D, GriddedSurfaceFluxes, GriddedWindStress};
 use crate::tides::canonical_name;
 use crate::types::ElementIndex;
@@ -90,6 +91,9 @@ pub struct Domain {
     pub rivers: Option<RiverSources>,
     /// `[mesh.patch]`: what was cut out of the whole mesh
     pub patch: Option<DomainPatch>,
+    /// `mesh.patch.whole_run`: the whole run's state at the patch's open
+    /// faces and band
+    pub run_parent: Option<RunParent>,
     /// What was done to build it, line by line, for a log
     pub notes: Vec<String>,
 }
@@ -203,14 +207,25 @@ impl CaseFile {
             (mesh, geom, bathymetry) = (cut.mesh, cut.geom, cut.bathymetry);
             (patch, whole) = (Some(cut.patch), Some(cut.whole));
         }
-        // A patch leaves out the `[[boundary]]` entries whose faces it cut away
+        // A patch leaves out the `[[boundary]]` entries whose faces it cut
+        // away; nested in the whole run, all of them
         let cut_tags = open_tags(&mesh)?;
-        let in_use = |b: &BoundarySection| patch.is_none() || cut_tags.contains(&b.tag);
+        let in_run = case.mesh.patch.as_ref().and_then(|p| p.whole_run.as_ref());
+        let in_use = |b: &BoundarySection| {
+            patch.is_none() || (in_run.is_none() && cut_tags.contains(&b.tag))
+        };
         for b in case.boundaries.iter().filter(|b| !in_use(b)) {
-            notes.push(format!(
-                "[[boundary]] tag = {:?}: none of its faces is in the patch, left out",
-                b.tag.name()
-            ));
+            notes.push(match in_run {
+                Some(_) => format!(
+                    "[[boundary]] tag = {:?}: the whole run's state instead, at every open face \
+                     of the patch",
+                    b.tag.name()
+                ),
+                None => format!(
+                    "[[boundary]] tag = {:?}: none of its faces is in the patch, left out",
+                    b.tag.name()
+                ),
+            });
         }
 
         // What the boundaries' tides carry, for the fit of a station's record
@@ -298,13 +313,13 @@ impl CaseFile {
             let path = self.resolve(&spec.file);
             parent_reader = Some(Arc::new(read_parent(&path, true)?));
             notes.push(format!(
-                "parent {}: read for the 3D start only (its boundary is not in the patch)",
+                "parent {}: read for the 3D start only (the patch does not nest in it)",
                 path.display()
             ));
         }
 
         let open_tags = open_tags(&mesh)?;
-        for tag in &open_tags {
+        for tag in open_tags.iter().filter(|_| in_run.is_none()) {
             if !case.boundaries.iter().any(|b| b.tag == *tag) {
                 return Err(CaseError::Invalid(format!(
                     "the mesh has {tag:?} boundary faces but the case no [[boundary]] with \
@@ -325,6 +340,46 @@ impl CaseFile {
                 )));
             }
         }
+        // Nested in the whole run's snapshots, from the restart's time (or
+        // the start) to the end
+        let run_parent = match (in_run, &patch) {
+            (Some(path), Some(cut)) => {
+                let spec = case.mesh.patch.as_ref().expect("a patch");
+                let path = self.resolve(path);
+                let t_start = match self.resume_path() {
+                    Some(restart) => crate::io::restart_time(&restart)
+                        .map_err(|e| CaseError::Io(format!("{}: {e}", restart.display())))?,
+                    None => 0.0,
+                };
+                let t_end = 3600.0 * case.run.duration_hours;
+                let tags: Vec<_> = open_tags.iter().map(|t| t.boundary_tag()).collect();
+                let parent = RunParent::new(
+                    &path,
+                    &mesh,
+                    &ops,
+                    &cut.whole_elements,
+                    &tags,
+                    (1000.0 * spec.band_km, SpongeProfile::Cosine),
+                    (t_start, t_end),
+                )
+                .map_err(|e| {
+                    CaseError::Invalid(format!("mesh.patch.whole_run {}: {e}", path.display()))
+                })?;
+                let (frames, first, last) = parent.frames();
+                notes.push(format!(
+                    "patch: nested in the whole run's snapshots {}: {frames} frames over \
+                     {:.3}–{:.3} h at {} nodes (its open faces and a {} km band, {} min)",
+                    path.display(),
+                    first / 3600.0,
+                    last / 3600.0,
+                    parent.n_slots(),
+                    spec.band_km,
+                    spec.band_minutes
+                ));
+                Some(parent)
+            }
+            _ => None,
+        };
         // A patch's stations: placed on the whole mesh, kept where they fall
         // in it
         let stations = match (&patch, &whole) {
@@ -410,6 +465,7 @@ impl CaseFile {
             cages: Vec::new(),
             rivers: None,
             patch,
+            run_parent,
             notes,
         };
         if let Some(farm) = &case.farm {

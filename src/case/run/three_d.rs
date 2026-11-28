@@ -187,32 +187,41 @@ impl CaseFile {
             None => "initial T, S from three_d.profile".into(),
         });
 
-        // 3. The open faces' band: to the parent's columns, or the start
-        let (band_km, band_minutes) = case
-            .boundaries
-            .iter()
-            .find_map(|b| b.nesting.as_ref())
-            .map_or((d.band_km, d.band_minutes), |n| (n.band_km, n.band_minutes));
+        // 3. The open faces' band: to the parent's columns, or the start; a
+        // patch nested in the whole run to the whole run's
+        let in_run = domain.run_parent.as_ref().zip(case.mesh.patch.as_ref());
+        let (band_km, band_minutes) = match in_run {
+            Some((_, patch)) => (patch.band_km, patch.band_minutes),
+            None => case
+                .boundaries
+                .iter()
+                .find_map(|b| b.nesting.as_ref())
+                .map_or((d.band_km, d.band_minutes), |n| (n.band_km, n.band_minutes)),
+        };
         let band = NestingBand3D {
             width: 1000.0 * band_km,
             profile: SpongeProfile::default(),
             velocity_timescale: Some(60.0 * band_minutes),
             tracer_timescale: Some(60.0 * band_minutes),
         };
-        let relaxed_to: Arc<dyn ParentColumns3D> = match &columns {
-            Some(columns) => columns.clone(),
-            None => Arc::new(ReferenceColumns::from_state(&state)),
+        let relaxed_to: Arc<dyn ParentColumns3D> = match (in_run, &columns) {
+            (Some((parent, _)), _) => Arc::new(parent.clone()),
+            (None, Some(columns)) => columns.clone(),
+            (None, None) => Arc::new(ReferenceColumns::from_state(&state)),
         };
         let tags: Vec<_> = domain.open_tags.iter().map(|t| t.boundary_tag()).collect();
         // None without open faces (a closed basin)
         let nesting = Nesting3D::new(relaxed_to, mesh, ops, nl, &tags, &band).ok();
         let band_text = format!("over a {band_km} km band, {band_minutes} min");
-        notes.push(match (&nesting, &columns) {
-            (None, _) => "open faces: none".into(),
-            (Some(_), Some(_)) => {
+        notes.push(match (&nesting, in_run, &columns) {
+            (None, _, _) => "open faces: none".into(),
+            (Some(_), Some(_), _) => {
+                format!("open faces: nested in the whole run's u, v, T, S {band_text}")
+            }
+            (Some(_), None, Some(_)) => {
                 format!("open faces: nested in the parent's u, v, T, S {band_text}")
             }
-            (Some(_), None) => {
+            (Some(_), None, None) => {
                 format!("open faces: relaxed to the stratification at rest {band_text}")
             }
         });

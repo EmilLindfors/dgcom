@@ -156,6 +156,7 @@ pub use profile_series::{
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
 pub use restart::{
     DriverData, Restart2D, Restart3D, RestartError, domain_fingerprint_2d, domain_fingerprint_3d,
+    restart_time,
 };
 pub use river_forcing::{RiverForcing, RiverMouth, RomsRhoPoints, RomsSource, roms_source};
 pub use snapshot::{
