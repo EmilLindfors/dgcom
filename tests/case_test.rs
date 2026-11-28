@@ -2765,7 +2765,7 @@ impl dgcom::case::CaseDevice for Recorder {
         for source in &form.sources {
             match source {
                 DeviceSource2D::Coriolis(c) => seen.coriolis_f = Some(c.f0),
-                DeviceSource2D::NestingRelaxation(r) => seen.relaxation_rates.push(r.rate()),
+                DeviceSource2D::NestingRelaxation { rate, .. } => seen.relaxation_rates.push(*rate),
                 DeviceSource2D::Atmosphere(_) => {}
             }
         }

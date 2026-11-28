@@ -9,7 +9,7 @@
 //! target\release\dgcom-gpu.exe phase1         # one gate (phase0, phase1, nest, weather, beach,
 //!                                             # transport3d, momentum3d, stage3d,
 //!                                             # limiter3d, vertical3d, implicit3d,
-//!                                             # forcing3d, pass3d, step3d, parent3d;
+//!                                             # forcing3d, pass3d, step3d, parent3d, patch;
 //!                                             # all by default)
 //! target\release\dgcom-gpu.exe case <case.toml> [--set key.path=value]...
 //!                                             # a case on the CPU and the GPU, compared
@@ -43,6 +43,8 @@
 //!   from what the pass moved (`pass3d`); a nesting parent model's columns
 //!   at the band's slots, sampled on the device (`parent3d`); value for
 //!   value.
+//! - **Patches:** a cut-out of a case's mesh nested in its whole run's
+//!   snapshots, 2D and 3D, through the case runner (`patch`, P8.14).
 //!
 //! Built without multiply–add contraction (`--no-fmad`), the GPU's results
 //! must be the CPU's bit for bit; that is the gate.
@@ -70,6 +72,7 @@ mod parent;
 mod parent3d;
 mod pass;
 mod pass3d;
+mod patch;
 mod phase0;
 mod phase1;
 mod stage3d;
@@ -110,7 +113,7 @@ type Gate = (
 );
 
 /// The gates in `all`'s order; the device's own judges last.
-const GATES: [Gate; 16] = [
+const GATES: [Gate; 17] = [
     ("phase0", phase0::run, true),
     ("phase1", phase1::run, true),
     ("nest", nest::run_gates, true),
@@ -126,6 +129,7 @@ const GATES: [Gate; 16] = [
     ("pass3d", pass3d::run, true),
     ("step3d", step3d::run, true),
     ("parent3d", parent3d::run, true),
+    ("patch", patch::run, true),
     ("judges", judges::run, true),
 ];
 

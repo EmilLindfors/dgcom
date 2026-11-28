@@ -10,7 +10,8 @@
 //! state uniform along each (a harmonic tide, still water), atlas tides
 //! node by node (`BoundaryTides`: each constituent's time factors from the
 //! host once per stage time, the sums per node on the device) or a parent
-//! model node by node (`OceanModelState`: its series per node on the device,
+//! node by node (`ParentSeries2D`: a parent model, `OceanModelState`, or a
+//! whole run's frames, `RunParent`; its series per node on the device,
 //! the time stencil from the host), raised by a weather's inverse barometer
 //! (`InverseBarometer`), Coriolis, the nesting's relaxation band
 //! (`NestingRelaxation2D`, a kernel after the element kernels), a weather's
@@ -46,7 +47,7 @@ use cuda_host::cuda_module;
 use dgcom::SWEState2D;
 use dgcom::boundary::{
     BCContext2D, DeviceBoundary2D, DeviceExternal2D, DeviceLevel, ElevationOnly, ExternalState,
-    NestingRelaxation2D, OceanModelState, Reflective2D, SWEBoundaryCondition2D,
+    PARENT_MOMENT, ParentSeries2D, Reflective2D, SWEBoundaryCondition2D,
     characteristic_boundary_state, parent_external_state, parent_state, parent_term,
     relaxation_source, tide_state, tide_term,
 };
@@ -117,7 +118,7 @@ pub struct OpenStates {
 const UNIFORM: u32 = 0;
 /// [`OpenForm::kind`]: atlas tides per face node (`BoundaryTides`).
 const TIDES: u32 = 1;
-/// [`OpenForm::kind`]: a parent model per face node (`OceanModelState`).
+/// [`OpenForm::kind`]: a parent per face node (`ParentSeries2D`).
 const PARENT: u32 = 2;
 
 /// An open boundary's external data as the boundary kernel evaluates it
@@ -190,9 +191,9 @@ fn weather_at(node: usize, m: &[f64], slots: WeatherSlots<'_>) -> [f64; 5] {
 /// density, its slots.
 type WeatherLevel<'a> = (usize, bool, f64, WeatherSlots<'a>);
 
-/// A parent model on the device (`OceanModelState`), in a device buffer:
+/// A parent on the device (`ParentSeries2D`), in a device buffer:
 /// where its slots' series and data start in the parent tables, and its
-/// moment in a level's row of the moments (`OceanModelState::moment`).
+/// moment in a level's row of the moments (`ParentSeries2D::moment`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ParentForm {
@@ -221,7 +222,7 @@ type ParentRows<'a> = (&'a [ParentForm], &'a [[f32; 3]], &'a [[f64; 2]]);
 
 /// Parent `form`'s `(η, velocity)` at its slot `slot` over bed `bed`, the
 /// time weights and ramp from `moment` (a level's row): dgcom's
-/// `parent_term` and `parent_state`, as `OceanModelState::evaluate`.
+/// `parent_term` and `parent_state`, as `ParentSeries2D::evaluate`.
 #[inline]
 fn parent_at(
     form: &ParentForm,
@@ -2787,8 +2788,8 @@ pub struct GpuSWE2D<'a> {
     /// The parents of the open boundaries and the relaxation bands (each
     /// once), and the bands, each with its parent's index, in the order the
     /// CPU adds them (after the Coriolis force)
-    parents: Vec<&'a OceanModelState>,
-    relaxations: Vec<(usize, &'a NestingRelaxation2D)>,
+    parents: Vec<&'a dyn ParentSeries2D>,
+    relaxations: Vec<(usize, Relaxation)>,
     /// The sources after the element kernels, in the CPU's order
     post: Vec<Post>,
     /// The weather of the air-pressure source or of the open boundaries'
@@ -2841,6 +2842,14 @@ enum Post {
     Relaxation(usize),
     /// The weather's momentum source
     Atmosphere,
+}
+
+/// A relaxation band's constants (`DeviceSource2D::NestingRelaxation`).
+#[derive(Clone, Copy, Debug)]
+struct Relaxation {
+    rate: f64,
+    wet_depth: f64,
+    momentum_only: bool,
 }
 
 /// The weather's regridded snapshots on the device
@@ -2966,7 +2975,7 @@ pub struct PassTables<'b> {
 /// boundary) and `[mean, source depth]`, a parent row's slot; and every
 /// parent's form, its slots' snapshots and `[parent depth, band weight]`,
 /// its slot of every mesh node and its band elements. A level's moments
-/// are the tides' (`1 + 3 n_c` each), then the parents' (`OceanModelState::MOMENT`
+/// are the tides' (`1 + 3 n_c` each), then the parents' (`PARENT_MOMENT`
 /// each).
 struct Forcing {
     /// Every open boundary's form, on the host and on the device
@@ -3003,14 +3012,14 @@ impl Forcing {
         opens: &[(DeviceExternal2D<'_>, ElevationOnly)],
         raises: &[Option<f64>],
         code: impl Fn(Option<BoundaryTag>) -> u32,
-        parents: &[&OceanModelState],
+        parents: &[&dyn ParentSeries2D],
     ) -> Result<Self, String> {
         let stream = &gpu.stream;
         let device = |e: cuda_core::DriverError| e.to_string();
-        let parent_of = |parent: &OceanModelState| {
+        let parent_of = |parent: &dyn ParentSeries2D| {
             parents
                 .iter()
-                .position(|p| p.is(parent))
+                .position(|p| p.samples() == parent.samples())
                 .expect("every open boundary's parent is listed")
         };
         // The moments: the tides', then the parents'
@@ -3036,7 +3045,7 @@ impl Forcing {
                 }
                 DeviceExternal2D::Parent(parent) => OpenForm {
                     kind: PARENT,
-                    parent: parent_of(parent) as u32,
+                    parent: parent_of(*parent) as u32,
                     ..OpenForm::default()
                 },
             });
@@ -3054,7 +3063,7 @@ impl Forcing {
         let (mut slot_of_node, mut band) = (Vec::new(), Vec::new());
         for parent in parents {
             parent_forms.push(ParentForm {
-                n_times: parent.reader().n_times() as u32,
+                n_times: parent.n_times() as u32,
                 series: u32::try_from(series.len()).map_err(|_| "a parent too long")?,
                 slots: slots.len() as u32,
                 moment: width as u32,
@@ -3062,7 +3071,7 @@ impl Forcing {
                 max_transport_ratio: parent.max_transport_ratio().unwrap_or(0.0),
                 reference_level: parent.reference_level(),
             });
-            width += OceanModelState::MOMENT;
+            width += PARENT_MOMENT;
             for slot in 0..parent.n_slots() {
                 series.extend_from_slice(parent.slot_series(slot));
                 slots.push([parent.parent_depth(slot), parent.band_weight(slot)]);
@@ -3430,7 +3439,7 @@ impl<'a> GpuSWE2D<'a> {
         // then the relaxation bands and the weather (a kernel each, after
         // them, in the CPU's order)
         let mut coriolis = None;
-        let mut relaxations: Vec<&NestingRelaxation2D> = Vec::new();
+        let mut relaxations: Vec<(&dyn ParentSeries2D, Relaxation)> = Vec::new();
         let mut post = Vec::new();
         for source in &form.sources {
             match *source {
@@ -3443,8 +3452,20 @@ impl<'a> GpuSWE2D<'a> {
                     }
                     coriolis = Some(c);
                 }
-                DeviceSource2D::NestingRelaxation(r) => {
-                    relaxations.push(r);
+                DeviceSource2D::NestingRelaxation {
+                    parent,
+                    rate,
+                    wet_depth,
+                    momentum_only,
+                } => {
+                    relaxations.push((
+                        parent,
+                        Relaxation {
+                            rate,
+                            wet_depth,
+                            momentum_only,
+                        },
+                    ));
                     post.push(Post::Relaxation(relaxations.len() - 1));
                 }
                 DeviceSource2D::Atmosphere(a) => {
@@ -3457,23 +3478,25 @@ impl<'a> GpuSWE2D<'a> {
             }
         }
         // Every parent once
-        let mut parents: Vec<&OceanModelState> = Vec::new();
-        let mut parent_index =
-            |parent: &'a OceanModelState| match parents.iter().position(|p| p.is(parent)) {
-                Some(i) => i,
-                None => {
-                    parents.push(parent);
-                    parents.len() - 1
-                }
-            };
+        let mut parents: Vec<&dyn ParentSeries2D> = Vec::new();
+        let mut parent_index = |parent: &'a dyn ParentSeries2D| match parents
+            .iter()
+            .position(|p| p.samples() == parent.samples())
+        {
+            Some(i) => i,
+            None => {
+                parents.push(parent);
+                parents.len() - 1
+            }
+        };
         for (external, _) in &opens {
             if let DeviceExternal2D::Parent(parent) = external {
-                parent_index(parent);
+                parent_index(*parent);
             }
         }
-        let relaxations: Vec<(usize, &NestingRelaxation2D)> = relaxations
+        let relaxations: Vec<(usize, Relaxation)> = relaxations
             .into_iter()
-            .map(|r| (parent_index(r.parent()), r))
+            .map(|(parent, r)| (parent_index(parent), r))
             .collect();
         let friction = form.friction.as_ref().map(|law| match law {
             DeviceFriction2D::Manning(m) => m.clone(),
@@ -3591,7 +3614,7 @@ impl<'a> GpuSWE2D<'a> {
         }
         for (parent, form) in self.parents.iter().zip(&self.forcing.parents_host) {
             let m = form.moment as usize;
-            parent.moment(time, &mut moments[m..m + OceanModelState::MOMENT]);
+            parent.moment(time, &mut moments[m..m + PARENT_MOMENT]);
         }
         open
     }
@@ -3944,9 +3967,9 @@ impl<'a> GpuSWE2D<'a> {
                         &gpu.stream,
                         gpu.spread(n_pass, 256),
                         p as u32,
-                        relaxation.rate(),
-                        relaxation.wet_depth(),
-                        u32::from(relaxation.momentum_only()),
+                        relaxation.rate,
+                        relaxation.wet_depth,
+                        u32::from(relaxation.momentum_only),
                         &f.parents,
                         &f.series,
                         &f.slots,
@@ -3979,15 +4002,15 @@ impl<'a> GpuSWE2D<'a> {
             for field in sources.fields_mut() {
                 field.zero_async(&gpu.stream).expect("clear the sources");
             }
-            for &(p, relaxation) in self.relaxations.iter().filter(|(_, r)| !r.momentum_only()) {
+            for &(p, relaxation) in self.relaxations.iter().filter(|(_, r)| !r.momentum_only) {
                 let [out_h, out_hu, out_hv] = sources.fields_mut();
                 gpu.module
                     .nesting_relaxation(
                         &gpu.stream,
                         gpu.spread(n_pass, 256),
                         p as u32,
-                        relaxation.rate(),
-                        relaxation.wet_depth(),
+                        relaxation.rate,
+                        relaxation.wet_depth,
                         0,
                         &f.parents,
                         &f.series,
@@ -4017,7 +4040,7 @@ impl<'a> GpuSWE2D<'a> {
     /// (`BarotropicPhysics::mass_sources_into`): a relaxation band that
     /// relaxes the level.
     pub fn has_mass_sources(&self) -> bool {
-        self.relaxations.iter().any(|(_, r)| !r.momentum_only())
+        self.relaxations.iter().any(|(_, r)| !r.momentum_only)
     }
 
     /// `BarotropicPhysics::compute_rhs_mass_fluxes_into` at `time` with

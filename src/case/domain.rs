@@ -25,8 +25,8 @@ use super::schema::{
 use super::{CaseError, CaseFile};
 use crate::analysis::{GaugeRecord, HarmonicAnalysis, TideGaugeStation};
 use crate::boundary::{
-    BoundaryCoverage, GaugeAdjustment, NestingOptions, OceanModelState, ParentDatum, RunParent,
-    TidalAtlas,
+    BoundaryCoverage, GaugeAdjustment, NestingOptions, OceanModelState, ParentDatum,
+    ParentSeries2D, RunParent, TidalAtlas,
 };
 use crate::io::{
     AtmosphereReader, BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox,

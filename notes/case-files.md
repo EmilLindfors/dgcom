@@ -546,7 +546,7 @@ Also needed on this patch: `boundary.0.nesting.atlas_coverage_m = 25000`, since 
 
 ### P8.14, second part: a patch nested in its whole run (2026-11-28)
 
-What (branch `feat/patch-in-run`, on `feat/mesh-patch`): `[mesh.patch] whole_run = "<the whole run's .dgsnap>"` nests every open face of the patch in the whole run's own snapshots instead of the case's boundaries (`boundary::RunParent`; no NorKyst, no atlas there). At a face the cut made, the external state is the dropped neighbour's value at the same point; at the whole domain's own open faces and across the band (`band_km`, default 1; `band_minutes`, default 30), it is the node's own value. Values are linear in time between frames. It serves three roles: the external state (η, ū, v̄) of the characteristic faces, the 2D band's relaxation (`RunParentRelaxation2D`), and the 3D band's `ParentColumns3D` (u, v, T, S on the same σ-levels). The frames read are those over the run, from the restart's time (`io::restart_time`, the header alone) or 0. A 3D patch still starts its columns from the case's parent (read for the start only). `examples/patch_effect_3d.rs` compares a change's effect on the whole run (B − A) with its effect on a patch nested in A (b − a) at named points. The workflow and the numbers are in `docs/patches.md`.
+What (branch `feat/patch-in-run`, on `feat/mesh-patch`): `[mesh.patch] whole_run = "<the whole run's .dgsnap>"` nests every open face of the patch in the whole run's own snapshots instead of the case's boundaries (`boundary::RunParent`; no NorKyst, no atlas there). At a face the cut made, the external state is the dropped neighbour's value at the same point; at the whole domain's own open faces and across the band (`band_km`, default 1; `band_minutes`, default 30), it is the node's own value. Values are linear in time between frames. It serves three roles: the external state (η, ū, v̄) of the characteristic faces, the 2D band's relaxation (`NestingRelaxation2D<RunParent>`), and the 3D band's `ParentColumns3D` (u, v, T, S on the same σ-levels). The frames read are those over the run, from the restart's time (`io::restart_time`, the header alone) or 0. A 3D patch still starts its columns from the case's parent (read for the start only). `examples/patch_effect_3d.rs` compares a change's effect on the whole run (B − A) with its effect on a patch nested in A (b − a) at named points. The workflow and the numbers are in `docs/patches.md`.
 
 **Measured (laptop CPU), Frøya 3D from the 46 h restart:**
 - **Fidelity.** The reference is the whole hour with 2-minute frames (0.9 GB; 30 steps of 120 s, 42.0 s stepping, 49.3 s wall). The 5 km Mausund patch nested in it: 3.0 s stepping, 8.2 s wall. Against the whole run:
@@ -562,6 +562,31 @@ What (branch `feat/patch-in-run`, on `feat/mesh-patch`): `[mesh.patch] whole_run
 
 Gates: `a_patch_nested_in_its_whole_run_replays_it` (the tidal channel's middle, 6 km: 0.66 mm and 0.58 mm/s against 427 mm and 285 mm/s with the case's tide at the cut; the same from the 1 h restart) and `a_3d_patch_nested_in_its_whole_run_replays_it` (the 3D channel's last 2.5 km at 1-minute frames: 0.86 mm and 0.10 mm/s against 492 mm and 20 mm/s walled; at 5-minute frames the ramped tide's front is 20 mm off). Both fail when the frames are held instead of interpolated (34 and 25 mm).
 
+### P8.14, third part: a patch nested in its whole run on the GPU (2026-11-28)
+
+What (branch `feat/patch-gpu`, on `feat/patch-in-run`): the whole run's depth mean at a patch's open faces and across its band is a parent's series per node, as NorKyst's is in `OceanModelState`. Both now implement `boundary::ParentSeries2D`. Its methods are the per-slot tables, the moment of a time (ramp, snapshot indices and weights; `PARENT_MOMENT` values), and the evaluation, which is `parent_term` over the snapshots then `parent_state`.
+
+- `RunParent`'s moment is linear between its two frames, with no ramp, no datum shift and no transport scaling. Its series are now stored slot by slot (`[slot][time]`), as the device reads them.
+- `NestingRelaxation2D<P = OceanModelState>` relaxes towards either parent, so `RunParentRelaxation2D` is gone.
+- The GPU's open-boundary and band kernels (`gpu/src/swe2d.rs`, `Forcing`, `nesting_relaxation`) take a `&dyn ParentSeries2D` where they took an `OceanModelState`, without a change to a kernel.
+- A 3D patch's band columns (u, v, T, S) take the GPU's host path for a parent without a device form (`Nest3D` in `gpu/src/model3d.rs`): gathered, `Nesting3D::columns` on the host, uploaded.
+- The CPU's 2D bits are unchanged: `0 + (1 − w)a + wb` is `(1 − w)a + wb`, and a ramp of 1 changes nothing. The replay tests pass unchanged.
+
+**Measured (RTX 4060 Laptop, 2026-11-28):**
+- **Bit for bit (`--no-fmad`).** The tidal channel's middle 6 km nested in its whole run, 2D (576 steps, 185 station records, the snapshot) and 3D (120 steps, 305 records, 8.4 MB snapshot); the 2D one also with `numerics.local_time_stepping_levels = 3`. Frøya's 5 km Mausund patch from the 46 h restart, nested in the 2-minute reference with the weather: 30 steps, 35 gauge records, the 29.9 MB snapshot. With multiply–add contraction the channel's patches are within 3e-8 of a field's largest value.
+- **Time, the stepping of the hour, FMA build:**
+
+  | | 3 km | 5 km | 10 km | 15 km | 20 km | whole |
+  |---|---|---|---|---|---|---|
+  | elements | 116 | 322 | 1,278 | 2,739 | 4,316 | 9,848 |
+  | CPU, 24 threads | 1.9 s | 3.0 | 7.9 | 14.3 | 21.2 | 41.3 |
+  | RTX 4060 | 2.5 s | 3.1 | 6.6 | 10.4 | 16.2 | 24.4 |
+
+  Patches take 30 steps (2-minute frames); the whole run takes 19 (10-minute frames). The laptop's card (FP64 at 1:64) pays from about a thousand elements up. Below that, the barotropic pass's short launches set the time (1.55 of the 5 km patch's 3.2 s, `DG_PROFILE=1`).
+- **The 3D band on the host:** `device: nesting columns` takes 0.30 s of the 5 km patch's 3.2 s of stepping (240 calls, 1.2 ms each), and 1.21 of the 20 km patch's 15.3 s (736 calls). Those are upper bounds, because the scope's sync absorbs the queued kernels. On the 20 km patch the weather's surface fluxes on the host take 2.7 s (`notes/gpu.md`, 4.5h).
+
+Gate: `dgcom-gpu patch` (`gpu/src/patch.rs`, in `all`): the tidal channel's patch nested in its whole run, 2D over 3 h and 3D over 1.5 h, through the case runner (`case::compare`). Its mutant is the GPU's patch nested in a whole run with M2 1 cm higher: 7.9 mm at the station in 2D, 1.5 mm in 3D, so caught. The FMA build first failed it on η at rest: the case gate judged a snapshot value against its frame's own largest, which is round-off before the tide reaches the patch (3.6e-15 counted as 0.88 of the field). It now judges against the field's largest over the run, as station records are judged. `dgcom-gpu all`: 72 fixtures held (`--no-fmad`, 638 s).
+
 ## Out of TODO.md (2026-11-15)
 
 The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the path to farm-site currents with a measured error on any coast, and the known defects of the runs made at farm depths. The lines below left it, verbatim. A folded line is part of a line there now (its context). A parked line comes back when a run, a measurement or a user asks for it. A dropped line is not to be done, for the reason after it. New opportunities in this area go under Parked.
@@ -572,7 +597,7 @@ The triage of 2026-11-15 (`notes/overview.md`) kept in `TODO.md` what is on the 
 - **P8.13** A film sits 1–2 m above the high water inside a partly dry element: 500–1100 nodes of the Chiloé run carry 1–50 mm of water on beds at +1 to +4 m through the ebb (one 22 cm on a +2.8 m bed, 1.2 m above the tide around it). Find why it does not drain (`notes/case-files.md`, Chiloé). The progress line no longer reads it (the nodes at least 1 m deep since 2026-11-13, the films' speed beside them). *(Folded 2026-11-15 into `TODO.md`'s P1.2 films on land that do not drain.)*
 
 ### Parked
-- **P8.14** A device form for `RunParent`, so `dgcom-gpu` runs a patch nested in its whole run: a per-slot table of η, ū, v̄ and the levels' u, v, T, S over frames is what `OceanModelState`'s and `ParentModel3D`'s device forms already upload, linear in time instead of cubic. GPU kernel work wants patches of thousands of elements anyway (the fixed costs per step).
+- **P8.14** A 3D device form for `RunParent` (`DeviceParent3D`): its band columns are on the σ-levels already, so a thread per slot and level blending two frames' f32 values (with `Parent3D`'s slot codes for local steps) would replace the host round trip. That trip is at most 8–9 % of a patch's GPU stepping (0.30 of 3.2 s at 5 km, 1.21 of 15.3 s at 20 km, 2026-11-28, above); the 2D form is done (third part).
 - **P8.14** A patch's fixed cost per step, ≈ 46 ms on Frøya's 3D case (fit over patch sizes, 2026-11-28), sets the floor of a small patch's loop (116 elements: 1.9 s of an hour's 30 steps); find what it is (`DG_PROFILE=1` on the 3 km patch) before timing kernels on patches of hundreds of elements.
 - **P8.14** A whole-run reference with frames every 2 minutes lands its steps on them (120 s against the production run's 133–200 s): the reference is not the production run's bits. Frames written between steps (dense output, P8.1's line above) would let the reference keep its steps.
 - **P8.14** A patch's build is most of its wall time: 8 of the 11.5 s of the 5 km Mausund patch's hour (2026-11-28, above), the whole bed rebuilt from the raster (smoothing and 3D bed included; 16 s for the 23,727-element coastline case's `dgcom check`), the 153 MB restart read whole, NorKyst sampled. A built domain kept between runs (the whole mesh and bed as `dgcom mesh` writes them, read back by a key of `[mesh]`, checked by `domain_fingerprint_2d`) would take a patch's hour to ≈ 4 s; profile the build first (`CaseFile::build_domain`).

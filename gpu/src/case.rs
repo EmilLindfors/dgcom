@@ -136,13 +136,35 @@ fn drive<I: TimeIntegrator<DeviceState> + IntegratorInfo>(
 }
 
 /// The case gate: the case at `path` (with `overrides`) on the CPU and on
-/// CUDA device 0, each into its own directory under `output/gpu_gate/`,
-/// their steps, volumes, clips, every station's every record and a 3D
-/// run's snapshot compared bit for bit (a build without multiply–add
-/// contraction).
+/// CUDA device 0, compared ([`compare`]) bit for bit (a build without
+/// multiply–add contraction) or within the gate's tolerance.
 pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
+    let (same, _) = compare(path, overrides, &[])?;
+    let verdict = gate::verdict(&path.display().to_string(), same);
+    if same {
+        println!("  the GPU's run is the CPU's {verdict}");
+        Ok(())
+    } else {
+        Err(format!("the GPU's run differs from the CPU's ({verdict})").into())
+    }
+}
+
+/// The case at `path` (with `overrides`) on the CPU and on CUDA device 0
+/// (with `gpu_only` after them: a mutant's input), each into its own
+/// directory under `output/gpu_gate/`, compared and printed: their steps,
+/// volumes, clips, every station's every record and a 3D run's snapshot.
+/// Whether the GPU's run holds to the CPU's by the gate's bar, and whether
+/// any of it differs at all.
+pub fn compare(
+    path: &Path,
+    overrides: &[String],
+    gpu_only: &[String],
+) -> Result<(bool, bool), Box<dyn Error>> {
     let run = |device: &str| -> Result<(RunReport, f64, std::path::PathBuf), Box<dyn Error>> {
         let mut all = overrides.to_vec();
+        if device != "cpu" {
+            all.extend_from_slice(gpu_only);
+        }
         all.push(format!("compute.device={device}"));
         all.push(format!(
             "output.directory=output/gpu_gate/{}",
@@ -218,8 +240,10 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
         && cpu.n_steps == gpu.n_steps
         && clips(&cpu) == clips(&gpu)
         && stages(&cpu) == stages(&gpu);
+    let mut differs = cpu.volume_m3.1.to_bits() != gpu.volume_m3.1.to_bits() || !all_same;
     for (c, g) in cpu.stations.iter().zip(&gpu.stations) {
         let (identical, n, worst, worst_rel) = compare_station(c, g);
+        differs |= identical != n;
         all_same &= identical == n || (!exact && worst_rel <= tolerance);
         println!(
             "  station {}: {identical} of {n} records bit-identical, largest difference \
@@ -240,6 +264,7 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
             "  snapshot {name}: {differ} of {} bytes differ",
             a.len().max(b.len())
         );
+        differs |= differ > 0;
         if exact {
             all_same &= differ == 0;
         } else if differ > 0 {
@@ -262,30 +287,26 @@ pub fn gate(path: &Path, overrides: &[String]) -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    let verdict = gate::verdict(&path.display().to_string(), all_same);
-    if all_same {
-        println!("  the GPU's run is the CPU's {verdict}");
-        Ok(())
-    } else {
-        Err(format!("the GPU's run differs from the CPU's ({verdict})").into())
-    }
+    Ok((all_same, differs))
 }
 
 /// A snapshot field's agreement over a run's frames.
 struct FieldDifference {
     name: String,
     /// Values farther than the gate's tolerance of the field's largest value
-    /// in their frame (or not finite on one side alone)
+    /// over the frames (or not finite on one side alone)
     beyond: usize,
     values: usize,
-    /// The largest difference over the field's largest value in its frame
+    /// The largest difference over the field's largest value
     worst: f64,
 }
 
 /// Two snapshot files of the same run, frame by frame, per field over the
 /// frames: how many values differ by more than the running gate's tolerance
-/// of their field's largest value in the frame, of how many, and the largest
-/// such difference.
+/// of their field's largest value over the run (as a station's records are
+/// judged; a frame's own largest is round-off where the field is still at
+/// rest, a patch's frames before the tide reaches it), of how many, and the
+/// largest such difference.
 fn compare_snapshots(a: &Path, b: &Path) -> Result<Vec<FieldDifference>, Box<dyn Error>> {
     let mut a = dgcom::io::SnapshotReader::open(a)?;
     let mut b = dgcom::io::SnapshotReader::open(b)?;
@@ -312,24 +333,33 @@ fn compare_snapshots(a: &Path, b: &Path) -> Result<Vec<FieldDifference>, Box<dyn
     if frames != b.n_frames()? {
         return Err("the snapshots hold different numbers of frames".into());
     }
+    let fields = |f: dgcom::io::SnapshotFrame| -> Vec<Vec<f32>> {
+        [f.eta, f.u, f.v]
+            .into_iter()
+            .chain(f.surface)
+            .chain(f.layers)
+            .collect()
+    };
+    // Each field's largest value over the frames, then the differences
+    let mut scale = vec![0.0f64; out.len()];
     for i in 0..frames {
-        let (fa, fb) = (a.read_frame(i)?, b.read_frame(i)?);
-        let fields = |f: &dgcom::io::SnapshotFrame| -> Vec<Vec<f32>> {
-            [f.eta.clone(), f.u.clone(), f.v.clone()]
-                .into_iter()
-                .chain(f.surface.iter().cloned())
-                .chain(f.layers.iter().cloned())
-                .collect()
-        };
-        let (xs, ys) = (fields(&fa), fields(&fb));
-        if xs.len() != out.len() || ys.len() != out.len() {
+        let xs = fields(a.read_frame(i)?);
+        if xs.len() != out.len() {
             return Err("the snapshots hold other fields than their header names".into());
         }
-        for ((x, y), field) in xs.iter().zip(&ys).zip(&mut out) {
-            let scale = x
+        for (x, s) in xs.iter().zip(&mut scale) {
+            *s = x
                 .iter()
                 .filter(|v| v.is_finite())
-                .fold(0.0f64, |m, v| m.max(f64::from(v.abs())));
+                .fold(*s, |m, v| m.max(f64::from(v.abs())));
+        }
+    }
+    for i in 0..frames {
+        let (xs, ys) = (fields(a.read_frame(i)?), fields(b.read_frame(i)?));
+        if ys.len() != out.len() {
+            return Err("the snapshots hold other fields than their header names".into());
+        }
+        for (((x, y), field), &scale) in xs.iter().zip(&ys).zip(&mut out).zip(&scale) {
             for (&p, &q) in x.iter().zip(y) {
                 field.values += 1;
                 if p.to_bits() == q.to_bits() {
