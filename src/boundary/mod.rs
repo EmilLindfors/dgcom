@@ -98,10 +98,10 @@ pub use ocean_columns::{
     DeepReference, OceanColumnsOptions, OceanModelColumns, ParentModel3D, ParentNode, deep_tracers,
 };
 pub use ocean_nesting::{
-    NestingError, NestingOptions, NestingRelaxation2D, OceanModelState, ParentDatum,
-    parent_external_state, parent_state, parent_term, relaxation_source,
+    NestingError, NestingOptions, NestingRelaxation2D, OceanModelState, PARENT_MOMENT, ParentDatum,
+    ParentSeries2D, parent_external_state, parent_state, parent_term, relaxation_source,
 };
-pub use run_parent::{RunParent, RunParentError, RunParentRelaxation2D};
+pub use run_parent::{RunParent, RunParentError};
 pub use tidal_atlas::{
     AtlasConstituent, AtlasPoint, BoundaryTides, GaugeAdjustment, TidalAtlas, TidalAtlasError,
     tide_level, tide_state, tide_term,

@@ -537,7 +537,7 @@ use dgcom::boundary::{
     SWEBoundaryCondition2D, TidalAtlas,
 };
 #[cfg(feature = "netcdf")]
-use dgcom::boundary::{NestingOptions, ParentDatum};
+use dgcom::boundary::{NestingOptions, ParentDatum, ParentSeries2D};
 use dgcom::equations::ShallowWater2D;
 #[cfg(feature = "netcdf")]
 use dgcom::io::WaveSpectraFile;

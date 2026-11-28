@@ -94,7 +94,7 @@ cargo oxide run --features simd             # multiply–adds fused: within ~1e-
 target/release/dgcom-gpu phase1             # one gate (phase0, phase1, nest, weather, beach,
                                             # transport3d, momentum3d, stage3d, limiter3d,
                                             # vertical3d, implicit3d, forcing3d, pass3d, step3d,
-                                            # parent3d, judges; all by default)
+                                            # parent3d, patch, judges; all by default)
 target/release/dgcom-gpu judges             # the device's own judges alone (a minute)
 target/release/dgcom-gpu case ../cases/tidal_channel/case.toml [--tolerance 1e-8] [--outliers 0]
                                             # the case on the CPU and the GPU, compared (the bar

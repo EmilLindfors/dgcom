@@ -143,10 +143,20 @@ impl ElementSources<'_> {
 pub enum DeviceSource2D<'a> {
     /// The Coriolis force, f- or β-plane
     Coriolis(crate::source::CoriolisSource2D),
-    /// The nesting's relaxation band towards its parent: the device holds
-    /// the parent's series per node and evaluates the source with
+    /// The nesting's relaxation band towards its parent
+    /// ([`crate::boundary::NestingRelaxation2D`]): the device holds the
+    /// parent's series per node and evaluates the source with
     /// [`crate::boundary::relaxation_source`]
-    NestingRelaxation(&'a crate::boundary::NestingRelaxation2D),
+    NestingRelaxation {
+        /// The parent
+        parent: &'a dyn crate::boundary::ParentSeries2D,
+        /// The rate at the boundary, `1/τ` (1/s)
+        rate: f64,
+        /// The depth below which a node is not relaxed (m)
+        wet_depth: f64,
+        /// Whether only the momentum is relaxed
+        momentum_only: bool,
+    },
     /// A weather model's pressure gradient and wind stress
     /// (`GriddedAtmosphere2D`): the device holds its regridded snapshots and
     /// sums them with the host's time stencil and ramp
@@ -158,11 +168,18 @@ impl std::fmt::Debug for DeviceSource2D<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Coriolis(c) => f.debug_tuple("Coriolis").field(c).finish(),
-            Self::NestingRelaxation(r) => f
+            Self::NestingRelaxation {
+                parent,
+                rate,
+                wet_depth,
+                momentum_only,
+            } => f
                 .debug_struct("NestingRelaxation")
-                .field("rate", &r.rate())
-                .field("slots", &r.parent().n_slots())
-                .finish_non_exhaustive(),
+                .field("slots", &parent.n_slots())
+                .field("rate", rate)
+                .field("wet_depth", wet_depth)
+                .field("momentum_only", momentum_only)
+                .finish(),
             Self::Atmosphere(a) => f.debug_tuple("Atmosphere").field(a).finish(),
         }
     }

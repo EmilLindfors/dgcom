@@ -135,9 +135,26 @@ the whole run's 142 µs:
 - **The build:** a patch rebuilds the whole bed first, 4.7 s of the
   Mausund patch's 8.2 s, of which 2.5 s is the 3D bed's smoothing of the
   whole mesh. A cache is parked (`notes/case-files.md`).
-- **GPU:** the whole run's parent has no device form yet, so `dgcom-gpu`
-  refuses a patch nested in it. A walled patch, or one nested in NorKyst,
-  takes the boundary forms the card already has (not tried yet).
+- **GPU:** `dgcom-gpu run … --set compute.device=cuda` runs a patch nested
+  in its whole run. Its open faces and its 2D band take the device's parent
+  kernels. A 3D patch's band columns are evaluated on the host and uploaded:
+  at most 8–9 % of the stepping, on the 5 and 20 km patches. The results are
+  the CPU's bit for bit in a build without multiply–add contraction
+  (`dgcom-gpu patch`; the Mausund patch's hour too). On the laptop's
+  RTX 4060 the card pays from about a thousand elements up:
+
+  | patch | elements | CPU (24 threads) | RTX 4060 |
+  |---|---|---|---|
+  | 3 km | 116 | 1.9 s | 2.5 s |
+  | 5 km | 322 | 3.0 s | 3.1 s |
+  | 10 km | 1,278 | 7.9 s | 6.6 s |
+  | 15 km | 2,739 | 14.3 s | 10.4 s |
+  | 20 km | 4,316 | 21.2 s | 16.2 s |
+  | whole | 9,848 | 41.3 s | 24.4 s |
+
+  That is the stepping of the hour (46 → 47 h), the FMA build. The patches
+  take 30 steps of 120 s, landing on their 2-minute frames. The whole run
+  takes 19 steps of up to 200 s with 10-minute frames.
 
 ## Checks
 
@@ -147,3 +164,7 @@ the whole run's 142 µs:
   the 3D one is 0.86 mm against 492 mm walled.
 - A mutant that holds the frames instead of interpolating them fails both
   replays.
+- `dgcom-gpu patch` (the GPU crate, `gpu/`) runs the tidal channel's middle
+  6 km nested in its whole run on the CPU and on the GPU, 2D and 3D. The two
+  agree bit for bit without multiply–add contraction, and within 1e-7 with
+  it. Its mutant nests the GPU's patch in a whole run with M2 1 cm higher.

@@ -281,7 +281,6 @@ struct Inner {
     nodes: Vec<NestedNode>,
     /// Elements with a node in the relaxation band
     band_elements: Vec<bool>,
-    n_nodes: usize,
     snapped: usize,
     /// Parent `(ζ, u, v)` per slot and snapshot, `[slot][time][3]`, the
     /// velocity in the mesh axes: interpolated in space once, so a node
@@ -447,18 +446,12 @@ impl OceanModelState {
                 slot_of_node,
                 nodes,
                 band_elements,
-                n_nodes,
                 snapped,
                 series,
                 has_velocity,
                 reference_level,
             }),
         })
-    }
-
-    /// The level (m) added to the parent's ζ (see [`NestingOptions::datum`]).
-    pub fn reference_level(&self) -> f64 {
-        self.inner.reference_level
     }
 
     /// A clock whose `t = 0` is the first snapshot of `reader`.
@@ -538,29 +531,6 @@ impl OceanModelState {
         self.inner.reader.bbox()
     }
 
-    /// Slot of the node `node_index` (a flat mesh node) at `(x, y)`: by
-    /// nodal index, or else the nearest open-boundary node by position.
-    pub fn slot_of(&self, node_index: Option<usize>, (x, y): (f64, f64)) -> usize {
-        if let Some(&slot) = node_index
-            .and_then(|i| self.inner.slot_of_node.get(i))
-            .filter(|&&s| s != u32::MAX)
-        {
-            return slot as usize;
-        }
-        self.inner
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.on_boundary)
-            .min_by(|a, b| {
-                let da = (a.1.position.0 - x).hypot(a.1.position.1 - y);
-                let db = (b.1.position.0 - x).hypot(b.1.position.1 - y);
-                da.total_cmp(&db)
-            })
-            .map(|(i, _)| i)
-            .expect("OceanModelState has boundary nodes")
-    }
-
     /// Snapshot weights and ramp at simulation time `t`.
     fn moment_at(&self, t: f64) -> Moment {
         let inner = &self.inner;
@@ -577,123 +547,11 @@ impl OceanModelState {
         }
     }
 
-    /// Parent `(η, u, v)` at slot `slot` in the mesh axes, over a child bed
-    /// at `bed` (for transport scaling); velocity `None` if the parent has
-    /// none.
-    fn evaluate(&self, slot: usize, moment: &Moment, bed: f64) -> (f64, Option<(f64, f64)>) {
-        let inner = &self.inner;
-        let series = self.slot_series(slot);
-        let mut sum = [0.0; 3];
-        for (t, w) in moment.time.terms() {
-            parent_term(&mut sum, w, &series[t]);
-        }
-        parent_state(
-            sum,
-            moment.ramp,
-            inner.reference_level,
-            inner.has_velocity,
-            self.transport(slot),
-            bed,
-        )
-    }
-
-    /// Slot `slot`'s `(ζ, u, v)` per snapshot (the velocity in the mesh axes).
-    pub fn slot_series(&self, slot: usize) -> &[[f32; 3]] {
-        let n = self.inner.reader.n_times();
-        &self.inner.series.as_chunks::<3>().0[slot * n..(slot + 1) * n]
-    }
-
-    /// [`parent_state`]'s `transport` at slot `slot`: the largest ratio
-    /// and the parent depth there, with transport scaling.
-    #[inline]
-    fn transport(&self, slot: usize) -> Option<(f64, f64)> {
-        let inner = &self.inner;
-        inner.options.transport_scaling.then(|| {
-            (
-                inner.options.max_transport_ratio,
-                inner.nodes[slot].parent_depth,
-            )
-        })
-    }
-
-    /// Number of sampled nodes (open-boundary and band nodes), the slots.
-    pub fn n_slots(&self) -> usize {
-        self.inner.nodes.len()
-    }
-
-    /// Slot of every flat mesh node (`u32::MAX`: not sampled).
-    pub fn slot_of_node(&self) -> &[u32] {
-        &self.inner.slot_of_node
-    }
-
-    /// Whether each element has a node in the relaxation band.
-    pub fn band_elements(&self) -> &[bool] {
-        &self.inner.band_elements
-    }
-
-    /// The parent's still-water depth at slot `slot` (m, NaN if unknown).
-    pub fn parent_depth(&self, slot: usize) -> f64 {
-        self.inner.nodes[slot].parent_depth
-    }
-
-    /// The relaxation weight at slot `slot` (1 on the boundary, 0 outside
-    /// the band).
-    pub fn band_weight(&self, slot: usize) -> f64 {
-        self.inner.nodes[slot].weight
-    }
-
-    /// Whether the parent has a depth-mean velocity.
-    pub fn has_velocity(&self) -> bool {
-        self.inner.has_velocity
-    }
-
-    /// The largest transport-scaling factor, with transport scaling.
-    pub fn max_transport_ratio(&self) -> Option<f64> {
-        let options = &self.inner.options;
-        options
-            .transport_scaling
-            .then_some(options.max_transport_ratio)
-    }
-
-    /// Whether `other` is this parent (a clone of it: the same samples).
-    pub fn is(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
-    }
-
-    /// The time-dependent part of the parent at simulation time `t`, the
-    /// same at every node, into `moment` ([`Self::MOMENT`] values): the
-    /// ramp, the number of snapshots, their indices and their weights (4
-    /// each, the unused ones 0). A device takes it from the host once per
-    /// stage time and evaluates each node with [`parent_term`] and
-    /// [`parent_state`], which give [`ExternalStateProvider::external_state`]'s
-    /// bits (P2.7, `notes/gpu.md`).
-    ///
-    /// # Panics
-    /// Outside the parent's time range, as the external state does.
-    pub fn moment(&self, t: f64, moment: &mut [f64]) {
-        let Moment { time, ramp } = self.moment_at(t);
-        moment[0] = ramp;
-        moment[1] = time.len as f64;
-        for i in 0..4 {
-            moment[2 + i] = time.idx[i] as f64;
-            moment[6 + i] = time.w[i];
-        }
-    }
-
-    /// The values of a [`Self::moment`].
-    pub const MOMENT: usize = 10;
-
     /// Relaxation band source term with timescale `timescale` (s) at the
     /// boundary; see the module docs. Needs `NestingOptions::band_width > 0`
     /// for anything beyond the boundary nodes themselves.
     pub fn relaxation(&self, timescale: f64) -> NestingRelaxation2D {
-        assert!(timescale > 0.0, "relaxation timescale must be positive");
-        NestingRelaxation2D {
-            parent: self.clone(),
-            rate: 1.0 / timescale,
-            momentum_only: false,
-            wet_depth: 0.05,
-        }
+        NestingRelaxation2D::new(self.clone(), timescale)
     }
 
     /// Add the tide of `correction` to the parent at every forced and band
@@ -818,11 +676,181 @@ impl OceanModelState {
     }
 }
 
+/// The values of a parent's moment ([`ParentSeries2D::moment`]).
+pub const PARENT_MOMENT: usize = 10;
+
+/// A parent's depth-mean state at the nodes of a mesh's open boundary and
+/// relaxation band as a series of snapshots per node (a *slot*): a parent
+/// model interpolated in space once ([`OceanModelState`]), a dgcom run's own
+/// frames ([`crate::boundary::RunParent`]). The open boundary takes it as
+/// its external data, the band ([`NestingRelaxation2D`]) relaxes towards
+/// it, and a device holds its tables and evaluates it as the CPU does: the
+/// moment of a time on the host ([`Self::moment`]), each node's
+/// [`Self::evaluate`] (P2.7, `notes/gpu.md`; [`DeviceExternal2D::Parent`],
+/// [`DeviceSource2D::NestingRelaxation`]).
+pub trait ParentSeries2D: Send + Sync {
+    /// Number of sampled nodes (open-boundary and band nodes), the slots.
+    fn n_slots(&self) -> usize;
+
+    /// Snapshots per slot.
+    fn n_times(&self) -> usize;
+
+    /// Slot `slot`'s `(ζ, u, v)` per snapshot (the velocity in the mesh axes).
+    fn slot_series(&self, slot: usize) -> &[[f32; 3]];
+
+    /// Slot of every flat mesh node (`u32::MAX`: not sampled).
+    fn slot_of_node(&self) -> &[u32];
+
+    /// Whether each element has a sampled node.
+    fn band_elements(&self) -> &[bool];
+
+    /// Slot of the node `node_index` (a flat mesh node) at `position`: by
+    /// nodal index, or else the nearest open-boundary node's by position.
+    fn slot_of(&self, node_index: Option<usize>, position: (f64, f64)) -> usize;
+
+    /// The relaxation weight at slot `slot` (1 on the boundary, 0 outside
+    /// the band).
+    fn band_weight(&self, slot: usize) -> f64;
+
+    /// The parent's still-water depth at slot `slot` (m, NaN if unknown).
+    fn parent_depth(&self, slot: usize) -> f64;
+
+    /// Whether the parent has a depth-mean velocity.
+    fn has_velocity(&self) -> bool;
+
+    /// The largest transport-scaling factor, with transport scaling.
+    fn max_transport_ratio(&self) -> Option<f64>;
+
+    /// The level (m) added to the parent's ζ, ramped with it.
+    fn reference_level(&self) -> f64;
+
+    /// The time-dependent part of the parent at simulation time `t`, the
+    /// same at every node, into `moment` ([`PARENT_MOMENT`] values): the
+    /// ramp, the number of snapshots, their indices and their weights (4
+    /// each, the unused ones 0).
+    ///
+    /// # Panics
+    /// Outside the parent's time range, where the parent panics.
+    fn moment(&self, t: f64, moment: &mut [f64]);
+
+    /// The address of the samples, the same for a parent's clones: what a
+    /// device keys its tables by (a parent shared by an open boundary and
+    /// its band goes up once).
+    fn samples(&self) -> *const ();
+
+    /// The parent's `(η, velocity)` at slot `slot` over a child bed `bed`
+    /// (for transport scaling), from the `moment` of a time: the snapshots'
+    /// [`parent_term`]s and [`parent_state`]. The CPU's and a device's
+    /// evaluation.
+    #[inline]
+    fn evaluate(&self, slot: usize, moment: &[f64], bed: f64) -> (f64, Option<(f64, f64)>) {
+        let series = self.slot_series(slot);
+        let mut sum = [0.0; 3];
+        for i in 0..moment[1] as usize {
+            parent_term(&mut sum, moment[6 + i], &series[moment[2 + i] as usize]);
+        }
+        parent_state(
+            sum,
+            moment[0],
+            self.reference_level(),
+            self.has_velocity(),
+            self.max_transport_ratio()
+                .map(|max| (max, self.parent_depth(slot))),
+            bed,
+        )
+    }
+}
+
+impl ParentSeries2D for OceanModelState {
+    fn n_slots(&self) -> usize {
+        self.inner.nodes.len()
+    }
+
+    fn n_times(&self) -> usize {
+        self.inner.reader.n_times()
+    }
+
+    fn slot_series(&self, slot: usize) -> &[[f32; 3]] {
+        let n = self.inner.reader.n_times();
+        &self.inner.series.as_chunks::<3>().0[slot * n..(slot + 1) * n]
+    }
+
+    fn slot_of_node(&self) -> &[u32] {
+        &self.inner.slot_of_node
+    }
+
+    fn band_elements(&self) -> &[bool] {
+        &self.inner.band_elements
+    }
+
+    fn slot_of(&self, node_index: Option<usize>, (x, y): (f64, f64)) -> usize {
+        if let Some(&slot) = node_index
+            .and_then(|i| self.inner.slot_of_node.get(i))
+            .filter(|&&s| s != u32::MAX)
+        {
+            return slot as usize;
+        }
+        self.inner
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.on_boundary)
+            .min_by(|a, b| {
+                let da = (a.1.position.0 - x).hypot(a.1.position.1 - y);
+                let db = (b.1.position.0 - x).hypot(b.1.position.1 - y);
+                da.total_cmp(&db)
+            })
+            .map(|(i, _)| i)
+            .expect("OceanModelState has boundary nodes")
+    }
+
+    fn band_weight(&self, slot: usize) -> f64 {
+        self.inner.nodes[slot].weight
+    }
+
+    fn parent_depth(&self, slot: usize) -> f64 {
+        self.inner.nodes[slot].parent_depth
+    }
+
+    fn has_velocity(&self) -> bool {
+        self.inner.has_velocity
+    }
+
+    fn max_transport_ratio(&self) -> Option<f64> {
+        let options = &self.inner.options;
+        options
+            .transport_scaling
+            .then_some(options.max_transport_ratio)
+    }
+
+    /// From [`NestingOptions::datum`].
+    fn reference_level(&self) -> f64 {
+        self.inner.reference_level
+    }
+
+    /// The parent's time stencil and the ramp.
+    fn moment(&self, t: f64, moment: &mut [f64]) {
+        let Moment { time, ramp } = self.moment_at(t);
+        moment[0] = ramp;
+        moment[1] = time.len as f64;
+        for i in 0..4 {
+            moment[2 + i] = time.idx[i] as f64;
+            moment[6 + i] = time.w[i];
+        }
+    }
+
+    fn samples(&self) -> *const () {
+        Arc::as_ptr(&self.inner).cast()
+    }
+}
+
 impl ExternalStateProvider for OceanModelState {
     /// Parent `(η, u, v)` in the mesh axes, the velocity transport-scaled.
     fn external_state(&self, ctx: &BCContext2D) -> ExternalState {
         let slot = self.slot_of(ctx.node_index, ctx.position);
-        parent_external_state(self.evaluate(slot, &self.moment_at(ctx.time), ctx.bathymetry))
+        let mut moment = [0.0; PARENT_MOMENT];
+        self.moment(ctx.time, &mut moment);
+        parent_external_state(self.evaluate(slot, &moment, ctx.bathymetry))
     }
 
     fn device_external(&self) -> Option<DeviceExternal2D<'_>> {
@@ -832,7 +860,7 @@ impl ExternalStateProvider for OceanModelState {
 
 /// Adds one snapshot of a node's parent series to its sum: `sum[q] += w ·
 /// values[q]` for ζ, u and v, with the snapshot's time weight `w`
-/// ([`OceanModelState::moment`]). Pointwise, for the CPU and a device.
+/// ([`ParentSeries2D::moment`]). Pointwise, for the CPU and a device.
 #[inline]
 pub fn parent_term(sum: &mut [f64; 3], w: f64, values: &[f32; 3]) {
     sum[0] += w * values[0] as f64;
@@ -891,18 +919,34 @@ struct Moment {
     ramp: f64,
 }
 
-/// Flow-relaxation band towards the parent state: `γ (q_parent − q)` with
-/// `γ = weight(d)/τ`. Built by [`OceanModelState::relaxation`]; see the
-/// module docs.
+/// Flow-relaxation band towards a parent's state ([`ParentSeries2D`]):
+/// `γ (q_parent − q)` with `γ = weight(d)/τ`. Built by
+/// [`OceanModelState::relaxation`] and [`crate::boundary::RunParent::relaxation`];
+/// see the module docs.
 #[derive(Clone, Debug)]
-pub struct NestingRelaxation2D {
-    parent: OceanModelState,
+pub struct NestingRelaxation2D<P = OceanModelState> {
+    parent: P,
     rate: f64,
     momentum_only: bool,
     wet_depth: f64,
 }
 
-impl NestingRelaxation2D {
+impl<P: ParentSeries2D> NestingRelaxation2D<P> {
+    /// Relaxation towards `parent` with timescale `timescale` (s) at the
+    /// boundary, the mass and the momentum, at nodes deeper than 5 cm.
+    ///
+    /// # Panics
+    /// Unless `timescale > 0`.
+    pub fn new(parent: P, timescale: f64) -> Self {
+        assert!(timescale > 0.0, "relaxation timescale must be positive");
+        Self {
+            parent,
+            rate: 1.0 / timescale,
+            momentum_only: false,
+            wet_depth: 0.05,
+        }
+    }
+
     /// Relax only the momentum, keeping the mass (the depth) free.
     pub fn with_momentum_only(mut self, enable: bool) -> Self {
         self.momentum_only = enable;
@@ -916,11 +960,12 @@ impl NestingRelaxation2D {
         self
     }
 
-    /// The source at a slot for state `q` over bed `bed`.
+    /// The source at a slot for state `q` over bed `bed`, the parent at
+    /// `moment`.
     #[inline]
-    fn relax(&self, slot: usize, moment: &Moment, q: &SWEState2D, bed: f64) -> SWEState2D {
+    fn relax(&self, slot: usize, moment: &[f64], q: &SWEState2D, bed: f64) -> SWEState2D {
         relaxation_source(
-            self.parent.inner.nodes[slot].weight,
+            self.parent.band_weight(slot),
             self.rate,
             self.wet_depth,
             self.momentum_only,
@@ -930,8 +975,37 @@ impl NestingRelaxation2D {
         )
     }
 
+    /// The source at every sampled node of `element`, to `add` (node,
+    /// source).
+    fn element_sources(
+        &self,
+        element: &ElementSources<'_>,
+        mut add: impl FnMut(usize, SWEState2D),
+    ) {
+        let k = element.element.as_usize();
+        if !self.parent.band_elements()[k] {
+            return;
+        }
+        let mut moment = [0.0; PARENT_MOMENT];
+        self.parent.moment(element.time, &mut moment);
+        let n = element.n_nodes();
+        let slots = &self.parent.slot_of_node()[k * n..(k + 1) * n];
+        for (i, &slot) in slots.iter().enumerate() {
+            if slot == u32::MAX {
+                continue;
+            }
+            let bed = element
+                .bathymetry
+                .map_or(0.0, |b| b.get(element.element, i));
+            add(
+                i,
+                self.relax(slot as usize, &moment, &element.state(i), bed),
+            );
+        }
+    }
+
     /// The parent it relaxes towards.
-    pub fn parent(&self) -> &OceanModelState {
+    pub fn parent(&self) -> &P {
         &self.parent
     }
 
@@ -987,17 +1061,14 @@ pub fn relaxation_source(
     )
 }
 
-impl SourceTerm2D for NestingRelaxation2D {
+impl<P: ParentSeries2D> SourceTerm2D for NestingRelaxation2D<P> {
     /// Per-node evaluation by position (slow: a search over the boundary
     /// nodes). The RHS kernels use [`SourceTerm2D::add_element`].
     fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D {
         let slot = self.parent.slot_of(None, ctx.position);
-        self.relax(
-            slot,
-            &self.parent.moment_at(ctx.time),
-            &ctx.state,
-            ctx.bathymetry,
-        )
+        let mut moment = [0.0; PARENT_MOMENT];
+        self.parent.moment(ctx.time, &mut moment);
+        self.relax(slot, &moment, &ctx.state, ctx.bathymetry)
     }
 
     fn add_element(
@@ -1007,26 +1078,11 @@ impl SourceTerm2D for NestingRelaxation2D {
         hu: &mut [f64],
         hv: &mut [f64],
     ) {
-        let inner = &self.parent.inner;
-        let k = element.element.as_usize();
-        if !inner.band_elements[k] {
-            return;
-        }
-        let moment = self.parent.moment_at(element.time);
-        let base = k * inner.n_nodes;
-        for i in 0..element.n_nodes() {
-            let slot = inner.slot_of_node[base + i];
-            if slot == u32::MAX {
-                continue;
-            }
-            let bed = element
-                .bathymetry
-                .map_or(0.0, |b| b.get(element.element, i));
-            let s = self.relax(slot as usize, &moment, &element.state(i), bed);
+        self.element_sources(element, |i, s| {
             h[i] += s.h;
             hu[i] += s.hu;
             hv[i] += s.hv;
-        }
+        });
     }
 
     fn is_node_local(&self) -> bool {
@@ -1034,7 +1090,12 @@ impl SourceTerm2D for NestingRelaxation2D {
     }
 
     fn device_form(&self) -> Option<DeviceSource2D<'_>> {
-        Some(DeviceSource2D::NestingRelaxation(self))
+        Some(DeviceSource2D::NestingRelaxation {
+            parent: &self.parent,
+            rate: self.rate,
+            wet_depth: self.wet_depth,
+            momentum_only: self.momentum_only,
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -1046,22 +1107,8 @@ impl SourceTerm2D for NestingRelaxation2D {
     }
 
     fn add_mass_element(&self, element: &ElementSources<'_>, h: &mut [f64]) {
-        let inner = &self.parent.inner;
-        let k = element.element.as_usize();
-        if self.momentum_only || !inner.band_elements[k] {
-            return;
-        }
-        let moment = self.parent.moment_at(element.time);
-        let base = k * inner.n_nodes;
-        for (i, h) in h.iter_mut().enumerate().take(element.n_nodes()) {
-            let slot = inner.slot_of_node[base + i];
-            if slot == u32::MAX {
-                continue;
-            }
-            let bed = element
-                .bathymetry
-                .map_or(0.0, |b| b.get(element.element, i));
-            *h += self.relax(slot as usize, &moment, &element.state(i), bed).h;
+        if !self.momentum_only {
+            self.element_sources(element, |i, s| h[i] += s.h);
         }
     }
 }
@@ -1365,7 +1412,8 @@ mod tests {
         assert!(!inner.band_elements[12]);
         assert!(inner.band_elements[0]);
         let relax = parent.relaxation(600.0);
-        let time = parent.moment_at(0.0);
+        let mut time = [0.0; PARENT_MOMENT];
+        parent.moment(0.0, &mut time);
         let slot = inner.slot_of_node[0] as usize;
         let at_parent = SWEState2D::from_primitives(DEPTH + 0.1, 0.2, -0.1);
         let s = relax.relax(slot, &time, &at_parent, -DEPTH);
@@ -1417,7 +1465,7 @@ mod tests {
                 parent.relaxation(900.0),
                 parent.relaxation(600.0).with_momentum_only(true),
             ];
-            let mut moment = [0.0; OceanModelState::MOMENT];
+            let mut moment = [0.0; PARENT_MOMENT];
             for t in [0.0, 1000.0, 3600.0, 9000.0, 18_000.0] {
                 parent.moment(t, &mut moment);
                 for slot in 0..parent.n_slots() {
@@ -1466,7 +1514,7 @@ mod tests {
                                     bed,
                                     device,
                                 );
-                                let on_cpu = relax.relax(slot, &parent.moment_at(t), &q, bed);
+                                let on_cpu = relax.relax(slot, &moment, &q, bed);
                                 assert_eq!(state_bits(on_device), state_bits(on_cpu));
                             }
                         }

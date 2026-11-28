@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use dgcom::boundary::{
     CharacteristicOBC, MultiBoundaryCondition2D, NestingOptions, OceanModelState, ParentDatum,
-    Reflective2D,
+    ParentSeries2D, Reflective2D,
 };
 use dgcom::equations::ShallowWater2D;
 use dgcom::io::{

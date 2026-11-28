@@ -64,10 +64,7 @@
 use std::sync::atomic::AtomicBool;
 
 use super::bathymetry_validation::warn_once_if_misconfigured;
-use super::{
-    BCContext2D, BoundaryState, BoundaryTides, DeviceBoundary2D, OceanModelState,
-    SWEBoundaryCondition2D,
-};
+use super::{BCContext2D, BoundaryState, BoundaryTides, DeviceBoundary2D, SWEBoundaryCondition2D};
 use crate::io::BoundaryTimeSeries;
 use crate::mesh::BoundaryTag;
 use crate::solver::SWEState2D;
@@ -142,12 +139,13 @@ pub enum DeviceExternal2D<'a> {
     /// ([`BoundaryTides::moment`]), the device sums them per node
     /// ([`super::tide_term`], [`super::tide_state`])
     Tides(&'a BoundaryTides),
-    /// A parent model's state per boundary node (`OceanModelState`): the
-    /// device holds each node's series of snapshots, the host evaluates the
-    /// time weights and the ramp once per stage time
-    /// ([`OceanModelState::moment`]), the device sums them per node
-    /// ([`super::parent_term`], [`super::parent_state`])
-    Parent(&'a OceanModelState),
+    /// A parent's state per boundary node ([`super::ParentSeries2D`]: a
+    /// parent model, `OceanModelState`; a dgcom run's frames, `RunParent`):
+    /// the device holds each node's series of snapshots, the host evaluates
+    /// the time weights and the ramp once per stage time
+    /// ([`super::ParentSeries2D::moment`]), the device sums them per node
+    /// ([`super::ParentSeries2D::evaluate`])
+    Parent(&'a dyn super::ParentSeries2D),
 }
 
 impl std::fmt::Debug for DeviceExternal2D<'_> {
