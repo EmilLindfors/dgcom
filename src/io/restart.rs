@@ -710,6 +710,26 @@ impl Fingerprint {
     }
 }
 
+/// The model time (s) of a 2D or 3D restart, from its header alone (the
+/// file is not read through or checked).
+pub fn restart_time(path: impl AsRef<Path>) -> Result<f64, RestartError> {
+    let mut input = BufReader::new(File::open(path.as_ref())?);
+    let mut magic = [0; 8];
+    input.read_exact(&mut magic)?;
+    let n_dims = match &magic[..7] {
+        m if m == MAGIC_2D => 2,
+        m if m == MAGIC_3D => 3,
+        _ => return Err(RestartError::Format("bad magic number".into())),
+    };
+    // The dimensions and the domain's fingerprint, then the time
+    let mut word = [0; 8];
+    for _ in 0..n_dims + 1 {
+        input.read_exact(&mut word)?;
+    }
+    input.read_exact(&mut word)?;
+    Ok(f64::from_bits(u64::from_le_bytes(word)))
+}
+
 /// A fingerprint of a 2D domain: the mesh's vertices and elements and the bed
 /// at every node (FNV-1a over their bits). Two runs with the same
 /// fingerprint step the same elements over the same bed.
@@ -948,6 +968,27 @@ mod tests {
             "the temporary file is left"
         );
         assert_same(&restart, &Restart3D::read(&path).unwrap());
+        assert_eq!(
+            restart_time(&path).unwrap().to_bits(),
+            restart.time.to_bits()
+        );
+
+        // A cut-out of its elements: their columns and history, in order
+        let kept = [2, 0];
+        let cut = restart.select_elements(&kept, 7);
+        assert_eq!((cut.domain, cut.state.n_elements), (7, 2));
+        let per = restart.state.u.len() / restart.state.n_elements;
+        for (new, &old) in kept.iter().enumerate() {
+            assert_eq!(
+                cut.state.u[new * per..][..per],
+                restart.state.u[old * per..][..per]
+            );
+            let n = restart.state.n_nodes;
+            assert_eq!(
+                cut.slow_forcing.g[0].data[1][new * n..][..n],
+                restart.slow_forcing.g[0].data[1][old * n..][..n]
+            );
+        }
 
         // Without the optional parts
         let mut bare = sample();
@@ -968,6 +1009,10 @@ mod tests {
         restart.write(&path).unwrap();
         let back = Restart2D::read(&path).unwrap();
         assert_eq!(back.time.to_bits(), restart.time.to_bits());
+        assert_eq!(
+            restart_time(&path).unwrap().to_bits(),
+            restart.time.to_bits()
+        );
         assert_eq!(back.domain, restart.domain);
         assert_eq!(
             (back.state.n_elements, back.state.n_nodes),

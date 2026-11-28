@@ -30,7 +30,7 @@ The files were split out of the old 1,500-line `TODO.md` on 2026-10-10, verbatim
 | [history.md](history.md) | Items resolved before the 2026-09-25 review, completed phases | — |
 | [review-2026-09-25.md](review-2026-09-25.md) | The full-crate review that set the current direction (historical; source comments cite its §s) | — |
 
-Reference documents live in `docs/`: `architecture.md` (module tree, status by layer), `accuracy.md` (verified convergence and conservation), `gmsh-meshes.md`, `stratified-rest-over-steep-beds.md`, `windows-native-deps.md`.
+Reference documents live in `docs/`: `architecture.md` (module tree, status by layer), `accuracy.md` (verified convergence and conservation), `patches.md` (developing and optimizing on cut-outs of a case's mesh), `gmsh-meshes.md`, `stratified-rest-over-steep-beds.md`, `windows-native-deps.md`.
 
 ## Conventions
 

@@ -212,62 +212,162 @@ fn a_patch_starts_from_the_whole_runs_restart() {
     assert_eq!(*resumed.stations[0].time_s.last().unwrap(), 7200.0);
 }
 
+/// The largest |difference| of η and of the speed between `name`'s records
+/// in `a` and `b` at their common times.
+fn record_gap(a: &[StationSeries], b: &[StationSeries], name: &str) -> (f64, f64, usize) {
+    let find = |s: &[StationSeries]| s.iter().find(|s| s.name == name).unwrap().clone();
+    let (sa, sb) = (find(a), find(b));
+    let (mut eta, mut speed, mut n) = (0.0_f64, 0.0_f64, 0);
+    for (i, t) in sb.time_s.iter().enumerate() {
+        let Some(j) = sa.time_s.iter().position(|x| x == t) else {
+            continue;
+        };
+        eta = eta.max((sb.eta_m[i] - sa.eta_m[j]).abs());
+        let du = sb.u_m_s[i] - sa.u_m_s[j];
+        let dv = sb.v_m_s[i] - sa.v_m_s[j];
+        speed = speed.max(du.hypot(dv));
+        n += 1;
+    }
+    (eta, speed, n)
+}
+
+/// A patch of the tidal channel's middle nested in the whole run's own
+/// snapshots (`mesh.patch.whole_run`) follows the whole run there: the
+/// middle station's η and current against the whole run's, where the same
+/// patch with the case's tide at its cut (the mouth's tide, the wrong one
+/// there) is far off. From the start and from the whole run's restart.
+#[test]
+fn a_patch_nested_in_its_whole_run_replays_it() {
+    let whole_dir = tempfile::tempdir().unwrap();
+    let whole_file = example(
+        whole_dir.path(),
+        &[
+            "run.duration_hours=3.0".into(),
+            "output.interval_minutes=5.0".into(),
+            "restart.interval_hours=1.0".into(),
+            "restart.keep=true".into(),
+        ],
+    );
+    let whole = whole_file.run(&mut |_| {}).unwrap();
+    let k = element_near(&whole_file.build_domain().unwrap(), [20500.0, 1500.0]);
+    let snapshot = whole_dir.path().join("tidal_channel.dgsnap");
+    let in_run = format!("mesh.patch.whole_run={:?}", snapshot.display().to_string());
+
+    let run = |extra: &[&str]| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = patch_overrides(k, 6.0, "open");
+        o.push("run.duration_hours=3.0".into());
+        o.push("output.interval_minutes=5.0".into());
+        o.extend(extra.iter().map(|s| s.to_string()));
+        let file = example(dir.path(), &o);
+        let domain = file.build_domain().unwrap();
+        let report = file.run_on(&domain, &mut |_| {}).unwrap();
+        (report, domain.notes, dir)
+    };
+    let (nested, notes, _d1) = run(&[&in_run]);
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.starts_with("patch: nested in the whole run's snapshots")),
+        "{notes:?}"
+    );
+    let (tide, _, _d2) = run(&[]);
+    let (eta, speed, n) = record_gap(&whole.stations, &nested.stations, "middle");
+    let (eta_tide, speed_tide, _) = record_gap(&whole.stations, &tide.stations, "middle");
+    println!(
+        "middle over 3 h ({n} records): nested in the run |Δη| ≤ {:.2} mm, |Δu| ≤ {:.2} mm/s; \
+         the case's tide at the cut {:.1} mm, {:.1} mm/s",
+        1e3 * eta,
+        1e3 * speed,
+        1e3 * eta_tide,
+        1e3 * speed_tide
+    );
+    assert!(n >= 36, "{n} common records");
+    // 0.66 mm and 0.58 mm/s against 427 mm and 285 mm/s (2026-11-28)
+    assert!(eta < 2e-3 && speed < 2e-3, "{eta}, {speed}");
+    assert!(
+        eta_tide > 0.1 && speed_tide > 0.1,
+        "{eta_tide}, {speed_tide}"
+    );
+
+    // From the whole run's restart at 1 h
+    let restart = whole_dir.path().join("tidal_channel_001.00h.restart");
+    let (seeded, _, _d3) = run(&[
+        &in_run,
+        &format!("restart.from={:?}", restart.display().to_string()),
+    ]);
+    let (eta_seeded, speed_seeded, n) = record_gap(&whole.stations, &seeded.stations, "middle");
+    println!(
+        "from the 1 h restart ({n} records): |Δη| ≤ {:.2} mm, |Δu| ≤ {:.2} mm/s",
+        1e3 * eta_seeded,
+        1e3 * speed_seeded
+    );
+    assert_eq!(seeded.stations[0].time_s[0], 3600.0);
+    assert!(
+        eta_seeded < 2e-3 && speed_seeded < 2e-3,
+        "{eta_seeded}, {speed_seeded}"
+    );
+}
+
+/// A 3D channel's M2 tide (as `case_test`'s resumed 3D run), its restarts
+/// every half hour, in `dir`.
+fn channel_3d(dir: &Path, minutes: f64, extra: &[String]) -> CaseFile {
+    let path = dir.join("case.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+            [run]
+            name = "channel"
+            duration_hours = {:?}
+
+            [mesh.rectangle]
+            x_m = [0.0, 10000.0]
+            y_m = [0.0, 2000.0]
+            nx = 10
+            ny = 2
+            west = "open"
+
+            [bathymetry]
+            depth_m = 20.0
+
+            [[boundary]]
+            tag = "open"
+            [boundary.tide]
+            ramp_hours = 0.25
+            constituents = [{{ name = "M2", amplitude_m = 0.5 }}]
+
+            [three_d]
+            levels = 6
+            dt_max_s = 47.0
+            profile = [[-6.0, 14.0, 32.0], [-14.0, 10.0, 34.0]]
+
+            [output]
+            directory = "out"
+            interval_minutes = 10.0
+            station_interval_minutes = 5.0
+
+            [[output.station]]
+            name = "head"
+            x_m = 9500.0
+            y_m = 1000.0
+
+            [restart]
+            interval_hours = 0.5
+            "#,
+            minutes / 60.0
+        ),
+    )
+    .unwrap();
+    CaseFile::read(&path, extra).unwrap()
+}
+
 /// A 3D channel's tide (as `case_test`'s resumed 3D run), its last 3 km
 /// started from the whole run's restart at 30 minutes, walled.
 #[test]
 fn a_patch_starts_from_the_whole_3d_runs_restart() {
-    let case = |dir: &Path, minutes: f64, extra: &[String]| {
-        let path = dir.join("case.toml");
-        std::fs::write(
-            &path,
-            format!(
-                r#"
-                [run]
-                name = "channel"
-                duration_hours = {:?}
-
-                [mesh.rectangle]
-                x_m = [0.0, 10000.0]
-                y_m = [0.0, 2000.0]
-                nx = 10
-                ny = 2
-                west = "open"
-
-                [bathymetry]
-                depth_m = 20.0
-
-                [[boundary]]
-                tag = "open"
-                [boundary.tide]
-                ramp_hours = 0.25
-                constituents = [{{ name = "M2", amplitude_m = 0.5 }}]
-
-                [three_d]
-                levels = 6
-                dt_max_s = 47.0
-                profile = [[-6.0, 14.0, 32.0], [-14.0, 10.0, 34.0]]
-
-                [output]
-                directory = "out"
-                interval_minutes = 10.0
-                station_interval_minutes = 5.0
-
-                [[output.station]]
-                name = "head"
-                x_m = 9500.0
-                y_m = 1000.0
-
-                [restart]
-                interval_hours = 0.5
-                "#,
-                minutes / 60.0
-            ),
-        )
-        .unwrap();
-        CaseFile::read(&path, extra).unwrap()
-    };
     let whole_dir = tempfile::tempdir().unwrap();
-    let whole_file = case(whole_dir.path(), 30.0, &[]);
+    let whole_file = channel_3d(whole_dir.path(), 30.0, &[]);
     let whole = whole_file.run(&mut |_| {}).unwrap();
     let restart = whole_dir.path().join("out").join("channel.restart");
     assert_eq!(dgcom::io::Restart3D::read(&restart).unwrap().time, 1800.0);
@@ -277,7 +377,7 @@ fn a_patch_starts_from_the_whole_3d_runs_restart() {
     let mut extra = patch_overrides(k, 2.5, "wall");
     extra.push(format!("restart.from={:?}", restart.display().to_string()));
     extra.push("output.directory=\"patch\"".into());
-    let file = case(dir.path(), 45.0, &extra);
+    let file = channel_3d(dir.path(), 45.0, &extra);
     let domain = file.build_domain().unwrap();
     assert_eq!(
         domain.mesh.n_elements, 6,
@@ -305,4 +405,55 @@ fn a_patch_starts_from_the_whole_3d_runs_restart() {
     assert!(head.eta_m.iter().chain(&head.u_m_s).all(|v| v.is_finite()));
     let (v0, v1) = report.volume_m3;
     assert!((v1 - v0).abs() <= 1e-11 * v0, "{v0} → {v1}");
+}
+
+/// The 3D channel's last 3 km nested in the whole run's snapshots follows
+/// it at the head (η, the depth mean), where the same patch walled at its
+/// cut stops the tide.
+#[test]
+fn a_3d_patch_nested_in_its_whole_run_replays_it() {
+    let whole_dir = tempfile::tempdir().unwrap();
+    // Frames every minute: at 5 the tide's ramped front, which sweeps the
+    // channel in 15 minutes, is 20 mm off at the head (0.9 mm at 1)
+    let every = ["output.interval_minutes=1.0".to_string()];
+    let whole_file = channel_3d(whole_dir.path(), 60.0, &every);
+    let whole = whole_file.run(&mut |_| {}).unwrap();
+    let k = element_near(&whole_file.build_domain().unwrap(), [9500.0, 500.0]);
+    let snapshot = whole_dir.path().join("out").join("channel.dgsnap");
+    let patch = |faces: &str, extra: &[String]| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = patch_overrides(k, 2.5, faces);
+        o.extend(every.iter().cloned());
+        o.extend(extra.iter().cloned());
+        let report = channel_3d(dir.path(), 60.0, &o).run(&mut |_| {}).unwrap();
+        (report, dir)
+    };
+    let in_run = format!("mesh.patch.whole_run={:?}", snapshot.display().to_string());
+    let (nested, _d1) = patch("open", &[in_run]);
+    assert!(
+        nested
+            .notes
+            .iter()
+            .any(|n| n.starts_with("open faces: nested in the whole run's u, v, T, S")),
+        "{:?}",
+        nested.notes
+    );
+    let (walled, _d2) = patch("wall", &[]);
+    let (eta, speed, n) = record_gap(&whole.stations, &nested.stations, "head");
+    let (eta_wall, speed_wall, _) = record_gap(&whole.stations, &walled.stations, "head");
+    println!(
+        "3D head over 1 h ({n} records): nested in the run |Δη| ≤ {:.3} mm, |Δū| ≤ {:.3} mm/s; \
+         walled {:.1} mm, {:.1} mm/s",
+        1e3 * eta,
+        1e3 * speed,
+        1e3 * eta_wall,
+        1e3 * speed_wall
+    );
+    assert!(n >= 12, "{n} records");
+    // 0.86 mm and 0.10 mm/s against 492 mm and 20 mm/s (2026-11-28)
+    assert!(eta < 2e-3 && speed < 1e-3, "{eta}, {speed}");
+    assert!(
+        eta_wall > 0.2 && speed_wall > 0.01,
+        "{eta_wall}, {speed_wall}"
+    );
 }
